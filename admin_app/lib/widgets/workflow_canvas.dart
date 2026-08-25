@@ -305,45 +305,58 @@ class _WorkflowCanvasState extends State<WorkflowCanvas> {
     }
     return Stack(
       children: [
+        // The dotted field is painted at VIEWPORT level, not inside the
+        // transformed child: a pattern drawn on the child stops at the
+        // graph's bounds and never repaints on pan or zoom, so the dots sat
+        // still while the graph moved and ran out entirely at the edges.
+        // Driving it from the controller instead gives an infinite field
+        // that scrolls and scales with the content.
         Positioned.fill(
           child: ColoredBox(
             color: CumulusColors.canvas,
-            child: InteractiveViewer(
-              transformationController: _view,
-              constrained: false,
-              boundaryMargin: const EdgeInsets.all(400),
-              minScale: 0.4,
-              maxScale: 2.0,
-              child: SizedBox(
-                width: layout.size.width,
-                height: layout.size.height,
-                child: Stack(
-                  children: [
-                    Positioned.fill(
-                      child: CustomPaint(
-                        painter: _FieldPainter(layout.edges),
-                      ),
-                    ),
-                    for (final node in layout.nodes)
-                      Positioned(
-                        left: node.position.dx,
-                        top: node.position.dy,
-                        width: _nodeWidth,
-                        height: _nodeHeight,
-                        child: _CanvasNode(
-                          node: node,
-                          selected: node.step.id == widget.selectedStepId,
-                          runStatus: widget.runPath?.statusByStep[node.step.id],
-                          inRun: widget.runPath?.executed(node.step.id),
-                          onTap: () => widget.onSelect(
-                            node.step.id == widget.selectedStepId
-                                ? null
-                                : node.step,
-                          ),
+            child: ListenableBuilder(
+              listenable: _view,
+              builder: (context, _) => CustomPaint(
+                painter: _DotFieldPainter(_view.value),
+                size: Size.infinite,
+              ),
+            ),
+          ),
+        ),
+        Positioned.fill(
+          child: InteractiveViewer(
+            transformationController: _view,
+            constrained: false,
+            boundaryMargin: const EdgeInsets.all(400),
+            minScale: 0.4,
+            maxScale: 2.0,
+            child: SizedBox(
+              width: layout.size.width,
+              height: layout.size.height,
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: CustomPaint(painter: _EdgePainter(layout.edges)),
+                  ),
+                  for (final node in layout.nodes)
+                    Positioned(
+                      left: node.position.dx,
+                      top: node.position.dy,
+                      width: _nodeWidth,
+                      height: _nodeHeight,
+                      child: _CanvasNode(
+                        node: node,
+                        selected: node.step.id == widget.selectedStepId,
+                        runStatus: widget.runPath?.statusByStep[node.step.id],
+                        inRun: widget.runPath?.executed(node.step.id),
+                        onTap: () => widget.onSelect(
+                          node.step.id == widget.selectedStepId
+                              ? null
+                              : node.step,
                         ),
                       ),
-                  ],
-                ),
+                    ),
+                ],
               ),
             ),
           ),
@@ -523,23 +536,55 @@ class _ZoomButton extends StatelessWidget {
   }
 }
 
-/// The dotted field plus the connectors, painted beneath the nodes so a
-/// branch label never covers a step's text.
-class _FieldPainter extends CustomPainter {
-  static const double dotSpacing = 22;
+/// The infinite dotted background, drawn in viewport space from the viewer's
+/// current transform.
+///
+/// It reads the translation and scale off the matrix and tiles from the
+/// remainder, so the field always covers the whole viewport however far the
+/// graph has been panned, and the dots travel and grow with the content
+/// instead of being a static texture bolted to the graph's own bounds.
+class _DotFieldPainter extends CustomPainter {
+  static const double spacing = 22;
 
-  final List<_Edge> edges;
+  final Matrix4 transform;
 
-  _FieldPainter(this.edges);
+  _DotFieldPainter(this.transform);
 
   @override
   void paint(Canvas canvas, Size size) {
+    final scale = transform.getMaxScaleOnAxis();
+    final step = spacing * scale;
+    // The viewer's minScale keeps this well above the floor today; the guard
+    // is here so that lowering minScale later degrades to a plain background
+    // rather than filling the viewport with a grey wash of touching dots.
+    if (!step.isFinite || step < 7) return;
+    final translation = transform.getTranslation();
+    // Dart's % is non-negative for a positive divisor, so this lands the
+    // first tile just off-screen in both directions without a sign dance.
+    final originX = translation.x % step;
+    final originY = translation.y % step;
+    final radius = (scale * 1.0).clamp(0.6, 2.0);
     final dot = Paint()..color = CumulusColors.borderStrong;
-    for (var x = dotSpacing / 2; x < size.width; x += dotSpacing) {
-      for (var y = dotSpacing / 2; y < size.height; y += dotSpacing) {
-        canvas.drawCircle(Offset(x, y), 1, dot);
+    for (var x = originX - step; x <= size.width + step; x += step) {
+      for (var y = originY - step; y <= size.height + step; y += step) {
+        canvas.drawCircle(Offset(x, y), radius, dot);
       }
     }
+  }
+
+  @override
+  bool shouldRepaint(_DotFieldPainter old) => old.transform != transform;
+}
+
+/// The connectors, painted beneath the nodes so a branch label never covers a
+/// step's text.
+class _EdgePainter extends CustomPainter {
+  final List<_Edge> edges;
+
+  _EdgePainter(this.edges);
+
+  @override
+  void paint(Canvas canvas, Size size) {
     for (final edge in edges) {
       _connector(canvas, edge);
     }
@@ -621,7 +666,7 @@ class _FieldPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_FieldPainter old) => old.edges != edges;
+  bool shouldRepaint(_EdgePainter old) => old.edges != edges;
 }
 
 class _CanvasNode extends StatelessWidget {

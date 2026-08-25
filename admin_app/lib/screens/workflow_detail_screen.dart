@@ -693,21 +693,13 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
-            child: Row(
-              children: [
-                SegmentedTabs(
-                  labels: const ['Definition', 'Runs'],
-                  selectedIndex: _rightTab,
-                  onChanged: (i) => setState(() => _rightTab = i),
-                ),
-                const Spacer(),
-                if (_rightTab == 1 && _runDetail != null && _isAdmin)
-                  TextButton.icon(
-                    onPressed: () => _promoteRun(_runDetail!),
-                    icon: const Icon(Icons.playlist_add_check, size: 15),
-                    label: const Text('Promote to golden set'),
-                  ),
-              ],
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: SegmentedTabs(
+                labels: const ['Definition', 'Runs'],
+                selectedIndex: _rightTab,
+                onChanged: (i) => setState(() => _rightTab = i),
+              ),
             ),
           ),
           const Divider(height: 1),
@@ -744,16 +736,76 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     );
   }
 
+  /// Two modes, not two panes. Browsing runs wants the full column; once one
+  /// is chosen the list collapses to a compact header with a way back, and
+  /// the payloads — the reason you picked the run — get the rest of the space.
   Widget _runsPanel() {
+    if (_selectedRun == null) return _runList();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Top half: which run to trace.
-        Expanded(child: _runList()),
+        _selectedRunHeader(),
         const Divider(height: 1),
-        // Bottom half: what the selected step did during that run.
         Expanded(child: _stepPayloadPanel()),
       ],
+    );
+  }
+
+  Widget _selectedRunHeader() {
+    final run = _selectedRun!;
+    final detail = _runDetail;
+    return Container(
+      color: CumulusColors.surfaceMuted.withValues(alpha: 0.6),
+      padding: const EdgeInsets.fromLTRB(10, 10, 16, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              IconButton(
+                tooltip: 'Back to all runs',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.arrow_back, size: 17),
+                onPressed: () => _selectRun(null),
+              ),
+              const SizedBox(width: 2),
+              Text(
+                run.id,
+                style: CumulusText.mono.copyWith(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(width: 8),
+              StatusBadge(
+                runStatusLabel(run.status),
+                tone: runTone(run.status),
+                dense: true,
+                uppercase: true,
+              ),
+              const Spacer(),
+              if (detail != null && _isAdmin)
+                TextButton.icon(
+                  onPressed: () => _promoteRun(detail),
+                  icon: const Icon(Icons.playlist_add_check, size: 15),
+                  label: const Text('Promote'),
+                ),
+            ],
+          ),
+          Padding(
+            padding: const EdgeInsets.only(left: 12, top: 2),
+            child: Text(
+              '${run.caseRef} · ${run.activeSeconds.round()}s active'
+              '${run.suspendedMinutes > 0 ? ' · ${run.suspendedMinutes}m suspended' : ''}'
+              ' · \$${run.costUsd.toStringAsFixed(2)}'
+              ' · ${run.modelCalls} ModelCall${run.modelCalls == 1 ? '' : 's'}'
+              ' · ${run.actionsCommitted} Action${run.actionsCommitted == 1 ? '' : 's'}'
+              ' · ${agoLabel(run.startedAt)}',
+              style: CumulusText.meta,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -776,18 +828,11 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
               const SizedBox(width: 10),
               Expanded(
                 child: Text(
-                  _selectedRun == null
-                      ? 'select one to trace its path'
-                      : 'tracing ${_selectedRun!.id}',
+                  'select one to trace its path through the graph',
                   style: CumulusText.sectionSubtitle,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              if (_selectedRun != null)
-                TextButton(
-                  onPressed: () => _selectRun(null),
-                  child: const Text('Clear'),
-                ),
             ],
           ),
         ),
@@ -798,11 +843,10 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
             separatorBuilder: (_, _) => const Divider(height: 1),
             itemBuilder: (context, i) {
               final run = _runs[i];
-              final selected = run.id == _selectedRun?.id;
+              // No selected state to paint: choosing a run replaces this list
+              // with the run's own header.
               return Material(
-                color: selected
-                    ? CumulusColors.accentSoft
-                    : Colors.transparent,
+                color: Colors.transparent,
                 child: InkWell(
                   onTap: () => _selectRun(run),
                   child: Padding(
@@ -831,9 +875,6 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
                                     run.id,
                                     style: CumulusText.mono.copyWith(
                                       fontSize: 12,
-                                      fontWeight: selected
-                                          ? FontWeight.w600
-                                          : FontWeight.w400,
                                     ),
                                   ),
                                   const SizedBox(width: 8),
@@ -888,12 +929,18 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     if (_loadingRun) return const CumulusLoading();
     final run = _runDetail;
     if (run == null) {
-      return const CumulusEmptyState(
-        icon: Icons.route_outlined,
-        title: 'No run selected',
+      // Reachable only when the journal fetch failed — the panel is not shown
+      // at all until a run is selected.
+      return CumulusEmptyState(
+        icon: Icons.error_outline,
+        title: 'Journal unavailable',
         message:
-            'Pick a run above to light up the path it took, then click a step '
-            'on that path to see what went in and what came out.',
+            'The execution trail for ${_selectedRun?.id ?? 'this run'} could '
+            'not be loaded. Journals are kept 45 days.',
+        action: OutlinedButton(
+          onPressed: () => _selectRun(_selectedRun),
+          child: const Text('Retry'),
+        ),
       );
     }
     final stepId = _selectedStepId;
