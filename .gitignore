@@ -14,8 +14,11 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the repo root on purpose. Unanchored, these Python build-output
+# rules also match admin_app/lib — the Flutter app's entire source tree, which
+# they silently excluded from every commit until this was caught.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
