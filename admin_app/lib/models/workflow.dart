@@ -513,6 +513,7 @@ class RunSummary {
 }
 
 class ModelCallRecord {
+  final String stepId;
   final String stepName;
   final String model;
   final int inputTokens;
@@ -525,6 +526,7 @@ class ModelCallRecord {
   final double temperature;
 
   ModelCallRecord({
+    required this.stepId,
     required this.stepName,
     required this.model,
     required this.inputTokens,
@@ -538,6 +540,7 @@ class ModelCallRecord {
   });
 
   factory ModelCallRecord.fromJson(Map<String, dynamic> j) => ModelCallRecord(
+    stepId: j['step_id'] as String? ?? '',
     stepName: j['step_name'] as String? ?? '',
     model: j['model'] as String? ?? '',
     inputTokens: _i(j['input_tokens']),
@@ -552,6 +555,7 @@ class ModelCallRecord {
 }
 
 class RunStepEvent {
+  final String stepId;
   final String type;
   final String name;
   final String status; // completed | waiting | failed | skipped
@@ -566,6 +570,7 @@ class RunStepEvent {
   final String outputPreview;
 
   RunStepEvent({
+    required this.stepId,
     required this.type,
     required this.name,
     required this.status,
@@ -581,6 +586,7 @@ class RunStepEvent {
   });
 
   factory RunStepEvent.fromJson(Map<String, dynamic> j) => RunStepEvent(
+    stepId: j['step_id'] as String? ?? '',
     type: j['type'] as String,
     name: j['name'] as String,
     status: j['status'] as String,

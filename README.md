@@ -416,9 +416,17 @@ selector**, pause/test actions):
 
 | Tab | What it holds |
 | --- | --- |
-| **Overview & telemetry** | Metadata and governed ROI assumptions, five KPI tiles, three synchronized daily charts (runs, spend, tokens — one cursor moves all three), and a paginated run table. Clicking a run opens a right-side drawer with its full audit trail: every step, the ModelCall payloads (prompt, raw response, model, tokens, cost), rule verdicts, the deciding human, and gateway ledger refs — plus **Promote to golden set**. |
-| **Workflow canvas** | The declarative export as an interactive DAG — pan, zoom, branch-labelled edges, distinct node types. Selecting a draft in the version selector overlays the diff (green glow added, red removed, amber modified); clicking a node opens the inspector (prompt template, model, threshold logic, output paths). **Export schema** yields the portable JSON. |
+| **Overview** | Five KPI tiles across the top, then the definition (metadata and governed ROI assumptions) beside one daily chart whose measure is chosen from a dropdown — runs, model spend, tokens, or human judgment. Whichever measure is on screen, hovering a day tooltips all four, so answering "and what did that day cost?" never means switching charts. |
+| **Workflow canvas** | A full-bleed workbench, split down the middle. On the left, the declarative export as an interactive DAG flowing **north to south** on a dotted field — pan, zoom, click, branch-labelled edges, distinct node types. On the right, two tabs: **Definition** shows the selected node's exported configuration, and **Runs** lists recent executions in the top half. Selecting a run traces its actual path through the graph (steps it never reached fade to ghosts, traversed edges light up in the accent); clicking a step on that path fills the lower half with what went in and what came out — prompt, raw response, model, tokens, cost, rule verdict, deciding human, gateway ledger ref. **Promote to golden set** lives there too. Selecting a draft in the top-bar version selector overlays the diff instead (green glow added, red removed, amber modified). |
 | **Evaluation & optimization** | Golden dataset on the left with its code-sync banner; the test harness top right (candidate vs baseline, **Run suite**); the cost & performance recommender bottom right, each card carrying its evidence and an **Apply to draft version** action. |
+
+The run-path trace is derived from the journal rather than from step status
+alone, because status is ambiguous: when a Rule branches to both an Action and
+a Task and the Task ran, `rule → action` and `task → action` are *both* edges
+between executed steps, but only the second was traversed. Walking the journal
+in order resolves it — an edge is taken when the next executed step is one this
+step actually points at — so a resumed run traces `rule → task → action` and
+never around the Task, and a suspended run simply has no edge out of it.
 
 It is kept deliberately close to DOCTRINE.md:
 

@@ -15,23 +15,6 @@ class ChartPoint {
   const ChartPoint(this.label, this.value, {this.extra = const []});
 }
 
-/// Shared hover index across several charts of the same time axis.
-///
-/// Reading three stacked charts means asking "what happened on *this* day" —
-/// which is only answerable if the crosshair moves in all of them at once.
-/// Charts given the same [ChartSync] highlight the same day together.
-class ChartSync extends ChangeNotifier {
-  int? _index;
-
-  int? get index => _index;
-
-  set index(int? value) {
-    if (_index == value) return;
-    _index = value;
-    notifyListeners();
-  }
-}
-
 /// Single-hue daily bar chart in the console's voice: thin indigo bars with
 /// rounded data ends, two recessive gridlines, a crosshair + tooltip on hover.
 ///
@@ -43,8 +26,9 @@ class DailyBarChart extends StatefulWidget {
   final String Function(double) format;
   final double height;
 
-  /// When supplied, hovering this chart moves every chart sharing the object.
-  final ChartSync? sync;
+  /// Rendered above the plot when set — the chart's own caption is usually
+  /// carried by the surrounding card instead.
+  final bool showTitle;
 
   const DailyBarChart({
     super.key,
@@ -52,7 +36,7 @@ class DailyBarChart extends StatefulWidget {
     required this.points,
     required this.format,
     this.height = 150,
-    this.sync,
+    this.showTitle = true,
   });
 
   @override
@@ -60,16 +44,10 @@ class DailyBarChart extends StatefulWidget {
 }
 
 class _DailyBarChartState extends State<DailyBarChart> {
-  int? _localHover;
-
-  int? get _hover => widget.sync?.index ?? _localHover;
+  int? _hover;
 
   void _setHover(int? index) {
-    if (widget.sync != null) {
-      widget.sync!.index = index;
-    } else if (index != _localHover) {
-      setState(() => _localHover = index);
-    }
+    if (index != _hover) setState(() => _hover = index);
   }
 
   @override
@@ -94,17 +72,11 @@ class _DailyBarChartState extends State<DailyBarChart> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(widget.title.toUpperCase(), style: CumulusText.statLabel),
-        const SizedBox(height: 10),
-        SizedBox(
-          height: widget.height,
-          child: widget.sync == null
-              ? chart
-              : ListenableBuilder(
-                  listenable: widget.sync!,
-                  builder: (context, _) => chart,
-                ),
-        ),
+        if (widget.showTitle) ...[
+          Text(widget.title.toUpperCase(), style: CumulusText.statLabel),
+          const SizedBox(height: 10),
+        ],
+        SizedBox(height: widget.height, child: chart),
       ],
     );
   }

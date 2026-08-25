@@ -33,10 +33,21 @@ CumulusTone recommendationTone(String kind) => switch (kind) {
   _ => CumulusTone.neutral,
 };
 
-const _runsPerPage = 10;
+/// The measures the overview chart can show. One chart, one axis — switching
+/// measure is a choice, never two scales stacked on one plot.
+enum ChartMeasure {
+  runs('Runs / day'),
+  spend('Model spend / day'),
+  tokens('Tokens / day'),
+  judgment('Human judgment / day');
 
-/// One definition, in three views: what it is and how it is doing, what it
-/// looks like as a graph, and how a candidate version measures up.
+  final String label;
+
+  const ChartMeasure(this.label);
+}
+
+/// One definition, in three views: what it is and how it is doing, the graph
+/// with its runs, and how a candidate version measures up.
 class WorkflowDetailScreen extends StatefulWidget {
   final String workflowId;
   final String myRole;
@@ -55,7 +66,6 @@ class WorkflowDetailScreen extends StatefulWidget {
 
 class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
   final ApiClient _api = ApiClient();
-  final ChartSync _chartSync = ChartSync();
 
   WorkflowDetail? _detail;
   WorkflowUsage? _usage;
@@ -65,31 +75,44 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
   List<Recommendation> _recommendations = [];
   List<WorkflowVersion> _versions = [];
 
-  /// The version the canvas is showing. Defaults to the draft when one is
-  /// open, because a draft exists to be reviewed.
   int? _selectedVersion;
   List<StepDiff> _canvasSteps = [];
   String? _selectedStepId;
 
+  /// The run being traced through the graph, and its journal.
+  RunSummary? _selectedRun;
+  RunDetail? _runDetail;
+  bool _loadingRun = false;
+
+  ChartMeasure _measure = ChartMeasure.runs;
+
+  /// 0 = step definition, 1 = runs and their step payloads.
+  int _rightTab = 0;
+
   bool _loading = true;
   String? _error;
   int _tab = 0;
-  int _runPage = 0;
   bool _launching = false;
   String? _applyingRecommendation;
   Timer? _poll;
 
   bool get _isAdmin => widget.myRole == 'admin' || widget.myRole == 'owner';
 
-  WorkflowVersion? get _current => _versions
-      .where((v) => v.version == _selectedVersion)
-      .firstOrNull;
+  WorkflowVersion? get _current =>
+      _versions.where((v) => v.version == _selectedVersion).firstOrNull;
 
   WorkflowVersion? get _activeVersion =>
       _versions.where((v) => v.isActive).firstOrNull;
 
   WorkflowVersion? get _draftVersion =>
       _versions.where((v) => v.isDraft).firstOrNull;
+
+  WorkflowStep? get _selectedStep =>
+      _canvasSteps.where((d) => d.step.id == _selectedStepId).firstOrNull?.step;
+
+  RunPath? get _runPath => _runDetail == null
+      ? null
+      : RunPath.fromRun(_runDetail!, [for (final d in _canvasSteps) d.step]);
 
   @override
   void initState() {
@@ -100,7 +123,6 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
   @override
   void dispose() {
     _poll?.cancel();
-    _chartSync.dispose();
     _api.close();
     super.dispose();
   }
@@ -115,7 +137,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
       final results = await Future.wait([
         _api.getWorkflow(id),
         _api.workflowUsage(id),
-        _api.workflowRuns(id, limit: 60),
+        _api.workflowRuns(id, limit: 40),
         _api.workflowGoldenSet(id),
         _api.workflowTestRuns(id),
         _api.workflowVersions(id),
@@ -197,6 +219,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
   Future<void> _setStatus(String status) async {
     try {
       final updated = await _api.updateWorkflow(widget.workflowId, status: status);
+      if (!mounted) return;
       setState(() => _detail = updated);
       _snack('Status set to $status');
     } on ApiException catch (e) {
@@ -227,6 +250,39 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     }
   }
 
+  /// Tracing a run means looking at the version that ran, so selecting one
+  /// moves the canvas off any draft it was showing.
+  Future<void> _selectRun(RunSummary? run) async {
+    if (run == null) {
+      setState(() {
+        _selectedRun = null;
+        _runDetail = null;
+      });
+      return;
+    }
+    setState(() {
+      _selectedRun = run;
+      _loadingRun = true;
+    });
+    final active = _activeVersion;
+    if (active != null && _selectedVersion != active.version) {
+      setState(() => _selectedVersion = active.version);
+      await _loadCanvas();
+    }
+    try {
+      final detail = await _api.workflowRun(widget.workflowId, run.id);
+      if (!mounted) return;
+      setState(() {
+        _runDetail = detail;
+        _loadingRun = false;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _loadingRun = false);
+      _snack(e.message);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading && _detail == null) return const CumulusLoading();
@@ -239,24 +295,57 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
       );
     }
     final w = _detail!;
-    return PageBody(
+    // The canvas tab is a workbench, not a document: its body runs edge to
+    // edge and fills the viewport, while the other two stay in the measured
+    // reading column the rest of the console uses.
+    final fullBleed = _tab == 1;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        BackLink(label: 'All workflows', onTap: widget.onBack),
-        _topBar(w),
-        SegmentedTabs(
-          labels: const [
-            'Overview & telemetry',
-            'Workflow canvas',
-            'Evaluation & optimization',
-          ],
-          selectedIndex: _tab,
-          onChanged: (i) => setState(() => _tab = i),
+        Padding(
+          padding: EdgeInsets.fromLTRB(fullBleed ? 24 : 14, 12, 28, 0),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: fullBleed ? double.infinity : 1420,
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  BackLink(label: 'All workflows', onTap: widget.onBack),
+                  _topBar(w),
+                  const SizedBox(height: 16),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: SegmentedTabs(
+                      labels: const [
+                        'Overview',
+                        'Workflow canvas',
+                        'Evaluation & optimization',
+                      ],
+                      selectedIndex: _tab,
+                      onChanged: (i) => setState(() => _tab = i),
+                    ),
+                  ),
+                  SizedBox(height: fullBleed ? 14 : 0),
+                ],
+              ),
+            ),
+          ),
         ),
-        ...switch (_tab) {
-          0 => _overviewTab(w),
-          1 => _canvasTab(),
-          _ => _evaluationTab(),
-        },
+        Expanded(
+          child: switch (_tab) {
+            0 => PageBody(
+              padding: const EdgeInsets.fromLTRB(14, 16, 28, 48),
+              children: _overviewBody(w),
+            ),
+            1 => _canvasBody(),
+            _ => PageBody(
+              padding: const EdgeInsets.fromLTRB(14, 16, 28, 48),
+              children: _evaluationBody(),
+            ),
+          },
+        ),
       ],
     );
   }
@@ -278,8 +367,10 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
             setState(() {
               _selectedVersion = version;
               _selectedStepId = null;
-              // The selector governs the canvas, so jumping versions takes
-              // you to the view where that choice is visible.
+              // A version and a run are two different things to look at; the
+              // run's path belongs to the version that ran.
+              _selectedRun = null;
+              _runDetail = null;
               _tab = 1;
             });
             _loadCanvas();
@@ -311,126 +402,115 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     );
   }
 
-  // ---- Tab 1: overview & telemetry ---------------------------------------
+  // ---- Tab 1: overview ----------------------------------------------------
 
-  List<Widget> _overviewTab(WorkflowDetail w) {
+  List<Widget> _overviewBody(WorkflowDetail w) {
     final usage = _usage!;
     return [
+      StatStrip(
+        tiles: [
+          StatTile(
+            label: 'Runs · ${usage.days}d',
+            value: compactCount(usage.runs),
+            caption: '${usage.completed} completed',
+          ),
+          StatTile(
+            label: 'Success rate',
+            value: percent(usage.successRate),
+            caption: '${usage.escalated} escalated',
+          ),
+          StatTile(
+            label: 'Model spend',
+            value: money(usage.costUsd),
+            caption:
+                '${compactCount(usage.modelCalls)} ModelCalls · '
+                '${compactCount(usage.tokens)} tokens',
+          ),
+          StatTile(
+            label: 'Human judgment',
+            value: compactCount(usage.tasksRaised),
+            caption: usage.runs == 0
+                ? 'no runs yet'
+                : '${(usage.tasksRaised * 100 / usage.runs).toStringAsFixed(1)}% of runs',
+          ),
+          StatTile(
+            label: 'Time saved',
+            value: '${(usage.minutesSaved / 60).round()}h',
+            caption: '≈${money(usage.roiUsd)} at loaded cost',
+            valueColor: CumulusColors.success,
+          ),
+        ],
+      ),
       LayoutBuilder(
         builder: (context, constraints) {
           final metadata = _metadataCard(w);
-          final kpis = _kpiGrid(usage);
+          final chart = _chartCard(usage);
           if (constraints.maxWidth < 1040) {
             return Column(
               spacing: 16,
               crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [metadata, kpis],
+              children: [metadata, chart],
             );
           }
-          return Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            spacing: 16,
-            children: [
-              SizedBox(width: 420, child: metadata),
-              Expanded(child: kpis),
-            ],
+          return IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 16,
+              children: [
+                SizedBox(width: 420, child: metadata),
+                Expanded(child: chart),
+              ],
+            ),
           );
         },
       ),
-      SectionCard(
-        title: 'Usage · ${usage.days} days',
-        subtitle: 'hover any day — all three charts follow the same cursor',
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final charts = [
-              DailyBarChart(
-                title: 'Runs / day',
-                height: 128,
-                sync: _chartSync,
-                points: [
-                  for (final d in usage.series)
-                    ChartPoint(
-                      dayLabel(d.date),
-                      d.runs.toDouble(),
-                      extra: ['${d.tasksRaised} tasks raised'],
-                    ),
-                ],
-                format: (v) => v.round().toString(),
-              ),
-              DailyBarChart(
-                title: 'Model spend / day',
-                height: 128,
-                sync: _chartSync,
-                points: [
-                  for (final d in usage.series)
-                    ChartPoint(dayLabel(d.date), d.costUsd),
-                ],
-                format: money,
-              ),
-              DailyBarChart(
-                title: 'Tokens / day',
-                height: 128,
-                sync: _chartSync,
-                points: [
-                  for (final d in usage.series)
-                    ChartPoint(dayLabel(d.date), d.tokens.toDouble()),
-                ],
-                format: (v) => compactCount(v.round()),
-              ),
-            ];
-            if (constraints.maxWidth < 1000) {
-              return Column(
-                spacing: 22,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: charts,
-              );
-            }
-            return Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              spacing: 28,
-              children: [for (final c in charts) Expanded(child: c)],
-            );
-          },
-        ),
-      ),
-      _recentRunsCard(),
     ];
   }
 
-  Widget _kpiGrid(WorkflowUsage usage) {
-    return StatStrip(
-      tiles: [
-        StatTile(
-          label: 'Runs · ${usage.days}d',
-          value: compactCount(usage.runs),
-          caption: '${usage.completed} completed',
-        ),
-        StatTile(
-          label: 'Success rate',
-          value: percent(usage.successRate),
-          caption: '${usage.escalated} escalated',
-        ),
-        StatTile(
-          label: 'Model spend',
-          value: money(usage.costUsd),
-          caption:
-              '${compactCount(usage.modelCalls)} ModelCalls · '
-              '${compactCount(usage.tokens)} tokens',
-        ),
-        StatTile(
-          label: 'Human judgment',
-          value: compactCount(usage.tasksRaised),
-          caption: usage.runs == 0
-              ? 'no runs yet'
-              : '${(usage.tasksRaised * 100 / usage.runs).toStringAsFixed(1)}% of runs',
-        ),
-        StatTile(
-          label: 'Time saved',
-          value: '${(usage.minutesSaved / 60).round()}h',
-          caption: '≈${money(usage.roiUsd)} at loaded cost',
-          valueColor: CumulusColors.success,
-        ),
-      ],
+  Widget _chartCard(WorkflowUsage usage) {
+    double valueOf(UsageDay d) => switch (_measure) {
+      ChartMeasure.runs => d.runs.toDouble(),
+      ChartMeasure.spend => d.costUsd,
+      ChartMeasure.tokens => d.tokens.toDouble(),
+      ChartMeasure.judgment => d.tasksRaised.toDouble(),
+    };
+    String format(double v) => switch (_measure) {
+      ChartMeasure.spend => money(v),
+      ChartMeasure.tokens => compactCount(v.round()),
+      _ => v.round().toString(),
+    };
+    return SectionCard(
+      title: 'Usage · ${usage.days} days',
+      subtitle: 'hover any day for the full breakdown',
+      headerTrailing: _MeasurePicker(
+        value: _measure,
+        onChanged: (m) => setState(() => _measure = m),
+      ),
+      child: DailyBarChart(
+        title: _measure.label,
+        showTitle: false,
+        height: 260,
+        format: format,
+        points: [
+          for (final d in usage.series)
+            ChartPoint(
+              dayLabel(d.date),
+              valueOf(d),
+              // Whichever measure is on screen, the tooltip carries the rest:
+              // switching charts to answer "and what did that day cost?" is
+              // the friction a single-measure plot would otherwise create.
+              extra: [
+                if (_measure != ChartMeasure.runs) '${d.runs} runs',
+                if (_measure != ChartMeasure.spend)
+                  '${money(d.costUsd)} model spend',
+                if (_measure != ChartMeasure.tokens)
+                  '${compactCount(d.tokens)} tokens',
+                if (_measure != ChartMeasure.judgment)
+                  '${d.tasksRaised} tasks raised',
+              ],
+            ),
+        ],
+      ),
     );
   }
 
@@ -460,7 +540,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     final trigger = w.steps.where((s) => s.type == 'trigger').firstOrNull;
     return SectionCard(
       title: 'Definition',
-      subtitle: 'Tier-2 map asset · transparent export · no opaque steps',
+      subtitle: 'Tier-2 map asset · transparent export',
       headerTrailing: _isAdmin
           ? TextButton.icon(
               onPressed: () => _editRoi(w),
@@ -496,6 +576,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
             '${w.roiMinutesPerRun.toStringAsFixed(0)} min saved per completed '
                 'run · \$${w.roiHourlyRateUsd.toStringAsFixed(0)}/h loaded',
           ),
+          const Spacer(),
           Container(
             margin: const EdgeInsets.only(top: 5),
             padding: const EdgeInsets.all(13),
@@ -574,153 +655,266 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     }
   }
 
-  Widget _recentRunsCard() {
-    final pages = (_runs.length / _runsPerPage).ceil().clamp(1, 999);
-    final page = _runPage.clamp(0, pages - 1);
-    final start = page * _runsPerPage;
-    final visible = _runs.skip(start).take(_runsPerPage).toList();
-    return ListCard(
-      title: 'Recent runs',
-      subtitle: 'click a run to inspect its full execution trail',
-      headerTrailing: _runs.length <= _runsPerPage
-          ? null
-          : Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  '${start + 1}–${start + visible.length} of ${_runs.length}',
-                  style: CumulusText.meta,
-                ),
-                IconButton(
-                  tooltip: 'Newer',
-                  icon: const Icon(Icons.chevron_left, size: 18),
-                  onPressed:
-                      page == 0 ? null : () => setState(() => _runPage = page - 1),
-                ),
-                IconButton(
-                  tooltip: 'Older',
-                  icon: const Icon(Icons.chevron_right, size: 18),
-                  onPressed: page >= pages - 1
-                      ? null
-                      : () => setState(() => _runPage = page + 1),
-                ),
-              ],
+  // ---- Tab 2: canvas workbench -------------------------------------------
+
+  Widget _canvasBody() {
+    return Container(
+      decoration: const BoxDecoration(
+        border: Border(top: BorderSide(color: CumulusColors.border)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: WorkflowCanvas(
+              steps: _canvasSteps,
+              diffAgainst: (_current?.isDraft ?? false) && _activeVersion != null
+                  ? '${_activeVersion!.display} (active)'
+                  : '',
+              runPath: _runPath,
+              selectedStepId: _selectedStepId,
+              onSelect: (step) => setState(() => _selectedStepId = step?.id),
+              onExportSchema:
+                  _current == null ? null : () => _exportSchema(_current!),
             ),
-      children: visible.isEmpty
-          ? [
-              const CumulusEmptyState(
-                icon: Icons.play_circle_outline,
-                title: 'No runs yet',
-                message: 'This definition has not executed in the journal window.',
-              ),
-            ]
-          : [
-              for (final run in visible)
-                CumulusListRow(
-                  onTap: () => _openRun(run),
-                  leading: Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: runTone(run.status).dot,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                  title: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(run.id, style: CumulusText.mono),
-                      const SizedBox(width: 10),
-                      StatusBadge(
-                        runStatusLabel(run.status),
-                        tone: runTone(run.status),
-                        dense: true,
-                        uppercase: true,
-                      ),
-                    ],
-                  ),
-                  subtitle: Text(
-                    '${run.caseRef} · ${run.modelCalls} '
-                    '${run.modelCalls == 1 ? 'ModelCall' : 'ModelCalls'} · '
-                    '${run.actionsCommitted} '
-                    '${run.actionsCommitted == 1 ? 'Action' : 'Actions'}'
-                    '${run.tasksRaised > 0 ? ' · task raised' : ''}',
-                  ),
-                  trailing: [
-                    SizedBox(
-                      width: 130,
-                      child: Text(
-                        run.suspendedMinutes > 0
-                            ? '${run.activeSeconds.round()}s + ${run.suspendedMinutes}m wait'
-                            : '${run.activeSeconds.round()}s',
-                        textAlign: TextAlign.right,
-                        style: CumulusText.meta,
-                      ),
-                    ),
-                    const SizedBox(width: 16),
-                    SizedBox(
-                      width: 60,
-                      child: Text(
-                        '\$${run.costUsd.toStringAsFixed(2)}',
-                        textAlign: TextAlign.right,
-                        style: const TextStyle(
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 16),
-                    SizedBox(
-                      width: 80,
-                      child: Text(
-                        agoLabel(run.startedAt),
-                        textAlign: TextAlign.right,
-                        style: CumulusText.meta,
-                      ),
-                    ),
-                  ],
-                ),
-            ],
+          ),
+          const VerticalDivider(width: 1, color: CumulusColors.border),
+          Expanded(child: _inspectorColumn()),
+        ],
+      ),
     );
   }
 
-  Future<void> _openRun(RunSummary run) async {
-    RunDetail detail;
-    try {
-      detail = await _api.workflowRun(widget.workflowId, run.id);
-    } on ApiException catch (e) {
-      _snack(e.message);
-      return;
+  Widget _inspectorColumn() {
+    return ColoredBox(
+      color: CumulusColors.surface,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            child: Row(
+              children: [
+                SegmentedTabs(
+                  labels: const ['Definition', 'Runs'],
+                  selectedIndex: _rightTab,
+                  onChanged: (i) => setState(() => _rightTab = i),
+                ),
+                const Spacer(),
+                if (_rightTab == 1 && _runDetail != null && _isAdmin)
+                  TextButton.icon(
+                    onPressed: () => _promoteRun(_runDetail!),
+                    icon: const Icon(Icons.playlist_add_check, size: 15),
+                    label: const Text('Promote to golden set'),
+                  ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: _rightTab == 0 ? _definitionPanel() : _runsPanel(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _definitionPanel() {
+    final step = _selectedStep;
+    if (step == null) {
+      return const CumulusEmptyState(
+        icon: Icons.touch_app_outlined,
+        title: 'Select a step',
+        message:
+            'Click any node on the canvas to see its exported configuration — '
+            'the model it calls, the threshold it checks, where it routes.',
+      );
     }
-    if (!mounted) return;
-    await showSideDrawer<void>(
-      context: context,
-      title: detail.id,
-      titleBadges: [
-        StatusBadge(
-          runStatusLabel(detail.status),
-          tone: runTone(detail.status),
-          dense: true,
-          uppercase: true,
+    final diff = _canvasSteps.where((d) => d.step.id == step.id).firstOrNull;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _StepHeader(step: step, diff: diff),
+          const SizedBox(height: 16),
+          _NodeConfiguration(step: step, diff: diff),
+        ],
+      ),
+    );
+  }
+
+  Widget _runsPanel() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Top half: which run to trace.
+        Expanded(child: _runList()),
+        const Divider(height: 1),
+        // Bottom half: what the selected step did during that run.
+        Expanded(child: _stepPayloadPanel()),
+      ],
+    );
+  }
+
+  Widget _runList() {
+    if (_runs.isEmpty) {
+      return const CumulusEmptyState(
+        icon: Icons.play_circle_outline,
+        title: 'No runs yet',
+        message: 'This definition has not executed in the journal window.',
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+          child: Row(
+            children: [
+              Text('RECENT RUNS', style: CumulusText.sectionTitle),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  _selectedRun == null
+                      ? 'select one to trace its path'
+                      : 'tracing ${_selectedRun!.id}',
+                  style: CumulusText.sectionSubtitle,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (_selectedRun != null)
+                TextButton(
+                  onPressed: () => _selectRun(null),
+                  child: const Text('Clear'),
+                ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView.separated(
+            padding: EdgeInsets.zero,
+            itemCount: _runs.length,
+            separatorBuilder: (_, _) => const Divider(height: 1),
+            itemBuilder: (context, i) {
+              final run = _runs[i];
+              final selected = run.id == _selectedRun?.id;
+              return Material(
+                color: selected
+                    ? CumulusColors.accentSoft
+                    : Colors.transparent,
+                child: InkWell(
+                  onTap: () => _selectRun(run),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 11,
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            color: runTone(run.status).dot,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Text(
+                                    run.id,
+                                    style: CumulusText.mono.copyWith(
+                                      fontSize: 12,
+                                      fontWeight: selected
+                                          ? FontWeight.w600
+                                          : FontWeight.w400,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  if (run.status != 'completed')
+                                    StatusBadge(
+                                      runStatusLabel(run.status),
+                                      tone: runTone(run.status),
+                                      dense: true,
+                                      uppercase: true,
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                '${run.caseRef} · ${run.modelCalls} MC · '
+                                '${run.actionsCommitted} act'
+                                '${run.tasksRaised > 0 ? ' · task' : ''}',
+                                style: CumulusText.meta,
+                              ),
+                            ],
+                          ),
+                        ),
+                        Text(
+                          '\$${run.costUsd.toStringAsFixed(2)}',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        SizedBox(
+                          width: 62,
+                          child: Text(
+                            agoLabel(run.startedAt),
+                            textAlign: TextAlign.right,
+                            style: CumulusText.meta,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
         ),
       ],
-      subtitle:
-          '${detail.caseRef} · ${detail.activeSeconds.round()}s active'
-          '${detail.suspendedMinutes > 0 ? ' · ${detail.suspendedMinutes}m suspended' : ''}'
-          ' · \$${detail.costUsd.toStringAsFixed(2)} model spend'
-          ' · ${compactCount(detail.tokensIn)} in / ${compactCount(detail.tokensOut)} out',
-      actions: [
-        if (_isAdmin)
-          FilledButton.icon(
-            onPressed: () {
-              Navigator.of(context).pop();
-              _promoteRun(detail);
-            },
-            icon: const Icon(Icons.playlist_add_check, size: 16),
-            label: const Text('Promote to golden set'),
-          ),
-      ],
-      builder: (context) => _RunAuditTrail(run: detail),
+    );
+  }
+
+  Widget _stepPayloadPanel() {
+    if (_loadingRun) return const CumulusLoading();
+    final run = _runDetail;
+    if (run == null) {
+      return const CumulusEmptyState(
+        icon: Icons.route_outlined,
+        title: 'No run selected',
+        message:
+            'Pick a run above to light up the path it took, then click a step '
+            'on that path to see what went in and what came out.',
+      );
+    }
+    final stepId = _selectedStepId;
+    final event = stepId == null
+        ? null
+        : run.steps.where((e) => e.stepId == stepId).firstOrNull;
+    if (event == null) {
+      return CumulusEmptyState(
+        icon: Icons.touch_app_outlined,
+        title: stepId == null ? 'Select a step' : 'Not in this run',
+        message: stepId == null
+            ? 'Click a step on the canvas to see its inputs and outputs for '
+                  '${run.id}.'
+            : 'This step is not part of ${run.id} — the run took a different '
+                  'branch.',
+      );
+    }
+    final call = run.calls.where((c) => c.stepId == event.stepId).firstOrNull;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
+      child: _StepRunDetail(event: event, call: call, runId: run.id),
     );
   }
 
@@ -793,65 +987,6 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     }
   }
 
-  // ---- Tab 2: canvas ------------------------------------------------------
-
-  List<Widget> _canvasTab() {
-    final version = _current;
-    final active = _activeVersion;
-    return [
-      SectionCard(
-        title: 'Workflow canvas',
-        subtitle: version == null
-            ? 'the declarative export as a graph'
-            : '${version.display} · ${version.notes}',
-        child: WorkflowCanvas(
-          steps: _canvasSteps,
-          diffAgainst: (version?.isDraft ?? false) && active != null
-              ? '${active.display} (active)'
-              : '',
-          selectedStepId: _selectedStepId,
-          onSelect: (step) {
-            setState(() => _selectedStepId = step?.id);
-            if (step != null) _openNodeInspector(step);
-          },
-          onExportSchema: version == null ? null : () => _exportSchema(version),
-        ),
-      ),
-    ];
-  }
-
-  Future<void> _openNodeInspector(WorkflowStep step) async {
-    final diff = _canvasSteps.where((d) => d.step.id == step.id).firstOrNull;
-    await showSideDrawer<void>(
-      context: context,
-      width: 520,
-      title: step.name,
-      titleBadges: [
-        StatusBadge(step.type, tone: stepTone(step.type), dense: true, uppercase: true),
-        if (governedBadge(step.type) != null)
-          StatusBadge(
-            governedBadge(step.type)!,
-            tone: stepTone(step.type),
-            dense: true,
-          ),
-        if (diff != null && diff.change != 'unchanged')
-          StatusBadge(
-            diff.change,
-            tone: switch (diff.change) {
-              'added' => CumulusTone.success,
-              'removed' => CumulusTone.danger,
-              _ => CumulusTone.warn,
-            },
-            dense: true,
-            uppercase: true,
-          ),
-      ],
-      subtitle: step.summary,
-      builder: (context) => _NodeInspector(step: step, diff: diff),
-    );
-    if (mounted) setState(() => _selectedStepId = null);
-  }
-
   Future<void> _exportSchema(WorkflowVersion version) async {
     final schema = _schemaJson(version);
     await showDialog<void>(
@@ -916,7 +1051,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
 
   // ---- Tab 3: evaluation & optimization ----------------------------------
 
-  List<Widget> _evaluationTab() {
+  List<Widget> _evaluationBody() {
     return [
       LayoutBuilder(
         builder: (context, constraints) {
@@ -1161,7 +1296,6 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
 
   Widget _harnessCard() {
     final cases = _golden?.cases.length ?? 0;
-    final latest = _tests.firstOrNull;
     return SectionCard(
       title: 'Test harness',
       subtitle: 'candidate vs baseline over the golden set · writes suppressed',
@@ -1210,15 +1344,14 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
               ),
             ],
           ),
-          if (latest != null) ...[
+          if (_tests.isNotEmpty) ...[
             const SizedBox(height: 18),
             const Divider(height: 1),
             const SizedBox(height: 14),
-            _TestRunRow(run: latest, onOpen: () => _openTestRun(latest)),
-          ],
-          for (final run in _tests.skip(1).take(4)) ...[
-            const SizedBox(height: 10),
-            _TestRunRow(run: run, onOpen: () => _openTestRun(run)),
+            for (final run in _tests.take(5)) ...[
+              _TestRunRow(run: run, onOpen: () => _openTestRun(run)),
+              const SizedBox(height: 8),
+            ],
           ],
         ],
       ),
@@ -1292,6 +1425,10 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
         _versions = versions;
         _detail = detail;
         _selectedVersion = draft.version;
+        _selectedRun = null;
+        _runDetail = null;
+        _selectedStepId = rec.stepId.isEmpty ? null : rec.stepId;
+        _rightTab = 0;
         _tab = 1;
       });
       await _loadCanvas();
@@ -1301,6 +1438,73 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     } finally {
       if (mounted) setState(() => _applyingRecommendation = null);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chart measure picker
+// ---------------------------------------------------------------------------
+
+class _MeasurePicker extends StatelessWidget {
+  final ChartMeasure value;
+  final ValueChanged<ChartMeasure> onChanged;
+
+  const _MeasurePicker({required this.value, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<ChartMeasure>(
+      tooltip: 'Choose a measure',
+      offset: const Offset(0, 36),
+      onSelected: onChanged,
+      itemBuilder: (context) => [
+        for (final measure in ChartMeasure.values)
+          PopupMenuItem<ChartMeasure>(
+            value: measure,
+            height: 40,
+            child: Row(
+              children: [
+                Icon(
+                  measure == value ? Icons.check : Icons.check,
+                  size: 15,
+                  color: measure == value
+                      ? CumulusColors.accent
+                      : Colors.transparent,
+                ),
+                const SizedBox(width: 10),
+                Text(measure.label, style: const TextStyle(fontSize: 13)),
+              ],
+            ),
+          ),
+      ],
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(13, 8, 9, 8),
+        decoration: BoxDecoration(
+          color: CumulusColors.surface,
+          borderRadius: BorderRadius.circular(CumulusRadius.control),
+          border: Border.all(color: CumulusColors.borderStrong),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              value.label,
+              style: const TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+                color: CumulusColors.ink,
+              ),
+            ),
+            const SizedBox(width: 6),
+            const Icon(
+              Icons.expand_more,
+              size: 16,
+              color: CumulusColors.inkMuted,
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -1428,14 +1632,92 @@ class _VersionField extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Node inspector
+// Step inspector (right column, Definition tab)
 // ---------------------------------------------------------------------------
 
-class _NodeInspector extends StatelessWidget {
+class _StepHeader extends StatelessWidget {
   final WorkflowStep step;
   final StepDiff? diff;
 
-  const _NodeInspector({required this.step, required this.diff});
+  const _StepHeader({required this.step, required this.diff});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 8,
+          runSpacing: 6,
+          children: [
+            Text(
+              step.name,
+              style: CumulusText.mono.copyWith(
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            StatusBadge(
+              step.type,
+              tone: stepTone(step.type),
+              dense: true,
+              uppercase: true,
+            ),
+            if (governedBadge(step.type) != null)
+              StatusBadge(
+                governedBadge(step.type)!,
+                tone: stepTone(step.type),
+                dense: true,
+              ),
+            if (diff != null && diff!.change != 'unchanged')
+              StatusBadge(
+                diff!.change,
+                tone: switch (diff!.change) {
+                  'added' => CumulusTone.success,
+                  'removed' => CumulusTone.danger,
+                  _ => CumulusTone.warn,
+                },
+                dense: true,
+                uppercase: true,
+              ),
+          ],
+        ),
+        if (step.summary.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(step.summary, style: CumulusText.body),
+        ],
+      ],
+    );
+  }
+}
+
+class _NodeConfiguration extends StatelessWidget {
+  final WorkflowStep step;
+  final StepDiff? diff;
+
+  const _NodeConfiguration({required this.step, required this.diff});
+
+  // Config keys worth naming explicitly, in the order a reviewer reads them;
+  // anything else the definition carries is listed after.
+  static const _known = {
+    'model': 'Model',
+    'prompt': 'Prompt template',
+    'temperature': 'Temperature',
+    'max_tokens': 'Max tokens',
+    'fallback': 'Fallback',
+    'cache': 'Prompt cache',
+    'rule_type': 'Rule type',
+    'threshold': 'Threshold',
+    'queue': 'Queue',
+    'target': 'Target',
+    'event': 'Event',
+    'source': 'Source',
+    'language': 'Implementation',
+    'transport': 'Transport',
+    'window': 'Window',
+    'gateway': 'Gateway',
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -1462,36 +1744,17 @@ class _NodeInspector extends StatelessWidget {
       ),
     );
 
-    // Config keys worth naming explicitly, in the order a reviewer reads
-    // them; anything else the definition carries is listed after.
-    const known = {
-      'model': 'Model',
-      'prompt': 'Prompt template',
-      'temperature': 'Temperature',
-      'max_tokens': 'Max tokens',
-      'fallback': 'Fallback',
-      'cache': 'Prompt cache',
-      'rule_type': 'Rule type',
-      'threshold': 'Threshold',
-      'queue': 'Queue',
-      'target': 'Target',
-      'event': 'Event',
-      'source': 'Source',
-      'language': 'Implementation',
-      'transport': 'Transport',
-      'window': 'Window',
-      'gateway': 'Gateway',
-    };
-
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        Text('CONFIGURATION', style: CumulusText.sectionTitle),
+        const SizedBox(height: 12),
         row('Step id', step.id),
-        for (final entry in known.entries)
+        for (final entry in _known.entries)
           if (step.config[entry.key] != null)
             row(entry.value, step.config[entry.key]!),
         for (final entry in step.config.entries)
-          if (!known.containsKey(entry.key)) row(entry.key, entry.value),
+          if (!_known.containsKey(entry.key)) row(entry.key, entry.value),
         if (step.next.isNotEmpty)
           row(
             'Output paths',
@@ -1504,7 +1767,7 @@ class _NodeInspector extends StatelessWidget {
           ),
         if (diff != null && diff!.changedFields.isNotEmpty)
           row('Changed in draft', diff!.changedFields.join(', ')),
-        const SizedBox(height: 8),
+        const SizedBox(height: 6),
         Container(
           padding: const EdgeInsets.all(13),
           decoration: BoxDecoration(
@@ -1548,260 +1811,118 @@ class _NodeInspector extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Run audit trail (inside the drawer)
+// Step payloads for one run (right column, Runs tab, lower half)
 // ---------------------------------------------------------------------------
 
-class _RunAuditTrail extends StatelessWidget {
-  final RunDetail run;
-
-  const _RunAuditTrail({required this.run});
-
-  @override
-  Widget build(BuildContext context) {
-    final callsByStep = {for (final c in run.calls) c.stepName: c};
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (run.triggerEvent.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 14),
-            child: Text(
-              'Triggered by ${run.triggerEvent}',
-              style: CumulusText.meta,
-            ),
-          ),
-        for (var i = 0; i < run.steps.length; i++)
-          _JournalEntry(
-            event: run.steps[i],
-            call: callsByStep[run.steps[i].name],
-            isLast: i == run.steps.length - 1,
-          ),
-      ],
-    );
-  }
-}
-
-class _JournalEntry extends StatefulWidget {
+class _StepRunDetail extends StatelessWidget {
   final RunStepEvent event;
   final ModelCallRecord? call;
-  final bool isLast;
+  final String runId;
 
-  const _JournalEntry({
+  const _StepRunDetail({
     required this.event,
     required this.call,
-    required this.isLast,
+    required this.runId,
   });
 
   @override
-  State<_JournalEntry> createState() => _JournalEntryState();
-}
-
-class _JournalEntryState extends State<_JournalEntry> {
-  bool _open = false;
-
-  @override
   Widget build(BuildContext context) {
-    final event = widget.event;
     final tone = event.status == 'failed'
         ? CumulusTone.danger
         : event.status == 'skipped'
         ? CumulusTone.neutral
         : stepTone(event.type);
-    final tag = switch (event.type) {
-      'trigger' || 'event' => 'EVT',
-      'modelcall' => 'MC',
-      'rule' => 'RL',
-      'task' => 'TSK',
-      'action' => 'ACT',
-      _ => 'TRN',
-    };
-    final dim = event.status == 'skipped';
-    final hasPayloads =
-        event.inputPreview.isNotEmpty || event.outputPreview.isNotEmpty;
-
-    return IntrinsicHeight(
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          SizedBox(
-            width: 34,
-            child: Column(
-              children: [
-                Container(
-                  width: 30,
-                  height: 30,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: tone.background,
-                    shape: BoxShape.circle,
-                  ),
-                  child: Text(
-                    tag,
-                    style: TextStyle(
-                      fontSize: 8.5,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 0.4,
-                      color: tone.foreground,
-                    ),
-                  ),
-                ),
-                if (!widget.isLast)
-                  Expanded(
-                    child: Container(
-                      width: 1,
-                      margin: const EdgeInsets.symmetric(vertical: 4),
-                      color: CumulusColors.border,
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.only(bottom: 16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Wrap(
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    spacing: 8,
-                    runSpacing: 4,
-                    children: [
-                      Text(
-                        '${switch (event.type) {
-                          'trigger' => 'Event received',
-                          'event' => 'Event emitted',
-                          'modelcall' => 'ModelCall',
-                          'rule' => 'Rule',
-                          'task' => 'Task',
-                          'action' => 'Action',
-                          _ => 'Transform',
-                        }} — ${event.name}',
-                        style: TextStyle(
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w600,
-                          color: dim ? CumulusColors.inkMuted : CumulusColors.ink,
-                        ),
-                      ),
-                      if (event.verdict.isNotEmpty)
-                        StatusBadge(
-                          'verdict: ${event.verdict}',
-                          tone: event.verdict == 'pass'
-                              ? CumulusTone.success
-                              : CumulusTone.warn,
-                          dense: true,
-                          uppercase: true,
-                        ),
-                      if (event.status == 'waiting')
-                        const StatusBadge(
-                          'WAITING',
-                          tone: CumulusTone.accent,
-                          dense: true,
-                        ),
-                      if (event.status == 'failed')
-                        const StatusBadge(
-                          'FAILED',
-                          tone: CumulusTone.danger,
-                          dense: true,
-                        ),
-                      if (event.ledgerRef.isNotEmpty)
-                        Text(
-                          'ledger #${event.ledgerRef}',
-                          style: CumulusText.mono.copyWith(fontSize: 10.5),
-                        ),
-                    ],
-                  ),
-                  if (event.detail.isNotEmpty) ...[
-                    const SizedBox(height: 3),
-                    Text(
-                      event.detail,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        height: 1.5,
-                        color: dim
-                            ? CumulusColors.inkMuted
-                            : CumulusColors.inkSecondary,
-                      ),
-                    ),
-                  ],
-                  if (event.decidedBy.isNotEmpty)
-                    Text(
-                      'decided by ${event.decidedBy}'
-                      '${event.suspendedMinutes > 0 ? ' after ${event.suspendedMinutes}m' : ''}'
-                      ' · in the curation ledger',
-                      style: CumulusText.meta,
-                    ),
-                  if (hasPayloads) ...[
-                    const SizedBox(height: 6),
-                    InkWell(
-                      onTap: () => setState(() => _open = !_open),
-                      borderRadius: BorderRadius.circular(6),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            _open ? Icons.expand_less : Icons.expand_more,
-                            size: 15,
-                            color: CumulusColors.inkSecondary,
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
-                            _open ? 'Hide payloads' : 'Inputs & outputs',
-                            style: const TextStyle(
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.w600,
-                              color: CumulusColors.inkSecondary,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    if (_open) ...[
-                      const SizedBox(height: 8),
-                      if (widget.call != null)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: Wrap(
-                            spacing: 8,
-                            runSpacing: 6,
-                            children: [
-                              StatusBadge(widget.call!.model, dense: true),
-                              StatusBadge(
-                                '${widget.call!.inputTokens} in / '
-                                '${widget.call!.outputTokens} out',
-                                dense: true,
-                              ),
-                              StatusBadge(
-                                '\$${widget.call!.costUsd.toStringAsFixed(3)}',
-                                dense: true,
-                              ),
-                              if (widget.call!.promptVersion.isNotEmpty)
-                                StatusBadge(
-                                  widget.call!.promptVersion,
-                                  dense: true,
-                                ),
-                            ],
-                          ),
-                        ),
-                      PayloadBlock(
-                        label: widget.call == null ? 'Input' : 'Prompt',
-                        content: event.inputPreview,
-                      ),
-                      PayloadBlock(
-                        label: widget.call == null ? 'Output' : 'Raw response',
-                        content: widget.call?.rawResponse.isNotEmpty == true
-                            ? widget.call!.rawResponse
-                            : event.outputPreview,
-                      ),
-                    ],
-                  ],
-                ],
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 8,
+          runSpacing: 6,
+          children: [
+            Text(
+              event.name,
+              style: CumulusText.mono.copyWith(
+                fontSize: 13.5,
+                fontWeight: FontWeight.w600,
               ),
             ),
+            StatusBadge(event.type, tone: tone, dense: true, uppercase: true),
+            if (event.verdict.isNotEmpty)
+              StatusBadge(
+                'verdict: ${event.verdict}',
+                tone: event.verdict == 'pass'
+                    ? CumulusTone.success
+                    : CumulusTone.warn,
+                dense: true,
+                uppercase: true,
+              ),
+            if (event.status == 'waiting')
+              const StatusBadge(
+                'WAITING',
+                tone: CumulusTone.accent,
+                dense: true,
+              ),
+            if (event.status == 'failed')
+              const StatusBadge(
+                'FAILED',
+                tone: CumulusTone.danger,
+                dense: true,
+              ),
+            if (event.ledgerRef.isNotEmpty)
+              Text(
+                'ledger #${event.ledgerRef}',
+                style: CumulusText.mono.copyWith(fontSize: 10.5),
+              ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text('in $runId · ${event.detail}', style: CumulusText.meta),
+        if (event.decidedBy.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              'decided by ${event.decidedBy}'
+              '${event.suspendedMinutes > 0 ? ' after ${event.suspendedMinutes}m' : ''}'
+              ' · in the curation ledger',
+              style: CumulusText.meta,
+            ),
+          ),
+        if (call != null) ...[
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: [
+              StatusBadge(call!.model, dense: true, tone: CumulusTone.violet),
+              StatusBadge(
+                '${call!.inputTokens} in / ${call!.outputTokens} out',
+                dense: true,
+              ),
+              StatusBadge(
+                '\$${call!.costUsd.toStringAsFixed(3)}',
+                dense: true,
+              ),
+              if (call!.promptVersion.isNotEmpty)
+                StatusBadge(call!.promptVersion, dense: true),
+              StatusBadge('${call!.durationMs}ms', dense: true),
+            ],
           ),
         ],
-      ),
+        const SizedBox(height: 14),
+        PayloadBlock(
+          label: call == null ? 'Input' : 'Prompt',
+          content: event.inputPreview,
+          maxLines: 10,
+        ),
+        PayloadBlock(
+          label: call == null ? 'Output' : 'Raw response',
+          content: call?.rawResponse.isNotEmpty == true
+              ? call!.rawResponse
+              : event.outputPreview,
+          maxLines: 10,
+        ),
+      ],
     );
   }
 }
@@ -2152,9 +2273,7 @@ class _RecommendationCard extends StatelessWidget {
               else
                 Text(
                   'Advisory — no automatic change',
-                  style: CumulusText.meta.copyWith(
-                    fontStyle: FontStyle.italic,
-                  ),
+                  style: CumulusText.meta.copyWith(fontStyle: FontStyle.italic),
                 ),
               const Spacer(),
               Text(

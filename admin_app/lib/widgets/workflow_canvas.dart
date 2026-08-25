@@ -6,13 +6,13 @@ import '../models/workflow.dart';
 import '../theme/cumulus_theme.dart';
 import 'ui_kit.dart';
 
-/// Node geometry. Fixed sizes keep the layered layout arithmetic honest —
-/// edges are drawn from the same numbers the nodes are positioned with.
-const double _nodeWidth = 210;
-const double _nodeHeight = 108;
-const double _hGap = 72;
-const double _vGap = 26;
-const double _padding = 40;
+/// Node geometry. Flow runs north to south: a layer is a row, and a branch
+/// spreads its arms across that row.
+const double _nodeWidth = 216;
+const double _nodeHeight = 92;
+const double _hGap = 40;
+const double _vGap = 62;
+const double _padding = 44;
 
 CumulusTone stepTone(String type) => switch (type) {
   'trigger' => CumulusTone.teal,
@@ -33,7 +33,56 @@ String? governedBadge(String type) => switch (type) {
   _ => null,
 };
 
-/// A laid-out node: the step, its diff annotation, and where it sits.
+/// What one run did with the graph: which steps it executed, and which edges
+/// it actually traversed.
+///
+/// The edge set matters because status alone is ambiguous. When a Rule
+/// branches to both an Action and a Task and the Task ran, `rule → action` and
+/// `task → action` are both edges between executed steps — but only the second
+/// was traversed. [fromRun] resolves that by walking the journal in order.
+class RunPath {
+  final String runId;
+  final Map<String, String> statusByStep;
+  final Set<String> takenEdges;
+
+  const RunPath({
+    required this.runId,
+    required this.statusByStep,
+    required this.takenEdges,
+  });
+
+  static String edgeKey(String from, String to) => '$from>$to';
+
+  bool executed(String stepId) {
+    final status = statusByStep[stepId];
+    return status != null && status != 'skipped';
+  }
+
+  factory RunPath.fromRun(RunDetail run, List<WorkflowStep> steps) {
+    final byId = {for (final s in steps) s.id: s};
+    final statuses = {for (final e in run.steps) e.stepId: e.status};
+    // The journal is in definition order; consecutive *executed* entries are
+    // the traversal, so an edge is taken when the next executed step is one
+    // this step actually points at.
+    final executed = run.steps
+        .where((e) => e.status != 'skipped' && byId.containsKey(e.stepId))
+        .toList();
+    final taken = <String>{};
+    for (var i = 0; i < executed.length - 1; i++) {
+      final from = executed[i].stepId;
+      final to = executed[i + 1].stepId;
+      if (byId[from]!.next.contains(to)) {
+        taken.add(edgeKey(from, to));
+      }
+    }
+    return RunPath(
+      runId: run.id,
+      statusByStep: statuses,
+      takenEdges: taken,
+    );
+  }
+}
+
 class _PlacedNode {
   final WorkflowStep step;
   final String change;
@@ -46,31 +95,34 @@ class _PlacedNode {
     required this.changedFields,
     required this.position,
   });
-
-  Rect get rect =>
-      Rect.fromLTWH(position.dx, position.dy, _nodeWidth, _nodeHeight);
 }
 
 class _Edge {
+  final String fromId;
+  final String toId;
   final Offset from;
   final Offset to;
   final String label;
-  final bool dimmed;
+  final bool ghost;
+  final bool taken;
 
   const _Edge({
+    required this.fromId,
+    required this.toId,
     required this.from,
     required this.to,
     required this.label,
-    required this.dimmed,
+    required this.ghost,
+    required this.taken,
   });
 }
 
-/// Layered left-to-right layout of the declarative export.
+/// Layered top-to-bottom layout of the declarative export.
 ///
-/// A step's layer is the longest path to it from a root, which is what makes
-/// a branch's two arms land in the same column rather than one drifting right
-/// of the other. Removed steps (present only in the baseline) are laid out
-/// beside the step they used to follow so a deletion is visible in place.
+/// A step's layer is the longest path to it from a root, which is what keeps a
+/// branch's two arms on the same row rather than letting one drift below the
+/// other. Steps present only in the baseline (removed by a draft) are placed
+/// just below where they used to sit, so a deletion is visible in position.
 class _Layout {
   final List<_PlacedNode> nodes;
   final List<_Edge> edges;
@@ -82,7 +134,7 @@ class _Layout {
     required this.size,
   });
 
-  static _Layout build(List<StepDiff> diffs) {
+  static _Layout build(List<StepDiff> diffs, RunPath? path) {
     if (diffs.isEmpty) {
       return const _Layout(nodes: [], edges: [], size: Size(0, 0));
     }
@@ -90,8 +142,6 @@ class _Layout {
     final byId = {for (final s in steps) s.id: s};
     final annotation = {for (final d in diffs) d.step.id: d};
 
-    // Longest-path layering, with a visit cap so a malformed cycle in an
-    // exported definition degrades to a readable graph instead of hanging.
     final layer = <String, int>{for (final s in steps) s.id: 0};
     for (var pass = 0; pass < steps.length; pass++) {
       var moved = false;
@@ -108,16 +158,12 @@ class _Layout {
       if (!moved) break;
     }
 
-    // Steps nothing points at, other than the first, are orphans (a removed
-    // step, or a trigger of a second entry point) — keep them in document
-    // order rather than stacking them all in column zero.
     final referenced = <String>{
       for (final s in steps) ...s.next.where(byId.containsKey),
     };
     for (final step in steps) {
       if (step.id == steps.first.id || referenced.contains(step.id)) continue;
       if (annotation[step.id]?.change == 'removed') {
-        // Place a deletion just after where it used to sit.
         final predecessor = steps.firstWhere(
           (s) => s.next.contains(step.id),
           orElse: () => step,
@@ -126,32 +172,29 @@ class _Layout {
       }
     }
 
-    final columns = <int, List<WorkflowStep>>{};
+    final rows = <int, List<WorkflowStep>>{};
     for (final step in steps) {
-      columns.putIfAbsent(layer[step.id]!, () => []).add(step);
+      rows.putIfAbsent(layer[step.id]!, () => []).add(step);
     }
 
+    final widest = rows.values.fold<int>(1, (m, r) => math.max(m, r.length));
+    final canvasWidth =
+        _padding * 2 + widest * _nodeWidth + (widest - 1) * _hGap;
     final placed = <String, _PlacedNode>{};
-    final tallest = columns.values.fold<int>(
-      1,
-      (m, c) => math.max(m, c.length),
-    );
-    final canvasHeight = _padding * 2 + tallest * _nodeHeight + (tallest - 1) * _vGap;
-    for (final entry in columns.entries) {
-      final column = entry.value;
-      final columnHeight =
-          column.length * _nodeHeight + (column.length - 1) * _vGap;
-      final top = (canvasHeight - columnHeight) / 2;
-      for (var i = 0; i < column.length; i++) {
-        final step = column[i];
+    for (final entry in rows.entries) {
+      final row = entry.value;
+      final rowWidth = row.length * _nodeWidth + (row.length - 1) * _hGap;
+      final left = (canvasWidth - rowWidth) / 2;
+      for (var i = 0; i < row.length; i++) {
+        final step = row[i];
         final diff = annotation[step.id];
         placed[step.id] = _PlacedNode(
           step: step,
           change: diff?.change ?? 'unchanged',
           changedFields: diff?.changedFields ?? const [],
           position: Offset(
-            _padding + entry.key * (_nodeWidth + _hGap),
-            top + i * (_nodeHeight + _vGap),
+            left + i * (_nodeWidth + _hGap),
+            _padding + entry.key * (_nodeHeight + _vGap),
           ),
         );
       }
@@ -164,48 +207,59 @@ class _Layout {
       for (var i = 0; i < step.next.length; i++) {
         final target = placed[step.next[i]];
         if (target == null) continue;
+        final key = RunPath.edgeKey(step.id, step.next[i]);
+        final taken = path?.takenEdges.contains(key) ?? false;
         edges.add(
           _Edge(
+            fromId: step.id,
+            toId: step.next[i],
             from: Offset(
-              source.position.dx + _nodeWidth,
-              source.position.dy + _nodeHeight / 2,
+              source.position.dx + _nodeWidth / 2,
+              source.position.dy + _nodeHeight,
             ),
             to: Offset(
-              target.position.dx,
-              target.position.dy + _nodeHeight / 2,
+              target.position.dx + _nodeWidth / 2,
+              target.position.dy,
             ),
             label: i < step.branchLabels.length ? step.branchLabels[i] : '',
-            dimmed:
-                source.change == 'removed' || target.change == 'removed',
+            ghost: source.change == 'removed' ||
+                target.change == 'removed' ||
+                (path != null && !taken),
+            taken: taken,
           ),
         );
       }
     }
 
-    final widest = columns.keys.fold<int>(0, math.max);
+    final deepest = rows.keys.fold<int>(0, math.max);
     return _Layout(
       nodes: placed.values.toList(),
       edges: edges,
       size: Size(
-        _padding * 2 + (widest + 1) * _nodeWidth + widest * _hGap,
-        canvasHeight,
+        canvasWidth,
+        _padding * 2 + (deepest + 1) * _nodeHeight + deepest * _vGap,
       ),
     );
   }
 }
 
-/// The pipeline as an interactive graph: pan, zoom, click a node to inspect.
+/// The pipeline as an interactive graph: a dotted field you can pan and zoom,
+/// flowing top to bottom, with click-to-inspect nodes.
 ///
 /// Built on [InteractiveViewer] and a [CustomPaint] edge layer rather than a
-/// graph package — the whole console ships with no charting or graph
-/// dependency, and a layered DAG of a dozen typed steps is arithmetic, not a
-/// library.
+/// graph package — the console ships with no charting or graph dependency, and
+/// a layered DAG of a dozen typed steps is arithmetic, not a library.
 class WorkflowCanvas extends StatefulWidget {
   final List<StepDiff> steps;
 
-  /// Non-empty when a draft is selected, e.g. "vs v14 (active)". Drives the
-  /// diff legend, which is otherwise hidden.
+  /// Non-empty when a draft is selected, e.g. "v14 (active)". Drives the diff
+  /// legend, which is otherwise hidden.
   final String diffAgainst;
+
+  /// When set, the graph is drawn as one run took it: steps the run skipped
+  /// fade to ghosts and the traversed edges are drawn in the accent.
+  final RunPath? runPath;
+
   final String? selectedStepId;
   final ValueChanged<WorkflowStep?> onSelect;
   final VoidCallback? onExportSchema;
@@ -215,6 +269,7 @@ class WorkflowCanvas extends StatefulWidget {
     required this.steps,
     required this.onSelect,
     this.diffAgainst = '',
+    this.runPath,
     this.selectedStepId,
     this.onExportSchema,
   });
@@ -235,15 +290,12 @@ class _WorkflowCanvasState extends State<WorkflowCanvas> {
   void _zoomBy(double factor) {
     final current = _view.value.getMaxScaleOnAxis();
     final next = (current * factor).clamp(0.4, 2.0);
-    // Zoom about the viewport's centre rather than the origin, so the graph
-    // does not walk off screen as you step through the levels.
-    final matrix = Matrix4.identity()..scaleByDouble(next, next, next, 1);
-    _view.value = matrix;
+    _view.value = Matrix4.identity()..scaleByDouble(next, next, next, 1);
   }
 
   @override
   Widget build(BuildContext context) {
-    final layout = _Layout.build(widget.steps);
+    final layout = _Layout.build(widget.steps, widget.runPath);
     if (layout.nodes.isEmpty) {
       return const CumulusEmptyState(
         icon: Icons.account_tree_outlined,
@@ -251,89 +303,139 @@ class _WorkflowCanvasState extends State<WorkflowCanvas> {
         message: 'This version has not exported its declarative shape yet.',
       );
     }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+    return Stack(
       children: [
-        Row(
-          children: [
-            if (widget.diffAgainst.isNotEmpty) ...[
-              Text('DIFF vs ${widget.diffAgainst}', style: CumulusText.statLabel),
-              const SizedBox(width: 12),
-              const _DiffKey(color: CumulusColors.success, label: 'added'),
-              const SizedBox(width: 10),
-              const _DiffKey(color: CumulusColors.warn, label: 'modified'),
-              const SizedBox(width: 10),
-              const _DiffKey(color: CumulusColors.danger, label: 'removed'),
-            ],
-            const Spacer(),
-            if (widget.onExportSchema != null)
-              TextButton.icon(
-                onPressed: widget.onExportSchema,
-                icon: const Icon(Icons.code, size: 15),
-                label: const Text('Export schema'),
-              ),
-            const SizedBox(width: 6),
-            _ZoomButton(
-              icon: Icons.remove,
-              tooltip: 'Zoom out',
-              onTap: () => _zoomBy(1 / 1.25),
-            ),
-            const SizedBox(width: 4),
-            _ZoomButton(
-              icon: Icons.add,
-              tooltip: 'Zoom in',
-              onTap: () => _zoomBy(1.25),
-            ),
-            const SizedBox(width: 4),
-            _ZoomButton(
-              icon: Icons.fit_screen_outlined,
-              tooltip: 'Reset view',
-              onTap: () => _view.value = Matrix4.identity(),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        Container(
-          height: math.min(560, layout.size.height + 40),
-          decoration: BoxDecoration(
+        Positioned.fill(
+          child: ColoredBox(
             color: CumulusColors.canvas,
-            borderRadius: BorderRadius.circular(CumulusRadius.control),
-            border: Border.all(color: CumulusColors.border),
+            child: InteractiveViewer(
+              transformationController: _view,
+              constrained: false,
+              boundaryMargin: const EdgeInsets.all(400),
+              minScale: 0.4,
+              maxScale: 2.0,
+              child: SizedBox(
+                width: layout.size.width,
+                height: layout.size.height,
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: CustomPaint(
+                        painter: _FieldPainter(layout.edges),
+                      ),
+                    ),
+                    for (final node in layout.nodes)
+                      Positioned(
+                        left: node.position.dx,
+                        top: node.position.dy,
+                        width: _nodeWidth,
+                        height: _nodeHeight,
+                        child: _CanvasNode(
+                          node: node,
+                          selected: node.step.id == widget.selectedStepId,
+                          runStatus: widget.runPath?.statusByStep[node.step.id],
+                          inRun: widget.runPath?.executed(node.step.id),
+                          onTap: () => widget.onSelect(
+                            node.step.id == widget.selectedStepId
+                                ? null
+                                : node.step,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
           ),
-          clipBehavior: Clip.antiAlias,
-          child: InteractiveViewer(
-            transformationController: _view,
-            constrained: false,
-            boundaryMargin: const EdgeInsets.all(200),
-            minScale: 0.4,
-            maxScale: 2.0,
-            child: SizedBox(
-              width: layout.size.width,
-              height: layout.size.height,
-              child: Stack(
-                children: [
-                  Positioned.fill(
-                    child: CustomPaint(painter: _EdgePainter(layout.edges)),
-                  ),
-                  for (final node in layout.nodes)
-                    Positioned(
-                      left: node.position.dx,
-                      top: node.position.dy,
-                      width: _nodeWidth,
-                      height: _nodeHeight,
-                      child: _CanvasNode(
-                        node: node,
-                        selected: node.step.id == widget.selectedStepId,
-                        onTap: () => widget.onSelect(
-                          node.step.id == widget.selectedStepId
-                              ? null
-                              : node.step,
+        ),
+        // Floating chrome, Airflow-style: the field is the whole surface and
+        // the controls sit on top of it rather than stealing a strip.
+        Positioned(
+          left: 12,
+          top: 12,
+          child: Row(
+            children: [
+              if (widget.diffAgainst.isNotEmpty)
+                _FloatingBar(
+                  children: [
+                    Text(
+                      'DIFF vs ${widget.diffAgainst}',
+                      style: CumulusText.statLabel,
+                    ),
+                    const SizedBox(width: 10),
+                    const _Key(color: CumulusColors.success, label: 'added'),
+                    const SizedBox(width: 8),
+                    const _Key(color: CumulusColors.warn, label: 'modified'),
+                    const SizedBox(width: 8),
+                    const _Key(color: CumulusColors.danger, label: 'removed'),
+                  ],
+                ),
+              if (widget.runPath != null)
+                _FloatingBar(
+                  children: [
+                    Text('PATH OF', style: CumulusText.statLabel),
+                    const SizedBox(width: 8),
+                    Text(
+                      widget.runPath!.runId,
+                      style: CumulusText.mono.copyWith(fontSize: 11.5),
+                    ),
+                    const SizedBox(width: 10),
+                    const _Key(color: CumulusColors.accent, label: 'taken'),
+                    const SizedBox(width: 8),
+                    const _Key(
+                      color: CumulusColors.inkMuted,
+                      label: 'not taken',
+                    ),
+                  ],
+                ),
+            ],
+          ),
+        ),
+        Positioned(
+          right: 12,
+          top: 12,
+          child: Row(
+            children: [
+              if (widget.onExportSchema != null) ...[
+                _FloatingBar(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  children: [
+                    TextButton.icon(
+                      onPressed: widget.onExportSchema,
+                      icon: const Icon(Icons.code, size: 14),
+                      label: const Text('Export schema'),
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
                         ),
                       ),
                     ),
+                  ],
+                ),
+                const SizedBox(width: 8),
+              ],
+              _FloatingBar(
+                padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 3),
+                children: [
+                  _ZoomButton(
+                    icon: Icons.remove,
+                    tooltip: 'Zoom out',
+                    onTap: () => _zoomBy(1 / 1.25),
+                  ),
+                  _ZoomButton(
+                    icon: Icons.add,
+                    tooltip: 'Zoom in',
+                    onTap: () => _zoomBy(1.25),
+                  ),
+                  _ZoomButton(
+                    icon: Icons.fit_screen_outlined,
+                    tooltip: 'Reset view',
+                    onTap: () => _view.value = Matrix4.identity(),
+                  ),
                 ],
               ),
-            ),
+            ],
           ),
         ),
       ],
@@ -341,11 +443,36 @@ class _WorkflowCanvasState extends State<WorkflowCanvas> {
   }
 }
 
-class _DiffKey extends StatelessWidget {
+class _FloatingBar extends StatelessWidget {
+  final List<Widget> children;
+  final EdgeInsets padding;
+
+  const _FloatingBar({
+    required this.children,
+    this.padding = const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(right: 8),
+      padding: padding,
+      decoration: BoxDecoration(
+        color: CumulusColors.surface,
+        borderRadius: BorderRadius.circular(CumulusRadius.control),
+        border: Border.all(color: CumulusColors.border),
+        boxShadow: CumulusShadows.card,
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: children),
+    );
+  }
+}
+
+class _Key extends StatelessWidget {
   final Color color;
   final String label;
 
-  const _DiffKey({required this.color, required this.label});
+  const _Key({required this.color, required this.label});
 
   @override
   Widget build(BuildContext context) {
@@ -380,19 +507,14 @@ class _ZoomButton extends StatelessWidget {
     return Tooltip(
       message: tooltip,
       child: Material(
-        color: CumulusColors.surface,
-        borderRadius: BorderRadius.circular(9),
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(8),
         child: InkWell(
           onTap: onTap,
-          borderRadius: BorderRadius.circular(9),
-          child: Container(
+          borderRadius: BorderRadius.circular(8),
+          child: SizedBox(
             width: 30,
-            height: 30,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(9),
-              border: Border.all(color: CumulusColors.borderStrong),
-            ),
+            height: 28,
             child: Icon(icon, size: 15, color: CumulusColors.inkSecondary),
           ),
         ),
@@ -401,58 +523,74 @@ class _ZoomButton extends StatelessWidget {
   }
 }
 
-/// Curved connectors with branch labels. Drawn beneath the nodes, so a label
-/// never covers a step's text.
-class _EdgePainter extends CustomPainter {
+/// The dotted field plus the connectors, painted beneath the nodes so a
+/// branch label never covers a step's text.
+class _FieldPainter extends CustomPainter {
+  static const double dotSpacing = 22;
+
   final List<_Edge> edges;
 
-  _EdgePainter(this.edges);
+  _FieldPainter(this.edges);
 
   @override
   void paint(Canvas canvas, Size size) {
-    for (final edge in edges) {
-      final paint = Paint()
-        ..color = edge.dimmed
-            ? CumulusColors.danger.withValues(alpha: 0.25)
-            : CumulusColors.borderStrong
-        ..strokeWidth = 1.6
-        ..style = PaintingStyle.stroke;
-      final dx = (edge.to.dx - edge.from.dx).abs();
-      final control = math.max(30.0, dx / 2);
-      final path = Path()
-        ..moveTo(edge.from.dx, edge.from.dy)
-        ..cubicTo(
-          edge.from.dx + control,
-          edge.from.dy,
-          edge.to.dx - control,
-          edge.to.dy,
-          edge.to.dx,
-          edge.to.dy,
-        );
-      canvas.drawPath(path, paint);
-      _arrowHead(canvas, edge.to, paint);
-      if (edge.label.isNotEmpty) {
-        _branchLabel(canvas, edge);
+    final dot = Paint()..color = CumulusColors.borderStrong;
+    for (var x = dotSpacing / 2; x < size.width; x += dotSpacing) {
+      for (var y = dotSpacing / 2; y < size.height; y += dotSpacing) {
+        canvas.drawCircle(Offset(x, y), 1, dot);
       }
+    }
+    for (final edge in edges) {
+      _connector(canvas, edge);
     }
   }
 
-  void _arrowHead(Canvas canvas, Offset tip, Paint paint) {
-    final head = Path()
-      ..moveTo(tip.dx - 7, tip.dy - 4.5)
-      ..lineTo(tip.dx, tip.dy)
-      ..lineTo(tip.dx - 7, tip.dy + 4.5);
-    canvas.drawPath(head, paint..strokeJoin = StrokeJoin.round);
+  void _connector(Canvas canvas, _Edge edge) {
+    final paint = Paint()
+      ..color = edge.taken
+          ? CumulusColors.accent
+          : edge.ghost
+          ? CumulusColors.borderStrong.withValues(alpha: 0.55)
+          : CumulusColors.borderStrong
+      ..strokeWidth = edge.taken ? 2.4 : 1.6
+      ..style = PaintingStyle.stroke
+      ..strokeJoin = StrokeJoin.round;
+    final dy = (edge.to.dy - edge.from.dy).abs();
+    final control = math.max(26.0, dy / 2);
+    final path = Path()
+      ..moveTo(edge.from.dx, edge.from.dy)
+      ..cubicTo(
+        edge.from.dx,
+        edge.from.dy + control,
+        edge.to.dx,
+        edge.to.dy - control,
+        edge.to.dx,
+        edge.to.dy,
+      );
+    canvas.drawPath(path, paint);
+    // Arrow into the top edge of the target.
+    canvas.drawPath(
+      Path()
+        ..moveTo(edge.to.dx - 4.5, edge.to.dy - 7)
+        ..lineTo(edge.to.dx, edge.to.dy)
+        ..lineTo(edge.to.dx + 4.5, edge.to.dy - 7),
+      paint,
+    );
+    if (edge.label.isNotEmpty) {
+      _label(canvas, edge);
+    }
   }
 
-  void _branchLabel(Canvas canvas, _Edge edge) {
+  void _label(Canvas canvas, _Edge edge) {
     final painter = TextPainter(
       text: TextSpan(
         text: edge.label,
-        style: const TextStyle(
+        style: TextStyle(
           fontSize: 10,
           fontWeight: FontWeight.w600,
-          color: CumulusColors.inkSecondary,
+          color: edge.taken
+              ? CumulusColors.accentInk
+              : CumulusColors.inkSecondary,
         ),
       ),
       textDirection: TextDirection.ltr,
@@ -473,7 +611,7 @@ class _EdgePainter extends CustomPainter {
     canvas.drawRRect(
       RRect.fromRectAndRadius(box, const Radius.circular(99)),
       Paint()
-        ..color = CumulusColors.border
+        ..color = edge.taken ? CumulusColors.accent : CumulusColors.border
         ..style = PaintingStyle.stroke,
     );
     painter.paint(
@@ -483,17 +621,25 @@ class _EdgePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_EdgePainter old) => old.edges != edges;
+  bool shouldRepaint(_FieldPainter old) => old.edges != edges;
 }
 
 class _CanvasNode extends StatelessWidget {
   final _PlacedNode node;
   final bool selected;
+
+  /// Null when no run is selected; otherwise the journal's status for this
+  /// step, and whether the run reached it at all.
+  final String? runStatus;
+  final bool? inRun;
+
   final VoidCallback onTap;
 
   const _CanvasNode({
     required this.node,
     required this.selected,
+    required this.runStatus,
+    required this.inRun,
     required this.onTap,
   });
 
@@ -505,9 +651,19 @@ class _CanvasNode extends StatelessWidget {
     final removed = node.change == 'removed';
     final added = node.change == 'added';
     final modified = node.change == 'modified';
+    // A step the selected run never reached is drawn as a ghost: still in
+    // position, so the shape of the definition survives, but visibly not part
+    // of what happened.
+    final excluded = inRun == false;
 
     final borderColor = selected
         ? CumulusColors.ink
+        : runStatus == 'failed'
+        ? CumulusColors.danger
+        : runStatus == 'waiting'
+        ? CumulusColors.accent
+        : inRun == true
+        ? CumulusColors.accent.withValues(alpha: 0.55)
         : added
         ? CumulusColors.success
         : removed
@@ -523,8 +679,30 @@ class _CanvasNode extends StatelessWidget {
       if (step.config['target'] != null) '→ ${step.config['target']}',
     ].join(' · ');
 
+    final note = switch (node.change) {
+      'added' => 'added in this draft',
+      'removed' => 'removed in this draft',
+      'modified' => 'changed: ${node.changedFields.join(', ')}',
+      _ => switch (runStatus) {
+        'failed' => 'failed in this run',
+        'waiting' => 'waiting on a human',
+        'skipped' => 'not taken in this run',
+        _ => null,
+      },
+    };
+    final noteColor = switch (node.change) {
+      'added' => CumulusColors.success,
+      'removed' => CumulusColors.danger,
+      'modified' => CumulusColors.warn,
+      _ => runStatus == 'failed'
+          ? CumulusColors.danger
+          : runStatus == 'waiting'
+          ? CumulusColors.accent
+          : CumulusColors.inkMuted,
+    };
+
     return Opacity(
-      opacity: removed ? 0.55 : 1,
+      opacity: removed || excluded ? 0.42 : 1,
       child: Material(
         color: CumulusColors.surface,
         borderRadius: BorderRadius.circular(CumulusRadius.control),
@@ -532,12 +710,13 @@ class _CanvasNode extends StatelessWidget {
           onTap: onTap,
           borderRadius: BorderRadius.circular(CumulusRadius.control),
           child: Container(
-            padding: const EdgeInsets.fromLTRB(13, 11, 13, 11),
+            padding: const EdgeInsets.fromLTRB(13, 10, 13, 10),
             decoration: BoxDecoration(
+              color: CumulusColors.surface,
               borderRadius: BorderRadius.circular(CumulusRadius.control),
               border: Border.all(
                 color: borderColor,
-                width: selected || added || removed || modified ? 1.6 : 1,
+                width: selected ? 2 : (added || removed || modified) ? 1.6 : 1,
               ),
               boxShadow: added
                   ? [
@@ -595,7 +774,7 @@ class _CanvasNode extends StatelessWidget {
                       ),
                   ],
                 ),
-                const SizedBox(height: 7),
+                const SizedBox(height: 6),
                 Text(
                   step.name,
                   maxLines: 1,
@@ -606,36 +785,27 @@ class _CanvasNode extends StatelessWidget {
                     decoration: removed ? TextDecoration.lineThrough : null,
                   ),
                 ),
-                const SizedBox(height: 3),
+                const SizedBox(height: 2),
                 Expanded(
                   child: Text(
                     config.isEmpty ? step.summary : config,
-                    maxLines: 2,
+                    maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                       fontSize: 10.5,
                       color: CumulusColors.inkMuted,
-                      height: 1.35,
                     ),
                   ),
                 ),
-                if (added || removed || modified)
+                if (note != null)
                   Text(
-                    switch (node.change) {
-                      'added' => 'added in this draft',
-                      'removed' => 'removed in this draft',
-                      _ => 'changed: ${node.changedFields.join(', ')}',
-                    },
+                    note,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontSize: 9.5,
                       fontWeight: FontWeight.w600,
-                      color: added
-                          ? CumulusColors.success
-                          : removed
-                          ? CumulusColors.danger
-                          : CumulusColors.warn,
+                      color: noteColor,
                     ),
                   ),
               ],
