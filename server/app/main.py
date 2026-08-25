@@ -14,7 +14,7 @@ from . import (
     rest_api,
     teams_api,
     users_api,
-    workflows_api,
+    flows_api,
 )
 from .config import settings
 from .deps import (
@@ -23,7 +23,7 @@ from .deps import (
     get_identity_service,
     get_service,
     get_team_service,
-    get_workflow_service,
+    get_flow_service,
 )
 from .logging_config import RequestContextMiddleware, configure_logging, request_id
 from .mcp_server import RequireAuthMiddleware, mcp
@@ -44,7 +44,7 @@ mcp_app = mcp.streamable_http_app(
 async def lifespan(app: FastAPI):
     service = get_service()  # hydrate storage + search index before serving
     get_identity_service()  # build the identity stores off the request path
-    get_workflow_service()  # hydrate the registry (and seed the demo fleet)
+    get_flow_service()  # hydrate the registry (and seed the demo fleet)
 
     # Hard cutover to identity-bound credentials: a key minted before
     # identities existed authenticates nothing (auth.py refuses it), so mark
@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
             "embeddingBackend": settings.embedding_backend,
             "assets": len(service.repo.all()),
             "teams": len(get_team_service().list()),
-            "workflows": len(get_workflow_service().list()),
+            "flows": len(get_flow_service().list()),
         },
     )
     # Mounted sub-app lifespans don't run automatically; drive the MCP session manager here.
@@ -138,7 +138,7 @@ app.include_router(rest_api.router)
 app.include_router(users_api.router)
 app.include_router(identities_api.router)
 app.include_router(teams_api.router)
-app.include_router(workflows_api.router)
+app.include_router(flows_api.router)
 app.include_router(api_keys_api.router)
 app.include_router(a2a.router)
 

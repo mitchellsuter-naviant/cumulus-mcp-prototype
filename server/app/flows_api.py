@@ -1,4 +1,4 @@
-"""REST surface for the Workflows section: registry, telemetry, audit, testing.
+"""REST surface for the Flows section: registry, telemetry, audit, testing.
 
 Reads need any authenticated role — watching how a workstream runs is a
 Workspace-grade capability, not an admin one. Registering, editing, pausing,
@@ -12,9 +12,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .auth import Principal, get_principal, require_reader, require_role
-from .deps import get_workflow_service
+from .deps import get_flow_service
 from .models import utcnow
-from .workflows import (
+from .flows import (
     AuditEntry,
     GoldenCase,
     GoldenSource,
@@ -24,13 +24,12 @@ from .workflows import (
     StepDiff,
     TestRun,
     UsageDay,
-    WorkflowDefinition,
-    WorkflowExistsError,
-    WorkflowKind,
-    WorkflowNotFoundError,
-    WorkflowStatus,
-    WorkflowStep,
-    WorkflowVersion,
+    FlowDefinition,
+    FlowExistsError,
+    FlowNotFoundError,
+    FlowStatus,
+    FlowStep,
+    FlowVersion,
     audit_entries,
     find_run,
     open_tasks,
@@ -38,19 +37,18 @@ from .workflows import (
     usage_series,
 )
 
-log = logging.getLogger("cumulus.workflows.api")
+log = logging.getLogger("cumulus.flows.api")
 
-router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
+router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
 
 
 # ---- public shapes ---------------------------------------------------------
 
 
-class WorkflowSummaryPublic(BaseModel):
+class FlowSummaryPublic(BaseModel):
     id: str
     name: str
-    kind: WorkflowKind
-    status: WorkflowStatus
+    status: FlowStatus
     description: str
     team: str
     tags: list[str]
@@ -65,8 +63,8 @@ class WorkflowSummaryPublic(BaseModel):
     spark: list[int] = Field(default_factory=list)
 
 
-class WorkflowDetailPublic(WorkflowSummaryPublic):
-    steps: list[WorkflowStep] = Field(default_factory=list)
+class FlowDetailPublic(FlowSummaryPublic):
+    steps: list[FlowStep] = Field(default_factory=list)
     queues: list[str] = Field(default_factory=list)
     workspace: str = ""
     roi_minutes_per_run: float = 0.0
@@ -89,7 +87,7 @@ class FleetSeriesDay(BaseModel):
 
 
 class FleetAttention(BaseModel):
-    workflow_id: str
+    flow_id: str
     reason: str
 
 
@@ -97,8 +95,8 @@ class FleetStats(BaseModel):
     days: int
     definitions: int
     active: int
-    workflows: int
-    dataflows: int
+    paused: int
+    draft: int
     runs: int
     completed: int
     success_rate: float | None = None
@@ -113,14 +111,13 @@ class FleetStats(BaseModel):
     attention: list[FleetAttention]
 
 
-class WorkflowCreate(BaseModel):
+class FlowCreate(BaseModel):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9\-]*$", max_length=60)
     name: str = Field(default="", max_length=120)
-    kind: WorkflowKind = "workflow"
     description: str = Field(default="", max_length=600)
     team: str = Field(default="", max_length=60)
     tags: list[str] = Field(default_factory=list)
-    steps: list[WorkflowStep] = Field(default_factory=list)
+    steps: list[FlowStep] = Field(default_factory=list)
     queues: list[str] = Field(default_factory=list)
     workspace: str = ""
     roi_minutes_per_run: float = 0.0
@@ -128,10 +125,10 @@ class WorkflowCreate(BaseModel):
     model_budget_usd_per_run: float = 0.50
 
 
-class WorkflowUpdate(BaseModel):
+class FlowUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=120)
     description: str | None = Field(default=None, max_length=600)
-    status: WorkflowStatus | None = None
+    status: FlowStatus | None = None
     team: str | None = Field(default=None, max_length=60)
     tags: list[str] | None = None
     roi_minutes_per_run: float | None = None
@@ -153,7 +150,7 @@ class GoldenCaseCreate(BaseModel):
 
 
 class GoldenSetPublic(BaseModel):
-    workflow_id: str
+    flow_id: str
     cases: list[GoldenCase] = Field(default_factory=list)
     synced_from: str = ""
     synced_at: str = ""
@@ -161,7 +158,7 @@ class GoldenSetPublic(BaseModel):
 
 class AppliedRecommendation(BaseModel):
     recommendation_id: str
-    draft: WorkflowVersion
+    draft: FlowVersion
     summary: str
 
 
@@ -170,8 +167,8 @@ class TestRunLaunch(BaseModel):
     baseline_version: str = Field(default="", max_length=60)
 
 
-class WorkflowUsage(BaseModel):
-    workflow_id: str
+class FlowUsage(BaseModel):
+    flow_id: str
     days: int
     runs: int
     completed: int
@@ -193,22 +190,21 @@ def _require_human(principal: Principal) -> None:
     """A key may not reshape the registry it authenticates against."""
     if principal.key_id is not None:
         log.warning(
-            "API key attempted workflow management", extra={"keyId": principal.key_id}
+            "API key attempted flow management", extra={"keyId": principal.key_id}
         )
         raise HTTPException(
             status_code=403,
-            detail="API keys cannot manage workflows; sign in as an admin.",
+            detail="API keys cannot manage flows; sign in as an admin.",
         )
 
 
-def _rollup(defn: WorkflowDefinition) -> WorkflowSummaryPublic:
+def _rollup(defn: FlowDefinition) -> FlowSummaryPublic:
     series = usage_series(defn, 30)
     runs = sum(d.runs for d in series)
     completed = sum(d.completed for d in series)
-    return WorkflowSummaryPublic(
+    return FlowSummaryPublic(
         id=defn.id,
         name=defn.name or defn.id,
-        kind=defn.kind,
         status=defn.status,
         description=defn.description,
         team=defn.team,
@@ -224,10 +220,10 @@ def _rollup(defn: WorkflowDefinition) -> WorkflowSummaryPublic:
     )
 
 
-def _detail(defn: WorkflowDefinition, golden_cases: int) -> WorkflowDetailPublic:
+def _detail(defn: FlowDefinition, golden_cases: int) -> FlowDetailPublic:
     base = _rollup(defn)
     draft = defn.draft_version()
-    return WorkflowDetailPublic(
+    return FlowDetailPublic(
         **base.model_dump(),
         steps=defn.steps,
         queues=defn.queues,
@@ -244,30 +240,27 @@ def _detail(defn: WorkflowDefinition, golden_cases: int) -> WorkflowDetailPublic
     )
 
 
-def _get_or_404(workflow_id: str) -> WorkflowDefinition:
-    defn = get_workflow_service().get(workflow_id)
+def _get_or_404(flow_id: str) -> FlowDefinition:
+    defn = get_flow_service().get(flow_id)
     if defn is None:
-        raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_id}")
     return defn
 
 
 # ---- fleet -----------------------------------------------------------------
 
 
-@router.get("", response_model=list[WorkflowSummaryPublic])
-def list_workflows(
+@router.get("", response_model=list[FlowSummaryPublic])
+def list_flows(
     q: str = "",
-    kind: WorkflowKind | None = None,
-    status: WorkflowStatus | None = None,
+    status: FlowStatus | None = None,
     team: str | None = None,
     principal: Principal = Depends(get_principal),
-) -> list[WorkflowSummaryPublic]:
+) -> list[FlowSummaryPublic]:
     require_reader(principal)
     out = []
     needle = q.strip().lower()
-    for defn in get_workflow_service().list():
-        if kind is not None and defn.kind != kind:
-            continue
+    for defn in get_flow_service().list():
         if status is not None and defn.status != status:
             continue
         if team is not None and defn.team != team:
@@ -288,7 +281,7 @@ def fleet_stats(
     principal: Principal = Depends(get_principal),
 ) -> FleetStats:
     require_reader(principal)
-    service = get_workflow_service()
+    service = get_flow_service()
     defs = service.list()
     per_day: dict[str, FleetSeriesDay] = {}
     runs = completed = tokens = calls = escalated = tasks_open = 0
@@ -318,20 +311,20 @@ def fleet_stats(
         if d_runs and (d_completed / d_runs) < 0.95:
             attention.append(
                 FleetAttention(
-                    workflow_id=defn.id,
+                    flow_id=defn.id,
                     reason=f"success {d_completed / d_runs:.1%} over the last {days}d",
                 )
             )
         if defn.status == "active" and not service.golden_set(defn.id).cases:
             attention.append(
-                FleetAttention(workflow_id=defn.id, reason="active with no golden set")
+                FleetAttention(flow_id=defn.id, reason="active with no golden set")
             )
     return FleetStats(
         days=days,
         definitions=len(defs),
         active=sum(1 for d in defs if d.status == "active"),
-        workflows=sum(1 for d in defs if d.kind == "workflow"),
-        dataflows=sum(1 for d in defs if d.kind == "dataflow"),
+        paused=sum(1 for d in defs if d.status == "paused"),
+        draft=sum(1 for d in defs if d.status == "draft"),
         runs=runs,
         completed=completed,
         success_rate=round(completed / runs, 4) if runs else None,
@@ -347,103 +340,103 @@ def fleet_stats(
     )
 
 
-@router.post("", response_model=WorkflowDetailPublic, status_code=201)
-def create_workflow(
-    payload: WorkflowCreate, principal: Principal = Depends(get_principal)
-) -> WorkflowDetailPublic:
+@router.post("", response_model=FlowDetailPublic, status_code=201)
+def create_flow(
+    payload: FlowCreate, principal: Principal = Depends(get_principal)
+) -> FlowDetailPublic:
     require_role(principal, "admin")
     _require_human(principal)
-    defn = WorkflowDefinition(
+    defn = FlowDefinition(
         **payload.model_dump(),
         status="draft",
         version=1,
         authored_by=principal.email or principal.uid,
     )
     try:
-        created = get_workflow_service().create(defn)
-    except WorkflowExistsError:
+        created = get_flow_service().create(defn)
+    except FlowExistsError:
         raise HTTPException(
-            status_code=409, detail=f"A workflow named '{payload.id}' already exists"
+            status_code=409, detail=f"A flow named '{payload.id}' already exists"
         )
-    log.info("Workflow registered", extra={"workflowId": created.id, "actor": principal.uid})
+    log.info("Flow registered", extra={"flowId": created.id, "actor": principal.uid})
     return _detail(created, 0)
 
 
-@router.get("/{workflow_id}", response_model=WorkflowDetailPublic)
-def get_workflow(
-    workflow_id: str, principal: Principal = Depends(get_principal)
-) -> WorkflowDetailPublic:
+@router.get("/{flow_id}", response_model=FlowDetailPublic)
+def get_flow(
+    flow_id: str, principal: Principal = Depends(get_principal)
+) -> FlowDetailPublic:
     require_reader(principal)
-    defn = _get_or_404(workflow_id)
-    golden = get_workflow_service().golden_set(workflow_id)
+    defn = _get_or_404(flow_id)
+    golden = get_flow_service().golden_set(flow_id)
     return _detail(defn, len(golden.cases))
 
 
-@router.patch("/{workflow_id}", response_model=WorkflowDetailPublic)
-def update_workflow(
-    workflow_id: str,
-    payload: WorkflowUpdate,
+@router.patch("/{flow_id}", response_model=FlowDetailPublic)
+def update_flow(
+    flow_id: str,
+    payload: FlowUpdate,
     principal: Principal = Depends(get_principal),
-) -> WorkflowDetailPublic:
+) -> FlowDetailPublic:
     require_role(principal, "admin")
     _require_human(principal)
-    defn = _get_or_404(workflow_id)
+    defn = _get_or_404(flow_id)
     patch = {k: v for k, v in payload.model_dump().items() if v is not None}
     # A status change is a governed lifecycle act; log it distinctly so the
     # trail reads "who paused this and when".
     if "status" in patch and patch["status"] != defn.status:
         log.info(
-            "Workflow status changed",
+            "Flow status changed",
             extra={
-                "workflowId": workflow_id,
+                "flowId": flow_id,
                 "from": defn.status,
                 "to": patch["status"],
                 "actor": principal.uid,
             },
         )
-    updated = get_workflow_service().update(defn.model_copy(update=patch))
-    log.info("Workflow updated", extra={"workflowId": workflow_id, "actor": principal.uid})
-    golden = get_workflow_service().golden_set(workflow_id)
+    updated = get_flow_service().update(defn.model_copy(update=patch))
+    log.info("Flow updated", extra={"flowId": flow_id, "actor": principal.uid})
+    golden = get_flow_service().golden_set(flow_id)
     return _detail(updated, len(golden.cases))
 
 
-@router.delete("/{workflow_id}", status_code=204)
-def delete_workflow(
-    workflow_id: str, principal: Principal = Depends(get_principal)
+@router.delete("/{flow_id}", status_code=204)
+def delete_flow(
+    flow_id: str, principal: Principal = Depends(get_principal)
 ) -> None:
     require_role(principal, "admin")
     _require_human(principal)
-    defn = _get_or_404(workflow_id)
+    defn = _get_or_404(flow_id)
     if defn.status == "active":
         # Definitions are map assets; an active one is deprecated, not erased.
         raise HTTPException(
             status_code=409,
-            detail="An active workflow cannot be deleted. Pause or deprecate it first.",
+            detail="An active flow cannot be deleted. Pause or deprecate it first.",
         )
     try:
-        get_workflow_service().delete(workflow_id)
-    except WorkflowNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
-    log.info("Workflow deleted", extra={"workflowId": workflow_id, "actor": principal.uid})
+        get_flow_service().delete(flow_id)
+    except FlowNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_id}")
+    log.info("Flow deleted", extra={"flowId": flow_id, "actor": principal.uid})
 
 
 # ---- telemetry -------------------------------------------------------------
 
 
-@router.get("/{workflow_id}/usage", response_model=WorkflowUsage)
-def workflow_usage(
-    workflow_id: str,
+@router.get("/{flow_id}/usage", response_model=FlowUsage)
+def flow_usage(
+    flow_id: str,
     days: int = Query(default=30, ge=1, le=365),
     principal: Principal = Depends(get_principal),
-) -> WorkflowUsage:
+) -> FlowUsage:
     require_reader(principal)
-    defn = _get_or_404(workflow_id)
+    defn = _get_or_404(flow_id)
     series = usage_series(defn, days)
     runs = sum(d.runs for d in series)
     completed = sum(d.completed for d in series)
     minutes = sum(d.minutes_saved for d in series)
-    return WorkflowUsage(
-        workflow_id=workflow_id,
+    return FlowUsage(
+        flow_id=flow_id,
         days=days,
         runs=runs,
         completed=completed,
@@ -459,22 +452,22 @@ def workflow_usage(
     )
 
 
-@router.get("/{workflow_id}/runs", response_model=list[RunSummary])
-def workflow_runs(
-    workflow_id: str,
+@router.get("/{flow_id}/runs", response_model=list[RunSummary])
+def flow_runs(
+    flow_id: str,
     limit: int = Query(default=25, ge=1, le=200),
     principal: Principal = Depends(get_principal),
 ) -> list[RunSummary]:
     require_reader(principal)
-    return recent_runs(_get_or_404(workflow_id), limit)
+    return recent_runs(_get_or_404(flow_id), limit)
 
 
-@router.get("/{workflow_id}/runs/{run_id}", response_model=RunDetail)
-def workflow_run(
-    workflow_id: str, run_id: str, principal: Principal = Depends(get_principal)
+@router.get("/{flow_id}/runs/{run_id}", response_model=RunDetail)
+def flow_run(
+    flow_id: str, run_id: str, principal: Principal = Depends(get_principal)
 ) -> RunDetail:
     require_reader(principal)
-    detail = find_run(_get_or_404(workflow_id), run_id)
+    detail = find_run(_get_or_404(flow_id), run_id)
     if detail is None:
         raise HTTPException(
             status_code=404,
@@ -483,44 +476,44 @@ def workflow_run(
     return detail
 
 
-@router.get("/{workflow_id}/audit", response_model=list[AuditEntry])
-def workflow_audit(
-    workflow_id: str,
+@router.get("/{flow_id}/audit", response_model=list[AuditEntry])
+def flow_audit(
+    flow_id: str,
     limit: int = Query(default=40, ge=1, le=200),
     principal: Principal = Depends(get_principal),
 ) -> list[AuditEntry]:
     require_reader(principal)
-    return audit_entries(_get_or_404(workflow_id), limit)
+    return audit_entries(_get_or_404(flow_id), limit)
 
 
 # ---- versions --------------------------------------------------------------
 
 
-@router.get("/{workflow_id}/versions", response_model=list[WorkflowVersion])
-def workflow_versions(
-    workflow_id: str, principal: Principal = Depends(get_principal)
-) -> list[WorkflowVersion]:
+@router.get("/{flow_id}/versions", response_model=list[FlowVersion])
+def flow_versions(
+    flow_id: str, principal: Principal = Depends(get_principal)
+) -> list[FlowVersion]:
     """Published history plus any open draft, newest first."""
     require_reader(principal)
-    _get_or_404(workflow_id)
-    return get_workflow_service().versions(workflow_id)
+    _get_or_404(flow_id)
+    return get_flow_service().versions(flow_id)
 
 
-@router.get("/{workflow_id}/versions/{version}", response_model=WorkflowVersion)
-def workflow_version(
-    workflow_id: str, version: int, principal: Principal = Depends(get_principal)
-) -> WorkflowVersion:
+@router.get("/{flow_id}/versions/{version}", response_model=FlowVersion)
+def flow_version(
+    flow_id: str, version: int, principal: Principal = Depends(get_principal)
+) -> FlowVersion:
     require_reader(principal)
-    _get_or_404(workflow_id)
-    found = get_workflow_service().version(workflow_id, version)
+    _get_or_404(flow_id)
+    found = get_flow_service().version(flow_id, version)
     if found is None:
         raise HTTPException(status_code=404, detail=f"Version not found: v{version}")
     return found
 
 
-@router.get("/{workflow_id}/versions/{version}/diff", response_model=list[StepDiff])
-def workflow_version_diff(
-    workflow_id: str,
+@router.get("/{flow_id}/versions/{version}/diff", response_model=list[StepDiff])
+def flow_version_diff(
+    flow_id: str,
     version: int,
     against: int | None = Query(
         default=None,
@@ -534,9 +527,9 @@ def workflow_version_diff(
     canvas can show what a draft deletes rather than silently dropping it.
     """
     require_reader(principal)
-    _get_or_404(workflow_id)
+    _get_or_404(flow_id)
     try:
-        return get_workflow_service().diff(workflow_id, version, against)
+        return get_flow_service().diff(flow_id, version, against)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -544,24 +537,24 @@ def workflow_version_diff(
 # ---- recommendations -------------------------------------------------------
 
 
-@router.get("/{workflow_id}/recommendations", response_model=list[Recommendation])
-def workflow_recommendations(
-    workflow_id: str,
+@router.get("/{flow_id}/recommendations", response_model=list[Recommendation])
+def flow_recommendations(
+    flow_id: str,
     days: int = Query(default=30, ge=7, le=365),
     principal: Principal = Depends(get_principal),
 ) -> list[Recommendation]:
     """Cost and performance insights derived from this definition's telemetry."""
     require_reader(principal)
-    _get_or_404(workflow_id)
-    return get_workflow_service().recommendations(workflow_id, days)
+    _get_or_404(flow_id)
+    return get_flow_service().recommendations(flow_id, days)
 
 
 @router.post(
-    "/{workflow_id}/recommendations/{recommendation_id}/apply",
+    "/{flow_id}/recommendations/{recommendation_id}/apply",
     response_model=AppliedRecommendation,
 )
 def apply_recommendation(
-    workflow_id: str,
+    flow_id: str,
     recommendation_id: str,
     principal: Principal = Depends(get_principal),
 ) -> AppliedRecommendation:
@@ -573,10 +566,10 @@ def apply_recommendation(
     """
     require_role(principal, "admin")
     _require_human(principal)
-    _get_or_404(workflow_id)
-    service = get_workflow_service()
+    _get_or_404(flow_id)
+    service = get_flow_service()
     rec = next(
-        (r for r in service.recommendations(workflow_id) if r.id == recommendation_id),
+        (r for r in service.recommendations(flow_id) if r.id == recommendation_id),
         None,
     )
     if rec is None:
@@ -589,7 +582,7 @@ def apply_recommendation(
         )
     try:
         _, draft = service.apply_recommendation(
-            workflow_id, rec, principal.email or principal.uid
+            flow_id, rec, principal.email or principal.uid
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -607,32 +600,32 @@ def apply_recommendation(
 # ---- golden set ------------------------------------------------------------
 
 
-@router.get("/{workflow_id}/golden-set", response_model=GoldenSetPublic)
+@router.get("/{flow_id}/golden-set", response_model=GoldenSetPublic)
 def golden_set(
-    workflow_id: str, principal: Principal = Depends(get_principal)
+    flow_id: str, principal: Principal = Depends(get_principal)
 ) -> GoldenSetPublic:
     require_reader(principal)
-    _get_or_404(workflow_id)
-    golden = get_workflow_service().golden_set(workflow_id)
+    _get_or_404(flow_id)
+    golden = get_flow_service().golden_set(flow_id)
     return GoldenSetPublic(
-        workflow_id=workflow_id,
+        flow_id=flow_id,
         cases=golden.cases,
         synced_from=golden.synced_from,
         synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
     )
 
 
-@router.post("/{workflow_id}/golden-set", response_model=GoldenSetPublic, status_code=201)
+@router.post("/{flow_id}/golden-set", response_model=GoldenSetPublic, status_code=201)
 def add_golden_case(
-    workflow_id: str,
+    flow_id: str,
     payload: GoldenCaseCreate,
     principal: Principal = Depends(get_principal),
 ) -> GoldenSetPublic:
     require_role(principal, "admin")
     _require_human(principal)
-    _get_or_404(workflow_id)
-    service = get_workflow_service()
-    existing = service.golden_set(workflow_id).cases
+    _get_or_404(flow_id)
+    service = get_flow_service()
+    existing = service.golden_set(flow_id).cases
     # Promoting a run is the flywheel in miniature: the execution that needed
     # judgment becomes the case that guards against needing it again.
     source = payload.source
@@ -649,13 +642,13 @@ def add_golden_case(
         payload=payload.payload,
     )
     try:
-        golden = service.add_golden_case(workflow_id, case)
+        golden = service.add_golden_case(flow_id, case)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     log.info(
         "Golden case added",
         extra={
-            "workflowId": workflow_id,
+            "flowId": flow_id,
             "caseId": case.id,
             "source": source,
             "runId": payload.run_id,
@@ -663,30 +656,30 @@ def add_golden_case(
         },
     )
     return GoldenSetPublic(
-        workflow_id=workflow_id,
+        flow_id=flow_id,
         cases=golden.cases,
         synced_from=golden.synced_from,
         synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
     )
 
 
-@router.delete("/{workflow_id}/golden-set/{case_id}", response_model=GoldenSetPublic)
+@router.delete("/{flow_id}/golden-set/{case_id}", response_model=GoldenSetPublic)
 def remove_golden_case(
-    workflow_id: str, case_id: str, principal: Principal = Depends(get_principal)
+    flow_id: str, case_id: str, principal: Principal = Depends(get_principal)
 ) -> GoldenSetPublic:
     require_role(principal, "admin")
     _require_human(principal)
-    _get_or_404(workflow_id)
+    _get_or_404(flow_id)
     try:
-        golden = get_workflow_service().remove_golden_case(workflow_id, case_id)
+        golden = get_flow_service().remove_golden_case(flow_id, case_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     log.info(
         "Golden case removed",
-        extra={"workflowId": workflow_id, "caseId": case_id, "actor": principal.uid},
+        extra={"flowId": flow_id, "caseId": case_id, "actor": principal.uid},
     )
     return GoldenSetPublic(
-        workflow_id=workflow_id,
+        flow_id=flow_id,
         cases=golden.cases,
         synced_from=golden.synced_from,
         synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
@@ -696,18 +689,18 @@ def remove_golden_case(
 # ---- test harness ----------------------------------------------------------
 
 
-@router.get("/{workflow_id}/test-runs", response_model=list[TestRun])
+@router.get("/{flow_id}/test-runs", response_model=list[TestRun])
 def list_test_runs(
-    workflow_id: str, principal: Principal = Depends(get_principal)
+    flow_id: str, principal: Principal = Depends(get_principal)
 ) -> list[TestRun]:
     require_reader(principal)
-    _get_or_404(workflow_id)
-    return get_workflow_service().test_runs.list_for(workflow_id)
+    _get_or_404(flow_id)
+    return get_flow_service().test_runs.list_for(flow_id)
 
 
-@router.post("/{workflow_id}/test-runs", response_model=TestRun, status_code=202)
+@router.post("/{flow_id}/test-runs", response_model=TestRun, status_code=202)
 def launch_test_run(
-    workflow_id: str,
+    flow_id: str,
     payload: TestRunLaunch,
     principal: Principal = Depends(get_principal),
 ) -> TestRun:
@@ -718,10 +711,10 @@ def launch_test_run(
     off an eval from CI with a minted key is a legitimate machine act.
     """
     require_role(principal, "admin")
-    defn = _get_or_404(workflow_id)
+    defn = _get_or_404(flow_id)
     try:
-        run = get_workflow_service().launch_test_run(
-            workflow_id,
+        run = get_flow_service().launch_test_run(
+            flow_id,
             payload.candidate_version,
             payload.baseline_version,
             launched_by=principal.email or principal.uid,
@@ -731,7 +724,7 @@ def launch_test_run(
     log.info(
         "Test run launched",
         extra={
-            "workflowId": defn.id,
+            "flowId": defn.id,
             "testId": run.id,
             "cases": run.total_cases,
             "actor": principal.uid,
@@ -740,13 +733,13 @@ def launch_test_run(
     return run
 
 
-@router.get("/{workflow_id}/test-runs/{test_id}", response_model=TestRun)
+@router.get("/{flow_id}/test-runs/{test_id}", response_model=TestRun)
 def get_test_run(
-    workflow_id: str, test_id: str, principal: Principal = Depends(get_principal)
+    flow_id: str, test_id: str, principal: Principal = Depends(get_principal)
 ) -> TestRun:
     require_reader(principal)
-    _get_or_404(workflow_id)
-    run = get_workflow_service().test_runs.get(test_id)
-    if run is None or run.workflow_id != workflow_id:
+    _get_or_404(flow_id)
+    run = get_flow_service().test_runs.get(test_id)
+    if run is None or run.flow_id != flow_id:
         raise HTTPException(status_code=404, detail=f"Test run not found: {test_id}")
     return run

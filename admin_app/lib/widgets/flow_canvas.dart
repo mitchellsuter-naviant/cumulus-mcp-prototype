@@ -2,7 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-import '../models/workflow.dart';
+import '../models/flow.dart';
 import '../theme/cumulus_theme.dart';
 import 'ui_kit.dart';
 
@@ -58,7 +58,7 @@ class RunPath {
     return status != null && status != 'skipped';
   }
 
-  factory RunPath.fromRun(RunDetail run, List<WorkflowStep> steps) {
+  factory RunPath.fromRun(RunDetail run, List<FlowStep> steps) {
     final byId = {for (final s in steps) s.id: s};
     final statuses = {for (final e in run.steps) e.stepId: e.status};
     // The journal is in definition order; consecutive *executed* entries are
@@ -84,7 +84,7 @@ class RunPath {
 }
 
 class _PlacedNode {
-  final WorkflowStep step;
+  final FlowStep step;
   final String change;
   final List<String> changedFields;
   final Offset position;
@@ -172,7 +172,7 @@ class _Layout {
       }
     }
 
-    final rows = <int, List<WorkflowStep>>{};
+    final rows = <int, List<FlowStep>>{};
     for (final step in steps) {
       rows.putIfAbsent(layer[step.id]!, () => []).add(step);
     }
@@ -249,7 +249,7 @@ class _Layout {
 /// Built on [InteractiveViewer] and a [CustomPaint] edge layer rather than a
 /// graph package — the console ships with no charting or graph dependency, and
 /// a layered DAG of a dozen typed steps is arithmetic, not a library.
-class WorkflowCanvas extends StatefulWidget {
+class FlowCanvas extends StatefulWidget {
   final List<StepDiff> steps;
 
   /// Non-empty when a draft is selected, e.g. "v14 (active)". Drives the diff
@@ -261,10 +261,10 @@ class WorkflowCanvas extends StatefulWidget {
   final RunPath? runPath;
 
   final String? selectedStepId;
-  final ValueChanged<WorkflowStep?> onSelect;
+  final ValueChanged<FlowStep?> onSelect;
   final VoidCallback? onExportSchema;
 
-  const WorkflowCanvas({
+  const FlowCanvas({
     super.key,
     required this.steps,
     required this.onSelect,
@@ -275,10 +275,10 @@ class WorkflowCanvas extends StatefulWidget {
   });
 
   @override
-  State<WorkflowCanvas> createState() => _WorkflowCanvasState();
+  State<FlowCanvas> createState() => _FlowCanvasState();
 }
 
-class _WorkflowCanvasState extends State<WorkflowCanvas> {
+class _FlowCanvasState extends State<FlowCanvas> {
   final TransformationController _view = TransformationController();
 
   @override
@@ -312,13 +312,18 @@ class _WorkflowCanvasState extends State<WorkflowCanvas> {
         // Driving it from the controller instead gives an infinite field
         // that scrolls and scales with the content.
         Positioned.fill(
-          child: ColoredBox(
-            color: CumulusColors.canvas,
-            child: ListenableBuilder(
-              listenable: _view,
-              builder: (context, _) => CustomPaint(
-                painter: _DotFieldPainter(_view.value),
-                size: Size.infinite,
+          // CustomPaint does not clip, and the field deliberately tiles from
+          // one step *outside* each edge so no partial row is missing — which
+          // without this spills a row of dots up over the header.
+          child: ClipRect(
+            child: ColoredBox(
+              color: CumulusColors.canvas,
+              child: ListenableBuilder(
+                listenable: _view,
+                builder: (context, _) => CustomPaint(
+                  painter: _DotFieldPainter(_view.value),
+                  size: Size.infinite,
+                ),
               ),
             ),
           ),

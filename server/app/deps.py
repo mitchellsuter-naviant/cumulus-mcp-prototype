@@ -14,7 +14,7 @@ from .storage import build_embedding_repository, build_repository
 from .teams import TeamService, build_team_directory
 from .usage import AssetUsageStore, build_asset_usage_store
 from .users import UserDirectory, build_user_directory
-from .workflows import WorkflowService, build_workflow_service, seed_workflows_if_empty
+from .flows import FlowService, build_flow_service, seed_flows_if_empty
 
 log = logging.getLogger("cumulus.deps")
 
@@ -27,7 +27,7 @@ _api_key_directory: ApiKeyDirectory | None = None
 _identity_service: IdentityService | None = None
 _team_service: TeamService | None = None
 _asset_usage: AssetUsageStore | None = None
-_workflow_service: WorkflowService | None = None
+_flow_service: FlowService | None = None
 # The generative backend is expensive to construct (a Vertex client) and holds
 # no request state, so it is cached; the AnswerService wrapper around it is
 # cheap and is rebuilt per call so it can never hold a stale KnowledgeService.
@@ -151,21 +151,21 @@ def get_team_service() -> TeamService:
     return _team_service
 
 
-def get_workflow_service() -> WorkflowService:
-    global _workflow_service
-    if _workflow_service is None:
-        service = build_workflow_service(
+def get_flow_service() -> FlowService:
+    global _flow_service
+    if _flow_service is None:
+        service = build_flow_service(
             settings.storage_backend,
             settings.firestore_project,
-            settings.workflows_collection,
+            settings.flows_collection,
             settings.golden_sets_collection,
             settings.test_runs_collection,
         )
         with _lock:
-            if _workflow_service is None:
-                seed_workflows_if_empty(service)
-                _workflow_service = service
-    return _workflow_service
+            if _flow_service is None:
+                seed_flows_if_empty(service)
+                _flow_service = service
+    return _flow_service
 
 
 def _build_answer_backend():

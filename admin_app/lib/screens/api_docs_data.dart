@@ -745,12 +745,11 @@ const apiKeysGroup = EndpointGroup(
   ],
 );
 
-// ---- Workflows ---------------------------------------------------------
+// ---- Flows ---------------------------------------------------------
 
-const _workflowSummaryShape = '''{
+const _flowSummaryShape = '''{
   "id": "invoice-intake",
   "name": "Invoice intake",
-  "kind": "workflow",
   "status": "active",
   "description": "Extracts, validates and routes vendor invoices…",
   "team": "finance-ops",
@@ -765,36 +764,37 @@ const _workflowSummaryShape = '''{
   "spark": [52, 58, 55, 61, 66, 63, 58, 71, 69, 74, 72, 78, 81, 86]
 }''';
 
-const workflowsGroup = EndpointGroup(
-  title: 'Workflows',
+const flowsGroup = EndpointGroup(
+  title: 'Flows',
   blurb:
-      'The registry and observability plane for authored logic — Workflow '
-      '(business layer) and DataFlow (data layer) definitions, their run '
-      'telemetry and ModelCall costs, the audit trail, golden sets, and the '
-      'test harness. Note: in this prototype the run telemetry is '
-      'synthesized deterministically per definition (no execution engine '
-      'yet); definitions, golden sets and test runs are real stored state.',
+      'The registry and observability plane for authored logic. There is one '
+      'kind of authored logic — a Flow — carrying its declarative steps, run '
+      'telemetry and ModelCall costs, audit trail, golden set, and test '
+      'harness. (The former Workflow/DataFlow split is retired: what differs '
+      'between flows is derived from their shape, such as whether the trigger '
+      'is a window or a business event.) Note: in this prototype the run '
+      'telemetry is synthesized deterministically per definition (no '
+      'execution engine yet); definitions, golden sets and test runs are '
+      'real stored state.',
   endpoints: [
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows',
+      path: '/api/v1/flows',
       summary: 'The fleet, with 30-day rollups, sorted by model spend.',
       auth: ApiAuth.reader,
       params: [
         ApiParam('q', 'string', where: 'query',
             description: 'Substring match over id, name, description, team, tags.'),
-        ApiParam('kind', 'string', where: 'query',
-            description: '`workflow` or `dataflow`.'),
         ApiParam('status', 'string', where: 'query',
             description: 'One of `draft`, `active`, `paused`, `deprecated`.'),
         ApiParam('team', 'string', where: 'query',
             description: 'Exact owning-team slug.'),
       ],
-      responseExample: '[$_workflowSummaryShape]',
+      responseExample: '[$_flowSummaryShape]',
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/stats',
+      path: '/api/v1/flows/stats',
       summary: 'Fleet-wide stats: runs, spend, ROI, tasks, a daily series.',
       auth: ApiAuth.reader,
       notes:
@@ -807,18 +807,18 @@ const workflowsGroup = EndpointGroup(
             description: 'Window length, 1–365.'),
       ],
       responseExample: '''{
-  "days": 30, "definitions": 6, "active": 5, "workflows": 4, "dataflows": 2,
+  "days": 30, "definitions": 6, "active": 5, "paused": 0, "draft": 1,
   "runs": 4770, "completed": 4601, "success_rate": 0.9646,
   "model_spend_usd": 1284.2, "tokens": 24810000, "model_calls": 7120,
   "hours_returned": 642.1, "roi_usd": 19263.0,
   "tasks_open": 23, "escalated": 19,
   "series": [{"date": "2026-07-26", "runs": 122, "cost_usd": 31.4, "tasks_raised": 9}],
-  "attention": [{"workflow_id": "contract-review", "reason": "success 91.2% over the last 30d"}]
+  "attention": [{"flow_id": "contract-review", "reason": "success 91.2% over the last 30d"}]
 }''',
     ),
     Endpoint(
       method: 'POST',
-      path: '/api/v1/workflows',
+      path: '/api/v1/flows',
       status: 201,
       summary: 'Register a new definition (created as a draft).',
       auth: ApiAuth.humanAdmin,
@@ -826,8 +826,6 @@ const workflowsGroup = EndpointGroup(
         ApiParam('id', 'string', required: true,
             description: 'Slug: lowercase letters, digits, hyphens.'),
         ApiParam('name', 'string'),
-        ApiParam('kind', 'string', defaultValue: 'workflow',
-            description: '`workflow` or `dataflow`.'),
         ApiParam('description', 'string'),
         ApiParam('team', 'string'),
         ApiParam('steps', 'list',
@@ -838,18 +836,18 @@ const workflowsGroup = EndpointGroup(
         ApiParam('roi_minutes_per_run', 'number', defaultValue: '0'),
         ApiParam('model_budget_usd_per_run', 'number', defaultValue: '0.50'),
       ],
-      errors: [ApiError(409, 'A workflow with that id already exists.')],
+      errors: [ApiError(409, 'A flow with that id already exists.')],
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}',
+      path: '/api/v1/flows/{id}',
       summary: 'One definition in full: steps, queues, budgets, rollups.',
       auth: ApiAuth.reader,
-      errors: [ApiError(404, 'Workflow not found.')],
+      errors: [ApiError(404, 'Flow not found.')],
     ),
     Endpoint(
       method: 'PATCH',
-      path: '/api/v1/workflows/{id}',
+      path: '/api/v1/flows/{id}',
       summary: 'Lifecycle and governed-knowledge edits.',
       auth: ApiAuth.humanAdmin,
       notes:
@@ -864,24 +862,24 @@ const workflowsGroup = EndpointGroup(
         ApiParam('roi_hourly_rate_usd', 'number'),
         ApiParam('model_budget_usd_per_run', 'number'),
       ],
-      errors: [ApiError(404, 'Workflow not found.')],
+      errors: [ApiError(404, 'Flow not found.')],
     ),
     Endpoint(
       method: 'DELETE',
-      path: '/api/v1/workflows/{id}',
+      path: '/api/v1/flows/{id}',
       status: 204,
       summary: 'Delete a non-active definition and its golden set.',
       auth: ApiAuth.humanAdmin,
       errors: [
-        ApiError(404, 'Workflow not found.'),
+        ApiError(404, 'Flow not found.'),
         ApiError(409,
-            'The workflow is active — pause or deprecate it first; '
+            'The flow is active — pause or deprecate it first; '
             'definitions are map assets.'),
       ],
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/usage',
+      path: '/api/v1/flows/{id}/usage',
       summary: 'Daily usage series plus totals: runs, cost, tokens, ROI.',
       auth: ApiAuth.reader,
       params: [
@@ -890,7 +888,7 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/runs',
+      path: '/api/v1/flows/{id}/runs',
       summary: 'Recent runs, newest first.',
       auth: ApiAuth.reader,
       params: [
@@ -899,7 +897,7 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/runs/{run_id}',
+      path: '/api/v1/flows/{id}/runs/{run_id}',
       summary: 'One run\'s full journal: steps, ModelCalls, decisions.',
       auth: ApiAuth.reader,
       notes:
@@ -909,7 +907,7 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/audit',
+      path: '/api/v1/flows/{id}/audit',
       summary: 'The ledger view: decisions, gateway commits, resolutions, '
           'knowledge changes.',
       auth: ApiAuth.reader,
@@ -919,7 +917,7 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/versions',
+      path: '/api/v1/flows/{id}/versions',
       summary: 'Published history plus any open draft, newest first.',
       auth: ApiAuth.reader,
       notes:
@@ -936,14 +934,14 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/versions/{version}',
+      path: '/api/v1/flows/{id}/versions/{version}',
       summary: 'One version with its full step list.',
       auth: ApiAuth.reader,
       errors: [ApiError(404, 'Version not found.')],
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/versions/{version}/diff',
+      path: '/api/v1/flows/{id}/versions/{version}/diff',
       summary: 'Steps annotated added / removed / modified.',
       auth: ApiAuth.reader,
       notes:
@@ -965,13 +963,13 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/recommendations',
+      path: '/api/v1/flows/{id}/recommendations',
       summary: 'Cost and performance insights from this definition\'s telemetry.',
       auth: ApiAuth.reader,
       notes:
           'Each card carries the evidence it was derived from. A model '
           'downgrade is proposed one rung at a time and only when the '
-          'workflow is already succeeding — spending less on something that '
+          'flow is already succeeding — spending less on something that '
           'is failing is not a saving. Cards with a null `proposed_change` '
           'are advisory and cannot be applied.',
       params: [
@@ -994,7 +992,7 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'POST',
-      path: '/api/v1/workflows/{id}/recommendations/{recommendation_id}/apply',
+      path: '/api/v1/flows/{id}/recommendations/{recommendation_id}/apply',
       summary: 'Stage a recommendation into the draft version.',
       auth: ApiAuth.humanAdmin,
       notes:
@@ -1009,7 +1007,7 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/golden-set',
+      path: '/api/v1/flows/{id}/golden-set',
       summary: 'The golden set, plus where its seeded half came from.',
       auth: ApiAuth.reader,
       notes:
@@ -1017,7 +1015,7 @@ const workflowsGroup = EndpointGroup(
           'set names the repository file it was seeded from rather than '
           'implying the UI is the only source.',
       responseExample: '''{
-  "workflow_id": "invoice-intake",
+  "flow_id": "invoice-intake",
   "synced_from": "server/tests/golden/invoice-intake.json",
   "synced_at": "2026-08-25T07:12:00Z",
   "cases": [
@@ -1029,7 +1027,7 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'POST',
-      path: '/api/v1/workflows/{id}/golden-set',
+      path: '/api/v1/flows/{id}/golden-set',
       status: 201,
       summary: 'Add a golden case; returns the updated set.',
       auth: ApiAuth.humanAdmin,
@@ -1058,20 +1056,20 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'DELETE',
-      path: '/api/v1/workflows/{id}/golden-set/{case_id}',
+      path: '/api/v1/flows/{id}/golden-set/{case_id}',
       summary: 'Remove a golden case; returns the updated set.',
       auth: ApiAuth.humanAdmin,
       errors: [ApiError(404, 'Golden case not found.')],
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/test-runs',
+      path: '/api/v1/flows/{id}/test-runs',
       summary: 'Past and in-flight test runs, newest first.',
       auth: ApiAuth.reader,
     ),
     Endpoint(
       method: 'POST',
-      path: '/api/v1/workflows/{id}/test-runs',
+      path: '/api/v1/flows/{id}/test-runs',
       status: 202,
       summary: 'Launch a golden-set evaluation. Writes suppressed.',
       auth: ApiAuth.admin,
@@ -1104,7 +1102,7 @@ const workflowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/workflows/{id}/test-runs/{test_id}',
+      path: '/api/v1/flows/{id}/test-runs/{test_id}',
       summary: 'One test run with per-case verdicts.',
       auth: ApiAuth.reader,
       errors: [ApiError(404, 'Test run not found.')],
@@ -1142,7 +1140,7 @@ const restGroups = <EndpointGroup>[
   usersGroup,
   identitiesGroup,
   teamsGroup,
-  workflowsGroup,
+  flowsGroup,
   apiKeysGroup,
   healthGroup,
 ];

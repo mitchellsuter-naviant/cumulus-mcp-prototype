@@ -3,15 +3,15 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../models/workflow.dart';
+import '../models/flow.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import '../widgets/cumulus_shell.dart';
 import '../widgets/mini_charts.dart';
 import '../widgets/side_drawer.dart';
 import '../widgets/ui_kit.dart';
-import '../widgets/workflow_canvas.dart';
-import 'workflows_screen.dart' show dayLabel, kindTone, money, percent, statusTone;
+import '../widgets/flow_canvas.dart';
+import 'flows_screen.dart' show dayLabel, money, percent, statusTone;
 
 String runStatusLabel(String status) => switch (status) {
   'waiting_on_human' => 'waiting on human',
@@ -48,32 +48,32 @@ enum ChartMeasure {
 
 /// One definition, in three views: what it is and how it is doing, the graph
 /// with its runs, and how a candidate version measures up.
-class WorkflowDetailScreen extends StatefulWidget {
-  final String workflowId;
+class FlowDetailScreen extends StatefulWidget {
+  final String flowId;
   final String myRole;
   final VoidCallback onBack;
 
-  const WorkflowDetailScreen({
+  const FlowDetailScreen({
     super.key,
-    required this.workflowId,
+    required this.flowId,
     required this.myRole,
     required this.onBack,
   });
 
   @override
-  State<WorkflowDetailScreen> createState() => _WorkflowDetailScreenState();
+  State<FlowDetailScreen> createState() => _FlowDetailScreenState();
 }
 
-class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
+class _FlowDetailScreenState extends State<FlowDetailScreen> {
   final ApiClient _api = ApiClient();
 
-  WorkflowDetail? _detail;
-  WorkflowUsage? _usage;
+  FlowDetail? _detail;
+  FlowUsage? _usage;
   List<RunSummary> _runs = [];
   GoldenSetInfo? _golden;
   List<TestRun> _tests = [];
   List<Recommendation> _recommendations = [];
-  List<WorkflowVersion> _versions = [];
+  List<FlowVersion> _versions = [];
 
   int? _selectedVersion;
   List<StepDiff> _canvasSteps = [];
@@ -98,16 +98,16 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
 
   bool get _isAdmin => widget.myRole == 'admin' || widget.myRole == 'owner';
 
-  WorkflowVersion? get _current =>
+  FlowVersion? get _current =>
       _versions.where((v) => v.version == _selectedVersion).firstOrNull;
 
-  WorkflowVersion? get _activeVersion =>
+  FlowVersion? get _activeVersion =>
       _versions.where((v) => v.isActive).firstOrNull;
 
-  WorkflowVersion? get _draftVersion =>
+  FlowVersion? get _draftVersion =>
       _versions.where((v) => v.isDraft).firstOrNull;
 
-  WorkflowStep? get _selectedStep =>
+  FlowStep? get _selectedStep =>
       _canvasSteps.where((d) => d.step.id == _selectedStepId).firstOrNull?.step;
 
   RunPath? get _runPath => _runDetail == null
@@ -133,21 +133,21 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
       _error = null;
     });
     try {
-      final id = widget.workflowId;
+      final id = widget.flowId;
       final results = await Future.wait([
-        _api.getWorkflow(id),
-        _api.workflowUsage(id),
-        _api.workflowRuns(id, limit: 40),
-        _api.workflowGoldenSet(id),
-        _api.workflowTestRuns(id),
-        _api.workflowVersions(id),
-        _api.workflowRecommendations(id),
+        _api.getFlow(id),
+        _api.flowUsage(id),
+        _api.flowRuns(id, limit: 40),
+        _api.flowGoldenSet(id),
+        _api.flowTestRuns(id),
+        _api.flowVersions(id),
+        _api.flowRecommendations(id),
       ]);
       if (!mounted) return;
-      final versions = results[5] as List<WorkflowVersion>;
+      final versions = results[5] as List<FlowVersion>;
       setState(() {
-        _detail = results[0] as WorkflowDetail;
-        _usage = results[1] as WorkflowUsage;
+        _detail = results[0] as FlowDetail;
+        _usage = results[1] as FlowUsage;
         _runs = results[2] as List<RunSummary>;
         _golden = results[3] as GoldenSetInfo;
         _tests = results[4] as List<TestRun>;
@@ -184,8 +184,8 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
       return;
     }
     try {
-      final diff = await _api.workflowVersionDiff(
-        widget.workflowId,
+      final diff = await _api.flowVersionDiff(
+        widget.flowId,
         version.version,
       );
       if (!mounted) return;
@@ -199,7 +199,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     if (_tests.any((t) => t.running)) {
       _poll ??= Timer.periodic(const Duration(seconds: 1), (_) async {
         try {
-          final tests = await _api.workflowTestRuns(widget.workflowId);
+          final tests = await _api.flowTestRuns(widget.flowId);
           if (!mounted) return;
           setState(() => _tests = tests);
           if (!tests.any((t) => t.running)) {
@@ -218,7 +218,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
 
   Future<void> _setStatus(String status) async {
     try {
-      final updated = await _api.updateWorkflow(widget.workflowId, status: status);
+      final updated = await _api.updateFlow(widget.flowId, status: status);
       if (!mounted) return;
       setState(() => _detail = updated);
       _snack('Status set to $status');
@@ -232,11 +232,11 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     setState(() => _launching = true);
     try {
       await _api.launchTestRun(
-        widget.workflowId,
+        widget.flowId,
         candidateVersion: _draftVersion?.display ?? '',
         baselineVersion: _activeVersion?.display ?? '',
       );
-      final tests = await _api.workflowTestRuns(widget.workflowId);
+      final tests = await _api.flowTestRuns(widget.flowId);
       if (!mounted) return;
       setState(() {
         _tests = tests;
@@ -270,7 +270,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
       await _loadCanvas();
     }
     try {
-      final detail = await _api.workflowRun(widget.workflowId, run.id);
+      final detail = await _api.flowRun(widget.flowId, run.id);
       if (!mounted) return;
       setState(() {
         _runDetail = detail;
@@ -289,7 +289,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     if (_error != null && _detail == null) {
       return PageBody(
         children: [
-          BackLink(label: 'All workflows', onTap: widget.onBack),
+          BackLink(label: 'All flows', onTap: widget.onBack),
           ErrorNotice(message: _error!, onRetry: _refresh),
         ],
       );
@@ -312,7 +312,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  BackLink(label: 'All workflows', onTap: widget.onBack),
+                  BackLink(label: 'All flows', onTap: widget.onBack),
                   _topBar(w),
                   const SizedBox(height: 16),
                   Align(
@@ -320,7 +320,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
                     child: SegmentedTabs(
                       labels: const [
                         'Overview',
-                        'Workflow canvas',
+                        'Flow canvas',
                         'Evaluation & optimization',
                       ],
                       selectedIndex: _tab,
@@ -352,13 +352,12 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
 
   // ---- top bar ------------------------------------------------------------
 
-  Widget _topBar(WorkflowDetail w) {
+  Widget _topBar(FlowDetail w) {
     return PageHeading(
-      eyebrow: '${w.kind} · ${w.team.isEmpty ? 'unassigned' : w.team}',
+      eyebrow: 'Flow · ${w.team.isEmpty ? 'unassigned' : w.team}',
       title: w.id,
       subtitle: w.description,
       pills: [
-        StatusBadge(w.kind, tone: kindTone(w.kind), uppercase: true),
         StatusBadge(w.status, tone: statusTone(w.status), uppercase: true),
         _VersionSelector(
           versions: _versions,
@@ -404,7 +403,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
 
   // ---- Tab 1: overview ----------------------------------------------------
 
-  List<Widget> _overviewBody(WorkflowDetail w) {
+  List<Widget> _overviewBody(FlowDetail w) {
     final usage = _usage!;
     return [
       StatStrip(
@@ -467,7 +466,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     ];
   }
 
-  Widget _chartCard(WorkflowUsage usage) {
+  Widget _chartCard(FlowUsage usage) {
     double valueOf(UsageDay d) => switch (_measure) {
       ChartMeasure.runs => d.runs.toDouble(),
       ChartMeasure.spend => d.costUsd,
@@ -514,7 +513,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     );
   }
 
-  Widget _metadataCard(WorkflowDetail w) {
+  Widget _metadataCard(FlowDetail w) {
     Widget row(String label, String value) => Padding(
       padding: const EdgeInsets.only(bottom: 13),
       child: Row(
@@ -551,14 +550,15 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          row(
-            'Kind',
-            w.kind == 'dataflow'
-                ? 'DataFlow — data/knowledge layer; populates and maintains the model'
-                : 'Workflow — business-logic layer; one run per case',
-          ),
-          if (trigger != null)
+          if (trigger != null) ...[
             row('Trigger', trigger.config['event'] ?? trigger.name),
+            row(
+              'Cadence',
+              (trigger.config['event'] ?? '').startsWith('timer:')
+                  ? 'Windowed — one run per window, landing work in bulk'
+                  : 'Per case — one run per event',
+            ),
+          ],
           row('Authored by', '${w.authoredBy} · Python + decorators → export'),
           row(
             'Version',
@@ -595,7 +595,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     );
   }
 
-  Future<void> _editRoi(WorkflowDetail w) async {
+  Future<void> _editRoi(FlowDetail w) async {
     final minutes = TextEditingController(
       text: w.roiMinutesPerRun.toStringAsFixed(0),
     );
@@ -643,8 +643,8 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     );
     if (saved != true) return;
     try {
-      final updated = await _api.updateWorkflow(
-        widget.workflowId,
+      final updated = await _api.updateFlow(
+        widget.flowId,
         roiMinutesPerRun: double.tryParse(minutes.text),
         roiHourlyRateUsd: double.tryParse(rate.text),
       );
@@ -666,7 +666,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Expanded(
-            child: WorkflowCanvas(
+            child: FlowCanvas(
               steps: _canvasSteps,
               diffAgainst: (_current?.isDraft ?? false) && _activeVersion != null
                   ? '${_activeVersion!.display} (active)'
@@ -1016,7 +1016,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     if (saved != true || name.text.trim().isEmpty) return;
     try {
       final golden = await _api.addGoldenCase(
-        widget.workflowId,
+        widget.flowId,
         name: name.text.trim(),
         expected: expected.text.trim(),
         inputRef: run.caseRef,
@@ -1034,7 +1034,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     }
   }
 
-  Future<void> _exportSchema(WorkflowVersion version) async {
+  Future<void> _exportSchema(FlowVersion version) async {
     final schema = _schemaJson(version);
     await showDialog<void>(
       context: context,
@@ -1071,7 +1071,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
 
   /// The portable form of the definition — what the customer keeps. Written
   /// out here rather than fetched so it always matches the version on screen.
-  String _schemaJson(WorkflowVersion version) {
+  String _schemaJson(FlowVersion version) {
     String esc(String s) => s.replaceAll('"', r'\"');
     final steps = version.steps
         .map(
@@ -1088,7 +1088,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
         )
         .join(',\n');
     return '{\n'
-        '  "workflow": "${widget.workflowId}",\n'
+        '  "flow": "${widget.flowId}",\n'
         '  "version": "${version.display}",\n'
         '  "status": "${version.status}",\n'
         '  "model_budget_usd_per_run": ${version.modelBudgetUsdPerRun},\n'
@@ -1206,7 +1206,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
                     onPressed: () async {
                       try {
                         final updated = await _api.removeGoldenCase(
-                          widget.workflowId,
+                          widget.flowId,
                           c.id,
                         );
                         if (!mounted) return;
@@ -1327,7 +1327,7 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
     if (saved != true || name.text.trim().isEmpty) return;
     try {
       final updated = await _api.addGoldenCase(
-        widget.workflowId,
+        widget.flowId,
         name: name.text.trim(),
         expected: expected.text.trim(),
         inputRef: inputRef.text.trim(),
@@ -1464,9 +1464,9 @@ class _WorkflowDetailScreenState extends State<WorkflowDetailScreen> {
   Future<void> _applyRecommendation(Recommendation rec) async {
     setState(() => _applyingRecommendation = rec.id);
     try {
-      final draft = await _api.applyRecommendation(widget.workflowId, rec.id);
-      final versions = await _api.workflowVersions(widget.workflowId);
-      final detail = await _api.getWorkflow(widget.workflowId);
+      final draft = await _api.applyRecommendation(widget.flowId, rec.id);
+      final versions = await _api.flowVersions(widget.flowId);
+      final detail = await _api.getFlow(widget.flowId);
       if (!mounted) return;
       setState(() {
         _versions = versions;
@@ -1560,7 +1560,7 @@ class _MeasurePicker extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class _VersionSelector extends StatelessWidget {
-  final List<WorkflowVersion> versions;
+  final List<FlowVersion> versions;
   final int? selected;
   final ValueChanged<int> onChanged;
 
@@ -1683,7 +1683,7 @@ class _VersionField extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class _StepHeader extends StatelessWidget {
-  final WorkflowStep step;
+  final FlowStep step;
   final StepDiff? diff;
 
   const _StepHeader({required this.step, required this.diff});
@@ -1740,7 +1740,7 @@ class _StepHeader extends StatelessWidget {
 }
 
 class _NodeConfiguration extends StatelessWidget {
-  final WorkflowStep step;
+  final FlowStep step;
   final StepDiff? diff;
 
   const _NodeConfiguration({required this.step, required this.diff});

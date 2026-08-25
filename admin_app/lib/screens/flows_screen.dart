@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-import '../models/workflow.dart';
+import '../models/flow.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import '../widgets/cumulus_shell.dart';
 import '../widgets/mini_charts.dart';
 import '../widgets/ui_kit.dart';
-import 'workflow_detail_screen.dart';
+import 'flow_detail_screen.dart';
 
 const _months = [
   'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -28,9 +28,6 @@ String money(double v) => v >= 1000
 
 String percent(double? v) => v == null ? '—' : '${(v * 100).toStringAsFixed(1)}%';
 
-CumulusTone kindTone(String kind) =>
-    kind == 'dataflow' ? CumulusTone.teal : CumulusTone.accent;
-
 CumulusTone statusTone(String status) => switch (status) {
   'active' => CumulusTone.success,
   'paused' => CumulusTone.warn,
@@ -38,26 +35,25 @@ CumulusTone statusTone(String status) => switch (status) {
   _ => CumulusTone.neutral,
 };
 
-/// The Workflows nav section: fleet landing page, with drill-down into one
+/// The Flows nav section: fleet landing page, with drill-down into one
 /// definition. Everything on screen arrives through the governed REST
 /// contract — the shell holds no privileged path.
-class WorkflowsSection extends StatefulWidget {
-  const WorkflowsSection({super.key});
+class FlowsSection extends StatefulWidget {
+  const FlowsSection({super.key});
 
   @override
-  State<WorkflowsSection> createState() => _WorkflowsSectionState();
+  State<FlowsSection> createState() => _FlowsSectionState();
 }
 
-class _WorkflowsSectionState extends State<WorkflowsSection> {
+class _FlowsSectionState extends State<FlowsSection> {
   final ApiClient _api = ApiClient();
   FleetStats? _stats;
-  List<WorkflowSummary> _all = [];
+  List<FlowSummary> _all = [];
   String _myRole = 'user';
   bool _loading = true;
   String? _error;
 
   final TextEditingController _search = TextEditingController();
-  String? _kind;
   String? _status;
   String? _team;
 
@@ -85,8 +81,8 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
     });
     try {
       final results = await Future.wait([
-        _api.workflowFleetStats(),
-        _api.listWorkflows(),
+        _api.flowFleetStats(),
+        _api.listFlows(),
       ]);
       try {
         final me = await _api.whoami();
@@ -95,7 +91,7 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
       if (!mounted) return;
       setState(() {
         _stats = results[0] as FleetStats;
-        _all = results[1] as List<WorkflowSummary>;
+        _all = results[1] as List<FlowSummary>;
         _loading = false;
       });
     } on ApiException catch (e) {
@@ -107,10 +103,9 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
     }
   }
 
-  List<WorkflowSummary> get _filtered {
+  List<FlowSummary> get _filtered {
     final needle = _search.text.trim().toLowerCase();
     return _all.where((w) {
-      if (_kind != null && w.kind != _kind) return false;
       if (_status != null && w.status != _status) return false;
       if (_team != null && w.team != _team) return false;
       if (needle.isNotEmpty) {
@@ -126,9 +121,9 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
   @override
   Widget build(BuildContext context) {
     if (_detailId != null) {
-      return WorkflowDetailScreen(
+      return FlowDetailScreen(
         key: ValueKey(_detailId),
-        workflowId: _detailId!,
+        flowId: _detailId!,
         myRole: _myRole,
         onBack: () {
           setState(() => _detailId = null);
@@ -150,10 +145,10 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
       children: [
         PageHeading(
           eyebrow: 'Execution layer · Authored logic',
-          title: 'Workflows',
+          title: 'Flows',
           subtitle:
-              'Every Workflow and DataFlow in the enterprise — the two kinds '
-              'of authored logic, governed, costed, and auditable.',
+              'Every Flow in the enterprise — the authored logic that does '
+              'the work, governed, costed, and auditable.',
           pills: [
             MetaPill('${stats.definitions} definitions'),
             if (stats.attention.isNotEmpty)
@@ -174,7 +169,8 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
               label: 'Definitions',
               value: '${stats.definitions}',
               caption:
-                  '${stats.workflows} workflows · ${stats.dataflows} dataflows',
+                  '${stats.active} active · ${stats.draft} draft · '
+                  '${stats.paused} paused',
             ),
             StatTile(
               label: 'Runs · 30d',
@@ -267,7 +263,7 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
               children: [
                 for (final item in stats.attention)
                   InkWell(
-                    onTap: () => setState(() => _detailId = item.workflowId),
+                    onTap: () => setState(() => _detailId = item.flowId),
                     borderRadius: BorderRadius.circular(8),
                     child: Padding(
                       padding: const EdgeInsets.symmetric(vertical: 2),
@@ -279,7 +275,7 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
                             color: CumulusColors.warn,
                           ),
                           const SizedBox(width: 8),
-                          Text(item.workflowId, style: CumulusText.mono),
+                          Text(item.flowId, style: CumulusText.mono),
                           const SizedBox(width: 10),
                           Expanded(
                             child: Text(item.reason, style: CumulusText.meta),
@@ -315,26 +311,9 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
             ),
             LensChip(
               label: 'All',
-              selected: _kind == null,
-              onTap: () => setState(() => _kind = null),
+              selected: _status == null,
+              onTap: () => setState(() => _status = null),
             ),
-            LensChip(
-              label: 'Workflows',
-              tone: CumulusTone.accent,
-              selected: _kind == 'workflow',
-              onTap: () => setState(
-                () => _kind = _kind == 'workflow' ? null : 'workflow',
-              ),
-            ),
-            LensChip(
-              label: 'Dataflows',
-              tone: CumulusTone.teal,
-              selected: _kind == 'dataflow',
-              onTap: () => setState(
-                () => _kind = _kind == 'dataflow' ? null : 'dataflow',
-              ),
-            ),
-            Container(width: 1, height: 24, color: CumulusColors.borderStrong),
             for (final status in const ['active', 'paused', 'draft', 'deprecated'])
               LensChip(
                 label: status,
@@ -389,9 +368,19 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
                   for (final w in rows)
                     CumulusListRow(
                       onTap: () => setState(() => _detailId = w.id),
-                      leading: Monogram(
-                        w.kind == 'dataflow' ? 'DF' : 'WF',
-                        tone: kindTone(w.kind),
+                      leading: Container(
+                        width: 32,
+                        height: 32,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: statusTone(w.status).background,
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          Icons.account_tree_outlined,
+                          size: 16,
+                          color: statusTone(w.status).foreground,
+                        ),
                       ),
                       title: Row(
                         mainAxisSize: MainAxisSize.min,
@@ -404,13 +393,6 @@ class _WorkflowsSectionState extends State<WorkflowsSection> {
                                 fontWeight: FontWeight.w600,
                               ),
                             ),
-                          ),
-                          const SizedBox(width: 8),
-                          StatusBadge(
-                            w.kind,
-                            tone: kindTone(w.kind),
-                            dense: true,
-                            uppercase: true,
                           ),
                           if (w.tasksOpen > 0) ...[
                             const SizedBox(width: 6),

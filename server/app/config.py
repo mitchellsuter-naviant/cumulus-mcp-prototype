@@ -32,15 +32,15 @@ class Settings:
         )
         # Teams: the owner of assets and the second axis of authorization.
         self.teams_collection: str = os.environ.get("TEAMS_COLLECTION", "teams")
-        # Workflow/DataFlow registry, plus its golden sets and test runs.
-        self.workflows_collection: str = os.environ.get(
-            "WORKFLOWS_COLLECTION", "workflows"
+        # Flow registry, plus its golden sets and test runs.
+        self.flows_collection: str = os.environ.get(
+            "FLOWS_COLLECTION", "flows"
         )
         self.golden_sets_collection: str = os.environ.get(
-            "GOLDEN_SETS_COLLECTION", "workflow_golden_sets"
+            "GOLDEN_SETS_COLLECTION", "flow_golden_sets"
         )
         self.test_runs_collection: str = os.environ.get(
-            "TEST_RUNS_COLLECTION", "workflow_test_runs"
+            "TEST_RUNS_COLLECTION", "flow_test_runs"
         )
         # "none" (default, local dev: everyone is owner) or "firebase".
         self.auth_backend: str = os.environ.get("AUTH_BACKEND", "none")

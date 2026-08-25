@@ -8,7 +8,7 @@ import '../models/asset.dart';
 import '../models/identity.dart';
 import '../models/platform_user.dart';
 import '../models/team.dart';
-import '../models/workflow.dart';
+import '../models/flow.dart';
 import 'auth_service.dart';
 
 /// Configure at build/run time:
@@ -437,11 +437,11 @@ class ApiClient {
         .toList();
   }
 
-  // ---- workflows ----
+  // ---- flows ----
 
-  /// The fleet: every Workflow and DataFlow definition with 30-day rollups,
+  /// The fleet: every Flow and DataFlow definition with 30-day rollups,
   /// sorted by model spend.
-  Future<List<WorkflowSummary>> listWorkflows({
+  Future<List<FlowSummary>> listFlows({
     String q = '',
     String? kind,
     String? status,
@@ -449,7 +449,7 @@ class ApiClient {
   }) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows', {
+        _uri('/api/v1/flows', {
           if (q.isNotEmpty) 'q': q,
           if (kind != null && kind.isNotEmpty) 'kind': kind,
           if (status != null && status.isNotEmpty) 'status': status,
@@ -460,14 +460,14 @@ class ApiClient {
     );
     _check(resp);
     return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => WorkflowSummary.fromJson(j as Map<String, dynamic>))
+        .map((j) => FlowSummary.fromJson(j as Map<String, dynamic>))
         .toList();
   }
 
-  Future<FleetStats> workflowFleetStats({int days = 30}) async {
+  Future<FleetStats> flowFleetStats({int days = 30}) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/stats', {'days': '$days'}),
+        _uri('/api/v1/flows/stats', {'days': '$days'}),
         headers: await _headers(),
       ),
     );
@@ -475,18 +475,18 @@ class ApiClient {
     return FleetStats.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  Future<WorkflowDetail> getWorkflow(String id) async {
+  Future<FlowDetail> getFlow(String id) async {
     final resp = await _send(
-      _http.get(_uri('/api/v1/workflows/$id'), headers: await _headers()),
+      _http.get(_uri('/api/v1/flows/$id'), headers: await _headers()),
     );
     _check(resp);
-    return WorkflowDetail.fromJson(
+    return FlowDetail.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
   }
 
   /// Lifecycle and governed-knowledge edits (status, ROI assumptions, budget).
-  Future<WorkflowDetail> updateWorkflow(
+  Future<FlowDetail> updateFlow(
     String id, {
     String? status,
     String? description,
@@ -496,7 +496,7 @@ class ApiClient {
   }) async {
     final resp = await _send(
       _http.patch(
-        _uri('/api/v1/workflows/$id'),
+        _uri('/api/v1/flows/$id'),
         headers: await _headers(),
         body: jsonEncode({
           if (status != null) 'status': status,
@@ -509,28 +509,28 @@ class ApiClient {
       ),
     );
     _check(resp);
-    return WorkflowDetail.fromJson(
+    return FlowDetail.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
   }
 
-  Future<WorkflowUsage> workflowUsage(String id, {int days = 30}) async {
+  Future<FlowUsage> flowUsage(String id, {int days = 30}) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/usage', {'days': '$days'}),
+        _uri('/api/v1/flows/$id/usage', {'days': '$days'}),
         headers: await _headers(),
       ),
     );
     _check(resp);
-    return WorkflowUsage.fromJson(
+    return FlowUsage.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
   }
 
-  Future<List<RunSummary>> workflowRuns(String id, {int limit = 25}) async {
+  Future<List<RunSummary>> flowRuns(String id, {int limit = 25}) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/runs', {'limit': '$limit'}),
+        _uri('/api/v1/flows/$id/runs', {'limit': '$limit'}),
         headers: await _headers(),
       ),
     );
@@ -541,10 +541,10 @@ class ApiClient {
   }
 
   /// The full journal of one run: every step, ModelCall, verdict and commit.
-  Future<RunDetail> workflowRun(String id, String runId) async {
+  Future<RunDetail> flowRun(String id, String runId) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/runs/$runId'),
+        _uri('/api/v1/flows/$id/runs/$runId'),
         headers: await _headers(),
       ),
     );
@@ -552,10 +552,10 @@ class ApiClient {
     return RunDetail.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  Future<List<AuditEntry>> workflowAudit(String id, {int limit = 60}) async {
+  Future<List<AuditEntry>> flowAudit(String id, {int limit = 60}) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/audit', {'limit': '$limit'}),
+        _uri('/api/v1/flows/$id/audit', {'limit': '$limit'}),
         headers: await _headers(),
       ),
     );
@@ -566,29 +566,29 @@ class ApiClient {
   }
 
   /// Published history plus any open draft, newest first.
-  Future<List<WorkflowVersion>> workflowVersions(String id) async {
+  Future<List<FlowVersion>> flowVersions(String id) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/versions'),
+        _uri('/api/v1/flows/$id/versions'),
         headers: await _headers(),
       ),
     );
     _check(resp);
     return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => WorkflowVersion.fromJson(j as Map<String, dynamic>))
+        .map((j) => FlowVersion.fromJson(j as Map<String, dynamic>))
         .toList();
   }
 
   /// Steps of [version] annotated added / removed / modified against
   /// [against] (the active version when omitted).
-  Future<List<StepDiff>> workflowVersionDiff(
+  Future<List<StepDiff>> flowVersionDiff(
     String id,
     int version, {
     int? against,
   }) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/versions/$version/diff', {
+        _uri('/api/v1/flows/$id/versions/$version/diff', {
           if (against != null) 'against': '$against',
         }),
         headers: await _headers(),
@@ -600,13 +600,13 @@ class ApiClient {
         .toList();
   }
 
-  Future<List<Recommendation>> workflowRecommendations(
+  Future<List<Recommendation>> flowRecommendations(
     String id, {
     int days = 30,
   }) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/recommendations', {'days': '$days'}),
+        _uri('/api/v1/flows/$id/recommendations', {'days': '$days'}),
         headers: await _headers(),
       ),
     );
@@ -618,25 +618,25 @@ class ApiClient {
 
   /// Stages a recommendation into the draft version — never the live one.
   /// Returns the draft it landed in.
-  Future<WorkflowVersion> applyRecommendation(
+  Future<FlowVersion> applyRecommendation(
     String id,
     String recommendationId,
   ) async {
     final resp = await _send(
       _http.post(
-        _uri('/api/v1/workflows/$id/recommendations/$recommendationId/apply'),
+        _uri('/api/v1/flows/$id/recommendations/$recommendationId/apply'),
         headers: await _headers(),
       ),
     );
     _check(resp);
     final body = jsonDecode(resp.body) as Map<String, dynamic>;
-    return WorkflowVersion.fromJson(body['draft'] as Map<String, dynamic>);
+    return FlowVersion.fromJson(body['draft'] as Map<String, dynamic>);
   }
 
-  Future<GoldenSetInfo> workflowGoldenSet(String id) async {
+  Future<GoldenSetInfo> flowGoldenSet(String id) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/golden-set'),
+        _uri('/api/v1/flows/$id/golden-set'),
         headers: await _headers(),
       ),
     );
@@ -659,7 +659,7 @@ class ApiClient {
   }) async {
     final resp = await _send(
       _http.post(
-        _uri('/api/v1/workflows/$id/golden-set'),
+        _uri('/api/v1/flows/$id/golden-set'),
         headers: await _headers(),
         body: jsonEncode({
           'name': name,
@@ -680,7 +680,7 @@ class ApiClient {
   Future<GoldenSetInfo> removeGoldenCase(String id, String caseId) async {
     final resp = await _send(
       _http.delete(
-        _uri('/api/v1/workflows/$id/golden-set/$caseId'),
+        _uri('/api/v1/flows/$id/golden-set/$caseId'),
         headers: await _headers(),
       ),
     );
@@ -690,10 +690,10 @@ class ApiClient {
     );
   }
 
-  Future<List<TestRun>> workflowTestRuns(String id) async {
+  Future<List<TestRun>> flowTestRuns(String id) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/test-runs'),
+        _uri('/api/v1/flows/$id/test-runs'),
         headers: await _headers(),
       ),
     );
@@ -704,7 +704,7 @@ class ApiClient {
   }
 
   /// Kicks off a golden-set evaluation; the harness runs case-by-case in the
-  /// background, so poll [workflowTestRun] for progress. Writes suppressed.
+  /// background, so poll [flowTestRun] for progress. Writes suppressed.
   Future<TestRun> launchTestRun(
     String id, {
     String candidateVersion = '',
@@ -712,7 +712,7 @@ class ApiClient {
   }) async {
     final resp = await _send(
       _http.post(
-        _uri('/api/v1/workflows/$id/test-runs'),
+        _uri('/api/v1/flows/$id/test-runs'),
         headers: await _headers(),
         body: jsonEncode({
           'candidate_version': candidateVersion,
@@ -724,10 +724,10 @@ class ApiClient {
     return TestRun.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  Future<TestRun> workflowTestRun(String id, String testId) async {
+  Future<TestRun> flowTestRun(String id, String testId) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/workflows/$id/test-runs/$testId'),
+        _uri('/api/v1/flows/$id/test-runs/$testId'),
         headers: await _headers(),
       ),
     );

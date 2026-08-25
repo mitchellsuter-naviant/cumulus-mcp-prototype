@@ -8,11 +8,11 @@ import '../widgets/cumulus_shell.dart';
 import 'api_docs_screen.dart';
 import 'asset_list_screen.dart';
 import 'identities_screen.dart';
-import 'workflows_screen.dart';
+import 'flows_screen.dart';
 
 const _destinations = <RailDestination>[
   RailDestination(icon: Icons.hub_outlined, label: 'Knowledge layer'),
-  RailDestination(icon: Icons.account_tree_outlined, label: 'Workflows'),
+  RailDestination(icon: Icons.account_tree_outlined, label: 'Flows'),
   RailDestination(
     icon: Icons.groups_outlined,
     label: 'Identities, access & keys',
@@ -125,7 +125,7 @@ class _HomeShellState extends State<HomeShell> {
               onCorpusChanged: _catalog.refresh,
             ),
           ),
-          _lazy(1, () => const WorkflowsSection()),
+          _lazy(1, () => const FlowsSection()),
           _lazy(2, () => const IdentitiesSection()),
         ],
       ),

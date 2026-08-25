@@ -353,9 +353,9 @@ class CommandCatalog extends ChangeNotifier {
       intent: OpenSectionIntent(0),
     ),
     CatalogEntry(
-      label: 'Workflows',
-      detail: 'authored logic — workflows and dataflows, cost and audit',
-      keywords: 'workflows dataflows agents pipelines runs cost roi testing',
+      label: 'Flows',
+      detail: 'authored logic — definitions, runs, cost and audit',
+      keywords: 'flows workflows dataflows agents pipelines runs cost roi testing',
       icon: Icons.account_tree_outlined,
       intent: OpenSectionIntent(1),
     ),

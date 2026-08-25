@@ -1,11 +1,15 @@
-"""Workflows & DataFlows: the registry and observability plane for authored logic.
+"""Flows: the registry and observability plane for authored logic.
 
 Doctrine grounding (DOCTRINE.md, Lens 2 and the Governance spine):
 
-  * There is deliberately **no "Agent" primitive** — the Workflow or DataFlow
-    *is* the agent. This module therefore manages the two kinds of authored
-    logic side by side: a Workflow (business layer, one run per case, may
-    suspend for a human) and a DataFlow (data/knowledge layer, stream/batch).
+  * There is deliberately **no "Agent" primitive** — the Flow *is* the agent.
+  * There is one kind of authored logic: a **Flow**. The doctrine's original
+    Workflow/DataFlow split has been retired — it was right about the physics
+    (per-case work and windowed bulk work behave differently) and wrong about
+    the level, putting a behavioural difference in the type system where it
+    produced arguments about which noun a definition was. What actually
+    differs is derived from a definition's own shape: how it is triggered and
+    where it writes. See `is_windowed` and `writes_canonical`.
   * A **ModelCall** is a governed operation, not a primitive: every LLM
     invocation records which model ran, its tokens, and its cost. All spend
     numbers here roll up from ModelCall records — cost is an audit product,
@@ -38,10 +42,9 @@ from pydantic import BaseModel, Field
 
 from .models import utcnow
 
-log = logging.getLogger("cumulus.workflows")
+log = logging.getLogger("cumulus.flows")
 
-WorkflowKind = Literal["workflow", "dataflow"]
-WorkflowStatus = Literal["draft", "active", "paused", "deprecated"]
+FlowStatus = Literal["draft", "active", "paused", "deprecated"]
 # The step vocabulary of the declarative export. `transform` is authored
 # non-model logic (parse, reshape, entity-match) carried as a faithful
 # plain-language description — implementation stays machinery.
@@ -72,7 +75,7 @@ def _hex(seed: str, n: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-class WorkflowStep(BaseModel):
+class FlowStep(BaseModel):
     """One typed step of the declarative export.
 
     `summary` is the transparency bar in miniature: a plain-language statement
@@ -108,7 +111,7 @@ class SeedProfile(BaseModel):
     case_prefix: str = "case"
 
 
-class WorkflowVersion(BaseModel):
+class FlowVersion(BaseModel):
     """One published or drafted revision of a definition.
 
     A version is a full snapshot of the declarative export, not a delta: the
@@ -120,7 +123,7 @@ class WorkflowVersion(BaseModel):
     version: int
     label: str = ""
     status: VersionStatus = "archived"
-    steps: list[WorkflowStep] = Field(default_factory=list)
+    steps: list[FlowStep] = Field(default_factory=list)
     model_budget_usd_per_run: float = 0.50
     notes: str = ""
     authored_by: str = ""
@@ -133,21 +136,20 @@ class WorkflowVersion(BaseModel):
 class StepDiff(BaseModel):
     """One step of a version, annotated against the version compared with."""
 
-    step: WorkflowStep
+    step: FlowStep
     change: ChangeKind = "unchanged"
     changed_fields: list[str] = Field(default_factory=list)
 
 
-class WorkflowDefinition(BaseModel):
+class FlowDefinition(BaseModel):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9\-]*$")
     name: str = ""
-    kind: WorkflowKind = "workflow"
     description: str = ""
     team: str = ""
-    status: WorkflowStatus = "draft"
+    status: FlowStatus = "draft"
     version: int = 1
     tags: list[str] = Field(default_factory=list)
-    steps: list[WorkflowStep] = Field(default_factory=list)
+    steps: list[FlowStep] = Field(default_factory=list)
     # Where human judgment lands, and where the work is watched from.
     queues: list[str] = Field(default_factory=list)
     workspace: str = ""
@@ -161,14 +163,14 @@ class WorkflowDefinition(BaseModel):
     profile: SeedProfile = Field(default_factory=SeedProfile)
     # Published history plus at most one open draft. `steps` above stays the
     # active version's steps, so every existing reader keeps working.
-    versions: list[WorkflowVersion] = Field(default_factory=list)
+    versions: list[FlowVersion] = Field(default_factory=list)
 
-    def version_history(self) -> list[WorkflowVersion]:
+    def version_history(self) -> list[FlowVersion]:
         """Newest first, with the active version synthesized if absent."""
         if self.versions:
             return sorted(self.versions, key=lambda v: v.version, reverse=True)
         return [
-            WorkflowVersion(
+            FlowVersion(
                 version=self.version,
                 label=f"v{self.version}",
                 status="active",
@@ -179,19 +181,19 @@ class WorkflowDefinition(BaseModel):
             )
         ]
 
-    def find_version(self, version: int) -> WorkflowVersion | None:
+    def find_version(self, version: int) -> FlowVersion | None:
         return next(
             (v for v in self.version_history() if v.version == version), None
         )
 
-    def active_version(self) -> WorkflowVersion:
+    def active_version(self) -> FlowVersion:
         history = self.version_history()
         return next(
             (v for v in history if v.status == "active"),
             next((v for v in history if v.status != "draft"), history[0]),
         )
 
-    def draft_version(self) -> WorkflowVersion | None:
+    def draft_version(self) -> FlowVersion | None:
         return next(
             (v for v in self.version_history() if v.status == "draft"), None
         )
@@ -215,7 +217,7 @@ class GoldenCase(BaseModel):
 
 
 class GoldenSet(BaseModel):
-    workflow_id: str
+    flow_id: str
     cases: list[GoldenCase] = Field(default_factory=list)
     # Where the seeded half of the set comes from in the repository. The
     # golden set is governed knowledge that FDEs also author in code, so the
@@ -246,7 +248,7 @@ class TestCaseResult(BaseModel):
 
 class TestRun(BaseModel):
     id: str
-    workflow_id: str
+    flow_id: str
     candidate_version: str
     baseline_version: str
     status: Literal["running", "completed"] = "running"
@@ -347,7 +349,7 @@ class RunStepEvent(BaseModel):
 
 class RunSummary(BaseModel):
     id: str
-    workflow_id: str
+    flow_id: str
     status: RunStatus
     case_ref: str
     started_at: datetime
@@ -381,66 +383,66 @@ class AuditEntry(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class WorkflowExistsError(Exception):
+class FlowExistsError(Exception):
     pass
 
 
-class WorkflowNotFoundError(Exception):
+class FlowNotFoundError(Exception):
     pass
 
 
-class WorkflowDirectory(Protocol):
-    def list(self) -> list[WorkflowDefinition]: ...
-    def get(self, workflow_id: str) -> WorkflowDefinition | None: ...
-    def create(self, defn: WorkflowDefinition) -> WorkflowDefinition: ...
-    def update(self, defn: WorkflowDefinition) -> WorkflowDefinition: ...
-    def delete(self, workflow_id: str) -> None: ...
+class FlowDirectory(Protocol):
+    def list(self) -> list[FlowDefinition]: ...
+    def get(self, flow_id: str) -> FlowDefinition | None: ...
+    def create(self, defn: FlowDefinition) -> FlowDefinition: ...
+    def update(self, defn: FlowDefinition) -> FlowDefinition: ...
+    def delete(self, flow_id: str) -> None: ...
 
 
 class GoldenSetDirectory(Protocol):
-    def get(self, workflow_id: str) -> GoldenSet | None: ...
+    def get(self, flow_id: str) -> GoldenSet | None: ...
     def put(self, golden: GoldenSet) -> GoldenSet: ...
-    def delete(self, workflow_id: str) -> None: ...
+    def delete(self, flow_id: str) -> None: ...
 
 
 class TestRunDirectory(Protocol):
-    def list_for(self, workflow_id: str) -> list[TestRun]: ...
+    def list_for(self, flow_id: str) -> list[TestRun]: ...
     def get(self, test_id: str) -> TestRun | None: ...
     def put(self, run: TestRun) -> TestRun: ...
 
 
-class InMemoryWorkflowDirectory:
+class InMemoryFlowDirectory:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._items: dict[str, WorkflowDefinition] = {}
+        self._items: dict[str, FlowDefinition] = {}
 
-    def list(self) -> list[WorkflowDefinition]:
+    def list(self) -> list[FlowDefinition]:
         with self._lock:
             return sorted(self._items.values(), key=lambda w: w.id)
 
-    def get(self, workflow_id: str) -> WorkflowDefinition | None:
+    def get(self, flow_id: str) -> FlowDefinition | None:
         with self._lock:
-            return self._items.get(workflow_id)
+            return self._items.get(flow_id)
 
-    def create(self, defn: WorkflowDefinition) -> WorkflowDefinition:
+    def create(self, defn: FlowDefinition) -> FlowDefinition:
         with self._lock:
             if defn.id in self._items:
-                raise WorkflowExistsError(defn.id)
+                raise FlowExistsError(defn.id)
             self._items[defn.id] = defn
             return defn
 
-    def update(self, defn: WorkflowDefinition) -> WorkflowDefinition:
+    def update(self, defn: FlowDefinition) -> FlowDefinition:
         with self._lock:
             if defn.id not in self._items:
-                raise WorkflowNotFoundError(defn.id)
+                raise FlowNotFoundError(defn.id)
             self._items[defn.id] = defn
             return defn
 
-    def delete(self, workflow_id: str) -> None:
+    def delete(self, flow_id: str) -> None:
         with self._lock:
-            if workflow_id not in self._items:
-                raise WorkflowNotFoundError(workflow_id)
-            del self._items[workflow_id]
+            if flow_id not in self._items:
+                raise FlowNotFoundError(flow_id)
+            del self._items[flow_id]
 
 
 class InMemoryGoldenSetDirectory:
@@ -448,18 +450,18 @@ class InMemoryGoldenSetDirectory:
         self._lock = threading.Lock()
         self._items: dict[str, GoldenSet] = {}
 
-    def get(self, workflow_id: str) -> GoldenSet | None:
+    def get(self, flow_id: str) -> GoldenSet | None:
         with self._lock:
-            return self._items.get(workflow_id)
+            return self._items.get(flow_id)
 
     def put(self, golden: GoldenSet) -> GoldenSet:
         with self._lock:
-            self._items[golden.workflow_id] = golden
+            self._items[golden.flow_id] = golden
             return golden
 
-    def delete(self, workflow_id: str) -> None:
+    def delete(self, flow_id: str) -> None:
         with self._lock:
-            self._items.pop(workflow_id, None)
+            self._items.pop(flow_id, None)
 
 
 class InMemoryTestRunDirectory:
@@ -467,9 +469,9 @@ class InMemoryTestRunDirectory:
         self._lock = threading.Lock()
         self._items: dict[str, TestRun] = {}
 
-    def list_for(self, workflow_id: str) -> list[TestRun]:
+    def list_for(self, flow_id: str) -> list[TestRun]:
         with self._lock:
-            runs = [r for r in self._items.values() if r.workflow_id == workflow_id]
+            runs = [r for r in self._items.values() if r.flow_id == flow_id]
         return sorted(runs, key=lambda r: r.launched_at, reverse=True)
 
     def get(self, test_id: str) -> TestRun | None:
@@ -482,50 +484,50 @@ class InMemoryTestRunDirectory:
             return run
 
 
-class FirestoreWorkflowDirectory:
+class FirestoreFlowDirectory:
     def __init__(self, project: str | None, collection: str) -> None:
         from google.cloud import firestore  # deferred: not needed for local dev
 
         self._client = firestore.Client(project=project)
         self._col = self._client.collection(collection)
 
-    def list(self) -> list[WorkflowDefinition]:
+    def list(self) -> list[FlowDefinition]:
         out = []
         for doc in self._col.stream():
             try:
-                out.append(WorkflowDefinition.model_validate(doc.to_dict()))
+                out.append(FlowDefinition.model_validate(doc.to_dict()))
             except Exception:
-                log.exception("Skipping unparseable workflow", extra={"docId": doc.id})
+                log.exception("Skipping unparseable flow", extra={"docId": doc.id})
         return sorted(out, key=lambda w: w.id)
 
-    def get(self, workflow_id: str) -> WorkflowDefinition | None:
-        snap = self._col.document(workflow_id).get()
+    def get(self, flow_id: str) -> FlowDefinition | None:
+        snap = self._col.document(flow_id).get()
         if not snap.exists:
             return None
         try:
-            return WorkflowDefinition.model_validate(snap.to_dict())
+            return FlowDefinition.model_validate(snap.to_dict())
         except Exception:
-            log.exception("Unparseable workflow", extra={"workflowId": workflow_id})
+            log.exception("Unparseable flow", extra={"flowId": flow_id})
             return None
 
-    def create(self, defn: WorkflowDefinition) -> WorkflowDefinition:
+    def create(self, defn: FlowDefinition) -> FlowDefinition:
         ref = self._col.document(defn.id)
         if ref.get().exists:
-            raise WorkflowExistsError(defn.id)
+            raise FlowExistsError(defn.id)
         ref.set(defn.model_dump(mode="json"))
         return defn
 
-    def update(self, defn: WorkflowDefinition) -> WorkflowDefinition:
+    def update(self, defn: FlowDefinition) -> FlowDefinition:
         ref = self._col.document(defn.id)
         if not ref.get().exists:
-            raise WorkflowNotFoundError(defn.id)
+            raise FlowNotFoundError(defn.id)
         ref.set(defn.model_dump(mode="json"))
         return defn
 
-    def delete(self, workflow_id: str) -> None:
-        ref = self._col.document(workflow_id)
+    def delete(self, flow_id: str) -> None:
+        ref = self._col.document(flow_id)
         if not ref.get().exists:
-            raise WorkflowNotFoundError(workflow_id)
+            raise FlowNotFoundError(flow_id)
         ref.delete()
 
 
@@ -536,22 +538,22 @@ class FirestoreGoldenSetDirectory:
         self._client = firestore.Client(project=project)
         self._col = self._client.collection(collection)
 
-    def get(self, workflow_id: str) -> GoldenSet | None:
-        snap = self._col.document(workflow_id).get()
+    def get(self, flow_id: str) -> GoldenSet | None:
+        snap = self._col.document(flow_id).get()
         if not snap.exists:
             return None
         try:
             return GoldenSet.model_validate(snap.to_dict())
         except Exception:
-            log.exception("Unparseable golden set", extra={"workflowId": workflow_id})
+            log.exception("Unparseable golden set", extra={"flowId": flow_id})
             return None
 
     def put(self, golden: GoldenSet) -> GoldenSet:
-        self._col.document(golden.workflow_id).set(golden.model_dump(mode="json"))
+        self._col.document(golden.flow_id).set(golden.model_dump(mode="json"))
         return golden
 
-    def delete(self, workflow_id: str) -> None:
-        self._col.document(workflow_id).delete()
+    def delete(self, flow_id: str) -> None:
+        self._col.document(flow_id).delete()
 
 
 class FirestoreTestRunDirectory:
@@ -561,9 +563,9 @@ class FirestoreTestRunDirectory:
         self._client = firestore.Client(project=project)
         self._col = self._client.collection(collection)
 
-    def list_for(self, workflow_id: str) -> list[TestRun]:
+    def list_for(self, flow_id: str) -> list[TestRun]:
         out = []
-        for doc in self._col.where("workflow_id", "==", workflow_id).stream():
+        for doc in self._col.where("flow_id", "==", flow_id).stream():
             try:
                 out.append(TestRun.model_validate(doc.to_dict()))
             except Exception:
@@ -590,10 +592,35 @@ class FirestoreTestRunDirectory:
 # ---------------------------------------------------------------------------
 
 
-def _day_usage(defn: WorkflowDefinition, day: date) -> UsageDay:
-    """Deterministic usage for one workflow on one day.
+def is_windowed(defn: "FlowDefinition") -> bool:
+    """True when the flow is woken by a window rather than by a single case.
 
-    Keyed by (workflow id, day) so every restart, instance, and backend agrees
+    This is the mechanical replacement for asking "is it a DataFlow?": a flow
+    started by a timer is processing a batch, whatever anyone named it, and a
+    flow started by a business event is processing one case.
+    """
+    trigger = next((s for s in defn.steps if s.type == "trigger"), None)
+    if trigger is None:
+        return False
+    return trigger.config.get("event", "").startswith("timer:")
+
+
+def writes_canonical(defn: "FlowDefinition") -> bool:
+    """True when the flow commits into the canonical graph.
+
+    Where competing claims meet, a Resolution picks a winner and records why —
+    so this, not a type, is what says a flow's audit trail will contain them.
+    """
+    return any(
+        s.type == "action" and s.config.get("target") == "graph"
+        for s in defn.steps
+    )
+
+
+def _day_usage(defn: FlowDefinition, day: date) -> UsageDay:
+    """Deterministic usage for one flow on one day.
+
+    Keyed by (flow id, day) so every restart, instance, and backend agrees
     on history. Drafts and days before creation produce zeroes.
     """
     created = defn.created_at.date()
@@ -603,7 +630,7 @@ def _day_usage(defn: WorkflowDefinition, day: date) -> UsageDay:
     p = defn.profile
     age = (day - created).days
     base = p.base_runs * (1.0 + p.growth_per_day * age)
-    if day.weekday() >= 5 and defn.kind == "workflow":
+    if day.weekday() >= 5:
         base *= p.weekend_factor
     if defn.status == "draft":
         base = min(base, 1.2)
@@ -641,12 +668,12 @@ def _day_usage(defn: WorkflowDefinition, day: date) -> UsageDay:
     )
 
 
-def usage_series(defn: WorkflowDefinition, days: int) -> list[UsageDay]:
+def usage_series(defn: FlowDefinition, days: int) -> list[UsageDay]:
     today = utcnow().date()
     return [_day_usage(defn, today - timedelta(days=d)) for d in range(days - 1, -1, -1)]
 
 
-def open_tasks(defn: WorkflowDefinition) -> int:
+def open_tasks(defn: FlowDefinition) -> int:
     """Tasks currently sitting in this definition's queues, deterministic per day."""
     if defn.status != "active":
         return 0
@@ -655,11 +682,11 @@ def open_tasks(defn: WorkflowDefinition) -> int:
     return int(round(backlog))
 
 
-def _run_id(defn: WorkflowDefinition, day: date, idx: int) -> str:
+def _run_id(defn: FlowDefinition, day: date, idx: int) -> str:
     return "run_" + _hex(f"{defn.id}:{day.isoformat()}:{idx}", 6)
 
 
-def _run_summary(defn: WorkflowDefinition, day: date, idx: int, runs_that_day: int) -> RunSummary:
+def _run_summary(defn: FlowDefinition, day: date, idx: int, runs_that_day: int) -> RunSummary:
     rid = _run_id(defn, day, idx)
     rng = _h(f"{rid}:shape")
     p = defn.profile
@@ -683,7 +710,7 @@ def _run_summary(defn: WorkflowDefinition, day: date, idx: int, runs_that_day: i
     actions = sum(1 for s in defn.steps if s.type == "action")
     return RunSummary(
         id=rid,
-        workflow_id=defn.id,
+        flow_id=defn.id,
         status=status,
         case_ref=f"{p.case_prefix}-{20000 + int(_hex(rid, 4), 16) % 9000}",
         started_at=started,
@@ -696,7 +723,7 @@ def _run_summary(defn: WorkflowDefinition, day: date, idx: int, runs_that_day: i
     )
 
 
-def recent_runs(defn: WorkflowDefinition, limit: int) -> list[RunSummary]:
+def recent_runs(defn: FlowDefinition, limit: int) -> list[RunSummary]:
     out: list[RunSummary] = []
     today = utcnow().date()
     for back in range(0, 45):
@@ -710,7 +737,7 @@ def recent_runs(defn: WorkflowDefinition, limit: int) -> list[RunSummary]:
     return out[:limit]
 
 
-def find_run(defn: WorkflowDefinition, run_id: str) -> RunDetail | None:
+def find_run(defn: FlowDefinition, run_id: str) -> RunDetail | None:
     today = utcnow().date()
     for back in range(0, 45):
         day = today - timedelta(days=back)
@@ -735,7 +762,7 @@ def _amount_for(case_ref: str) -> int:
     return 500 + int(_hex(f"{case_ref}:amount", 5), 16) % 24000
 
 
-def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
+def _run_detail(defn: FlowDefinition, summary: RunSummary) -> RunDetail:
     rng = _h(f"{summary.id}:detail")
     steps: list[RunStepEvent] = []
     calls: list[ModelCallRecord] = []
@@ -962,7 +989,7 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
     )
 
 
-def audit_entries(defn: WorkflowDefinition, limit: int) -> list[AuditEntry]:
+def audit_entries(defn: FlowDefinition, limit: int) -> list[AuditEntry]:
     """The ledger view: what this definition decided, committed, and learned."""
     out: list[AuditEntry] = []
     for run in recent_runs(defn, max(limit * 2, 40)):
@@ -986,12 +1013,12 @@ def audit_entries(defn: WorkflowDefinition, limit: int) -> list[AuditEntry]:
             elif ev.type == "action" and ev.status == "completed":
                 out.append(
                     AuditEntry(
-                        at=ev.at, kind="action", actor=f"workflow:{defn.id}",
+                        at=ev.at, kind="action", actor=f"flow:{defn.id}",
                         summary=f"{ev.name} committed via Action Gateway ({run.case_ref})",
                         run_id=run.id, ledger_ref=ev.ledger_ref,
                     )
                 )
-        if defn.kind == "dataflow" and run.status == "completed":
+        if writes_canonical(defn) and run.status == "completed":
             rng = _h(f"{run.id}:resolution")
             if rng.random() < 0.35:
                 out.append(
@@ -1020,7 +1047,7 @@ _DIFFABLE = ("type", "name", "summary", "config", "next", "branch_labels")
 
 
 def diff_versions(
-    candidate: WorkflowVersion, baseline: WorkflowVersion
+    candidate: FlowVersion, baseline: FlowVersion
 ) -> list[StepDiff]:
     """Annotate `candidate`'s steps against `baseline`.
 
@@ -1059,7 +1086,7 @@ def diff_versions(
 # ---------------------------------------------------------------------------
 
 # Cheaper substitutes, in descending capability. A downgrade is only ever
-# proposed one rung at a time: two rungs is a different workflow, not a saving.
+# proposed one rung at a time: two rungs is a different flow, not a saving.
 _DOWNGRADE_PATH = {
     "claude-opus-5": "claude-sonnet-5",
     "claude-fable-5": "claude-sonnet-5",
@@ -1073,7 +1100,7 @@ def _blended_rate(model: str) -> float:
 
 
 def recommendations(
-    defn: WorkflowDefinition, usage: list[UsageDay], golden_cases: int
+    defn: FlowDefinition, usage: list[UsageDay], golden_cases: int
 ) -> list[Recommendation]:
     """Insight cards derived from this definition's own execution telemetry.
 
@@ -1098,7 +1125,7 @@ def recommendations(
         model = step.config.get("model", "claude-sonnet-5")
         cheaper = _DOWNGRADE_PATH.get(model)
         # A downgrade is only defensible when the step is expensive AND the
-        # workflow is currently succeeding with room to spare. Below the bar,
+        # flow is currently succeeding with room to spare. Below the bar,
         # the right move is to fix quality, not to spend less failing.
         if not cheaper or per_step_spend < 5 or success < 0.97:
             continue
@@ -1112,7 +1139,7 @@ def recommendations(
                 kind="model-downgrade",
                 title=f"Downgrade opportunity: {step.name}",
                 detail=(
-                    f"{step.name} runs on {model}. This workflow is completing "
+                    f"{step.name} runs on {model}. This flow is completing "
                     f"{success:.1%} of runs, which leaves headroom to try "
                     f"{cheaper} on the golden set before promoting it."
                 ),
@@ -1212,9 +1239,10 @@ def recommendations(
             )
         )
 
-    # Batching: a DataFlow paying per-record model costs is the doctrine's
-    # named anti-pattern (bulk work must not run one-model-call-per-record).
-    if defn.kind == "dataflow" and model_steps and runs > 300:
+    # Batching: bulk work paying per-record model costs is the doctrine's
+    # named anti-pattern. The tell is the trigger, not a type — a flow woken
+    # by a window is doing bulk work whatever anyone called it.
+    if is_windowed(defn) and model_steps and runs > 300:
         savings = spend * 0.35 * monthly
         step = model_steps[0]
         out.append(
@@ -1250,63 +1278,63 @@ def recommendations(
 # ---------------------------------------------------------------------------
 
 
-class WorkflowService:
+class FlowService:
     def __init__(
         self,
-        workflows: WorkflowDirectory,
+        flows: FlowDirectory,
         golden_sets: GoldenSetDirectory,
         test_runs: TestRunDirectory,
         # Seconds the simulated harness spends per golden case; tests shrink it.
         test_seconds_per_case: float = 0.15,
     ) -> None:
-        self.workflows = workflows
+        self.flows = flows
         self.golden_sets = golden_sets
         self.test_runs = test_runs
         self.test_seconds_per_case = test_seconds_per_case
 
     # ---- registry ----
 
-    def list(self) -> list[WorkflowDefinition]:
-        return self.workflows.list()
+    def list(self) -> list[FlowDefinition]:
+        return self.flows.list()
 
-    def get(self, workflow_id: str) -> WorkflowDefinition | None:
-        return self.workflows.get(workflow_id)
+    def get(self, flow_id: str) -> FlowDefinition | None:
+        return self.flows.get(flow_id)
 
-    def require(self, workflow_id: str) -> WorkflowDefinition:
-        defn = self.workflows.get(workflow_id)
+    def require(self, flow_id: str) -> FlowDefinition:
+        defn = self.flows.get(flow_id)
         if defn is None:
-            raise WorkflowNotFoundError(workflow_id)
+            raise FlowNotFoundError(flow_id)
         return defn
 
-    def create(self, defn: WorkflowDefinition) -> WorkflowDefinition:
-        return self.workflows.create(defn)
+    def create(self, defn: FlowDefinition) -> FlowDefinition:
+        return self.flows.create(defn)
 
-    def update(self, defn: WorkflowDefinition) -> WorkflowDefinition:
-        return self.workflows.update(
+    def update(self, defn: FlowDefinition) -> FlowDefinition:
+        return self.flows.update(
             defn.model_copy(update={"updated_at": utcnow()})
         )
 
-    def delete(self, workflow_id: str) -> None:
-        self.workflows.delete(workflow_id)
-        self.golden_sets.delete(workflow_id)
+    def delete(self, flow_id: str) -> None:
+        self.flows.delete(flow_id)
+        self.golden_sets.delete(flow_id)
 
     # ---- versions ----
 
-    def versions(self, workflow_id: str) -> list[WorkflowVersion]:
-        return self.require(workflow_id).version_history()
+    def versions(self, flow_id: str) -> list[FlowVersion]:
+        return self.require(flow_id).version_history()
 
-    def version(self, workflow_id: str, version: int) -> WorkflowVersion | None:
-        return self.require(workflow_id).find_version(version)
+    def version(self, flow_id: str, version: int) -> FlowVersion | None:
+        return self.require(flow_id).find_version(version)
 
-    def version_by_label(self, workflow_id: str, label: str) -> WorkflowVersion | None:
+    def version_by_label(self, flow_id: str, label: str) -> FlowVersion | None:
         return next(
-            (v for v in self.versions(workflow_id) if v.display() == label), None
+            (v for v in self.versions(flow_id) if v.display() == label), None
         )
 
     def diff(
-        self, workflow_id: str, version: int, against: int | None
+        self, flow_id: str, version: int, against: int | None
     ) -> list[StepDiff]:
-        defn = self.require(workflow_id)
+        defn = self.require(flow_id)
         candidate = defn.find_version(version)
         if candidate is None:
             raise ValueError(f"Version not found: v{version}")
@@ -1318,8 +1346,8 @@ class WorkflowService:
         return diff_versions(candidate, baseline)
 
     def _ensure_draft(
-        self, defn: WorkflowDefinition, authored_by: str
-    ) -> tuple[WorkflowDefinition, WorkflowVersion]:
+        self, defn: FlowDefinition, authored_by: str
+    ) -> tuple[FlowDefinition, FlowVersion]:
         """Open a draft off the active version, or return the existing one.
 
         A change is never applied to the live version: the point of a draft is
@@ -1330,7 +1358,7 @@ class WorkflowService:
         if existing is not None:
             return defn, existing
         active = defn.active_version()
-        draft = WorkflowVersion(
+        draft = FlowVersion(
             version=active.version + 1,
             label=f"v{active.version + 1}-draft",
             status="draft",
@@ -1343,8 +1371,8 @@ class WorkflowService:
         return defn.model_copy(update={"versions": history + [draft]}), draft
 
     def apply_recommendation(
-        self, workflow_id: str, rec: Recommendation, actor: str
-    ) -> tuple[WorkflowDefinition, WorkflowVersion]:
+        self, flow_id: str, rec: Recommendation, actor: str
+    ) -> tuple[FlowDefinition, FlowVersion]:
         """Stage a recommendation's change into the draft version.
 
         Advisory cards (no `proposed_change`) are refused rather than
@@ -1354,7 +1382,7 @@ class WorkflowService:
             raise ValueError(
                 "This insight is advisory — there is no mechanical change to apply."
             )
-        defn = self.require(workflow_id)
+        defn = self.require(flow_id)
         defn, draft = self._ensure_draft(defn, actor)
         change = rec.proposed_change
         step_id = change.get("step_id", "")
@@ -1391,7 +1419,7 @@ class WorkflowService:
         log.info(
             "Recommendation applied to draft",
             extra={
-                "workflowId": workflow_id,
+                "flowId": flow_id,
                 "recommendationId": rec.id,
                 "draft": updated_draft.display(),
                 "actor": actor,
@@ -1399,26 +1427,26 @@ class WorkflowService:
         )
         return saved, updated_draft
 
-    def recommendations(self, workflow_id: str, days: int = 30) -> list[Recommendation]:
-        defn = self.require(workflow_id)
+    def recommendations(self, flow_id: str, days: int = 30) -> list[Recommendation]:
+        defn = self.require(flow_id)
         return recommendations(
-            defn, usage_series(defn, days), len(self.golden_set(workflow_id).cases)
+            defn, usage_series(defn, days), len(self.golden_set(flow_id).cases)
         )
 
     # ---- golden set ----
 
-    def golden_set(self, workflow_id: str) -> GoldenSet:
-        return self.golden_sets.get(workflow_id) or GoldenSet(workflow_id=workflow_id)
+    def golden_set(self, flow_id: str) -> GoldenSet:
+        return self.golden_sets.get(flow_id) or GoldenSet(flow_id=flow_id)
 
-    def add_golden_case(self, workflow_id: str, case: GoldenCase) -> GoldenSet:
-        golden = self.golden_set(workflow_id)
+    def add_golden_case(self, flow_id: str, case: GoldenCase) -> GoldenSet:
+        golden = self.golden_set(flow_id)
         if any(c.id == case.id for c in golden.cases):
             raise ValueError(f"Golden case already exists: {case.id}")
         golden.cases.append(case)
         return self.golden_sets.put(golden)
 
-    def remove_golden_case(self, workflow_id: str, case_id: str) -> GoldenSet:
-        golden = self.golden_set(workflow_id)
+    def remove_golden_case(self, flow_id: str, case_id: str) -> GoldenSet:
+        golden = self.golden_set(flow_id)
         remaining = [c for c in golden.cases if c.id != case_id]
         if len(remaining) == len(golden.cases):
             raise ValueError(f"Golden case not found: {case_id}")
@@ -1429,21 +1457,21 @@ class WorkflowService:
 
     def launch_test_run(
         self,
-        workflow_id: str,
+        flow_id: str,
         candidate_version: str,
         baseline_version: str,
         launched_by: str,
     ) -> TestRun:
-        defn = self.require(workflow_id)
-        golden = self.golden_set(workflow_id)
+        defn = self.require(flow_id)
+        golden = self.golden_set(flow_id)
         if not golden.cases:
             raise ValueError(
                 "No golden set: add cases before launching a test run."
             )
         draft = defn.draft_version()
         run = TestRun(
-            id="test_" + _hex(f"{workflow_id}:{time.time_ns()}", 10),
-            workflow_id=workflow_id,
+            id="test_" + _hex(f"{flow_id}:{time.time_ns()}", 10),
+            flow_id=flow_id,
             candidate_version=(
                 candidate_version
                 or (draft.display() if draft else f"v{defn.version + 1}-draft")
@@ -1462,7 +1490,7 @@ class WorkflowService:
         thread.start()
         return run
 
-    def _version_cost_factor(self, defn: WorkflowDefinition, label: str) -> float:
+    def _version_cost_factor(self, defn: FlowDefinition, label: str) -> float:
         """How this version's model choices scale cost, relative to the active one.
 
         This is what makes the recommender loop honest end to end: apply a
@@ -1476,7 +1504,7 @@ class WorkflowService:
             return 1.0
         active = defn.active_version()
 
-        def weight(steps: list[WorkflowStep]) -> float:
+        def weight(steps: list[FlowStep]) -> float:
             rates = [
                 _blended_rate(s.config.get("model", "claude-sonnet-5"))
                 for s in steps
@@ -1490,7 +1518,7 @@ class WorkflowService:
         return weight(version.steps) / base
 
     def _grade(
-        self, defn: WorkflowDefinition, case: GoldenCase, version: str, factor: float
+        self, defn: FlowDefinition, case: GoldenCase, version: str, factor: float
     ) -> tuple[bool, float, int]:
         """Deterministic verdict for one (case, version) pair.
 
@@ -1513,7 +1541,7 @@ class WorkflowService:
         return passed, cost, duration
 
     def _execute_test_run(
-        self, test_id: str, defn: WorkflowDefinition, cases: list[GoldenCase]
+        self, test_id: str, defn: FlowDefinition, cases: list[GoldenCase]
     ) -> None:
         """Simulated harness execution: case-by-case, writes suppressed.
 
@@ -1575,7 +1603,7 @@ class WorkflowService:
             log.info(
                 "Test run completed",
                 extra={
-                    "workflowId": defn.id, "testId": run.id,
+                    "flowId": defn.id, "testId": run.id,
                     "passed": run.passed, "total": run.total_cases,
                     "baselinePassed": run.baseline_passed,
                     "regressions": run.regressions,
@@ -1586,21 +1614,21 @@ class WorkflowService:
             log.exception("Test run execution failed", extra={"testId": test_id})
 
 
-def build_workflow_service(
+def build_flow_service(
     backend: str,
     project: str | None,
-    workflows_collection: str,
+    flows_collection: str,
     golden_sets_collection: str,
     test_runs_collection: str,
-) -> WorkflowService:
+) -> FlowService:
     if backend == "firestore":
-        return WorkflowService(
-            FirestoreWorkflowDirectory(project, workflows_collection),
+        return FlowService(
+            FirestoreFlowDirectory(project, flows_collection),
             FirestoreGoldenSetDirectory(project, golden_sets_collection),
             FirestoreTestRunDirectory(project, test_runs_collection),
         )
-    return WorkflowService(
-        InMemoryWorkflowDirectory(),
+    return FlowService(
+        InMemoryFlowDirectory(),
         InMemoryGoldenSetDirectory(),
         InMemoryTestRunDirectory(),
     )
@@ -1615,12 +1643,11 @@ def _ago(days: int) -> datetime:
     return utcnow() - timedelta(days=days)
 
 
-def _seed_definitions() -> list[WorkflowDefinition]:
+def _seed_definitions() -> list[FlowDefinition]:
     return [
-        WorkflowDefinition(
+        FlowDefinition(
             id="invoice-intake",
             name="Invoice intake",
-            kind="workflow",
             description=(
                 "Extracts, validates and routes vendor invoices; pauses for AP "
                 "judgment when a Rule says the amount needs review."
@@ -1642,47 +1669,46 @@ def _seed_definitions() -> list[WorkflowDefinition]:
                 active_seconds=42, case_prefix="inv",
             ),
             steps=[
-                WorkflowStep(
+                FlowStep(
                     id="t1", type="trigger", name="InvoiceReceived",
-                    summary="starts one run per invoice landed by the mail-intake DataFlow",
+                    summary="starts one run per invoice landed by the mail-intake flow",
                     config={"event": "InvoiceReceived", "source": "mail-intake"},
                     next=["m1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="m1", type="modelcall", name="extract-invoice",
                     summary="extracts amount, vendor, PO and line items from the document",
                     config={"model": "claude-sonnet-5", "prompt": "invoice-extraction v9"},
                     next=["r1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="r1", type="rule", name="amount-threshold",
                     summary="is the amount over the $10,000 review threshold?",
                     config={"rule_type": "threshold", "threshold": "$10,000"},
                     next=["a1", "k1"], branch_labels=["pass", "review"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="k1", type="task", name="confirm-extraction",
                     summary="a person confirms or corrects the extraction; the run suspends in place",
                     config={"queue": "ap-clerk"},
                     next=["a1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="a1", type="action", name="post-to-erp",
                     summary="guarded write of the approved invoice to the ERP",
                     config={"target": "erp", "gateway": "action-gateway"},
                     next=["e1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="e1", type="event", name="InvoicePosted",
                     summary="emitted on commit; corrections flow back decoupled via ExtractionCorrected",
                     config={"event": "InvoicePosted"},
                 ),
             ],
         ),
-        WorkflowDefinition(
+        FlowDefinition(
             id="expense-triage",
             name="Expense triage",
-            kind="workflow",
             description=(
                 "One ModelCall policy check on each expense report; approves "
                 "in-policy spend and raises a Task for the rest."
@@ -1704,43 +1730,42 @@ def _seed_definitions() -> list[WorkflowDefinition]:
                 active_seconds=18, case_prefix="exp",
             ),
             steps=[
-                WorkflowStep(
+                FlowStep(
                     id="t1", type="trigger", name="ExpenseSubmitted",
                     summary="one run per submitted report",
                     config={"event": "ExpenseSubmitted"}, next=["m1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="m1", type="modelcall", name="policy-check",
                     summary="checks the report against the expense policy in the knowledge layer",
                     config={"model": "claude-haiku-4-5", "prompt": "expense-policy v5"},
                     next=["r1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="r1", type="rule", name="policy-verdict",
                     summary="in policy, and under the manager-approval limit?",
                     config={"rule_type": "match-condition"},
                     next=["a1", "k1"], branch_labels=["approve", "review"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="k1", type="task", name="review-expense",
                     summary="a reviewer decides the flagged report with the model's findings attached",
                     config={"queue": "expense-review"}, next=["a1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="a1", type="action", name="record-decision",
                     summary="guarded write of the approval or rejection",
                     config={"target": "expense-system"}, next=["e1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="e1", type="event", name="ExpenseDecided",
                     summary="emitted on commit", config={"event": "ExpenseDecided"},
                 ),
             ],
         ),
-        WorkflowDefinition(
+        FlowDefinition(
             id="contract-review",
             name="Contract review",
-            kind="workflow",
             description=(
                 "Multi-model pipeline on inbound contracts: clause extraction, "
                 "then an independent risk review, then legal judgment on anything "
@@ -1765,54 +1790,53 @@ def _seed_definitions() -> list[WorkflowDefinition]:
                 active_seconds=210, case_prefix="ctr",
             ),
             steps=[
-                WorkflowStep(
+                FlowStep(
                     id="t1", type="trigger", name="ContractUploaded",
                     summary="one run per contract landing in the deal room",
                     config={"event": "ContractUploaded"}, next=["m1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="m1", type="modelcall", name="clause-extraction",
                     summary="extracts and classifies every clause against the playbook ontology",
                     config={"model": "claude-sonnet-5", "prompt": "clause-extraction v11"},
                     next=["x1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="x1", type="transform", name="clause-normalizer",
                     summary="maps extracted clauses onto canonical clause Objects and Links",
                     config={"language": "python"}, next=["m2"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="m2", type="modelcall", name="risk-review",
                     summary="independent second model scores deviation from the standard terms",
                     config={"model": "claude-opus-5", "prompt": "risk-review v4"},
                     next=["r1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="r1", type="rule", name="risk-threshold",
                     summary="is any clause scored above the escalation threshold?",
                     config={"rule_type": "threshold", "threshold": "risk ≥ 0.6"},
                     next=["a1", "k1"], branch_labels=["standard", "escalate"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="k1", type="task", name="legal-review",
                     summary="counsel reviews the flagged clauses with both models' reasoning attached",
                     config={"queue": "legal-review"}, next=["a1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="a1", type="action", name="file-review-summary",
                     summary="guarded write of the review summary into the deal room",
                     config={"target": "deal-room"}, next=["e1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="e1", type="event", name="ContractReviewed",
                     summary="emitted on commit", config={"event": "ContractReviewed"},
                 ),
             ],
         ),
-        WorkflowDefinition(
+        FlowDefinition(
             id="deal-brief",
             name="Deal brief",
-            kind="workflow",
             description=(
                 "Synthesizes a deal-room briefing from CRM state, correspondence "
                 "and the knowledge layer whenever a deal changes stage."
@@ -1834,33 +1858,32 @@ def _seed_definitions() -> list[WorkflowDefinition]:
                 active_seconds=95, case_prefix="deal",
             ),
             steps=[
-                WorkflowStep(
+                FlowStep(
                     id="t1", type="trigger", name="DealStageChanged",
                     summary="fires when a deal moves stage in the CRM",
                     config={"event": "DealStageChanged"}, next=["x1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="x1", type="transform", name="gather-context",
                     summary="pulls the deal Object, its Links, and related knowledge assets",
                     config={"language": "python"}, next=["m1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="m1", type="modelcall", name="synthesize-brief",
                     summary="writes the briefing with citations into the graph",
                     config={"model": "claude-opus-5", "prompt": "deal-brief v2"},
                     next=["a1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="a1", type="action", name="post-to-workspace",
                     summary="guarded write of the brief into the Deal Room workspace",
                     config={"target": "deal-room"},
                 ),
             ],
         ),
-        WorkflowDefinition(
+        FlowDefinition(
             id="vendor-master-sync",
             name="Vendor master sync",
-            kind="dataflow",
             description=(
                 "Keeps the canonical vendor list in agreement with the ERP: lands "
                 "changes, entity-matches them to canonical Objects, and resolves "
@@ -1883,49 +1906,48 @@ def _seed_definitions() -> list[WorkflowDefinition]:
                 weekend_factor=1.0, active_seconds=25, case_prefix="batch",
             ),
             steps=[
-                WorkflowStep(
+                FlowStep(
                     id="t1", type="trigger", name="every-2h",
                     summary="windowing timer event through the standard Trigger mechanism",
                     config={"event": "timer:2h"}, next=["x1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="x1", type="transform", name="land-erp-changes",
                     summary="lands the change feed as bulk observations with per-revision lineage",
                     config={"language": "python", "transport": "change-feed"},
                     next=["m1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="m1", type="modelcall", name="match-assist",
                     summary="scores ambiguous vendor-name matches the deterministic keys cannot settle",
                     config={"model": "claude-haiku-4-5"}, next=["r1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="r1", type="rule", name="match-confidence",
                     summary="accept the identity Link automatically above 0.85 confidence?",
                     config={"rule_type": "threshold", "threshold": "0.85"},
                     next=["a1", "k1"], branch_labels=["accept", "review"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="k1", type="task", name="confirm-match",
                     summary="a data steward confirms low-confidence merges; reversal info retained",
                     config={"queue": "data-steward"}, next=["a1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="a1", type="action", name="upsert-canonical",
                     summary="resolution writes: winning claims recorded with why; losers retained",
                     config={"target": "graph"}, next=["e1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="e1", type="event", name="VendorMasterReconciled",
                     summary="summarizing event per window — never per record",
                     config={"event": "VendorMasterReconciled"},
                 ),
             ],
         ),
-        WorkflowDefinition(
+        FlowDefinition(
             id="document-embedder",
             name="Document embedder",
-            kind="dataflow",
             description=(
                 "Parses, chunks and embeds landed documents into the knowledge "
                 "layer; derived vectors carry their source-plus-recipe derivation record."
@@ -1947,27 +1969,27 @@ def _seed_definitions() -> list[WorkflowDefinition]:
                 weekend_factor=1.0, active_seconds=60, case_prefix="doc",
             ),
             steps=[
-                WorkflowStep(
+                FlowStep(
                     id="t1", type="trigger", name="DocumentLanded",
                     summary="event-triggered on each landed document",
                     config={"event": "DocumentLanded"}, next=["x1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="x1", type="transform", name="parse-and-chunk",
                     summary="extracts text and splits it on the chunking policy in the Mapping",
                     config={"language": "python"}, next=["m1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="m1", type="modelcall", name="summarize-for-index",
                     summary="writes the retrieval summary and tags for each chunk",
                     config={"model": "claude-haiku-4-5"}, next=["a1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="a1", type="action", name="register-derived-dataset",
                     summary="records the derived vectors with {from, fromVersion, recipe}",
                     config={"target": "knowledge-layer"}, next=["e1"],
                 ),
-                WorkflowStep(
+                FlowStep(
                     id="e1", type="event", name="DocumentIndexed",
                     summary="emitted per document", config={"event": "DocumentIndexed"},
                 ),
@@ -1976,7 +1998,7 @@ def _seed_definitions() -> list[WorkflowDefinition]:
     ]
 
 
-def _seed_golden_cases(workflow_id: str) -> list[GoldenCase]:
+def _seed_golden_cases(flow_id: str) -> list[GoldenCase]:
     catalogs: dict[str, list[tuple[str, str, str, GoldenSource]]] = {
         "invoice-intake": [
             ("Standard invoice · single PO", "inv-fixture-001", "amount $2,340 · vendor acme-industrial · automatic path", "correction-set"),
@@ -2024,7 +2046,7 @@ def _seed_golden_cases(workflow_id: str) -> list[GoldenCase]:
             source=source,
             added_by="system:seed",
         )
-        for i, (name, ref, expected, source) in enumerate(catalogs.get(workflow_id, []))
+        for i, (name, ref, expected, source) in enumerate(catalogs.get(flow_id, []))
     ]
 
 
@@ -2037,10 +2059,10 @@ _SEED_DRAFTS: dict[str, str] = {
 }
 
 
-def _seed_version_history(defn: WorkflowDefinition) -> list[WorkflowVersion]:
+def _seed_version_history(defn: FlowDefinition) -> list[FlowVersion]:
     """Two archived revisions, the active one, and sometimes an open draft."""
     active_steps = [s.model_copy(deep=True) for s in defn.steps]
-    versions: list[WorkflowVersion] = []
+    versions: list[FlowVersion] = []
 
     # Archived revisions differ only in their governed knowledge (an older
     # prompt), which is the most common real edit and keeps the diff legible.
@@ -2056,7 +2078,7 @@ def _seed_version_history(defn: WorkflowDefinition) -> list[WorkflowVersion]:
                     copy = copy.model_copy(update={"config": config})
             older.append(copy)
         versions.append(
-            WorkflowVersion(
+            FlowVersion(
                 version=defn.version - back,
                 label=f"v{defn.version - back}",
                 status="archived",
@@ -2069,7 +2091,7 @@ def _seed_version_history(defn: WorkflowDefinition) -> list[WorkflowVersion]:
         )
 
     versions.append(
-        WorkflowVersion(
+        FlowVersion(
             version=defn.version,
             label=f"v{defn.version}",
             status="active",
@@ -2093,7 +2115,7 @@ def _seed_version_history(defn: WorkflowDefinition) -> list[WorkflowVersion]:
             s.model_copy(update={"next": ["x0"]}) if s.id == "t1" else s
             for s in draft_steps
         ]
-        guard = WorkflowStep(
+        guard = FlowStep(
             id="x0", type="transform", name="duplicate-check",
             summary="rejects an invoice already posted, before any model runs",
             config={"language": "python"}, next=["m1"],
@@ -2117,7 +2139,7 @@ def _seed_version_history(defn: WorkflowDefinition) -> list[WorkflowVersion]:
         notes = "Cheaper second-opinion model; normalizer folded into extraction."
 
     versions.append(
-        WorkflowVersion(
+        FlowVersion(
             version=defn.version + 1,
             label=f"v{defn.version + 1}-draft",
             status="draft",
@@ -2131,7 +2153,7 @@ def _seed_version_history(defn: WorkflowDefinition) -> list[WorkflowVersion]:
     return versions
 
 
-def seed_workflows_if_empty(service: WorkflowService) -> int:
+def seed_flows_if_empty(service: FlowService) -> int:
     """Register the demo fleet when the registry is empty. Idempotent."""
     if service.list():
         return 0
@@ -2145,7 +2167,7 @@ def seed_workflows_if_empty(service: WorkflowService) -> int:
             if cases:
                 service.golden_sets.put(
                     GoldenSet(
-                        workflow_id=defn.id,
+                        flow_id=defn.id,
                         cases=cases,
                         # FDEs author golden cases in code as well as in the
                         # console; naming the file keeps the console honest
@@ -2155,8 +2177,8 @@ def seed_workflows_if_empty(service: WorkflowService) -> int:
                     )
                 )
             created += 1
-        except WorkflowExistsError:
+        except FlowExistsError:
             continue
     if created:
-        log.info("Seeded workflow definitions", extra={"count": created})
+        log.info("Seeded flow definitions", extra={"count": created})
     return created

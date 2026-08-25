@@ -1,7 +1,7 @@
-/// Models for the Workflows section — the registry and observability plane
-/// for the two kinds of authored logic (Workflow and DataFlow).
+/// Models for the Flows section — the registry and observability plane
+/// for authored logic. One primitive: a Flow.
 ///
-/// Mirrors `server/app/workflows_api.py`. Costs come from audited ModelCall
+/// Mirrors `server/app/flows_api.py`. Costs come from audited ModelCall
 /// records; the run journal and audit entries are the governance trail.
 library;
 
@@ -14,7 +14,7 @@ List<String> _strings(dynamic v) =>
 DateTime _date(dynamic v) =>
     DateTime.tryParse(v?.toString() ?? '')?.toLocal() ?? DateTime.now();
 
-class WorkflowStep {
+class FlowStep {
   final String id;
   final String type; // trigger | modelcall | rule | task | action | event | transform
   final String name;
@@ -23,7 +23,7 @@ class WorkflowStep {
   final List<String> next;
   final List<String> branchLabels;
 
-  WorkflowStep({
+  FlowStep({
     required this.id,
     required this.type,
     required this.name,
@@ -33,7 +33,7 @@ class WorkflowStep {
     required this.branchLabels,
   });
 
-  factory WorkflowStep.fromJson(Map<String, dynamic> j) => WorkflowStep(
+  factory FlowStep.fromJson(Map<String, dynamic> j) => FlowStep(
     id: j['id'] as String,
     type: j['type'] as String,
     name: j['name'] as String,
@@ -48,17 +48,17 @@ class WorkflowStep {
 
 /// One published or drafted revision of a definition — a full snapshot of the
 /// declarative export, never a delta.
-class WorkflowVersion {
+class FlowVersion {
   final int version;
   final String label;
   final String status; // active | archived | draft
-  final List<WorkflowStep> steps;
+  final List<FlowStep> steps;
   final double modelBudgetUsdPerRun;
   final String notes;
   final String authoredBy;
   final DateTime createdAt;
 
-  WorkflowVersion({
+  FlowVersion({
     required this.version,
     required this.label,
     required this.status,
@@ -73,12 +73,12 @@ class WorkflowVersion {
   bool get isActive => status == 'active';
   String get display => label.isEmpty ? 'v$version' : label;
 
-  factory WorkflowVersion.fromJson(Map<String, dynamic> j) => WorkflowVersion(
+  factory FlowVersion.fromJson(Map<String, dynamic> j) => FlowVersion(
     version: _i(j['version']),
     label: j['label'] as String? ?? '',
     status: j['status'] as String? ?? 'archived',
     steps: (j['steps'] as List<dynamic>? ?? const [])
-        .map((s) => WorkflowStep.fromJson(s as Map<String, dynamic>))
+        .map((s) => FlowStep.fromJson(s as Map<String, dynamic>))
         .toList(),
     modelBudgetUsdPerRun: _d(j['model_budget_usd_per_run']),
     notes: j['notes'] as String? ?? '',
@@ -89,7 +89,7 @@ class WorkflowVersion {
 
 /// A step annotated against the version being compared with.
 class StepDiff {
-  final WorkflowStep step;
+  final FlowStep step;
   final String change; // unchanged | added | removed | modified
   final List<String> changedFields;
 
@@ -100,7 +100,7 @@ class StepDiff {
   });
 
   factory StepDiff.fromJson(Map<String, dynamic> j) => StepDiff(
-    step: WorkflowStep.fromJson(j['step'] as Map<String, dynamic>),
+    step: FlowStep.fromJson(j['step'] as Map<String, dynamic>),
     change: j['change'] as String? ?? 'unchanged',
     changedFields: _strings(j['changed_fields']),
   );
@@ -174,10 +174,9 @@ class GoldenSetInfo {
   );
 }
 
-class WorkflowSummary {
+class FlowSummary {
   final String id;
   final String name;
-  final String kind; // workflow | dataflow
   final String status; // draft | active | paused | deprecated
   final String description;
   final String team;
@@ -191,10 +190,9 @@ class WorkflowSummary {
   final double minutesSaved30d;
   final List<int> spark;
 
-  WorkflowSummary({
+  FlowSummary({
     required this.id,
     required this.name,
-    required this.kind,
     required this.status,
     required this.description,
     required this.team,
@@ -209,10 +207,9 @@ class WorkflowSummary {
     required this.spark,
   });
 
-  factory WorkflowSummary.fromJson(Map<String, dynamic> j) => WorkflowSummary(
+  factory FlowSummary.fromJson(Map<String, dynamic> j) => FlowSummary(
     id: j['id'] as String,
     name: j['name'] as String? ?? j['id'] as String,
-    kind: j['kind'] as String,
     status: j['status'] as String,
     description: j['description'] as String? ?? '',
     team: j['team'] as String? ?? '',
@@ -228,8 +225,8 @@ class WorkflowSummary {
   );
 }
 
-class WorkflowDetail extends WorkflowSummary {
-  final List<WorkflowStep> steps;
+class FlowDetail extends FlowSummary {
+  final List<FlowStep> steps;
   final List<String> queues;
   final String workspace;
   final double roiMinutesPerRun;
@@ -242,8 +239,8 @@ class WorkflowDetail extends WorkflowSummary {
   final String draftVersionLabel;
   final int versionCount;
 
-  WorkflowDetail({
-    required WorkflowSummary base,
+  FlowDetail({
+    required FlowSummary base,
     required this.steps,
     required this.queues,
     required this.workspace,
@@ -259,7 +256,6 @@ class WorkflowDetail extends WorkflowSummary {
   }) : super(
          id: base.id,
          name: base.name,
-         kind: base.kind,
          status: base.status,
          description: base.description,
          team: base.team,
@@ -274,10 +270,10 @@ class WorkflowDetail extends WorkflowSummary {
          spark: base.spark,
        );
 
-  factory WorkflowDetail.fromJson(Map<String, dynamic> j) => WorkflowDetail(
-    base: WorkflowSummary.fromJson(j),
+  factory FlowDetail.fromJson(Map<String, dynamic> j) => FlowDetail(
+    base: FlowSummary.fromJson(j),
     steps: (j['steps'] as List<dynamic>? ?? const [])
-        .map((s) => WorkflowStep.fromJson(s as Map<String, dynamic>))
+        .map((s) => FlowStep.fromJson(s as Map<String, dynamic>))
         .toList(),
     queues: _strings(j['queues']),
     workspace: j['workspace'] as String? ?? '',
@@ -315,13 +311,13 @@ class FleetSeriesDay {
 }
 
 class FleetAttention {
-  final String workflowId;
+  final String flowId;
   final String reason;
 
-  FleetAttention({required this.workflowId, required this.reason});
+  FleetAttention({required this.flowId, required this.reason});
 
   factory FleetAttention.fromJson(Map<String, dynamic> j) => FleetAttention(
-    workflowId: j['workflow_id'] as String,
+    flowId: j['flow_id'] as String,
     reason: j['reason'] as String? ?? '',
   );
 }
@@ -330,8 +326,8 @@ class FleetStats {
   final int days;
   final int definitions;
   final int active;
-  final int workflows;
-  final int dataflows;
+  final int paused;
+  final int draft;
   final int runs;
   final int completed;
   final double? successRate;
@@ -349,8 +345,8 @@ class FleetStats {
     required this.days,
     required this.definitions,
     required this.active,
-    required this.workflows,
-    required this.dataflows,
+    required this.paused,
+    required this.draft,
     required this.runs,
     required this.completed,
     required this.successRate,
@@ -369,8 +365,8 @@ class FleetStats {
     days: _i(j['days']),
     definitions: _i(j['definitions']),
     active: _i(j['active']),
-    workflows: _i(j['workflows']),
-    dataflows: _i(j['dataflows']),
+    paused: _i(j['paused']),
+    draft: _i(j['draft']),
     runs: _i(j['runs']),
     completed: _i(j['completed']),
     successRate: j['success_rate'] == null ? null : _d(j['success_rate']),
@@ -426,7 +422,7 @@ class UsageDay {
   );
 }
 
-class WorkflowUsage {
+class FlowUsage {
   final int days;
   final int runs;
   final int completed;
@@ -440,7 +436,7 @@ class WorkflowUsage {
   final double roiUsd;
   final List<UsageDay> series;
 
-  WorkflowUsage({
+  FlowUsage({
     required this.days,
     required this.runs,
     required this.completed,
@@ -455,7 +451,7 @@ class WorkflowUsage {
     required this.series,
   });
 
-  factory WorkflowUsage.fromJson(Map<String, dynamic> j) => WorkflowUsage(
+  factory FlowUsage.fromJson(Map<String, dynamic> j) => FlowUsage(
     days: _i(j['days']),
     runs: _i(j['runs']),
     completed: _i(j['completed']),
@@ -755,7 +751,7 @@ class TestCaseResult {
 
 class TestRun {
   final String id;
-  final String workflowId;
+  final String flowId;
   final String candidateVersion;
   final String baselineVersion;
   final String status; // running | completed
@@ -775,7 +771,7 @@ class TestRun {
 
   TestRun({
     required this.id,
-    required this.workflowId,
+    required this.flowId,
     required this.candidateVersion,
     required this.baselineVersion,
     required this.status,
@@ -801,7 +797,7 @@ class TestRun {
 
   factory TestRun.fromJson(Map<String, dynamic> j) => TestRun(
     id: j['id'] as String,
-    workflowId: j['workflow_id'] as String,
+    flowId: j['flow_id'] as String,
     candidateVersion: j['candidate_version'] as String? ?? '',
     baselineVersion: j['baseline_version'] as String? ?? '',
     status: j['status'] as String? ?? 'running',

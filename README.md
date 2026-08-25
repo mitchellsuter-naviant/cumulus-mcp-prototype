@@ -126,7 +126,7 @@ Local dev uses the in-memory backend and auto-seeds from [server/seed](server/se
 - REST: `GET/POST /api/v1/assets`, `GET/PUT/DELETE /api/v1/assets/{id}`, `GET /api/v1/assets/{id}/context`, `GET /api/v1/assets/tree`, `GET /api/v1/search?q=...`, `GET /api/v1/search/status`, `POST /api/v1/search/reindex`
 - Users: `GET/POST /api/v1/users`, `PUT /api/v1/users/{uid}/role`, `DELETE /api/v1/users/{uid}`, `GET /api/v1/users/me`
 - Identities: `GET/POST /api/v1/identities`, `PUT /api/v1/identities/{uid}/role`, `DELETE /api/v1/identities/{uid}`
-- Workflows: `GET/POST /api/v1/workflows`, `GET /api/v1/workflows/stats`, `GET/PATCH/DELETE /api/v1/workflows/{id}`, `GET .../usage`, `GET .../runs`, `GET .../runs/{run_id}`, `GET .../audit`, `GET/POST .../golden-set`, `DELETE .../golden-set/{case_id}`, `GET/POST .../test-runs`, `GET .../test-runs/{test_id}` — see [Workflows](#workflows)
+- Flows: `GET/POST /api/v1/flows`, `GET /api/v1/flows/stats`, `GET/PATCH/DELETE /api/v1/flows/{id}`, `GET .../usage`, `GET .../runs`, `GET .../runs/{run_id}`, `GET .../audit`, `GET/POST .../golden-set`, `DELETE .../golden-set/{case_id}`, `GET/POST .../test-runs`, `GET .../test-runs/{test_id}` — see [Flows](#flows)
 - MCP: `POST /mcp/` — tools `list_docs`, `get_doc`, `search_docs`, `get_context`; resource template `kb://{doc_id}`
 - A2A: `POST /a2a` with JSON-RPC `message/send`; agent card at `/.well-known/agent-card.json`
 
@@ -143,9 +143,9 @@ Requires the **MCP Python SDK 2.x** (`mcp.server.MCPServer`). The 1.x API
 | `ADMIN_API_KEY` | unset | Legacy machine credential: `X-API-Key` acts as owner |
 | `API_KEYS_COLLECTION` | `api_keys` | Firestore collection for minted keys |
 | `API_KEY_USAGE_COLLECTION` | `api_key_usage` | Firestore collection for daily usage rollups |
-| `WORKFLOWS_COLLECTION` | `workflows` | Firestore collection for Workflow/DataFlow definitions |
-| `GOLDEN_SETS_COLLECTION` | `workflow_golden_sets` | Firestore collection for golden sets |
-| `TEST_RUNS_COLLECTION` | `workflow_test_runs` | Firestore collection for harness test runs |
+| `FLOWS_COLLECTION` | `flows` | Firestore collection for Flow definitions |
+| `GOLDEN_SETS_COLLECTION` | `flow_golden_sets` | Firestore collection for golden sets |
+| `TEST_RUNS_COLLECTION` | `flow_test_runs` | Firestore collection for harness test runs |
 | `AUTH_BACKEND` | `none` | `none` (dev: everyone is owner) or `firebase` (verify ID tokens) |
 | `USER_BACKEND` | follows `AUTH_BACKEND` | `memory` or `firebase` — where platform users live |
 | `SEED_DIR` | `server/seed` | Seed docs loaded when store is empty |
@@ -407,9 +407,9 @@ gcloud run services logs read cumulus-knowledge --region us-central1 \
   --log-filter='jsonPayload.keyId="<key_id>"'
 ```
 
-## Workflows
+## Flows
 
-The **Workflows** nav section is the landing and management page for all
+The **Flows** nav section is the landing and management page for all
 authored logic in the enterprise. A fleet page lists every definition; opening
 one gives three views under a shared top bar (title, status, **version
 selector**, pause/test actions):
@@ -417,7 +417,7 @@ selector**, pause/test actions):
 | Tab | What it holds |
 | --- | --- |
 | **Overview** | Five KPI tiles across the top, then the definition (metadata and governed ROI assumptions) beside one daily chart whose measure is chosen from a dropdown — runs, model spend, tokens, or human judgment. Whichever measure is on screen, hovering a day tooltips all four, so answering "and what did that day cost?" never means switching charts. |
-| **Workflow canvas** | A full-bleed workbench, split down the middle. On the left, the declarative export as an interactive DAG flowing **north to south** on an infinite dotted field — pan, zoom, click, branch-labelled edges, distinct node types. (The dots are painted in viewport space from the viewer's transform, not inside the transformed child: a pattern drawn on the child stops at the graph's bounds and never repaints as you move, so the field would sit still while the graph slid over it and run out at the edges.) On the right, two tabs: **Definition** shows the selected node's exported configuration, and **Runs** lists recent executions. Selecting a run traces its actual path through the graph (steps it never reached fade to ghosts, traversed edges light up in the accent) and collapses the list into a compact header with a back button, so the payloads get the rest of the column: clicking a step on the path shows what went in and what came out — prompt, raw response, model, tokens, cost, rule verdict, deciding human, gateway ledger ref. **Promote to golden set** sits in that header. Selecting a draft in the top-bar version selector overlays the diff instead (green glow added, red removed, amber modified). |
+| **Flow canvas** | A full-bleed workbench, split down the middle. On the left, the declarative export as an interactive DAG flowing **north to south** on an infinite dotted field — pan, zoom, click, branch-labelled edges, distinct node types. (The dots are painted in viewport space from the viewer's transform, not inside the transformed child: a pattern drawn on the child stops at the graph's bounds and never repaints as you move, so the field would sit still while the graph slid over it and run out at the edges.) On the right, two tabs: **Definition** shows the selected node's exported configuration, and **Runs** lists recent executions. Selecting a run traces its actual path through the graph (steps it never reached fade to ghosts, traversed edges light up in the accent) and collapses the list into a compact header with a back button, so the payloads get the rest of the column: clicking a step on the path shows what went in and what came out — prompt, raw response, model, tokens, cost, rule verdict, deciding human, gateway ledger ref. **Promote to golden set** sits in that header. Selecting a draft in the top-bar version selector overlays the diff instead (green glow added, red removed, amber modified). |
 | **Evaluation & optimization** | Golden dataset on the left with its code-sync banner; the test harness top right (candidate vs baseline, **Run suite**); the cost & performance recommender bottom right, each card carrying its evidence and an **Apply to draft version** action. |
 
 The run-path trace is derived from the journal rather than from step status
@@ -430,10 +430,17 @@ never around the Task, and a suspended run simply has no edge out of it.
 
 It is kept deliberately close to DOCTRINE.md:
 
-- There is **no "Agent" primitive** — the Workflow or DataFlow *is* the agent
-  (Lens 2), so the registry manages both kinds side by side: `kind: workflow`
-  (business layer, one run per case, may suspend for a human) and
-  `kind: dataflow` (data/knowledge layer, stream/batch).
+- There is **no "Agent" primitive** — the Flow *is* the agent (Lens 2).
+- There is **one kind of authored logic: a Flow.** The doctrine's original
+  Workflow/DataFlow split is retired. It was right about the physics — per-case
+  work and windowed bulk work really do behave differently — and wrong about
+  the level, putting a behavioural difference in the type system, where it
+  bought arguments about which noun a definition was rather than better
+  defaults. What differs is now read off a definition's own shape:
+  `is_windowed()` asks whether the trigger is a window or a business event, and
+  `writes_canonical()` asks whether it commits into the graph. Those two derive
+  the batching insight and the claim-resolution audit entries that the type
+  used to gate.
 - **Cost is an audit product.** Every spend number rolls up from ModelCall
   records (model, tokens, cost) — the governed operation the doctrine requires
   to be audited. There is no separate metering path.
@@ -454,7 +461,7 @@ It is kept deliberately close to DOCTRINE.md:
   out. Exactly one version is active; at most one draft is open.
 - The **recommender** derives insights from a definition's own telemetry and
   carries the evidence on every card. Two rules keep it honest: a model
-  downgrade is proposed one rung at a time, and only when the workflow is
+  downgrade is proposed one rung at a time, and only when the flow is
   already succeeding — spending less on something that is failing is not a
   saving — and applying a card edits the **draft**, never the live version, so
   the change has to survive the golden set before it becomes what runs.
@@ -466,11 +473,11 @@ It is kept deliberately close to DOCTRINE.md:
 telemetry (runs, journals, spend, audit entries) is *synthesized
 deterministically* from each definition's seed profile — stable across
 restarts and identical on every backend. Definitions, golden sets, and test
-runs are real stored state (`workflows`, `workflow_golden_sets`,
-`workflow_test_runs` collections; in-memory for local dev). The registry
+runs are real stored state (`flows`, `flow_golden_sets`, `flow_test_runs`
+collections; in-memory for local dev). The registry
 seeds a six-definition demo fleet on first start when empty. When a real
 engine lands, the synthesis functions in
-[server/app/workflows.py](server/app/workflows.py) (`usage_series`,
+[server/app/flows.py](server/app/flows.py) (`usage_series`,
 `recent_runs`, `find_run`, `audit_entries`) are the seams to replace — the
 REST contract and the console stay as they are.
 
