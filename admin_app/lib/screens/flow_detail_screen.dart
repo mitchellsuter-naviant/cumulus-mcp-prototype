@@ -698,7 +698,17 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
               child: SegmentedTabs(
                 labels: const ['Definition', 'Runs'],
                 selectedIndex: _rightTab,
-                onChanged: (i) => setState(() => _rightTab = i),
+                onChanged: (i) => setState(() {
+                  _rightTab = i;
+                  // Leaving Runs drops the trace with it. The run highlight
+                  // belongs to the Runs tab; leaving it on while reading the
+                  // definition claims the graph is showing one execution when
+                  // nothing on screen says which.
+                  if (i == 0) {
+                    _selectedRun = null;
+                    _runDetail = null;
+                  }
+                }),
               ),
             ),
           ),

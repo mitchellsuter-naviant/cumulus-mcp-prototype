@@ -106,6 +106,11 @@ class _Edge {
   final bool ghost;
   final bool taken;
 
+  /// Set when this edge skips a row and has to route around whatever sits in
+  /// it. Both cubic control points share this x, bowing the curve clear of
+  /// the intervening node instead of drawing straight through it.
+  final double? bypassX;
+
   const _Edge({
     required this.fromId,
     required this.toId,
@@ -114,7 +119,17 @@ class _Edge {
     required this.label,
     required this.ghost,
     required this.taken,
+    this.bypassX,
   });
+
+  /// Where the curve actually passes at t=0.5 — the honest place for a label.
+  /// For a cubic, x(0.5) = (p0 + 3c1 + 3c2 + p3) / 8.
+  Offset get midpoint => Offset(
+    bypassX == null
+        ? (from.dx + to.dx) / 2
+        : (from.dx + to.dx + 6 * bypassX!) / 8,
+    (from.dy + to.dy) / 2,
+  );
 }
 
 /// Layered top-to-bottom layout of the declarative export.
@@ -209,34 +224,81 @@ class _Layout {
         if (target == null) continue;
         final key = RunPath.edgeKey(step.id, step.next[i]);
         final taken = path?.takenEdges.contains(key) ?? false;
+        final from = Offset(
+          source.position.dx + _nodeWidth / 2,
+          source.position.dy + _nodeHeight,
+        );
+        final to = Offset(
+          target.position.dx + _nodeWidth / 2,
+          target.position.dy,
+        );
+
+        // An edge that skips a row would otherwise be drawn straight through
+        // whatever occupies it — which is exactly what a branch does when one
+        // arm is longer than the other (rule → action, past the task). Route
+        // it around the far side of every row it skips.
+        double? bypassX;
+        final fromLayer = layer[step.id]!;
+        final toLayer = layer[step.next[i]]!;
+        if ((toLayer - fromLayer).abs() > 1) {
+          final lo = math.min(fromLayer, toLayer);
+          final hi = math.max(fromLayer, toLayer);
+          var clearRight = math.max(from.dx, to.dx);
+          var clearLeft = math.min(from.dx, to.dx);
+          for (var l = lo + 1; l < hi; l++) {
+            for (final blocking in rows[l] ?? const <FlowStep>[]) {
+              final node = placed[blocking.id];
+              if (node == null) continue;
+              clearRight = math.max(clearRight, node.position.dx + _nodeWidth);
+              clearLeft = math.min(clearLeft, node.position.dx);
+            }
+          }
+          // Leave on whichever side is nearer, so the detour stays short.
+          // The margin has to clear the branch label's pill as well as the
+          // curve, or the label lands back on the card it routed around.
+          const margin = 46.0;
+          final centre = (from.dx + to.dx) / 2;
+          var lane = (clearRight - centre) <= (centre - clearLeft)
+              ? clearRight + margin
+              : clearLeft - margin;
+          // A left-hand lane can fall off the near edge of the surface, which
+          // the width calculation below cannot rescue; go right instead.
+          if (lane < margin) lane = clearRight + margin;
+          // Invert x(0.5) = (p0 + 6c + p3) / 8 so the curve reaches the lane.
+          bypassX = (8 * lane - from.dx - to.dx) / 6;
+        }
+
         edges.add(
           _Edge(
             fromId: step.id,
             toId: step.next[i],
-            from: Offset(
-              source.position.dx + _nodeWidth / 2,
-              source.position.dy + _nodeHeight,
-            ),
-            to: Offset(
-              target.position.dx + _nodeWidth / 2,
-              target.position.dy,
-            ),
+            from: from,
+            to: to,
             label: i < step.branchLabels.length ? step.branchLabels[i] : '',
             ghost: source.change == 'removed' ||
                 target.change == 'removed' ||
                 (path != null && !taken),
             taken: taken,
+            bypassX: bypassX,
           ),
         );
       }
     }
 
     final deepest = rows.keys.fold<int>(0, math.max);
+    // A bypass lane can swing wider than the node grid, and a branch label
+    // rides on it — so the surface has to grow to hold them or the detour
+    // gets clipped at the edge of the child.
+    var width = canvasWidth;
+    for (final edge in edges) {
+      if (edge.bypassX == null) continue;
+      width = math.max(width, edge.midpoint.dx + 90);
+    }
     return _Layout(
       nodes: placed.values.toList(),
       edges: edges,
       size: Size(
-        canvasWidth,
+        width,
         _padding * 2 + (deepest + 1) * _nodeHeight + deepest * _vGap,
       ),
     );
@@ -605,11 +667,22 @@ class _EdgePainter extends CustomPainter {
       ..strokeWidth = edge.taken ? 2.4 : 1.6
       ..style = PaintingStyle.stroke
       ..strokeJoin = StrokeJoin.round;
-    final dy = (edge.to.dy - edge.from.dy).abs();
-    final control = math.max(26.0, dy / 2);
-    final path = Path()
-      ..moveTo(edge.from.dx, edge.from.dy)
-      ..cubicTo(
+    final dy = edge.to.dy - edge.from.dy;
+    final path = Path()..moveTo(edge.from.dx, edge.from.dy);
+    if (edge.bypassX case final lane?) {
+      // Both controls on the lane, at a third and two thirds of the drop, so
+      // the curve leaves and rejoins vertically but bulges clear in between.
+      path.cubicTo(
+        lane,
+        edge.from.dy + dy * 0.35,
+        lane,
+        edge.from.dy + dy * 0.65,
+        edge.to.dx,
+        edge.to.dy,
+      );
+    } else {
+      final control = math.max(26.0, dy.abs() / 2);
+      path.cubicTo(
         edge.from.dx,
         edge.from.dy + control,
         edge.to.dx,
@@ -617,6 +690,7 @@ class _EdgePainter extends CustomPainter {
         edge.to.dx,
         edge.to.dy,
       );
+    }
     canvas.drawPath(path, paint);
     // Arrow into the top edge of the target.
     canvas.drawPath(
@@ -640,15 +714,16 @@ class _EdgePainter extends CustomPainter {
           fontWeight: FontWeight.w600,
           color: edge.taken
               ? CumulusColors.accentInk
+              : edge.ghost
+              ? CumulusColors.inkMuted
               : CumulusColors.inkSecondary,
         ),
       ),
       textDirection: TextDirection.ltr,
     )..layout();
-    final mid = Offset(
-      (edge.from.dx + edge.to.dx) / 2,
-      (edge.from.dy + edge.to.dy) / 2,
-    );
+    // On the curve, not on the straight line between the endpoints — a
+    // bypassing edge is nowhere near that line.
+    final mid = edge.midpoint;
     final box = Rect.fromCenter(
       center: mid,
       width: painter.width + 14,
@@ -714,6 +789,10 @@ class _CanvasNode extends StatelessWidget {
         ? CumulusColors.accent
         : inRun == true
         ? CumulusColors.accent.withValues(alpha: 0.55)
+        // Outside the run: the lightest border there is, so the card reads as
+        // one flat muted block rather than an outlined empty one.
+        : inRun == false
+        ? CumulusColors.border
         : added
         ? CumulusColors.success
         : removed
@@ -751,115 +830,127 @@ class _CanvasNode extends StatelessWidget {
           : CumulusColors.inkMuted,
     };
 
-    return Opacity(
-      opacity: removed || excluded ? 0.42 : 1,
-      child: Material(
-        color: CumulusColors.surface,
+    // A step outside this run is muted, not made transparent. Transparency
+    // reads as a rendering fault — half-drawn rather than deliberately off —
+    // and it lets the dotted field show through the card. A flat muted fill
+    // with greyed content recedes just as far and looks intended.
+    final inert = removed || excluded;
+    final surface = inert ? CumulusColors.surfaceMuted : CumulusColors.surface;
+
+    return Material(
+      color: surface,
+      borderRadius: BorderRadius.circular(CumulusRadius.control),
+      child: InkWell(
+        onTap: onTap,
         borderRadius: BorderRadius.circular(CumulusRadius.control),
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(CumulusRadius.control),
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(13, 10, 13, 10),
-            decoration: BoxDecoration(
-              color: CumulusColors.surface,
-              borderRadius: BorderRadius.circular(CumulusRadius.control),
-              border: Border.all(
-                color: borderColor,
-                width: selected ? 2 : (added || removed || modified) ? 1.6 : 1,
-              ),
-              boxShadow: added
-                  ? [
-                      BoxShadow(
-                        color: CumulusColors.success.withValues(alpha: 0.22),
-                        blurRadius: 14,
-                        spreadRadius: 1,
-                      ),
-                    ]
-                  : CumulusShadows.card,
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(13, 10, 13, 10),
+          decoration: BoxDecoration(
+            color: surface,
+            borderRadius: BorderRadius.circular(CumulusRadius.control),
+            border: Border.all(
+              color: borderColor,
+              width: selected ? 2 : (added || removed || modified) ? 1.6 : 1,
             ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      width: 7,
-                      height: 7,
-                      decoration: BoxDecoration(
-                        color: tone.dot,
-                        shape: BoxShape.circle,
-                      ),
+            boxShadow: inert
+                ? const []
+                : added
+                ? [
+                    BoxShadow(
+                      color: CumulusColors.success.withValues(alpha: 0.22),
+                      blurRadius: 14,
+                      spreadRadius: 1,
                     ),
-                    const SizedBox(width: 6),
-                    Text(
-                      step.type.toUpperCase(),
-                      style: TextStyle(
-                        fontSize: 9.5,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 1,
-                        color: tone.foreground,
-                      ),
-                    ),
-                    const Spacer(),
-                    if (badge != null && !removed)
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: tone.background,
-                          borderRadius: BorderRadius.circular(99),
-                        ),
-                        child: Text(
-                          badge,
-                          style: TextStyle(
-                            fontSize: 8,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 0.6,
-                            color: tone.foreground,
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  step.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: CumulusText.mono.copyWith(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    decoration: removed ? TextDecoration.lineThrough : null,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Expanded(
-                  child: Text(
-                    config.isEmpty ? step.summary : config,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 10.5,
-                      color: CumulusColors.inkMuted,
+                  ]
+                : CumulusShadows.card,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 7,
+                    height: 7,
+                    decoration: BoxDecoration(
+                      color: inert ? CumulusColors.inkMuted : tone.dot,
+                      shape: BoxShape.circle,
                     ),
                   ),
-                ),
-                if (note != null)
+                  const SizedBox(width: 6),
                   Text(
-                    note,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                    step.type.toUpperCase(),
                     style: TextStyle(
                       fontSize: 9.5,
-                      fontWeight: FontWeight.w600,
-                      color: noteColor,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1,
+                      color: inert
+                          ? CumulusColors.inkMuted
+                          : tone.foreground,
                     ),
                   ),
-              ],
-            ),
+                  const Spacer(),
+                  // The governed-operation badge is a claim about what this
+                  // step does when it runs. On a step this run never reached
+                  // it is noise, so it is withheld rather than greyed.
+                  if (badge != null && !inert)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: tone.background,
+                        borderRadius: BorderRadius.circular(99),
+                      ),
+                      child: Text(
+                        badge,
+                        style: TextStyle(
+                          fontSize: 8,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.6,
+                          color: tone.foreground,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Text(
+                step.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: CumulusText.mono.copyWith(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: inert ? CumulusColors.inkMuted : CumulusColors.ink,
+                  decoration: removed ? TextDecoration.lineThrough : null,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Expanded(
+                child: Text(
+                  config.isEmpty ? step.summary : config,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 10.5,
+                    color: CumulusColors.inkMuted,
+                  ),
+                ),
+              ),
+              if (note != null)
+                Text(
+                  note,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w600,
+                    color: noteColor,
+                  ),
+                ),
+            ],
           ),
         ),
       ),
