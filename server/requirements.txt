@@ -2,6 +2,12 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 mcp>=2.0
 google-cloud-firestore>=2.16
+# 2.35.0 percent-encodes the "(default)" database id in the gRPC routing
+# header and Firestore rejects it ("Invalid database id %28default%29"),
+# which kills the container at startup. Verified against real Firestore:
+# 2.34.0 works with firestore 2.28.1 and 2.29.0; 2.35.0 fails with both.
+# Lift the cap once a fixed release lands.
+google-api-core<2.35
 pydantic>=2.7
 email-validator>=2.0
 firebase-admin>=6.5
