@@ -187,14 +187,19 @@ def test_golden_set_add_and_remove(client, owner):
     before = client.get(
         "/api/v1/workflows/invoice-intake/golden-set", headers=owner
     ).json()
+    # The set names the repository file its seeded half came from, so the
+    # console never implies it is the only source of golden cases.
+    assert before["synced_from"].endswith("invoice-intake.json")
+    assert before["synced_at"]
+
     added = client.post(
         "/api/v1/workflows/invoice-intake/golden-set",
         json={"name": "Zero-amount invoice", "expected": "rejected · no Action"},
         headers=owner,
     )
     assert added.status_code == 201
-    cases = added.json()
-    assert len(cases) == len(before) + 1
+    cases = added.json()["cases"]
+    assert len(cases) == len(before["cases"]) + 1
     new_case = cases[-1]
     assert new_case["source"] == "human-authored"
 
@@ -202,7 +207,7 @@ def test_golden_set_add_and_remove(client, owner):
         f"/api/v1/workflows/invoice-intake/golden-set/{new_case['id']}", headers=owner
     )
     assert removed.status_code == 200
-    assert len(removed.json()) == len(before)
+    assert len(removed.json()["cases"]) == len(before["cases"])
     assert (
         client.delete(
             "/api/v1/workflows/invoice-intake/golden-set/gc-does-not-exist",
@@ -210,6 +215,161 @@ def test_golden_set_add_and_remove(client, owner):
         ).status_code
         == 404
     )
+
+
+def test_promoting_a_run_tags_the_case_and_keeps_the_pointer(client, owner):
+    run = client.get(
+        "/api/v1/workflows/invoice-intake/runs", params={"limit": 1}, headers=owner
+    ).json()[0]
+    added = client.post(
+        "/api/v1/workflows/invoice-intake/golden-set",
+        json={
+            "name": f"Promoted {run['case_ref']}",
+            "expected": "matches the recorded outcome",
+            "run_id": run["id"],
+            "payload": '{"case_ref": "%s"}' % run["case_ref"],
+        },
+        headers=owner,
+    )
+    assert added.status_code == 201
+    case = added.json()["cases"][-1]
+    # A promoted case is tagged as such and keeps a pointer back to the
+    # execution that motivated it, so a failing eval is traceable.
+    assert case["source"] == "promoted-from-run"
+    assert case["run_id"] == run["id"]
+    assert case["payload"]
+
+
+# ---- versions ----
+
+
+def test_version_history_and_draft(client, owner):
+    versions = client.get(
+        "/api/v1/workflows/invoice-intake/versions", headers=owner
+    ).json()
+    assert [v["version"] for v in versions] == sorted(
+        [v["version"] for v in versions], reverse=True
+    )
+    statuses = {v["status"] for v in versions}
+    assert "active" in statuses and "archived" in statuses and "draft" in statuses
+    assert sum(1 for v in versions if v["status"] == "active") == 1
+    assert sum(1 for v in versions if v["status"] == "draft") == 1
+    # A version is a full snapshot, never a delta.
+    assert all(v["steps"] for v in versions)
+
+    detail = client.get("/api/v1/workflows/invoice-intake", headers=owner).json()
+    assert detail["active_version_label"] == "v14"
+    assert detail["draft_version_label"] == "v15-draft"
+    assert detail["version_count"] == len(versions)
+
+    assert (
+        client.get(
+            "/api/v1/workflows/invoice-intake/versions/999", headers=owner
+        ).status_code
+        == 404
+    )
+
+
+def test_version_diff_marks_added_removed_and_modified(client, owner):
+    # invoice-intake's seeded draft inserts a guard ahead of the model call.
+    diff = client.get(
+        "/api/v1/workflows/invoice-intake/versions/15/diff", headers=owner
+    ).json()
+    by_id = {d["step"]["id"]: d for d in diff}
+    assert by_id["x0"]["change"] == "added"
+    # The trigger now points at the guard rather than the model call.
+    assert by_id["t1"]["change"] == "modified"
+    assert "next" in by_id["t1"]["changed_fields"]
+    assert by_id["a1"]["change"] == "unchanged"
+
+    # contract-review's draft drops the normalizer, which must still appear.
+    ctr = client.get(
+        "/api/v1/workflows/contract-review/versions/7/diff", headers=owner
+    ).json()
+    removed = [d for d in ctr if d["change"] == "removed"]
+    assert [d["step"]["id"] for d in removed] == ["x1"]
+    modified = {d["step"]["id"] for d in ctr if d["change"] == "modified"}
+    assert "m2" in modified  # cheaper second-opinion model
+
+    # An archived version differs from the live one only in governed knowledge.
+    older = client.get(
+        "/api/v1/workflows/invoice-intake/versions/13/diff", headers=owner
+    ).json()
+    changed = [d for d in older if d["change"] == "modified"]
+    assert changed and all(d["changed_fields"] == ["config"] for d in changed)
+
+
+# ---- recommendations ----
+
+
+def test_recommendations_carry_evidence_and_apply_to_a_draft(client, owner):
+    recs = client.get(
+        "/api/v1/workflows/invoice-intake/recommendations", headers=owner
+    ).json()
+    assert recs
+    for rec in recs:
+        assert rec["title"] and rec["detail"] and rec["evidence"]
+    # Sorted by the money at stake.
+    savings = [r["estimated_monthly_savings_usd"] for r in recs]
+    assert savings == sorted(savings, reverse=True)
+
+    downgrade = next((r for r in recs if r["kind"] == "model-downgrade"), None)
+    assert downgrade is not None, recs
+    assert downgrade["proposed_change"]["from"] == "claude-sonnet-5"
+    assert downgrade["proposed_change"]["to"] == "claude-haiku-4-5"
+
+    applied = client.post(
+        f"/api/v1/workflows/invoice-intake/recommendations/{downgrade['id']}/apply",
+        headers=owner,
+    )
+    assert applied.status_code == 200, applied.text
+    draft = applied.json()["draft"]
+    # The change lands in a DRAFT, never in the live version.
+    assert draft["status"] == "draft"
+    step = next(
+        s for s in draft["steps"] if s["id"] == downgrade["proposed_change"]["step_id"]
+    )
+    assert step["config"]["model"] == "claude-haiku-4-5"
+    live = client.get("/api/v1/workflows/invoice-intake", headers=owner).json()
+    active_step = next(
+        s for s in live["steps"] if s["id"] == downgrade["proposed_change"]["step_id"]
+    )
+    assert active_step["config"]["model"] == "claude-sonnet-5"
+
+
+def test_downgrade_is_withheld_while_the_workflow_is_failing(client, owner):
+    """Spending less on something that is not working is not a saving.
+
+    contract-review runs on the most expensive model in the fleet, so it is
+    the obvious downgrade candidate on cost alone — but it completes ~93% of
+    runs, below the bar, so the card is deliberately not offered.
+    """
+    recs = client.get(
+        "/api/v1/workflows/contract-review/recommendations", headers=owner
+    ).json()
+    assert recs  # other insights still surface
+    assert not [r for r in recs if r["kind"] == "model-downgrade"]
+
+
+def test_advisory_recommendation_cannot_be_applied(client, owner):
+    recs = client.get(
+        "/api/v1/workflows/document-embedder/recommendations", headers=owner
+    ).json()
+    advisory = next((r for r in recs if r["proposed_change"] is None), None)
+    assert advisory is not None, recs
+    resp = client.post(
+        f"/api/v1/workflows/document-embedder/recommendations/{advisory['id']}/apply",
+        headers=owner,
+    )
+    assert resp.status_code == 409
+    assert "advisory" in resp.json()["detail"].lower()
+
+
+def test_unknown_recommendation_is_404(client, owner):
+    resp = client.post(
+        "/api/v1/workflows/invoice-intake/recommendations/nope/apply", headers=owner
+    )
+    assert resp.status_code == 404
 
 
 def test_test_run_executes_against_golden_set(client, owner):
@@ -255,6 +415,66 @@ def test_test_run_executes_against_golden_set(client, owner):
             break
         time.sleep(0.05)
     assert rerun["passed"] == run["passed"]
+
+
+def test_test_run_compares_candidate_against_baseline(client, owner):
+    """Every case is graded twice, so the comparison is like-for-like."""
+    launched = client.post(
+        "/api/v1/workflows/contract-review/test-runs",
+        json={"candidate_version": "v7-draft", "baseline_version": "v6"},
+        headers=owner,
+    ).json()
+    run = launched
+    for _ in range(200):
+        run = client.get(
+            f"/api/v1/workflows/contract-review/test-runs/{run['id']}", headers=owner
+        ).json()
+        if run["status"] == "completed":
+            break
+        time.sleep(0.05)
+    assert run["status"] == "completed"
+    for result in run["results"]:
+        assert result["baseline_passed"] is not None
+        assert result["baseline_cost_usd"] > 0
+    assert run["baseline_passed"] == sum(
+        1 for r in run["results"] if r["baseline_passed"]
+    )
+    assert run["cost_delta_usd"] == round(
+        run["cost_usd"] - run["baseline_cost_usd"], 3
+    )
+    # A regression is a case the baseline passed and the candidate did not.
+    assert run["regressions"] == sum(
+        1 for r in run["results"] if r["baseline_passed"] and not r["passed"]
+    )
+
+
+def test_applied_downgrade_shows_up_as_a_cost_saving(client, owner):
+    """The recommender loop has to close: apply, run, see the delta."""
+    recs = client.get(
+        "/api/v1/workflows/invoice-intake/recommendations", headers=owner
+    ).json()
+    downgrade = next(r for r in recs if r["kind"] == "model-downgrade")
+    client.post(
+        f"/api/v1/workflows/invoice-intake/recommendations/{downgrade['id']}/apply",
+        headers=owner,
+    )
+    run = client.post(
+        "/api/v1/workflows/invoice-intake/test-runs", json={}, headers=owner
+    ).json()
+    # Launching with no explicit versions picks up the draft and the live one.
+    assert run["candidate_version"] == "v15-draft"
+    assert run["baseline_version"] == "v14"
+    for _ in range(200):
+        run = client.get(
+            f"/api/v1/workflows/invoice-intake/test-runs/{run['id']}", headers=owner
+        ).json()
+        if run["status"] == "completed":
+            break
+        time.sleep(0.05)
+    assert run["status"] == "completed"
+    # The draft names a cheaper model, so the candidate must cost less.
+    assert run["cost_delta_usd"] < 0
+    assert run["cost_usd"] < run["baseline_cost_usd"]
 
 
 def test_test_run_refused_without_golden_set(client, owner):

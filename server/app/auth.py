@@ -82,6 +82,7 @@ _PATH_LITERALS = frozenset(
         "api", "v1", "assets", "tree", "search", "users", "me", "role",
         "api-keys", "usage", "identities", "teams", "members", "assets",
         "workflows", "stats", "runs", "audit", "golden-set", "test-runs",
+        "versions", "diff", "recommendations", "apply",
         "mcp", "a2a", "health", "healthz", "status", "reindex",
         ".well-known",
         "agent-card.json", "agent.json",

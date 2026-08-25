@@ -410,7 +410,17 @@ gcloud run services logs read cumulus-knowledge --region us-central1 \
 ## Workflows
 
 The **Workflows** nav section is the landing and management page for all
-authored logic in the enterprise, kept deliberately close to DOCTRINE.md:
+authored logic in the enterprise. A fleet page lists every definition; opening
+one gives three views under a shared top bar (title, status, **version
+selector**, pause/test actions):
+
+| Tab | What it holds |
+| --- | --- |
+| **Overview & telemetry** | Metadata and governed ROI assumptions, five KPI tiles, three synchronized daily charts (runs, spend, tokens — one cursor moves all three), and a paginated run table. Clicking a run opens a right-side drawer with its full audit trail: every step, the ModelCall payloads (prompt, raw response, model, tokens, cost), rule verdicts, the deciding human, and gateway ledger refs — plus **Promote to golden set**. |
+| **Workflow canvas** | The declarative export as an interactive DAG — pan, zoom, branch-labelled edges, distinct node types. Selecting a draft in the version selector overlays the diff (green glow added, red removed, amber modified); clicking a node opens the inspector (prompt template, model, threshold logic, output paths). **Export schema** yields the portable JSON. |
+| **Evaluation & optimization** | Golden dataset on the left with its code-sync banner; the test harness top right (candidate vs baseline, **Run suite**); the cost & performance recommender bottom right, each card carrying its evidence and an **Apply to draft version** action. |
+
+It is kept deliberately close to DOCTRINE.md:
 
 - There is **no "Agent" primitive** — the Workflow or DataFlow *is* the agent
   (Lens 2), so the registry manages both kinds side by side: `kind: workflow`
@@ -428,7 +438,18 @@ authored logic in the enterprise, kept deliberately close to DOCTRINE.md:
 - The **golden set** is a knowledge-role Dataset seeded from the correction
   set; the **test harness** grades a candidate version against it with writes
   suppressed — no Action reaches the gateway from a test run, and grading is
-  deterministic per (case, candidate) so evals reproduce.
+  deterministic per (case, candidate) so evals reproduce. Every case is graded
+  against the baseline too, so the comparison is like-for-like and a
+  *regression* (baseline passed, candidate did not) is visible per case.
+- A **version** is a full snapshot of the declarative export, never a delta —
+  a chain of deltas is exactly the opaque artifact the transparency bar rules
+  out. Exactly one version is active; at most one draft is open.
+- The **recommender** derives insights from a definition's own telemetry and
+  carries the evidence on every card. Two rules keep it honest: a model
+  downgrade is proposed one rung at a time, and only when the workflow is
+  already succeeding — spending less on something that is failing is not a
+  saving — and applying a card edits the **draft**, never the live version, so
+  the change has to survive the golden set before it becomes what runs.
 - ROI figures derive from per-definition assumptions (`roi_minutes_per_run`,
   `roi_hourly_rate_usd`) — governed knowledge, editable in the console,
   logged on change.

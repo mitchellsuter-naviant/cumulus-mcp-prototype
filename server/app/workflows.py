@@ -46,8 +46,13 @@ WorkflowStatus = Literal["draft", "active", "paused", "deprecated"]
 # non-model logic (parse, reshape, entity-match) carried as a faithful
 # plain-language description — implementation stays machinery.
 StepType = Literal["trigger", "modelcall", "rule", "task", "action", "event", "transform"]
-GoldenSource = Literal["correction-set", "exemplar", "human-authored"]
+GoldenSource = Literal[
+    "correction-set", "exemplar", "human-authored", "promoted-from-run"
+]
 RunStatus = Literal["completed", "waiting_on_human", "escalated", "failed"]
+VersionStatus = Literal["active", "archived", "draft"]
+# What changed about a step between two versions, for the canvas diff overlay.
+ChangeKind = Literal["unchanged", "added", "removed", "modified"]
 
 _REVIEWERS = ["j.alvarez", "p.okafor", "m.chen", "s.brandt", "d.silva"]
 
@@ -103,6 +108,36 @@ class SeedProfile(BaseModel):
     case_prefix: str = "case"
 
 
+class WorkflowVersion(BaseModel):
+    """One published or drafted revision of a definition.
+
+    A version is a full snapshot of the declarative export, not a delta: the
+    map has to stay readable on its own, and a chain of deltas is exactly the
+    kind of opaque artifact the transparency bar rules out. Snapshots are
+    small (a handful of typed steps), so the cost is nothing.
+    """
+
+    version: int
+    label: str = ""
+    status: VersionStatus = "archived"
+    steps: list[WorkflowStep] = Field(default_factory=list)
+    model_budget_usd_per_run: float = 0.50
+    notes: str = ""
+    authored_by: str = ""
+    created_at: datetime = Field(default_factory=utcnow)
+
+    def display(self) -> str:
+        return self.label or f"v{self.version}"
+
+
+class StepDiff(BaseModel):
+    """One step of a version, annotated against the version compared with."""
+
+    step: WorkflowStep
+    change: ChangeKind = "unchanged"
+    changed_fields: list[str] = Field(default_factory=list)
+
+
 class WorkflowDefinition(BaseModel):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9\-]*$")
     name: str = ""
@@ -124,6 +159,42 @@ class WorkflowDefinition(BaseModel):
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     profile: SeedProfile = Field(default_factory=SeedProfile)
+    # Published history plus at most one open draft. `steps` above stays the
+    # active version's steps, so every existing reader keeps working.
+    versions: list[WorkflowVersion] = Field(default_factory=list)
+
+    def version_history(self) -> list[WorkflowVersion]:
+        """Newest first, with the active version synthesized if absent."""
+        if self.versions:
+            return sorted(self.versions, key=lambda v: v.version, reverse=True)
+        return [
+            WorkflowVersion(
+                version=self.version,
+                label=f"v{self.version}",
+                status="active",
+                steps=self.steps,
+                model_budget_usd_per_run=self.model_budget_usd_per_run,
+                authored_by=self.authored_by,
+                created_at=self.updated_at,
+            )
+        ]
+
+    def find_version(self, version: int) -> WorkflowVersion | None:
+        return next(
+            (v for v in self.version_history() if v.version == version), None
+        )
+
+    def active_version(self) -> WorkflowVersion:
+        history = self.version_history()
+        return next(
+            (v for v in history if v.status == "active"),
+            next((v for v in history if v.status != "draft"), history[0]),
+        )
+
+    def draft_version(self) -> WorkflowVersion | None:
+        return next(
+            (v for v in self.version_history() if v.status == "draft"), None
+        )
 
 
 class GoldenCase(BaseModel):
@@ -134,11 +205,24 @@ class GoldenCase(BaseModel):
     source: GoldenSource = "correction-set"
     added_by: str = ""
     added_at: datetime = Field(default_factory=utcnow)
+    # Set when the case was promoted out of a real run, so a failing eval can
+    # be traced back to the execution that motivated it.
+    run_id: str = ""
+    # Free-form JSON payload when the case was added as one rather than as a
+    # document reference. Stored as text: it is the customer's fixture, and
+    # re-serializing it would quietly change what is being tested.
+    payload: str = ""
 
 
 class GoldenSet(BaseModel):
     workflow_id: str
     cases: list[GoldenCase] = Field(default_factory=list)
+    # Where the seeded half of the set comes from in the repository. The
+    # golden set is governed knowledge that FDEs also author in code, so the
+    # console states which file it was seeded from rather than pretending the
+    # UI is the only source.
+    synced_from: str = ""
+    synced_at: datetime | None = None
 
 
 class TestCaseResult(BaseModel):
@@ -149,6 +233,15 @@ class TestCaseResult(BaseModel):
     actual: str = ""
     cost_usd: float = 0.0
     duration_ms: int = 0
+    # The same case run against the baseline version, so the comparison is
+    # like-for-like rather than candidate-versus-remembered-numbers.
+    baseline_passed: bool | None = None
+    baseline_cost_usd: float = 0.0
+    baseline_duration_ms: int = 0
+
+    @property
+    def regressed(self) -> bool:
+        return self.baseline_passed is True and not self.passed
 
 
 class TestRun(BaseModel):
@@ -164,9 +257,38 @@ class TestRun(BaseModel):
     results: list[TestCaseResult] = Field(default_factory=list)
     passed: int = 0
     cost_usd: float = 0.0
+    baseline_passed: int = 0
+    baseline_cost_usd: float = 0.0
+    # Candidate minus baseline. Negative cost is a saving; negative latency is
+    # faster. Kept as stored fields so a finished run reads the same forever.
+    cost_delta_usd: float = 0.0
+    latency_delta_ms: int = 0
+    regressions: int = 0
     # Doctrinal constant: the harness never commits an Action. Kept on the
     # record so the audit trail states it rather than implying it.
     writes_suppressed: bool = True
+
+
+class Recommendation(BaseModel):
+    """One cost or performance insight derived from execution telemetry.
+
+    Every card carries its evidence and the exact change it proposes, because
+    a recommendation you cannot audit is not usable for governance work — and
+    applying one edits governed knowledge, which is a ledgered act.
+    """
+
+    id: str
+    kind: Literal["model-downgrade", "prompt-cache", "budget", "coverage", "batching"]
+    title: str
+    detail: str
+    evidence: str = ""
+    step_id: str = ""
+    step_name: str = ""
+    estimated_monthly_savings_usd: float = 0.0
+    confidence: float = 0.0
+    # None when the insight is advisory (e.g. "add golden cases") rather than
+    # a mechanical edit the console can stage into a draft.
+    proposed_change: dict[str, str] | None = None
 
 
 # ---- synthesized telemetry shapes (never stored) --------------------------
@@ -193,6 +315,14 @@ class ModelCallRecord(BaseModel):
     output_tokens: int
     cost_usd: float
     duration_ms: int
+    # The governance spine requires a ModelCall to record its inputs and its
+    # captured output, not merely that it happened. These are previews — the
+    # full payloads live with the run journal — but they are what makes an
+    # answer traceable rather than asserted.
+    prompt_preview: str = ""
+    raw_response: str = ""
+    prompt_version: str = ""
+    temperature: float = 0.0
 
 
 class RunStepEvent(BaseModel):
@@ -210,6 +340,9 @@ class RunStepEvent(BaseModel):
     decided_by: str = ""
     suspended_minutes: int = 0
     ledger_ref: str = ""
+    # What went into this step and what came out, for the run drawer.
+    input_preview: str = ""
+    output_preview: str = ""
 
 
 class RunSummary(BaseModel):
@@ -597,6 +730,11 @@ _MODEL_RATES = {
 }
 
 
+def _amount_for(case_ref: str) -> int:
+    """A stable pretend amount for a case, used across payload previews."""
+    return 500 + int(_hex(f"{case_ref}:amount", 5), 16) % 24000
+
+
 def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
     rng = _h(f"{summary.id}:detail")
     steps: list[RunStepEvent] = []
@@ -607,6 +745,8 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
     cost_share = summary.cost_usd / len([s for s in modelcall_steps if s])
     raised = summary.tasks_raised > 0
     stopped = False
+    amount = _amount_for(summary.case_ref)
+    case = summary.case_ref
 
     for step in defn.steps:
         if stopped:
@@ -623,7 +763,15 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
                 RunStepEvent(
                     step_id=step.id, type=step.type, name=step.name,
                     status="completed", at=at, duration_ms=dur,
-                    detail=f"{summary.case_ref} · {step.summary or 'event binding matched'}",
+                    detail=f"{case} · {step.summary or 'event binding matched'}",
+                    input_preview=(
+                        '{\n'
+                        f'  "event": "{step.config.get("event", step.name)}",\n'
+                        f'  "case_ref": "{case}",\n'
+                        f'  "source": "{step.config.get("source", "transport")}"\n'
+                        '}'
+                    ),
+                    output_preview=f'{{ "run_id": "{summary.id}", "accepted": true }}',
                 )
             )
         elif step.type == "modelcall":
@@ -635,11 +783,29 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
             dur = int(rng.uniform(900, 4200))
             tokens_in += cin
             tokens_out += cout
+            prompt_version = step.config.get("prompt", "inline")
+            temperature = float(step.config.get("temperature", "0.0") or 0.0)
+            prompt = (
+                f"[system] {step.summary}\n"
+                f"[prompt {prompt_version}]\n"
+                f"[user] Document for {case}. Return structured fields only."
+            )
+            response = (
+                '{\n'
+                f'  "case_ref": "{case}",\n'
+                f'  "amount_usd": {amount},\n'
+                f'  "confidence": {round(rng.uniform(0.72, 0.99), 2)},\n'
+                '  "fields_extracted": '
+                f'{int(rng.uniform(6, 18))}\n'
+                '}'
+            )
             calls.append(
                 ModelCallRecord(
                     step_id=step.id, step_name=step.name, model=model,
                     input_tokens=cin, output_tokens=cout,
                     cost_usd=round(cost_share, 3), duration_ms=dur,
+                    prompt_preview=prompt, raw_response=response,
+                    prompt_version=prompt_version, temperature=temperature,
                 )
             )
             steps.append(
@@ -650,16 +816,25 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
                         f"{model} · in {cin:,} tok · out {cout:,} tok · "
                         f"${cost_share:.3f} · output captured for audit"
                     ),
+                    input_preview=prompt, output_preview=response,
                 )
             )
         elif step.type == "rule":
             verdict = "review" if raised else "pass"
+            threshold = step.config.get("threshold", "—")
             steps.append(
                 RunStepEvent(
                     step_id=step.id, type=step.type, name=step.name,
                     status="completed", at=at, duration_ms=int(rng.uniform(1, 8)),
                     verdict=verdict,
                     detail=f"pure check · inputs recorded · {step.summary}",
+                    input_preview=(
+                        f'{{ "value": {amount}, "threshold": "{threshold}" }}'
+                    ),
+                    output_preview=(
+                        f'{{ "verdict": "{verdict}", "rule_type": '
+                        f'"{step.config.get("rule_type", "predicate")}" }}'
+                    ),
                 )
             )
         elif step.type == "task":
@@ -679,6 +854,11 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
                         step_id=step.id, type=step.type, name=step.name,
                         status="waiting", at=at, queue=queue,
                         detail="run suspended in place — resumes when the Task resolves",
+                        input_preview=(
+                            f'{{ "queue": "{queue}", "case_ref": "{case}", '
+                            f'"proposed": {amount} }}'
+                        ),
+                        output_preview="(awaiting human judgment)",
                     )
                 )
                 stopped = True
@@ -693,6 +873,17 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
                         "approved with corrections — decision and correction "
                         "appended to the curation ledger; correction set updated"
                     ),
+                    input_preview=(
+                        f'{{ "queue": "{queue}", "case_ref": "{case}", '
+                        f'"proposed": {amount} }}'
+                    ),
+                    output_preview=(
+                        '{\n'
+                        '  "decision": "approved_with_corrections",\n'
+                        f'  "decided_by": "{decider}",\n'
+                        '  "corrections": ["po_number"]\n'
+                        '}'
+                    ),
                 )
             )
             at = at + timedelta(minutes=summary.suspended_minutes)
@@ -705,6 +896,14 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
                         detail=(
                             "target system rejected the write after retries — "
                             "escalated to a human Task with full context; no rollback assumed"
+                        ),
+                        input_preview=(
+                            f'{{ "target": "{step.config.get("target", "system")}", '
+                            f'"case_ref": "{case}" }}'
+                        ),
+                        output_preview=(
+                            '{ "error": "rejected_by_target", "retries": 3, '
+                            '"escalated": true }'
                         ),
                     )
                 )
@@ -720,6 +919,20 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
                         "committed through the Action Gateway — schema, permission "
                         "and status gates passed; stamped originated-by-Cumulus"
                     ),
+                    input_preview=(
+                        '{\n'
+                        f'  "target": "{step.config.get("target", "system")}",\n'
+                        f'  "case_ref": "{case}",\n'
+                        f'  "amount_usd": {amount}\n'
+                        '}'
+                    ),
+                    output_preview=(
+                        '{\n'
+                        f'  "committed": true,\n'
+                        f'  "ledger_ref": "{ledger}",\n'
+                        '  "originated_by": "cumulus"\n'
+                        '}'
+                    ),
                 )
             )
         elif step.type in ("event", "transform"):
@@ -728,6 +941,12 @@ def _run_detail(defn: WorkflowDefinition, summary: RunSummary) -> RunDetail:
                     step_id=step.id, type=step.type, name=step.name,
                     status="completed", at=at, duration_ms=dur,
                     detail=step.summary,
+                    input_preview=f'{{ "case_ref": "{case}" }}',
+                    output_preview=(
+                        f'{{ "event": "{step.config.get("event", step.name)}" }}'
+                        if step.type == "event"
+                        else f'{{ "records": {int(rng.uniform(1, 40))} }}'
+                    ),
                 )
             )
         at = at + timedelta(milliseconds=steps[-1].duration_ms if steps else 50)
@@ -792,6 +1011,241 @@ def audit_entries(defn: WorkflowDefinition, limit: int) -> list[AuditEntry]:
 
 
 # ---------------------------------------------------------------------------
+# Version diffing
+# ---------------------------------------------------------------------------
+
+# Fields whose change is worth surfacing on the canvas. `id` is the identity,
+# so it is deliberately absent: a changed id is an add plus a remove.
+_DIFFABLE = ("type", "name", "summary", "config", "next", "branch_labels")
+
+
+def diff_versions(
+    candidate: WorkflowVersion, baseline: WorkflowVersion
+) -> list[StepDiff]:
+    """Annotate `candidate`'s steps against `baseline`.
+
+    Removed steps are appended at the end carrying the *baseline* step, so the
+    canvas can render a ghost node rather than silently dropping it — "what
+    did this draft delete" is exactly the question a reviewer asks.
+    """
+    base_by_id = {s.id: s for s in baseline.steps}
+    out: list[StepDiff] = []
+    for step in candidate.steps:
+        previous = base_by_id.get(step.id)
+        if previous is None:
+            out.append(StepDiff(step=step, change="added"))
+            continue
+        changed = [
+            field
+            for field in _DIFFABLE
+            if getattr(step, field) != getattr(previous, field)
+        ]
+        out.append(
+            StepDiff(
+                step=step,
+                change="modified" if changed else "unchanged",
+                changed_fields=changed,
+            )
+        )
+    candidate_ids = {s.id for s in candidate.steps}
+    for step in baseline.steps:
+        if step.id not in candidate_ids:
+            out.append(StepDiff(step=step, change="removed"))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Cost & performance recommender
+# ---------------------------------------------------------------------------
+
+# Cheaper substitutes, in descending capability. A downgrade is only ever
+# proposed one rung at a time: two rungs is a different workflow, not a saving.
+_DOWNGRADE_PATH = {
+    "claude-opus-5": "claude-sonnet-5",
+    "claude-fable-5": "claude-sonnet-5",
+    "claude-sonnet-5": "claude-haiku-4-5",
+}
+
+
+def _blended_rate(model: str) -> float:
+    rate_in, rate_out = _MODEL_RATES.get(model, (3.0, 15.0))
+    return rate_in * 0.6 + rate_out * 0.4
+
+
+def recommendations(
+    defn: WorkflowDefinition, usage: list[UsageDay], golden_cases: int
+) -> list[Recommendation]:
+    """Insight cards derived from this definition's own execution telemetry.
+
+    Each card carries the evidence it was derived from, because an
+    unauditable recommendation cannot be acted on safely — and applying one
+    edits governed knowledge, which lands in the ledger.
+    """
+    out: list[Recommendation] = []
+    runs = sum(d.runs for d in usage)
+    completed = sum(d.completed for d in usage)
+    spend = sum(d.cost_usd for d in usage)
+    tasks = sum(d.tasks_raised for d in usage)
+    if runs == 0:
+        return out
+    success = completed / runs
+    model_steps = [s for s in defn.steps if s.type == "modelcall"]
+    per_step_spend = spend / len(model_steps) if model_steps else 0.0
+    days = max(1, len(usage))
+    monthly = 30.0 / days
+
+    for step in model_steps:
+        model = step.config.get("model", "claude-sonnet-5")
+        cheaper = _DOWNGRADE_PATH.get(model)
+        # A downgrade is only defensible when the step is expensive AND the
+        # workflow is currently succeeding with room to spare. Below the bar,
+        # the right move is to fix quality, not to spend less failing.
+        if not cheaper or per_step_spend < 5 or success < 0.97:
+            continue
+        ratio = _blended_rate(cheaper) / _blended_rate(model)
+        savings = per_step_spend * (1 - ratio) * monthly
+        if savings < 1:
+            continue
+        out.append(
+            Recommendation(
+                id=f"{defn.id}:downgrade:{step.id}",
+                kind="model-downgrade",
+                title=f"Downgrade opportunity: {step.name}",
+                detail=(
+                    f"{step.name} runs on {model}. This workflow is completing "
+                    f"{success:.1%} of runs, which leaves headroom to try "
+                    f"{cheaper} on the golden set before promoting it."
+                ),
+                evidence=(
+                    f"{runs:,} runs / {days}d · ${per_step_spend:,.2f} attributed "
+                    f"to this step · success {success:.1%}"
+                ),
+                step_id=step.id,
+                step_name=step.name,
+                estimated_monthly_savings_usd=round(savings, 2),
+                confidence=round(min(0.95, success), 2),
+                proposed_change={
+                    "step_id": step.id,
+                    "field": "model",
+                    "from": model,
+                    "to": cheaper,
+                },
+            )
+        )
+
+    # Prompt caching: a stable system prompt re-sent on every run is the
+    # cheapest win available, and it is invisible unless someone looks at the
+    # input/output token ratio.
+    if model_steps and runs >= 200:
+        step = model_steps[0]
+        tokens = sum(d.tokens for d in usage)
+        if tokens / max(1, runs) > 3000:
+            savings = spend * 0.25 * monthly
+            out.append(
+                Recommendation(
+                    id=f"{defn.id}:cache:{step.id}",
+                    kind="prompt-cache",
+                    title=f"Cache the standing prompt on {step.name}",
+                    detail=(
+                        "Input tokens dominate this definition's spend and the "
+                        "system prompt is identical across runs, so the stable "
+                        "prefix can be cached rather than re-sent."
+                    ),
+                    evidence=(
+                        f"{tokens / max(1, runs):,.0f} tokens per run across "
+                        f"{runs:,} runs · ${spend:,.2f} in {days}d"
+                    ),
+                    step_id=step.id,
+                    step_name=step.name,
+                    estimated_monthly_savings_usd=round(savings, 2),
+                    confidence=0.6,
+                    proposed_change={
+                        "step_id": step.id,
+                        "field": "cache",
+                        "from": step.config.get("cache", "off"),
+                        "to": "prefix",
+                    },
+                )
+            )
+
+    # Budget drift: the per-run cap is governed knowledge, so a systematic
+    # breach is a decision someone owes, not a number to quietly raise.
+    cost_per_run = spend / runs
+    if defn.model_budget_usd_per_run and cost_per_run > defn.model_budget_usd_per_run:
+        out.append(
+            Recommendation(
+                id=f"{defn.id}:budget",
+                kind="budget",
+                title="Runs are exceeding their model budget",
+                detail=(
+                    f"Average spend is ${cost_per_run:.2f} per run against a "
+                    f"${defn.model_budget_usd_per_run:.2f} cap. Either the cap is "
+                    "stale or the pipeline has grown — both are decisions, so "
+                    "this one is not applied automatically."
+                ),
+                evidence=(
+                    f"${spend:,.2f} over {runs:,} runs in {days}d "
+                    f"= ${cost_per_run:.2f}/run"
+                ),
+                confidence=0.9,
+            )
+        )
+
+    # Coverage: a thin golden set makes every other recommendation unsafe to
+    # accept, so it is surfaced as an insight rather than left implicit.
+    if golden_cases < 8:
+        out.append(
+            Recommendation(
+                id=f"{defn.id}:coverage",
+                kind="coverage",
+                title="Golden set is thin for this much traffic",
+                detail=(
+                    f"{golden_cases} cases cover {runs:,} runs. Promote recent "
+                    "runs — especially ones a human corrected — so a candidate "
+                    "version can be graded on cases that actually occur."
+                ),
+                evidence=(
+                    f"{golden_cases} golden cases · {tasks:,} human decisions "
+                    f"available to promote in {days}d"
+                ),
+                confidence=0.75,
+            )
+        )
+
+    # Batching: a DataFlow paying per-record model costs is the doctrine's
+    # named anti-pattern (bulk work must not run one-model-call-per-record).
+    if defn.kind == "dataflow" and model_steps and runs > 300:
+        savings = spend * 0.35 * monthly
+        step = model_steps[0]
+        out.append(
+            Recommendation(
+                id=f"{defn.id}:batch:{step.id}",
+                kind="batching",
+                title=f"Widen the window on {step.name}",
+                detail=(
+                    "This DataFlow invokes a model on a narrow window. A wider "
+                    "window amortizes the standing prompt across more records "
+                    "and cuts the per-record share."
+                ),
+                evidence=f"{runs:,} windowed runs in {days}d · ${spend:,.2f}",
+                step_id=step.id,
+                step_name=step.name,
+                estimated_monthly_savings_usd=round(savings, 2),
+                confidence=0.55,
+                proposed_change={
+                    "step_id": step.id,
+                    "field": "window",
+                    "from": step.config.get("window", "2h"),
+                    "to": "6h",
+                },
+            )
+        )
+
+    out.sort(key=lambda r: r.estimated_monthly_savings_usd, reverse=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
 
@@ -836,6 +1290,121 @@ class WorkflowService:
         self.workflows.delete(workflow_id)
         self.golden_sets.delete(workflow_id)
 
+    # ---- versions ----
+
+    def versions(self, workflow_id: str) -> list[WorkflowVersion]:
+        return self.require(workflow_id).version_history()
+
+    def version(self, workflow_id: str, version: int) -> WorkflowVersion | None:
+        return self.require(workflow_id).find_version(version)
+
+    def version_by_label(self, workflow_id: str, label: str) -> WorkflowVersion | None:
+        return next(
+            (v for v in self.versions(workflow_id) if v.display() == label), None
+        )
+
+    def diff(
+        self, workflow_id: str, version: int, against: int | None
+    ) -> list[StepDiff]:
+        defn = self.require(workflow_id)
+        candidate = defn.find_version(version)
+        if candidate is None:
+            raise ValueError(f"Version not found: v{version}")
+        baseline = (
+            defn.find_version(against) if against is not None else defn.active_version()
+        )
+        if baseline is None:
+            raise ValueError(f"Version not found: v{against}")
+        return diff_versions(candidate, baseline)
+
+    def _ensure_draft(
+        self, defn: WorkflowDefinition, authored_by: str
+    ) -> tuple[WorkflowDefinition, WorkflowVersion]:
+        """Open a draft off the active version, or return the existing one.
+
+        A change is never applied to the live version: the point of a draft is
+        that a candidate is graded against the golden set before it becomes
+        the thing running in production.
+        """
+        existing = defn.draft_version()
+        if existing is not None:
+            return defn, existing
+        active = defn.active_version()
+        draft = WorkflowVersion(
+            version=active.version + 1,
+            label=f"v{active.version + 1}-draft",
+            status="draft",
+            steps=[s.model_copy(deep=True) for s in active.steps],
+            model_budget_usd_per_run=defn.model_budget_usd_per_run,
+            notes="Opened from the console.",
+            authored_by=authored_by,
+        )
+        history = defn.version_history()
+        return defn.model_copy(update={"versions": history + [draft]}), draft
+
+    def apply_recommendation(
+        self, workflow_id: str, rec: Recommendation, actor: str
+    ) -> tuple[WorkflowDefinition, WorkflowVersion]:
+        """Stage a recommendation's change into the draft version.
+
+        Advisory cards (no `proposed_change`) are refused rather than
+        silently no-oping: "applied" must mean something changed.
+        """
+        if not rec.proposed_change:
+            raise ValueError(
+                "This insight is advisory — there is no mechanical change to apply."
+            )
+        defn = self.require(workflow_id)
+        defn, draft = self._ensure_draft(defn, actor)
+        change = rec.proposed_change
+        step_id = change.get("step_id", "")
+        field = change.get("field", "")
+        target = change.get("to", "")
+        steps = []
+        touched = False
+        for step in draft.steps:
+            if step.id != step_id:
+                steps.append(step)
+                continue
+            config = dict(step.config)
+            config[field] = target
+            steps.append(step.model_copy(update={"config": config}))
+            touched = True
+        if not touched:
+            raise ValueError(f"Step not found in the draft: {step_id}")
+        note = (
+            f"{rec.title} — set {field} to {target} on {step_id} "
+            f"(applied by {actor})."
+        )
+        updated_draft = draft.model_copy(
+            update={
+                "steps": steps,
+                "notes": (draft.notes + " " + note).strip(),
+                "authored_by": actor,
+            }
+        )
+        versions = [
+            updated_draft if v.version == draft.version else v
+            for v in defn.version_history()
+        ]
+        saved = self.update(defn.model_copy(update={"versions": versions}))
+        log.info(
+            "Recommendation applied to draft",
+            extra={
+                "workflowId": workflow_id,
+                "recommendationId": rec.id,
+                "draft": updated_draft.display(),
+                "actor": actor,
+            },
+        )
+        return saved, updated_draft
+
+    def recommendations(self, workflow_id: str, days: int = 30) -> list[Recommendation]:
+        defn = self.require(workflow_id)
+        return recommendations(
+            defn, usage_series(defn, days), len(self.golden_set(workflow_id).cases)
+        )
+
     # ---- golden set ----
 
     def golden_set(self, workflow_id: str) -> GoldenSet:
@@ -871,11 +1440,15 @@ class WorkflowService:
             raise ValueError(
                 "No golden set: add cases before launching a test run."
             )
+        draft = defn.draft_version()
         run = TestRun(
             id="test_" + _hex(f"{workflow_id}:{time.time_ns()}", 10),
             workflow_id=workflow_id,
-            candidate_version=candidate_version or f"v{defn.version + 1}-draft",
-            baseline_version=baseline_version or f"v{defn.version}",
+            candidate_version=(
+                candidate_version
+                or (draft.display() if draft else f"v{defn.version + 1}-draft")
+            ),
+            baseline_version=baseline_version or defn.active_version().display(),
             launched_by=launched_by,
             total_cases=len(golden.cases),
         )
@@ -889,25 +1462,79 @@ class WorkflowService:
         thread.start()
         return run
 
+    def _version_cost_factor(self, defn: WorkflowDefinition, label: str) -> float:
+        """How this version's model choices scale cost, relative to the active one.
+
+        This is what makes the recommender loop honest end to end: apply a
+        downgrade to the draft, run the suite, and the cost delta reflects the
+        models the draft actually names rather than a hard-coded discount.
+        """
+        version = next(
+            (v for v in defn.version_history() if v.display() == label), None
+        )
+        if version is None:
+            return 1.0
+        active = defn.active_version()
+
+        def weight(steps: list[WorkflowStep]) -> float:
+            rates = [
+                _blended_rate(s.config.get("model", "claude-sonnet-5"))
+                for s in steps
+                if s.type == "modelcall"
+            ]
+            return sum(rates) if rates else 0.0
+
+        base = weight(active.steps)
+        if base <= 0:
+            return 1.0
+        return weight(version.steps) / base
+
+    def _grade(
+        self, defn: WorkflowDefinition, case: GoldenCase, version: str, factor: float
+    ) -> tuple[bool, float, int]:
+        """Deterministic verdict for one (case, version) pair.
+
+        Keyed by version, so the same candidate always reproduces the same
+        result — the property any eval worth trusting has to have — while a
+        different candidate genuinely can diverge.
+        """
+        rng = _h(f"{defn.id}:{case.id}:{version}")
+        base = {
+            "correction-set": 0.94,
+            "exemplar": 0.84,
+            "human-authored": 0.90,
+            "promoted-from-run": 0.92,
+        }
+        passed = rng.random() < base.get(case.source, 0.9)
+        cost = round(defn.profile.cost_per_run * rng.uniform(0.5, 1.1) * factor, 3)
+        # A cheaper model is also a faster one, roughly; enough to make the
+        # latency column move in the direction the cost column moves.
+        duration = int(rng.uniform(1200, 6500) * (0.75 + 0.25 * factor))
+        return passed, cost, duration
+
     def _execute_test_run(
         self, test_id: str, defn: WorkflowDefinition, cases: list[GoldenCase]
     ) -> None:
         """Simulated harness execution: case-by-case, writes suppressed.
 
-        Grading is deterministic per (case, candidate version) so re-running
-        the same candidate reproduces the same result — which is also what a
-        real eval against pinned inputs should do.
+        Each case is graded against BOTH the candidate and the baseline, so
+        the comparison is like-for-like rather than candidate-versus-
+        remembered-numbers, and a regression is visible per case.
         """
         run = self.test_runs.get(test_id)
         if run is None:
             return
         try:
+            candidate_factor = self._version_cost_factor(defn, run.candidate_version)
+            baseline_factor = self._version_cost_factor(defn, run.baseline_version)
             for case in cases:
                 time.sleep(self.test_seconds_per_case)
-                rng = _h(f"{defn.id}:{case.id}:{run.candidate_version}")
-                base = {"correction-set": 0.94, "exemplar": 0.84, "human-authored": 0.90}
-                passed = rng.random() < base.get(case.source, 0.9)
-                cost = round(defn.profile.cost_per_run * rng.uniform(0.5, 1.1), 3)
+                passed, cost, duration = self._grade(
+                    defn, case, run.candidate_version, candidate_factor
+                )
+                base_passed, base_cost, base_duration = self._grade(
+                    defn, case, run.baseline_version, baseline_factor
+                )
                 run.results.append(
                     TestCaseResult(
                         case_id=case.id,
@@ -922,11 +1549,25 @@ class WorkflowService:
                             )
                         ),
                         cost_usd=cost,
-                        duration_ms=int(rng.uniform(1200, 6500)),
+                        duration_ms=duration,
+                        baseline_passed=base_passed,
+                        baseline_cost_usd=base_cost,
+                        baseline_duration_ms=base_duration,
                     )
                 )
                 run.passed = sum(1 for r in run.results if r.passed)
-                run.cost_usd = round(sum(r.cost_usd for r in run.results), 2)
+                run.baseline_passed = sum(1 for r in run.results if r.baseline_passed)
+                run.cost_usd = round(sum(r.cost_usd for r in run.results), 3)
+                run.baseline_cost_usd = round(
+                    sum(r.baseline_cost_usd for r in run.results), 3
+                )
+                run.cost_delta_usd = round(run.cost_usd - run.baseline_cost_usd, 3)
+                run.regressions = sum(1 for r in run.results if r.regressed)
+                done = len(run.results)
+                run.latency_delta_ms = int(
+                    sum(r.duration_ms - r.baseline_duration_ms for r in run.results)
+                    / max(1, done)
+                )
                 self.test_runs.put(run)
             run.status = "completed"
             run.finished_at = utcnow()
@@ -936,6 +1577,9 @@ class WorkflowService:
                 extra={
                     "workflowId": defn.id, "testId": run.id,
                     "passed": run.passed, "total": run.total_cases,
+                    "baselinePassed": run.baseline_passed,
+                    "regressions": run.regressions,
+                    "costDelta": run.cost_delta_usd,
                 },
             )
         except Exception:
@@ -1384,6 +2028,109 @@ def _seed_golden_cases(workflow_id: str) -> list[GoldenCase]:
     ]
 
 
+# Definitions that seed an open draft, and how that draft differs from the
+# active version. Enough to exercise every diff indicator on the canvas:
+# a modified node, an added node, and a removed one.
+_SEED_DRAFTS: dict[str, str] = {
+    "invoice-intake": "add-duplicate-check",
+    "contract-review": "cheaper-risk-review",
+}
+
+
+def _seed_version_history(defn: WorkflowDefinition) -> list[WorkflowVersion]:
+    """Two archived revisions, the active one, and sometimes an open draft."""
+    active_steps = [s.model_copy(deep=True) for s in defn.steps]
+    versions: list[WorkflowVersion] = []
+
+    # Archived revisions differ only in their governed knowledge (an older
+    # prompt), which is the most common real edit and keeps the diff legible.
+    for back in (2, 1):
+        older = []
+        for step in active_steps:
+            copy = step.model_copy(deep=True)
+            if copy.type == "modelcall" and "prompt" in copy.config:
+                name, _, revision = copy.config["prompt"].rpartition(" v")
+                if revision.isdigit():
+                    config = dict(copy.config)
+                    config["prompt"] = f"{name} v{max(1, int(revision) - back)}"
+                    copy = copy.model_copy(update={"config": config})
+            older.append(copy)
+        versions.append(
+            WorkflowVersion(
+                version=defn.version - back,
+                label=f"v{defn.version - back}",
+                status="archived",
+                steps=older,
+                model_budget_usd_per_run=defn.model_budget_usd_per_run,
+                notes="Superseded.",
+                authored_by=defn.authored_by,
+                created_at=defn.updated_at - timedelta(days=30 * back),
+            )
+        )
+
+    versions.append(
+        WorkflowVersion(
+            version=defn.version,
+            label=f"v{defn.version}",
+            status="active",
+            steps=active_steps,
+            model_budget_usd_per_run=defn.model_budget_usd_per_run,
+            notes="Live.",
+            authored_by=defn.authored_by,
+            created_at=defn.updated_at,
+        )
+    )
+
+    recipe = _SEED_DRAFTS.get(defn.id)
+    if recipe is None:
+        return versions
+
+    draft_steps = [s.model_copy(deep=True) for s in active_steps]
+    if recipe == "add-duplicate-check":
+        # A new deterministic guard in front of the model call, so the trigger
+        # is modified (its `next` moves) and the guard itself is added.
+        draft_steps = [
+            s.model_copy(update={"next": ["x0"]}) if s.id == "t1" else s
+            for s in draft_steps
+        ]
+        guard = WorkflowStep(
+            id="x0", type="transform", name="duplicate-check",
+            summary="rejects an invoice already posted, before any model runs",
+            config={"language": "python"}, next=["m1"],
+        )
+        draft_steps.insert(1, guard)
+        notes = "Adds a deterministic duplicate guard ahead of extraction."
+    else:
+        # Swap the second-opinion model for a cheaper one and drop the
+        # normalizer that the extraction step now does inline.
+        draft_steps = [
+            s.model_copy(update={"config": {**s.config, "model": "claude-sonnet-5"}})
+            if s.id == "m2"
+            else s
+            for s in draft_steps
+        ]
+        draft_steps = [
+            s.model_copy(update={"next": ["m2"]}) if s.id == "m1" else s
+            for s in draft_steps
+            if s.id != "x1"
+        ]
+        notes = "Cheaper second-opinion model; normalizer folded into extraction."
+
+    versions.append(
+        WorkflowVersion(
+            version=defn.version + 1,
+            label=f"v{defn.version + 1}-draft",
+            status="draft",
+            steps=draft_steps,
+            model_budget_usd_per_run=defn.model_budget_usd_per_run,
+            notes=notes,
+            authored_by=defn.authored_by,
+            created_at=utcnow() - timedelta(days=2),
+        )
+    )
+    return versions
+
+
 def seed_workflows_if_empty(service: WorkflowService) -> int:
     """Register the demo fleet when the registry is empty. Idempotent."""
     if service.list():
@@ -1391,10 +2138,22 @@ def seed_workflows_if_empty(service: WorkflowService) -> int:
     created = 0
     for defn in _seed_definitions():
         try:
-            service.create(defn)
+            service.create(
+                defn.model_copy(update={"versions": _seed_version_history(defn)})
+            )
             cases = _seed_golden_cases(defn.id)
             if cases:
-                service.golden_sets.put(GoldenSet(workflow_id=defn.id, cases=cases))
+                service.golden_sets.put(
+                    GoldenSet(
+                        workflow_id=defn.id,
+                        cases=cases,
+                        # FDEs author golden cases in code as well as in the
+                        # console; naming the file keeps the console honest
+                        # about not being the only source.
+                        synced_from=f"server/tests/golden/{defn.id}.json",
+                        synced_at=utcnow() - timedelta(hours=2),
+                    )
+                )
             created += 1
         except WorkflowExistsError:
             continue

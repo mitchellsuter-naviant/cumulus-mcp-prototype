@@ -18,8 +18,10 @@ from .workflows import (
     AuditEntry,
     GoldenCase,
     GoldenSource,
+    Recommendation,
     RunDetail,
     RunSummary,
+    StepDiff,
     TestRun,
     UsageDay,
     WorkflowDefinition,
@@ -28,6 +30,7 @@ from .workflows import (
     WorkflowNotFoundError,
     WorkflowStatus,
     WorkflowStep,
+    WorkflowVersion,
     audit_entries,
     find_run,
     open_tasks,
@@ -72,6 +75,10 @@ class WorkflowDetailPublic(WorkflowSummaryPublic):
     authored_by: str = ""
     created_at: str = ""
     golden_cases: int = 0
+    # What the version selector needs without a second round trip.
+    active_version_label: str = ""
+    draft_version_label: str = ""
+    version_count: int = 0
 
 
 class FleetSeriesDay(BaseModel):
@@ -137,6 +144,25 @@ class GoldenCaseCreate(BaseModel):
     input_ref: str = Field(default="", max_length=200)
     expected: str = Field(default="", max_length=600)
     source: GoldenSource = "human-authored"
+    # Set when promoting a real execution: the case keeps a pointer back to
+    # the run that motivated it, so a failing eval is traceable.
+    run_id: str = Field(default="", max_length=80)
+    # A JSON fixture pasted or uploaded from the console. Held verbatim —
+    # re-serializing would quietly change what is under test.
+    payload: str = Field(default="", max_length=20000)
+
+
+class GoldenSetPublic(BaseModel):
+    workflow_id: str
+    cases: list[GoldenCase] = Field(default_factory=list)
+    synced_from: str = ""
+    synced_at: str = ""
+
+
+class AppliedRecommendation(BaseModel):
+    recommendation_id: str
+    draft: WorkflowVersion
+    summary: str
 
 
 class TestRunLaunch(BaseModel):
@@ -200,6 +226,7 @@ def _rollup(defn: WorkflowDefinition) -> WorkflowSummaryPublic:
 
 def _detail(defn: WorkflowDefinition, golden_cases: int) -> WorkflowDetailPublic:
     base = _rollup(defn)
+    draft = defn.draft_version()
     return WorkflowDetailPublic(
         **base.model_dump(),
         steps=defn.steps,
@@ -211,6 +238,9 @@ def _detail(defn: WorkflowDefinition, golden_cases: int) -> WorkflowDetailPublic
         authored_by=defn.authored_by,
         created_at=defn.created_at.isoformat(),
         golden_cases=golden_cases,
+        active_version_label=defn.active_version().display(),
+        draft_version_label=draft.display() if draft else "",
+        version_count=len(defn.version_history()),
     )
 
 
@@ -463,36 +493,160 @@ def workflow_audit(
     return audit_entries(_get_or_404(workflow_id), limit)
 
 
+# ---- versions --------------------------------------------------------------
+
+
+@router.get("/{workflow_id}/versions", response_model=list[WorkflowVersion])
+def workflow_versions(
+    workflow_id: str, principal: Principal = Depends(get_principal)
+) -> list[WorkflowVersion]:
+    """Published history plus any open draft, newest first."""
+    require_reader(principal)
+    _get_or_404(workflow_id)
+    return get_workflow_service().versions(workflow_id)
+
+
+@router.get("/{workflow_id}/versions/{version}", response_model=WorkflowVersion)
+def workflow_version(
+    workflow_id: str, version: int, principal: Principal = Depends(get_principal)
+) -> WorkflowVersion:
+    require_reader(principal)
+    _get_or_404(workflow_id)
+    found = get_workflow_service().version(workflow_id, version)
+    if found is None:
+        raise HTTPException(status_code=404, detail=f"Version not found: v{version}")
+    return found
+
+
+@router.get("/{workflow_id}/versions/{version}/diff", response_model=list[StepDiff])
+def workflow_version_diff(
+    workflow_id: str,
+    version: int,
+    against: int | None = Query(
+        default=None,
+        description="Version to compare with. Defaults to the active version.",
+    ),
+    principal: Principal = Depends(get_principal),
+) -> list[StepDiff]:
+    """Steps of `version`, annotated added / removed / modified.
+
+    Removed steps are returned last carrying the *baseline* step, so the
+    canvas can show what a draft deletes rather than silently dropping it.
+    """
+    require_reader(principal)
+    _get_or_404(workflow_id)
+    try:
+        return get_workflow_service().diff(workflow_id, version, against)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ---- recommendations -------------------------------------------------------
+
+
+@router.get("/{workflow_id}/recommendations", response_model=list[Recommendation])
+def workflow_recommendations(
+    workflow_id: str,
+    days: int = Query(default=30, ge=7, le=365),
+    principal: Principal = Depends(get_principal),
+) -> list[Recommendation]:
+    """Cost and performance insights derived from this definition's telemetry."""
+    require_reader(principal)
+    _get_or_404(workflow_id)
+    return get_workflow_service().recommendations(workflow_id, days)
+
+
+@router.post(
+    "/{workflow_id}/recommendations/{recommendation_id}/apply",
+    response_model=AppliedRecommendation,
+)
+def apply_recommendation(
+    workflow_id: str,
+    recommendation_id: str,
+    principal: Principal = Depends(get_principal),
+) -> AppliedRecommendation:
+    """Stage a recommendation into the draft version — never into the live one.
+
+    Applying edits governed knowledge, so it is admin-gated, human-only, and
+    logged. The change lands in a draft precisely so it has to survive the
+    golden set before it becomes what runs.
+    """
+    require_role(principal, "admin")
+    _require_human(principal)
+    _get_or_404(workflow_id)
+    service = get_workflow_service()
+    rec = next(
+        (r for r in service.recommendations(workflow_id) if r.id == recommendation_id),
+        None,
+    )
+    if rec is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Recommendation not found — insights are derived from live "
+                "telemetry and may no longer apply."
+            ),
+        )
+    try:
+        _, draft = service.apply_recommendation(
+            workflow_id, rec, principal.email or principal.uid
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    change = rec.proposed_change or {}
+    return AppliedRecommendation(
+        recommendation_id=rec.id,
+        draft=draft,
+        summary=(
+            f"{change.get('field', 'setting')} on {rec.step_name or change.get('step_id', '')} "
+            f"set to {change.get('to', '')} in {draft.display()}"
+        ),
+    )
+
+
 # ---- golden set ------------------------------------------------------------
 
 
-@router.get("/{workflow_id}/golden-set", response_model=list[GoldenCase])
+@router.get("/{workflow_id}/golden-set", response_model=GoldenSetPublic)
 def golden_set(
     workflow_id: str, principal: Principal = Depends(get_principal)
-) -> list[GoldenCase]:
+) -> GoldenSetPublic:
     require_reader(principal)
     _get_or_404(workflow_id)
-    return get_workflow_service().golden_set(workflow_id).cases
+    golden = get_workflow_service().golden_set(workflow_id)
+    return GoldenSetPublic(
+        workflow_id=workflow_id,
+        cases=golden.cases,
+        synced_from=golden.synced_from,
+        synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
+    )
 
 
-@router.post("/{workflow_id}/golden-set", response_model=list[GoldenCase], status_code=201)
+@router.post("/{workflow_id}/golden-set", response_model=GoldenSetPublic, status_code=201)
 def add_golden_case(
     workflow_id: str,
     payload: GoldenCaseCreate,
     principal: Principal = Depends(get_principal),
-) -> list[GoldenCase]:
+) -> GoldenSetPublic:
     require_role(principal, "admin")
     _require_human(principal)
     _get_or_404(workflow_id)
     service = get_workflow_service()
     existing = service.golden_set(workflow_id).cases
+    # Promoting a run is the flywheel in miniature: the execution that needed
+    # judgment becomes the case that guards against needing it again.
+    source = payload.source
+    if payload.run_id and source == "human-authored":
+        source = "promoted-from-run"
     case = GoldenCase(
         id=f"gc-{len(existing) + 1:03d}-{utcnow().strftime('%H%M%S')}",
         name=payload.name,
         input_ref=payload.input_ref,
         expected=payload.expected,
-        source=payload.source,
+        source=source,
         added_by=principal.email or principal.uid,
+        run_id=payload.run_id,
+        payload=payload.payload,
     )
     try:
         golden = service.add_golden_case(workflow_id, case)
@@ -500,15 +654,26 @@ def add_golden_case(
         raise HTTPException(status_code=409, detail=str(exc))
     log.info(
         "Golden case added",
-        extra={"workflowId": workflow_id, "caseId": case.id, "actor": principal.uid},
+        extra={
+            "workflowId": workflow_id,
+            "caseId": case.id,
+            "source": source,
+            "runId": payload.run_id,
+            "actor": principal.uid,
+        },
     )
-    return golden.cases
+    return GoldenSetPublic(
+        workflow_id=workflow_id,
+        cases=golden.cases,
+        synced_from=golden.synced_from,
+        synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
+    )
 
 
-@router.delete("/{workflow_id}/golden-set/{case_id}", response_model=list[GoldenCase])
+@router.delete("/{workflow_id}/golden-set/{case_id}", response_model=GoldenSetPublic)
 def remove_golden_case(
     workflow_id: str, case_id: str, principal: Principal = Depends(get_principal)
-) -> list[GoldenCase]:
+) -> GoldenSetPublic:
     require_role(principal, "admin")
     _require_human(principal)
     _get_or_404(workflow_id)
@@ -520,7 +685,12 @@ def remove_golden_case(
         "Golden case removed",
         extra={"workflowId": workflow_id, "caseId": case_id, "actor": principal.uid},
     )
-    return golden.cases
+    return GoldenSetPublic(
+        workflow_id=workflow_id,
+        cases=golden.cases,
+        synced_from=golden.synced_from,
+        synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
+    )
 
 
 # ---- test harness ----------------------------------------------------------
