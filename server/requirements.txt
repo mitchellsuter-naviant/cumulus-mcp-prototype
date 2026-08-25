@@ -1,0 +1,15 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+mcp>=2.0
+google-cloud-firestore>=2.16
+pydantic>=2.7
+email-validator>=2.0
+firebase-admin>=6.5
+# Cosine scoring over the whole corpus per query; a Python loop over thousands
+# of 768-dim vectors is ~100x slower and would show up in search latency.
+numpy>=1.26
+# Vertex AI embeddings. Only imported when EMBEDDING_BACKEND=vertex, but it
+# ships in the image so the backend can be switched with an env var alone.
+# This is the current client: the vertexai.language_models path is deprecated
+# and past its stated removal date.
+google-genai>=2.19

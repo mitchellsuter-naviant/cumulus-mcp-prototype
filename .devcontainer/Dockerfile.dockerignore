@@ -1,0 +1,5 @@
+# BuildKit reads this in preference to a root .dockerignore for this Dockerfile.
+# The image COPYs nothing from the repo (sources arrive via the workspace bind
+# mount), so exclude everything and keep the build context near-empty instead
+# of shipping build/ and .dart_tool/ to the daemon on every rebuild.
+*

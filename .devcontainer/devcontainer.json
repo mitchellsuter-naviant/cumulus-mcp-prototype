@@ -1,0 +1,121 @@
+// =============================================================================
+// Cumulus MCP Prototype — Dev Container
+//
+// One container for the whole prototype:
+//   - Flutter *web* admin app in admin_app/ (pinned SDK, Chromium,
+//     Firebase + FlutterFire CLIs), deployed to Firebase Hosting
+//   - Python FastAPI server in server/ (venv at server/.venv) exposing REST,
+//     MCP (Streamable HTTP), and A2A front doors; deployed to Cloud Run
+//
+// GCP project: cumulus-mcp-prototype (set below via CLOUDSDK_CORE_PROJECT —
+// no `gcloud config set` needed, and the host's gcloud config is not mutated).
+//
+// Host prerequisites: Docker Desktop, the VS Code "Dev Containers" extension,
+// and gcloud auth on the HOST (credentials are bind-mounted in):
+//   gcloud auth login
+//   gcloud auth application-default login
+//
+// Day-to-day commands inside the container:
+//   cd admin_app && flutter run -d web-server --web-port 3000   # → localhost:3000
+//   cd server && .venv/bin/uvicorn app.main:app --port 8080     # API on :8080
+//   ./deploy/deploy.sh cumulus-mcp-prototype                    # full deploy
+// =============================================================================
+{
+    "name": "Cumulus MCP Prototype",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "features": {
+        // `gh` for pull requests and releases from inside the container.
+        "ghcr.io/devcontainers/features/github-cli:1": {}
+    },
+    "mounts": [
+        // Host gcloud config, so ADC and `gcloud` work without re-auth.
+        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.config/gcloud,target=/root/.config/gcloud,type=bind",
+        // Persist Claude Code state (sessions, memory, login) across rebuilds.
+        "source=cumulus-mcp-prototype-claude,target=/root/.claude,type=volume",
+        // Keep `firebase login` credentials across rebuilds.
+        "source=cumulus-mcp-prototype-configstore,target=/root/.config/configstore,type=volume",
+        // Cache pub packages; seeded from the image so the FlutterFire CLI survives.
+        "source=cumulus-mcp-prototype-pub-cache,target=/root/.pub-cache,type=volume"
+    ],
+    "containerEnv": {
+        "CLAUDE_CONFIG_DIR": "/root/.claude",
+        "GOOGLE_CLOUD_PROJECT": "cumulus-mcp-prototype",
+        "CLOUDSDK_CORE_PROJECT": "cumulus-mcp-prototype",
+        // Firebase CLI authenticates off the bind-mounted ADC credential; the
+        // firebase.googleapis.com API rejects user ADC without a quota project.
+        "GOOGLE_CLOUD_QUOTA_PROJECT": "cumulus-mcp-prototype"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "Dart-Code.dart-code",
+                "Dart-Code.flutter",
+                "ms-python.python",
+                "ms-python.debugpy",
+                "ms-python.vscode-pylance",
+                "ms-python.black-formatter",
+                "anthropic.claude-code",
+                "GitHub.copilot",
+                "redhat.vscode-yaml"
+            ],
+            "settings": {
+                "dart.flutterSdkPath": "/usr/local/flutter",
+                // `-d chrome` can't open a window from inside the container;
+                // web-server + the host browser is the workflow.
+                "dart.flutterRunAdditionalArgs": [
+                    "-d",
+                    "web-server",
+                    "--web-port",
+                    "3000",
+                    "--web-hostname",
+                    "0.0.0.0"
+                ],
+                "python.defaultInterpreterPath": "${workspaceFolder}/server/.venv/bin/python",
+                "python.testing.pytestEnabled": true,
+                "python.testing.pytestArgs": [
+                    "server"
+                ],
+                "editor.formatOnSave": true,
+                "[dart]": {
+                    "editor.defaultFormatter": "Dart-Code.dart-code",
+                    "editor.rulers": [
+                        80
+                    ],
+                    "editor.codeActionsOnSave": {
+                        "source.organizeImports": "explicit"
+                    }
+                },
+                "[python]": {
+                    "editor.defaultFormatter": "ms-python.black-formatter"
+                },
+                "files.exclude": {
+                    "**/.dart_tool": true,
+                    "**/build": true,
+                    "**/__pycache__": true
+                },
+                "terminal.integrated.defaultProfile.linux": "bash",
+                "extensions.ignoreRecommendations": true
+            }
+        }
+    },
+    // Resolve dependencies for whichever halves of the repo exist yet:
+    // admin_app/ (Flutter web admin) and server/ (FastAPI + MCP + A2A).
+    "postCreateCommand": "git config --global --add safe.directory \"$PWD\" && { [ -f admin_app/pubspec.yaml ] && (cd admin_app && flutter pub get); [ -f server/requirements.txt ] && (cd server && python -m venv .venv && .venv/bin/pip install -r requirements.txt); true; }",
+    // Sign commits with the host's SSH key via the forwarded agent.
+    "postStartCommand": "bash .devcontainer/setup-git-signing.sh || true",
+    "forwardPorts": [
+        3000,
+        8080
+    ],
+    "portsAttributes": {
+        "3000": {
+            "label": "Flutter web dev server",
+            "onAutoForward": "notify"
+        },
+        "8080": {
+            "label": "Cumulus API / MCP (local)"
+        }
+    }
+}

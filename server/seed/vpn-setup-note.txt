@@ -1,0 +1,19 @@
+---
+id: vpn-setup-note
+path: engineering/notes/vpn-setup
+title: VPN Setup Notes
+authority_level: note
+scope: team
+owner: platform-eng
+tags: vpn, network, setup
+status: published
+content_type: text/plain
+---
+Quick VPN setup notes for the engineering team.
+
+1. Install the corporate VPN client from the self-service portal.
+2. Sign in with SSO; approve the MFA prompt.
+3. Choose the region closest to you for lowest latency.
+4. If DNS fails after connecting, toggle "Use VPN DNS" in the client settings.
+
+These are informal notes; the security team's standard wins if anything conflicts.

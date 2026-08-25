@@ -1,0 +1,5 @@
+# Minimal config so pytest resolves `import app.*` regardless of where it is
+# invoked from (CLI in server/, or VS Code's test explorer at the repo root).
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

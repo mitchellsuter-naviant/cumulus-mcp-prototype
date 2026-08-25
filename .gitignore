@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+deploy/.admin_api_key
+.firebaserc
+deploy/last-deploy.log
+.firebase/

@@ -1,0 +1,28 @@
+rules_version = '2';
+
+// Client SDKs get nothing. Every read and write reaches Firestore through the
+// Cloud Run API, which resolves a principal and applies role and team
+// authorization per request.
+//
+// This is deny-all rather than something conditional on `request.auth` on
+// purpose. The Firebase web API key ships inside the admin app's JavaScript
+// bundle and is public by design, so a rule like `if request.auth != null`
+// would let any signed-in account read the whole corpus directly — bypassing
+// team ownership, draft status, and the authority model entirely. There is no
+// client-side rule that reproduces those checks, so the client has no business
+// reading this data at all.
+//
+// Cloud Run reaches Firestore with a service account through the Admin SDK,
+// which bypasses these rules. Denying everything here therefore costs the
+// server nothing; it only closes the direct path.
+//
+// This state was already the effective default. It is committed so it stays
+// true: enabling "test mode" in the Firebase console would otherwise make the
+// corpus world-readable silently, with no deploy and no signal.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
