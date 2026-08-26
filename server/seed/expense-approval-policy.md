@@ -31,6 +31,12 @@ here change what the flow does — no code changes, and every edit is logged.
   to the expense-review queue regardless of amount.
 - Restricted categories: alcohol, gifts, entertainment. These are always
   elevated for human review.
+- Business purpose required above: $75.00. A line at or above this amount must
+  carry a stated purpose — from the submitter's own commentary or supplied by a
+  reviewer — before it can be approved.
+- Requested amount tolerance: $0.50. A line may request less than the document
+  total (the submitter's own split); requesting more than the document supports
+  by beyond this tolerance is always elevated.
 
 ## Submission rules
 

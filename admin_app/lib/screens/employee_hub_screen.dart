@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
@@ -388,6 +389,21 @@ class _PtoCardState extends State<_PtoCard> {
 
 // ---- Expenses ------------------------------------------------------------
 
+/// The expense submission form.
+///
+/// A submission is **N documents plus the submitter's own words**, and both
+/// halves are load-bearing:
+///
+/// - Several receipts go in as one request, because a trip is one request. Each
+///   carries its own note, because "only claiming $75 of the $110 — the rest
+///   was mine" is about *that* receipt.
+/// - The overall commentary is a governed input to the run: the projection
+///   reads a stated claim out of a note, both are quoted in the run journal,
+///   and a stated purpose is what keeps a line above the governed threshold
+///   from needing a reviewer at all.
+///
+/// So the form's job is to make the notes feel worth writing rather than
+/// optional. The hint text says what they do.
 class _ExpenseCard extends StatefulWidget {
   final ApiClient api;
   final VoidCallback onChanged;
@@ -403,54 +419,113 @@ class _ExpenseCard extends StatefulWidget {
   State<_ExpenseCard> createState() => _ExpenseCardState();
 }
 
+/// One attachment being composed, with its note.
+class _Attachment {
+  final XFile? file;
+  final String name;
+  final TextEditingController note = TextEditingController();
+
+  _Attachment({this.file, required this.name});
+
+  void dispose() => note.dispose();
+}
+
 class _ExpenseCardState extends State<_ExpenseCard> {
-  XFile? _file;
-  final _note = TextEditingController();
+  final List<_Attachment> _attachments = [];
+  final _commentary = TextEditingController();
   bool _busy = false;
+  bool _dragging = false;
   String? _message;
+  Reimbursement? _result;
 
   @override
   void dispose() {
-    _note.dispose();
+    for (final attachment in _attachments) {
+      attachment.dispose();
+    }
+    _commentary.dispose();
     super.dispose();
   }
 
   Future<void> _pick() async {
-    final file = await openFile(
+    final files = await openFiles(
       acceptedTypeGroups: const [
-        XTypeGroup(label: 'receipts', extensions: ['png', 'jpg', 'jpeg']),
+        XTypeGroup(
+          label: 'receipts',
+          extensions: ['png', 'jpg', 'jpeg', 'pdf'],
+        ),
       ],
     );
-    if (file != null) setState(() => _file = file);
+    if (files.isEmpty) return;
+    setState(() {
+      for (final file in files) {
+        _attachments.add(_Attachment(file: file, name: file.name));
+      }
+    });
   }
+
+  void _addFromDrop(List<XFile> files) {
+    setState(() {
+      _dragging = false;
+      for (final file in files) {
+        _attachments.add(_Attachment(file: file, name: file.name));
+      }
+    });
+  }
+
+  void _remove(_Attachment attachment) {
+    setState(() {
+      _attachments.remove(attachment);
+      attachment.dispose();
+    });
+  }
+
+  bool get _canSubmit =>
+      !_busy &&
+      (_attachments.isNotEmpty || _commentary.text.trim().isNotEmpty);
 
   Future<void> _submit() async {
     setState(() {
       _busy = true;
       _message = null;
+      _result = null;
     });
     try {
-      final bytes = _file == null ? null : await _file!.readAsBytes();
+      final documents = <Map<String, String>>[];
+      for (final attachment in _attachments) {
+        final bytes = await attachment.file?.readAsBytes();
+        documents.add({
+          'content_base64': bytes == null ? '' : base64Encode(bytes),
+          'filename': attachment.name,
+          'note': attachment.note.text.trim(),
+        });
+      }
       final row = await widget.api.submitReimbursement(
-        imageBase64: bytes == null ? '' : base64Encode(bytes),
-        filename: _file?.name ?? '',
-        note: _note.text.trim(),
+        documents: documents,
+        commentary: _commentary.text.trim(),
       );
+      if (!mounted) return;
       setState(() {
         _busy = false;
-        _file = null;
-        _note.clear();
+        for (final attachment in _attachments) {
+          attachment.dispose();
+        }
+        _attachments.clear();
+        _commentary.clear();
+        _result = row;
         _message = switch (row.state) {
           'approved' =>
-            'Approved automatically — ${row.vendor}, '
-                '\$${row.totalUsd.toStringAsFixed(2)} (${row.verdictReason}).',
+            'Approved automatically — \$${row.requestedUsd.toStringAsFixed(2)} '
+                'across ${row.lines.length} line(s). ${row.verdictReason}.',
           _ =>
-            'Elevated for review — ${row.verdictReason}. '
-                'It will appear in the expense-review queue.',
+            'Elevated for review — ${row.verdictReason}. It is in the '
+                'expense-review queue, and the run is suspended until someone '
+                'decides.',
         };
       });
       widget.onChanged();
     } on ApiException catch (e) {
+      if (!mounted) return;
       setState(() {
         _busy = false;
         _message = e.message;
@@ -461,55 +536,210 @@ class _ExpenseCardState extends State<_ExpenseCard> {
   @override
   Widget build(BuildContext context) {
     return SectionCard(
-      title: 'Expenses',
+      title: 'Submit an expense',
       subtitle:
-          'a submitted receipt runs the expense-reimbursement flow: extraction, '
-          'policy check, then auto-approval or review',
+          'several receipts go in as one request · your notes are read by the '
+          'flow, not filed beside it',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              OutlinedButton.icon(
-                onPressed: _busy ? null : _pick,
-                icon: const Icon(Icons.receipt_long_outlined, size: 16),
-                label: Text(_file?.name ?? 'Choose receipt image'),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: TextField(
-                  controller: _note,
-                  enabled: !_busy,
-                  // The Submit button's enabled state reads this text.
-                  onChanged: (_) => setState(() {}),
-                  decoration: const InputDecoration(
-                    labelText: 'Note (what this was for)',
-                    isDense: true,
-                  ),
+          DropTarget(
+            onDragEntered: (_) => setState(() => _dragging = true),
+            onDragExited: (_) => setState(() => _dragging = false),
+            onDragDone: (detail) => _addFromDrop(detail.files),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 22, horizontal: 18),
+              decoration: BoxDecoration(
+                color: _dragging
+                    ? CumulusColors.accentSoft
+                    : CumulusColors.surfaceMuted.withValues(alpha: 0.6),
+                borderRadius: BorderRadius.circular(CumulusRadius.control),
+                border: Border.all(
+                  color: _dragging
+                      ? CumulusColors.accent
+                      : CumulusColors.borderStrong,
+                  width: _dragging ? 1.6 : 1,
                 ),
               ),
-              const SizedBox(width: 10),
-              FilledButton(
-                onPressed: _busy || (_file == null && _note.text.trim().isEmpty)
-                    ? null
-                    : _submit,
-                child: _busy
+              child: Column(
+                children: [
+                  Icon(
+                    Icons.cloud_upload_outlined,
+                    size: 22,
+                    color: _dragging
+                        ? CumulusColors.accent
+                        : CumulusColors.inkMuted,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _dragging
+                        ? 'Drop them here'
+                        : 'Drag receipts here, or add them',
+                    style: const TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                      color: CumulusColors.ink,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'PNG, JPG or PDF · one request can carry several',
+                    style: CumulusText.meta,
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: _busy ? null : _pick,
+                    icon: const Icon(Icons.add, size: 16),
+                    label: const Text('Add receipts'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_attachments.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            const FieldLabel(
+              'Attached receipts',
+              hint:
+                  'a note here can say what a receipt was for, or that you are '
+                  'only claiming part of it',
+            ),
+            for (final attachment in _attachments)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Padding(
+                      padding: EdgeInsets.only(top: 10),
+                      child: Icon(
+                        Icons.receipt_outlined,
+                        size: 16,
+                        color: CumulusColors.inkMuted,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 180,
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 9),
+                        child: Text(
+                          attachment.name,
+                          style: CumulusText.body,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: TextField(
+                        controller: attachment.note,
+                        enabled: !_busy,
+                        decoration: const InputDecoration(
+                          hintText:
+                              'e.g. dinner with the Acme team after the Phase 2 '
+                              'review — only claiming \$75 of the \$110',
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: _busy ? null : () => _remove(attachment),
+                      icon: const Icon(Icons.close, size: 16),
+                      tooltip: 'Remove',
+                    ),
+                  ],
+                ),
+              ),
+          ],
+          const SizedBox(height: 12),
+          LabeledField(
+            label: 'What was this for?',
+            hint:
+                'read by the flow — a stated purpose is what keeps a larger '
+                'claim from needing a reviewer',
+            child: TextField(
+              controller: _commentary,
+              enabled: !_busy,
+              maxLines: 3,
+              minLines: 2,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                hintText:
+                    'Client visit to Acme — cab, lunch, and the team dinner '
+                    'after the Phase 2 review.',
+                isDense: true,
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              FilledButton.icon(
+                onPressed: _canSubmit ? _submit : null,
+                icon: _busy
                     ? const SizedBox(
                         width: 14,
                         height: 14,
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
-                    : const Text('Submit'),
+                    : const Icon(Icons.send, size: 16),
+                label: Text(
+                  _attachments.length > 1
+                      ? 'Submit ${_attachments.length} receipts'
+                      : 'Submit',
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  'Submitting runs the flow now: extraction per document, the '
+                  'governed policy read, then auto-approval or a review Task.',
+                  style: CumulusText.meta,
+                ),
               ),
             ],
           ),
           if (_message != null) ...[
-            const SizedBox(height: 10),
-            Text(_message!, style: CumulusText.body),
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              decoration: BoxDecoration(
+                color: (_result?.state == 'approved'
+                        ? CumulusTone.success
+                        : CumulusTone.warn)
+                    .background,
+                borderRadius: BorderRadius.circular(CumulusRadius.control),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(_message!, style: CumulusText.body),
+                  if (_result != null && _result!.lines.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    for (final line in _result!.lines)
+                      Text(
+                        '· line ${line.ordinal}: ${line.vendor} · '
+                        '${line.category} · claiming '
+                        '\$${line.requestedUsd.toStringAsFixed(2)}'
+                        '${line.isSplit ? ' of \$${line.documentTotalUsd.toStringAsFixed(2)} on the receipt' : ''}',
+                        style: CumulusText.meta,
+                      ),
+                  ],
+                  if (_result != null && _result!.runId.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(_result!.runId, style: CumulusText.mono),
+                  ],
+                ],
+              ),
+            ),
           ],
           if (widget.mine.isNotEmpty) ...[
-            const SizedBox(height: 14),
-            const FieldLabel('Your reimbursements'),
+            const SizedBox(height: 16),
+            const FieldLabel('Your recent requests'),
             for (final r in widget.mine.take(5))
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
@@ -526,7 +756,8 @@ class _ExpenseCardState extends State<_ExpenseCard> {
                     ),
                     const SizedBox(width: 10),
                     Text(
-                      '${r.vendor} · \$${r.totalUsd.toStringAsFixed(2)}',
+                      '${r.vendor} · \$${r.requestedUsd.toStringAsFixed(2)}'
+                      '${r.lines.length > 1 ? ' · ${r.lines.length} lines' : ''}',
                       style: CumulusText.body,
                     ),
                     const SizedBox(width: 10),

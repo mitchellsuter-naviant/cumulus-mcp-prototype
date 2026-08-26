@@ -39,7 +39,7 @@ def test_seed_is_idempotent(client):
 
 def test_seeded_queue_lists_open_first_high_priority_first(client):
     rows = client.get("/api/v1/tasks").json()
-    assert len(rows) >= 10
+    assert len(rows) >= 8
     statuses = [r["status"] for r in rows]
     # Open before done, no interleaving.
     assert statuses == sorted(statuses, key=lambda s: 0 if s == "open" else 1)
@@ -84,7 +84,7 @@ def test_get_task_and_missing(client):
 
 def test_decide_records_verdict_actor_and_is_once_only(client):
     resp = client.post(
-        "/api/v1/tasks/task_reimb_seed_08/decide",
+        "/api/v1/tasks/task_payout_3307/decide",
         json={"verdict": "approved", "note": "Matches the PO."},
     )
     assert resp.status_code == 200
@@ -94,11 +94,11 @@ def test_decide_records_verdict_actor_and_is_once_only(client):
     assert decided["decision"]["decided_by"]  # attributed, always
     assert decided["decision"]["decided_at_iso"]
     # The decision is durable state, not a response-only echo.
-    again = client.get("/api/v1/tasks/task_reimb_seed_08").json()
+    again = client.get("/api/v1/tasks/task_payout_3307").json()
     assert again["decision"]["note"] == "Matches the PO."
     # A second decider learns the judgment already happened.
     resp = client.post(
-        "/api/v1/tasks/task_reimb_seed_08/decide", json={"verdict": "rejected"}
+        "/api/v1/tasks/task_payout_3307/decide", json={"verdict": "rejected"}
     )
     assert resp.status_code == 409
 

@@ -10,8 +10,12 @@ from fastapi.responses import JSONResponse
 from . import (
     a2a,
     api_keys_api,
+    data_api,
+    evals_api,
+    graph_api,
     identities_api,
     rest_api,
+    runs_api,
     teams_api,
     users_api,
     flows_api,
@@ -24,8 +28,13 @@ from .config import settings
 from .deps import (
     get_api_key_directory,
     get_asset_usage,
+    get_anomaly_service,
+    get_document_service,
+    get_graph_service,
     get_identity_service,
+    get_run_engine,
     get_service,
+    get_sync_service,
     get_team_service,
     get_flow_service,
     get_task_service,
@@ -53,8 +62,28 @@ async def lifespan(app: FastAPI):
     get_identity_service()  # build the identity stores off the request path
     get_flow_service()  # hydrate the registry (and seed the demo fleet)
     get_task_service()  # hydrate the task queue (and seed the demo backlog)
+
+    # The ontology and the Collection registry are declared in Python and
+    # exported to the map, so they are republished on every start: if the
+    # declaration changed, the document changes with it.
+    try:
+        from .platform_assets import publish_generated_assets
+
+        publish_generated_assets(service)
+    except Exception:
+        log.exception("Publishing generated governed knowledge failed")
+
+    # Every flow service is built here, not lazily, because a flow registers
+    # its body with the run engine when it is constructed — and a Task decided
+    # against a flow whose service was never built would have nothing to resume
+    # into.
+    get_graph_service()
+    get_document_service()
+    get_run_engine()
+    get_anomaly_service()
+    get_sync_service()  # registers the three inbound sync bodies
     get_reimbursement_service()  # hydrate the table (and seed decided history)
-    get_payable_service()  # hydrate the AP table (and seed decided history)
+    get_payable_service()  # hydrate the AP world (vendors, POs, invoices)
 
     # Hard cutover to identity-bound credentials: a key minted before
     # identities existed authenticates nothing (auth.py refuses it), so mark
@@ -99,6 +128,8 @@ async def lifespan(app: FastAPI):
             "teams": len(get_team_service().list()),
             "flows": len(get_flow_service().list()),
             "openTasks": get_task_service().stats().open,
+            "graphObjects": get_graph_service().stats()["objects"],
+            "runs": len(get_run_engine().list()),
         },
     )
     # Mounted sub-app lifespans don't run automatically; drive the MCP session manager here.
@@ -154,6 +185,10 @@ app.include_router(tasks_api.router)
 app.include_router(reimbursements_api.router)
 app.include_router(payables_api.router)
 app.include_router(employee_api.router)
+app.include_router(graph_api.router)
+app.include_router(runs_api.router)
+app.include_router(data_api.router)
+app.include_router(evals_api.router)
 app.include_router(api_keys_api.router)
 app.include_router(a2a.router)
 

@@ -514,3 +514,96 @@ def test_an_unknown_sort_is_rejected(wired):
         wired.get("/api/v1/search", params={"q": "leave", "sort": "vibes"}).status_code
         == 422
     )
+
+
+# ---- the entity layer's tools ----------------------------------------------
+#
+# Questions whose answers live in the edges rather than in any document. The
+# planner needs a credential to *phrase* an answer, so these exercise the
+# Toolbox directly — which is where the retrieval-vs-traversal distinction
+# actually lives.
+
+
+def test_graph_tools_answer_a_question_no_document_contains():
+    from app.answering import Toolbox
+    from app.reimbursements import SubmittedDocument
+    from tests import world as test_world
+
+    world = test_world.fresh()
+    for hint in (
+        "total=64.20 category=meals",
+        "total=32.50 category=travel",
+        "total=41.00 category=meals",
+    ):
+        world.expenses.submit(
+            "john.smith@customer.example",
+            documents=[SubmittedDocument(hint=hint)],
+            commentary="Client visit to Acme.",
+        )
+
+    tools = Toolbox(world.knowledge, None, graph=world.graph)
+    resolved = tools.resolve_entity("Employee", "john.smith@customer.example")
+    assert resolved["resolved"] is not None
+
+    rollup = tools.aggregate_edges(
+        resolved["resolved"]["id"],
+        "submitted:out>has_expense_line:out",
+        sum_field="requested_usd",
+        group_by="category",
+        since_days=180,
+    )
+    assert rollup["count"] == 3
+    assert rollup["total"] == pytest.approx(137.70)
+    assert rollup["grouped"]["meals"] == pytest.approx(105.20)
+    # The step is recorded, so the traversal is auditable the way a citation is.
+    assert any(step.tool == "aggregate_edges" for step in tools.steps)
+
+
+def test_an_ambiguous_name_is_not_guessed_at():
+    from app.answering import Toolbox
+    from app.graph import Claim
+    from tests import world as test_world
+
+    world = test_world.fresh()
+    world.graph.upsert(
+        "Vendor", "Acme Industrial Inc.",
+        [Claim(field="name", value="Acme Industrial Inc.", source="erp:vendors")],
+    )
+    tools = Toolbox(world.knowledge, None, graph=world.graph)
+    outcome = tools.resolve_entity("Vendor", "Acme Industial Inc")
+    assert outcome["resolved"] is None
+    assert outcome["candidates"][0]["label"] == "Acme Industrial Inc."
+    assert "rather than guessing" in outcome["note"]
+
+
+def test_graph_tools_degrade_politely_without_an_entity_layer():
+    from app.answering import Toolbox
+    from tests import world as test_world
+
+    world = test_world.fresh()
+    tools = Toolbox(world.knowledge, None, graph=None)
+    assert "error" in tools.resolve_entity("Vendor", "Acme")
+    assert "error" in tools.aggregate_edges("x", "issued:out")
+
+
+def test_describe_entity_surfaces_retained_conflicts():
+    from app.answering import Toolbox
+    from app.sync import SyncRequest
+    from tests import world as test_world
+
+    world = test_world.fresh()
+    for source, terms in (("erp-vendors", "NET30"), ("procurement-coupa", "NET60")):
+        world.sync.deliver(SyncRequest.model_validate({
+            "source": source,
+            "vendors": [{
+                "external_id": f"{source}-1", "name": "Acme Industrial Inc.",
+                "payment_terms": terms,
+            }],
+        }), actor="system:test")
+    tools = Toolbox(world.knowledge, None, graph=world.graph)
+    resolved = tools.resolve_entity("Vendor", "Acme Industrial Inc.")
+    described = tools.describe_entity(resolved["resolved"]["id"])
+    assert described["fields"]["payment_terms"] == "NET30"
+    assert {c["source"] for c in described["conflicts"]["payment_terms"]} == {
+        "erp:erp-vendors", "procurement:procurement-coupa"
+    }

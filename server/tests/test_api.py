@@ -19,17 +19,18 @@ def client(_client):
 def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    assert resp.json()["assets"] == 9
+    assert resp.json()["assets"] == 11
 
 
 def test_list_and_prefix_filter(client):
-    assert len(client.get("/api/v1/assets").json()) == 9
+    assert len(client.get("/api/v1/assets").json()) == 11
     finance = client.get("/api/v1/assets", params={"prefix": "finance"}).json()
     assert {a["id"] for a in finance} == {
         "expense-approval-policy",
         "travel-booking-guideline",
         "invoice-posting-policy",
         "vendor-exemplar-acme-industrial",
+        "vendor-exemplar-northwind-traders",
     }
 
 

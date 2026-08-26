@@ -8,6 +8,7 @@ import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import '../widgets/case_review.dart';
 import '../widgets/cumulus_shell.dart';
+import '../widgets/eval_contract.dart';
 import '../widgets/mini_charts.dart';
 import '../widgets/side_drawer.dart';
 import '../widgets/ui_kit.dart';
@@ -1498,6 +1499,12 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
 
   List<Widget> _evaluationBody() {
     return [
+      // The contract comes first: what this flow is answerable for, judged
+      // against the shared enterprise model in an isolated world. The golden
+      // sets and experiments below it are the older, synthetic harness — they
+      // grade by case id rather than by running the flow.
+      EvalContractPanel(api: _api, flowId: widget.flowId),
+      const SizedBox(height: 8),
       LayoutBuilder(
         builder: (context, constraints) {
           final datasets = Column(

@@ -100,10 +100,16 @@ class Toolbox:
     documents rather than trusting the model's spelling.
     """
 
-    def __init__(self, service, teams, include_drafts: bool = False) -> None:
+    def __init__(
+        self, service, teams, include_drafts: bool = False, graph=None
+    ) -> None:
         self._service = service
         self._teams = teams
         self._include_drafts = include_drafts
+        # The entity layer. Optional so a deployment without one still answers
+        # every document question; the graph tools simply say they have nothing
+        # to walk rather than failing the turn.
+        self._graph = graph
         self.steps: list[AskStep] = []
         self.touched: dict[str, str] = {}
         self._documents_read = 0
@@ -354,6 +360,178 @@ class Toolbox:
             "assets_owned": owned,
         }
 
+    # -- the entity layer -------------------------------------------------
+    #
+    # These exist because a whole class of question is not retrieval at all.
+    # "How much has John Smith submitted in the last six months" is not written
+    # in any document — it lives in the edges — so no amount of searching finds
+    # it. The planner needs to resolve an entity, walk typed edges, and add up
+    # what it finds, and it needs to show that path in its steps so the answer
+    # is auditable the way a citation is.
+
+    def resolve_entity(self, type: str, name: str, limit: int = 5) -> dict:
+        """Find the canonical entity a name refers to, with the alternatives."""
+        if self._graph is None:
+            return {"error": "No entity layer is configured in this deployment."}
+        from .resolution import ResolutionThresholds, score_candidates
+
+        known = self._graph.find(type)
+        candidates = score_candidates([name], "", known)[:limit]
+        self._record(
+            "resolve_entity", {"type": type, "name": name},
+            f"{len(candidates)} candidate {type}(s)"
+            + (f", best {candidates[0].label} at {candidates[0].score:.2f}"
+               if candidates else ""),
+        )
+        thresholds = ResolutionThresholds()
+        return {
+            "type": type,
+            "query": name,
+            "resolved": (
+                {
+                    "id": candidates[0].object_id,
+                    "label": candidates[0].label,
+                    "score": candidates[0].score,
+                }
+                if candidates and candidates[0].score >= thresholds.auto_link_at
+                else None
+            ),
+            "candidates": [
+                {"id": c.object_id, "label": c.label, "score": c.score,
+                 "why": c.reason}
+                for c in candidates
+            ],
+            "note": (
+                "Nothing scored above the auto-link threshold; say which "
+                "candidate you mean rather than guessing."
+                if candidates and candidates[0].score < thresholds.auto_link_at
+                else ""
+            ),
+        }
+
+    def describe_entity(self, object_id: str) -> dict:
+        """One entity: its resolved fields, its conflicts, and its edges."""
+        if self._graph is None:
+            return {"error": "No entity layer is configured in this deployment."}
+        record = self._graph.get(object_id)
+        if record is None:
+            return {"error": f"No entity with id '{object_id}'."}
+        edges: dict[str, int] = {}
+        for direction in ("out", "in"):
+            for link, _ in self._graph.neighbors(record.id, None, direction):
+                key = f"{link.type} ({direction})"
+                edges[key] = edges.get(key, 0) + 1
+        self._record(
+            "describe_entity", {"object_id": object_id},
+            f"{record.type} {record.label}: {len(record.props)} field(s), "
+            f"{sum(edges.values())} edge(s)",
+        )
+        return {
+            "id": record.id,
+            "type": record.type,
+            "label": record.label,
+            "status": record.status,
+            "fields": record.props,
+            "edges": edges,
+            "conflicts": {
+                field: [
+                    {"value": c.value, "source": c.source} for c in claims
+                ]
+                for field, claims in record.conflicts().items()
+            },
+            "ref": record.ref(),
+        }
+
+    def aggregate_edges(
+        self,
+        object_id: str,
+        path: str,
+        sum_field: str = "",
+        group_by: str = "",
+        since_days: int = 0,
+    ) -> dict:
+        """Walk a typed path from one entity and add up what is at the end.
+
+        `path` is `link_type:direction` hops joined by `>`, e.g.
+        `submitted:out>has_expense_line:out`. Typed and fixed-length on
+        purpose: open-ended traversal is where this store stops being the right
+        answer, so the shape of the question is declared rather than discovered.
+        """
+        if self._graph is None:
+            return {"error": "No entity layer is configured in this deployment."}
+        root = self._graph.get(object_id)
+        if root is None:
+            return {"error": f"No entity with id '{object_id}'."}
+        hops: list[tuple[str, str]] = []
+        for hop in path.split(">"):
+            link_type, _, direction = hop.strip().partition(":")
+            if not link_type:
+                continue
+            hops.append((link_type, direction or "out"))
+        if not hops:
+            return {"error": "path must be like 'submitted:out>has_expense_line:out'."}
+
+        cutoff = None
+        if since_days:
+            from datetime import timedelta
+
+            from .models import utcnow
+
+            cutoff = utcnow() - timedelta(days=since_days)
+
+        reached = self._graph.traverse(root.id, hops)
+        rows: list[dict] = []
+        for record in reached:
+            if cutoff is not None:
+                stamp = ""
+                for field in ("submitted_at", "invoice_date", "date", "ordered_date"):
+                    if record.props.get(field):
+                        stamp = str(record.props[field])
+                        break
+                if stamp:
+                    from datetime import datetime
+
+                    try:
+                        when = datetime.fromisoformat(stamp)
+                    except ValueError:
+                        when = None
+                    if when is not None:
+                        if when.tzinfo is None:
+                            when = when.replace(tzinfo=cutoff.tzinfo)
+                        if when < cutoff:
+                            continue
+            rows.append({"id": record.id, "label": record.label, **record.props})
+
+        total = None
+        if sum_field:
+            total = round(
+                sum(float(r.get(sum_field) or 0) for r in rows), 2
+            )
+        grouped: dict[str, float] = {}
+        if group_by and sum_field:
+            for row in rows:
+                key = str(row.get(group_by) or "—")
+                grouped[key] = round(
+                    grouped.get(key, 0.0) + float(row.get(sum_field) or 0), 2
+                )
+        self._record(
+            "aggregate_edges",
+            {"object_id": object_id, "path": path, "sum_field": sum_field,
+             "since_days": since_days},
+            f"{len(rows)} record(s) at the end of {path}"
+            + (f", {sum_field} totalling {total}" if total is not None else ""),
+        )
+        return {
+            "root": {"id": root.id, "type": root.type, "label": root.label},
+            "path": path,
+            "count": len(rows),
+            "total": total,
+            "grouped": grouped or None,
+            # Capped: the planner needs the shape and the sum, not every row.
+            "rows": rows[:25],
+            "truncated": len(rows) > 25,
+        }
+
     # -- dispatch ---------------------------------------------------------
 
     @property
@@ -365,6 +543,9 @@ class Toolbox:
             "list_teams": self.list_teams,
             "resolve_team": self.resolve_team,
             "get_team": self.get_team,
+            "resolve_entity": self.resolve_entity,
+            "describe_entity": self.describe_entity,
+            "aggregate_edges": self.aggregate_edges,
         }
 
     def call(self, name: str, arguments: dict) -> dict:
@@ -457,6 +638,89 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
             "type": "OBJECT",
             "properties": {"slug": {"type": "STRING"}},
             "required": ["slug"],
+        },
+    },
+    {
+        "name": "resolve_entity",
+        "description": (
+            "Turn a name into a canonical entity id in the graph. Use this "
+            "FIRST for any question about a specific person, vendor, invoice or "
+            "purchase order, because the graph is keyed by id and names are "
+            "ambiguous. Returns ranked candidates; if nothing clears the "
+            "threshold, ask which one is meant instead of guessing."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "type": {
+                    "type": "STRING",
+                    "description": (
+                        "Object type, e.g. Employee, Vendor, Invoice, "
+                        "PurchaseOrder."
+                    ),
+                },
+                "name": {"type": "STRING", "description": "The name as written."},
+                "limit": {"type": "INTEGER"},
+            },
+            "required": ["type", "name"],
+        },
+    },
+    {
+        "name": "describe_entity",
+        "description": (
+            "Everything known about one entity: its resolved field values, the "
+            "fields where two source systems disagree (both values are kept), "
+            "and a count of its edges by type. Use it to see what an entity has "
+            "before deciding which path to walk."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "object_id": {
+                    "type": "STRING",
+                    "description": "Canonical id from resolve_entity.",
+                },
+            },
+            "required": ["object_id"],
+        },
+    },
+    {
+        "name": "aggregate_edges",
+        "description": (
+            "Walk a typed path of edges from one entity and total a field at "
+            "the end. This is the tool for counting and summing questions — "
+            "'how much has this employee submitted', 'what has this vendor "
+            "billed' — whose answers are in no document and cannot be searched "
+            "for. Path is `link_type:direction` hops joined by `>`, for example "
+            "`submitted:out>has_expense_line:out` from an Employee, or "
+            "`issued:out` from a Vendor. Use since_days to bound the window."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "object_id": {"type": "STRING"},
+                "path": {
+                    "type": "STRING",
+                    "description": (
+                        "e.g. submitted:out>has_expense_line:out"
+                    ),
+                },
+                "sum_field": {
+                    "type": "STRING",
+                    "description": (
+                        "Numeric field to total, e.g. requested_usd, total_usd."
+                    ),
+                },
+                "group_by": {
+                    "type": "STRING",
+                    "description": "Field to break the total down by, e.g. category.",
+                },
+                "since_days": {
+                    "type": "INTEGER",
+                    "description": "Only records dated within this many days.",
+                },
+            },
+            "required": ["object_id", "path"],
         },
     },
 ]
@@ -584,10 +848,11 @@ def build_answer_backend(
 class AnswerService:
     """Answers questions, with or without a generative backend behind it."""
 
-    def __init__(self, service, teams, backend: AnswerBackend | None) -> None:
+    def __init__(self, service, teams, backend: AnswerBackend | None, graph=None) -> None:
         self._service = service
         self._teams = teams
         self._backend = backend
+        self._graph = graph
 
     @property
     def enabled(self) -> bool:
@@ -605,7 +870,10 @@ class AnswerService:
         scope_asset_id: str | None = None,
         include_drafts: bool = False,
     ) -> AskAnswer:
-        tools = Toolbox(self._service, self._teams, include_drafts=include_drafts)
+        tools = Toolbox(
+            self._service, self._teams, include_drafts=include_drafts,
+            graph=self._graph,
+        )
         context = self._scope_context(question, scope_asset_id, tools)
 
         if self._backend is None:

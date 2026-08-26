@@ -132,11 +132,29 @@ if [[ "$EMBEDDING_BACKEND" == "vertex" || "$ANSWER_BACKEND" == "vertex" ]]; then
 fi
 
 echo "==> Deploying server to Cloud Run"
+# Collections whose *row shape* changed with the flow rewrite, pinned to a
+# generation. The seeds only run against an empty collection, so pointing at
+# the old ones would leave stale rows in place and skip the seed that builds
+# the graph, the runs and the tasks that go with them — a deployment that looks
+# fine and demonstrates nothing. Bump the suffix whenever a stored shape
+# changes; the old generation stays readable in Firestore rather than being
+# migrated in place.
+#
+# Set them here rather than by hand after the fact, because --set-env-vars
+# *replaces* the whole environment: an override applied to a live revision is
+# silently dropped by the next deploy.
+COLLECTION_GENERATION="${COLLECTION_GENERATION:-v3}"
+GENERATION_ENV="TASKS_COLLECTION=tasks_$COLLECTION_GENERATION"
+GENERATION_ENV="$GENERATION_ENV,REIMBURSEMENTS_COLLECTION=reimbursements_$COLLECTION_GENERATION"
+GENERATION_ENV="$GENERATION_ENV,PAYABLES_COLLECTION=payables_$COLLECTION_GENERATION"
+
+echo "==> Pinning reshaped collections to generation $COLLECTION_GENERATION"
+
 gcloud run deploy "$SERVICE" \
   --source "$REPO_ROOT/server" \
   --region "$REGION" \
   --allow-unauthenticated \
-  --set-env-vars "STORAGE_BACKEND=firestore,AUTH_BACKEND=firebase,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ADMIN_API_KEY=$ADMIN_API_KEY,EMBEDDING_BACKEND=$EMBEDDING_BACKEND,EMBEDDING_LOCATION=$VERTEX_MODEL_LOCATION,ANSWER_BACKEND=$ANSWER_BACKEND,ANSWER_LOCATION=$VERTEX_MODEL_LOCATION" \
+  --set-env-vars "STORAGE_BACKEND=firestore,AUTH_BACKEND=firebase,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ADMIN_API_KEY=$ADMIN_API_KEY,EMBEDDING_BACKEND=$EMBEDDING_BACKEND,EMBEDDING_LOCATION=$VERTEX_MODEL_LOCATION,ANSWER_BACKEND=$ANSWER_BACKEND,ANSWER_LOCATION=$VERTEX_MODEL_LOCATION,$GENERATION_ENV" \
   --quiet
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"

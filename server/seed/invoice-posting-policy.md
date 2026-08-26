@@ -26,12 +26,38 @@ change what the flow does — no code changes, and every edit is logged.
   the document, an adjudicator merges the candidates, and a clerk verifies
   the proposed exemplar before anything posts.
 
-## Controls not yet automated
+## Three-way match
 
-- Three-way match (invoice ↔ purchase order ↔ receiving record) is declared
-  in the flow as a placeholder until the PO and receiving feeds land.
-- Fraud screening (bank-detail changes, duplicate invoices, round-number
-  anomalies) is likewise declared and pending.
+The flow matches invoice lines against the purchase order they bill and the
+receiving report that booked the goods in. These values govern that match.
+
+- Price variance tolerance: 2.0%. A unit price within this of the PO line is
+  treated as agreeing.
+- Quantity variance tolerance: 0.0 units. Billing more than was received is
+  always a variance.
+- Freight and tax allowance: $150.00. Lines of kind freight or tax carry no PO
+  line by nature; up to this amount they are accepted without one.
+- Receiving report required above: $500.00. Below this an invoice may post
+  against the PO alone; at or above it, goods must be booked in first.
+- Unmatched line tolerance: 0 lines. Any goods line with no PO line is a
+  variance a clerk rules on.
+
+## Anomaly screening
+
+Scored against the vendor's own history rather than a global rule, because
+"unusual for this vendor" is the only definition that survives contact with a
+real vendor list.
+
+- Amount outlier multiple: 3.0. An invoice more than this multiple of the
+  vendor's median invoice is flagged.
+- First-time-large threshold: $5,000.00. A vendor with fewer than three prior
+  invoices billing at least this much is flagged regardless of the multiple.
+- Duplicate window: 30 days. A same-vendor invoice within this window whose
+  total matches an existing one to the cent is flagged as a suspected
+  duplicate.
+- Cadence deviation multiple: 4.0. An invoice arriving far outside the
+  vendor's usual interval is flagged.
+- Anomaly profile window: 365 days. How far back the vendor profile looks.
 
 ## Disputes
 

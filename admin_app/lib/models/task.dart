@@ -61,6 +61,8 @@ class TaskDecision {
 
 class QueueTask {
   final String id;
+  /// The run this task suspended. Non-empty for anything a live flow raised.
+  final String runId;
   final String kind; // decision | match_review | curation | eval_review | exception
   final String title;
   final String summary;
@@ -78,6 +80,7 @@ class QueueTask {
 
   const QueueTask({
     required this.id,
+    required this.runId,
     required this.kind,
     required this.title,
     required this.summary,
@@ -99,6 +102,7 @@ class QueueTask {
 
   factory QueueTask.fromJson(Map<String, dynamic> json) => QueueTask(
     id: json['id'] as String,
+    runId: json['run_id'] as String? ?? '',
     kind: json['kind'] as String? ?? 'decision',
     title: json['title'] as String? ?? '',
     summary: json['summary'] as String? ?? '',

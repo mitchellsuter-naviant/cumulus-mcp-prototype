@@ -1,378 +1,510 @@
-"""The live accounts-payable runner and its table.
+"""The accounts-payable Flow, end to end.
 
-The doctrinal assertions: the posting rule's values come from the governed
-policy document (editing it changes behavior with no code change), a vendor
-with no exemplar gets three independent extractions adjudicated field by
-field, verifying that ensemble writes the exemplar into the knowledge layer
-for real (so the next invoice takes the one-shot path), an elevated run
-suspends into a real Task, deciding that Task resumes the run and commits
-the state, and submission is a human act (keys refused).
+The doctrinal assertions:
+
+- a vendor is an *entity*: the first ModelCall reads names, the resolver decides
+  identity against the vendor master, and two systems' ids for one company
+  resolve to one Vendor;
+- extraction is one-shot against the vendor's exemplar when we have one and a
+  three-model adjudicated ensemble when we do not, and verifying the ensemble
+  writes the exemplar — so the vendor's *next* invoice is one-shot;
+- the three-way match is retained as a MatchSet, and "no receiving report yet"
+  is a state rather than a failure;
+- the anomaly screen is scored against the vendor's own history with governed
+  thresholds;
+- the posting rule's values come from the governed document;
+- a clerk's correction re-runs the match rather than overriding it.
 """
 
 import pytest
 
-import app.deps as deps
-from app.config import settings
-from app.main import app
-from app.models import AssetCreate
-from app.payables import (
-    InMemoryPayableDirectory,
-    PayableService,
-    StubInvoiceReader,
-    seed_payables_if_empty,
-)
-from app.payables_api import router as payables_router
-from app.service import KnowledgeService, seed_if_empty
-from app.storage import InMemoryRepository
-from app.tasks import InMemoryTaskDirectory, TaskService, seed_tasks_if_empty
-
-# The two knowledge docs the runner reads. The other engineer's seed files
-# may land later; the fixture creates these only when the seed corpus lacks
-# them, so this module is green standalone.
-_POSTING_POLICY_MD = """# Invoice Posting Policy
-
-The accounts-payable flow reads this section as governed values. Edits here
-change what the flow does — no code changes, and every edit is logged.
-
-- Auto-post limit: $2,500.00 per invoice. At or under this limit a
-  confidently classified invoice posts without review.
-- Minimum classification confidence: 0.75. Below this the invoice routes
-  to the ap-clerk queue regardless of amount.
-"""
-
-_ACME_EXEMPLAR_MD = """# Vendor exemplar: Acme Industrial
-
-One-shot extraction template for `acme-industrial` invoices.
-
-- Invoice number format: `INV-####` — match this pattern exactly
-- Invoice date format: ISO 8601 (YYYY-MM-DD), header block
-- PO pattern: `PO-####`, under the bill-to block
-- Where the total sits: bottom-right summary block, labelled "Amount Due"
-"""
+from app.graph import object_id
+from app.matching import MatchLine, MatchTolerances, match_invoice
+from app.models import AssetUpdate
+from app.payables import seed_payables_if_empty
+from app.sync import SyncRequest
+from tests import world as test_world
 
 
 @pytest.fixture()
-def client(_client):
-    deps._service = KnowledgeService(InMemoryRepository())
-    seed_if_empty(deps._service, settings.seed_dir)
-    if deps._service.repo.get("invoice-posting-policy") is None:
-        deps._service.create(AssetCreate(
-            id="invoice-posting-policy",
-            path="finance/policies/invoice-posting",
-            title="Invoice Posting Policy",
-            content=_POSTING_POLICY_MD,
-            authority_level="policy",
-            owner="finance-ops",
-            tags=["payables", "finance"],
-            status="published",
-        ))
-    if deps._service.repo.get("vendor-exemplar-acme-industrial") is None:
-        deps._service.create(AssetCreate(
-            id="vendor-exemplar-acme-industrial",
-            path="finance/exemplars/acme-industrial",
-            title="Vendor exemplar: Acme Industrial",
-            content=_ACME_EXEMPLAR_MD,
-            authority_level="how-to",
-            owner="finance-ops",
-            tags=["exemplar", "ap", "acme-industrial"],
-            status="published",
-        ))
-    deps._task_service = TaskService(InMemoryTaskDirectory())
-    seed_tasks_if_empty(deps._task_service)
-    deps._payable_service = PayableService(
-        InMemoryPayableDirectory(),
-        StubInvoiceReader(),
-        deps._service,
-        deps._task_service,
-    )
-    seed_payables_if_empty(deps._payable_service)
+def world():
+    return test_world.fresh()
 
-    # ---- temporary integration shims, test-fixture only -------------------
-    # 1) deps.get_payable_service lands with the wiring PR; until it does,
-    #    install an accessor that serves the singleton set above. Once the
-    #    real accessor exists this setattr is skipped and the singleton
-    #    assignment above is all the isolation needed.
-    if not hasattr(deps, "get_payable_service"):
-        setattr(deps, "get_payable_service", lambda: deps._payable_service)
-    # 2) main.py gains include_router(payables_api.router) in the same PR;
-    #    until then, mount it here so the TestClient can reach the routes.
-    if not any(getattr(r, "path", "") == "/api/v1/payables" for r in app.routes):
-        app.include_router(payables_router)
+
+@pytest.fixture()
+def client(_client, world):
     return _client
 
 
-@pytest.fixture()
-def owner(monkeypatch):
-    monkeypatch.setattr(settings, "auth_backend", "firebase")
-    monkeypatch.setattr(settings, "admin_api_key", "root-sekret")
-    return {"X-API-Key": "root-sekret"}
+def _vendors(world):
+    world.sync.deliver(SyncRequest.model_validate({
+        "source": "erp-vendors",
+        "watermark": "2026-08-01T00:00:00Z",
+        "vendors": [
+            {
+                "external_id": "V-10041", "name": "Acme Industrial Inc.",
+                "tax_id": "94-2711883", "status": "active",
+                "payment_terms": "NET30",
+            },
+            {
+                "external_id": "V-10088", "name": "Northwind Traders LLC",
+                "tax_id": "81-4410072", "status": "active",
+            },
+        ],
+    }), actor="system:test")
 
 
-def _decide(client, task_id, verdict, note="", correction=""):
-    """Decide via the API, then resume the payable run directly.
+def _orders(world):
+    world.sync.deliver(SyncRequest.model_validate({
+        "source": "erp-purchasing",
+        "purchase_orders": [{
+            "external_id": "PO-7741", "po_number": "PO-7741",
+            "vendor_external_id": "V-10041", "vendor_name": "Acme Industrial Inc.",
+            "ordered_date": "2026-08-05", "status": "open",
+            "lines": [
+                {"sku": "STL-0250", "description": "Hot-rolled steel plate, 1/4 in",
+                 "quantity_ordered": 2.0, "unit_price_usd": 486.00},
+                {"sku": "FAS-M12", "description": "Grade 8 hex bolt, M12 x 60mm, box of 100",
+                 "quantity_ordered": 3.0, "unit_price_usd": 128.75},
+            ],
+        }],
+    }), actor="system:test")
 
-    Temporary integration shim, test-only: tasks_api's resume-hook list
-    gains get_payable_service().apply_task_decision with the wiring PR;
-    until then the decided task is handed to the service by hand.
-    """
-    resp = client.post(
-        f"/api/v1/tasks/{task_id}/decide",
-        json={"verdict": verdict, "note": note, "correction": correction},
+
+def _receipts(world, short: float = 0.0):
+    world.sync.deliver(SyncRequest.model_validate({
+        "source": "wms-receiving",
+        "receiving_reports": [{
+            "external_id": "RR-5501", "receipt_number": "RR-5501",
+            "po_number": "PO-7741", "received_date": "2026-08-11",
+            "status": "complete",
+            "lines": [
+                {"sku": "STL-0250", "description": "Hot-rolled steel plate, 1/4 in",
+                 "quantity_received": 2.0 - short},
+                {"sku": "FAS-M12", "description": "Grade 8 hex bolt, M12 x 60mm, box of 100",
+                 "quantity_received": 3.0},
+            ],
+        }],
+    }), actor="system:test")
+
+
+# ---- the governed read -----------------------------------------------------
+
+
+def test_posting_values_come_from_the_document(world):
+    policy = world.payables.read_policy()
+    assert policy.found_asset and policy.limit_usd == 2500.0
+    assert policy.source_ref.endswith("@rev1")
+
+
+def test_editing_the_posting_limit_changes_the_flow(world):
+    _vendors(world)
+    _orders(world)
+    _receipts(world)
+    content = world.knowledge.repo.get("invoice-posting-policy").content
+    world.knowledge.update("invoice-posting-policy", AssetUpdate(
+        content=content.replace("Auto-post limit: $2,500.00", "Auto-post limit: $500.00")
+    ))
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-1 lines=STL-0250:2,FAS-M12:3",
     )
-    assert resp.status_code == 200
-    return deps._payable_service.apply_task_decision(
-        deps._task_service.get(task_id)
-    )
+    assert record.state == "pending"
+    assert "$500.00 auto-post limit" in record.verdict_reason
+    assert record.policy_ref.endswith("@rev2")
 
 
-# ---- the table ----
+# ---- identity --------------------------------------------------------------
 
 
-def test_seeded_table_and_stats_agree(client):
-    rows = client.get("/api/v1/payables").json()
-    stats = client.get("/api/v1/payables/stats").json()
-    assert stats["total"] == len(rows) == 7
-    assert stats["posted"] == sum(1 for r in rows if r["state"] == "posted") == 6
-    assert stats["denied"] == 1 and stats["pending"] == 0
-    assert stats["one_shot"] == 5 and stats["ensemble"] == 2
-    assert stats["posted_usd"] == round(
-        sum(r["total_usd"] for r in rows if r["state"] == "posted"), 2
-    )
-    # Newest first.
-    submitted = [r["submitted_at_iso"] for r in rows]
-    assert submitted == sorted(submitted, reverse=True)
-
-
-def test_state_filter_and_missing_row(client):
-    denied = client.get("/api/v1/payables", params={"state": "denied"}).json()
-    assert {r["id"] for r in denied} == {"inv_seed_06"}
-    assert client.get("/api/v1/payables/inv_nope").status_code == 404
-
-
-def test_placeholders_present_on_every_record(client):
-    rows = client.get("/api/v1/payables").json()
-    fresh = client.post(
-        "/api/v1/payables",
-        json={"note": "vendor=acme-industrial total=310.00 invoice=INV-2301"},
-    ).json()
-    for r in rows + [fresh]:
-        assert r["three_way_match"] == "placeholder"
-        assert r["fraud_screen"] == "placeholder"
-
-
-# ---- the run: a known vendor takes the one-shot path ----
-
-
-def test_known_vendor_under_limit_posts_one_shot(client):
-    resp = client.post(
-        "/api/v1/payables",
-        json={
-            "filename": "acme-aug.png",
-            "note": "vendor=acme-industrial total=1234.56 invoice=INV-2041 "
-                    "po=PO-7741 date=2026-08-20",
-        },
-    )
-    assert resp.status_code == 201
-    row = resp.json()
-    assert row["state"] == "posted"
-    assert row["extraction_path"] == "one-shot"
-    assert row["total_usd"] == 1234.56
-    assert row["invoice_number"] == "INV-2041" and row["po_number"] == "PO-7741"
-    assert row["exemplar_ref"].startswith(
-        "knowledge:vendor-exemplar-acme-industrial@rev"
-    )
-    assert row["task_id"] == ""
-    # The journal traces the declared steps, ending in the gateway commit.
-    steps = [e["step_id"] for e in row["journal"]]
-    assert steps == ["t1", "m0", "x1", "r1", "m1", "x3", "x4", "r2", "a1", "e1"]
-    assert "knowledge:invoice-posting-policy" in row["policy_ref"]
-
-
-def test_known_vendor_over_limit_suspends_and_decision_posts(client):
-    row = client.post(
-        "/api/v1/payables",
-        json={"note": "vendor=acme-industrial total=4100.00 invoice=INV-2050"},
-    ).json()
-    assert row["state"] == "pending"
-    assert "exceeds the $2,500.00 auto-post limit" in row["verdict_reason"]
-    steps = [e["step_id"] for e in row["journal"]]
-    assert steps == ["t1", "m0", "x1", "r1", "m1", "x3", "x4", "r2", "k2"]
-
-    # The Task is real, in the declared queue, carrying the policy ref.
-    task = client.get(f"/api/v1/tasks/{row['task_id']}").json()
-    assert task["queue"] == "ap-clerk" and task["kind"] == "decision"
-    assert task["case_ref"] == row["id"]
-    assert "knowledge:invoice-posting-policy" in task["refs"]
-
-    # Deciding the task resumes the run: state commits, journal completes.
-    _decide(client, row["task_id"], "approved", note="Matches the PO.")
-    resumed = client.get(f"/api/v1/payables/{row['id']}").json()
-    assert resumed["state"] == "posted"
-    assert resumed["decided_by"]
-    assert [e["step_id"] for e in resumed["journal"]][-3:] == ["k2", "a1", "e1"]
-
-
-# ---- the run: an unknown vendor gets the ensemble, then the flywheel ----
-
-
-def _submit_unknown(client, slug="meridian-freight", total="940.00"):
-    return client.post(
-        "/api/v1/payables",
-        json={
-            "filename": f"{slug}-invoice.pdf",
-            "note": f"vendor={slug} total={total} invoice=INV-3320 "
-                    "po=PO-8812 date=2026-08-20",
-        },
-    ).json()
-
-
-def test_unknown_vendor_runs_the_ensemble_and_suspends(client):
-    row = _submit_unknown(client)
-    assert row["state"] == "pending"
-    assert row["extraction_path"] == "ensemble"
-    assert row["exemplar_ref"] == ""
-    # Three independent extractions, model names recorded.
-    assert len(row["candidates"]) == 3
-    assert {c["model"] for c in row["candidates"]} == {
-        "stub-extractor-a", "stub-extractor-b", "stub-extractor-c",
+def test_two_systems_one_vendor(world):
+    _vendors(world)
+    world.sync.deliver(SyncRequest.model_validate({
+        "source": "procurement-coupa",
+        "vendors": [{
+            "external_id": "C-5501", "name": "ACME INDUSTRIAL, INCORPORATED",
+            "tax_id": "94-2711883", "status": "active",
+        }],
+    }), actor="system:test")
+    acme = world.graph.get(object_id("Vendor", "Acme Industrial Inc."))
+    assert acme is not None
+    sources = {
+        str(other.props.get("source"))
+        for _, other in world.graph.neighbors(acme.id, "identified_as", "out")
     }
-    # Extractor b renders the date MM/DD/YYYY, so adjudication had work.
-    assert row["conflicts"]
-    assert any("invoice_date" in c for c in row["conflicts"])
-    assert row["invoice_date"] == "2026-08-20"  # majority ISO
-    assert row["total_usd"] == 940.00  # median absorbs the ±$0.01 offset
-    steps = [e["step_id"] for e in row["journal"]]
-    assert steps == ["t1", "m0", "x1", "r1", "m2a", "m2b", "m2c", "x2", "k1"]
+    # One canonical vendor, both systems' ids hanging off it.
+    assert sources == {"erp-vendors", "procurement-coupa"}
+    assert len(world.graph.find("Vendor")) == 2
 
-    # The curation Task carries per-model values for the verifier.
-    task = client.get(f"/api/v1/tasks/{row['task_id']}").json()
-    assert task["queue"] == "ap-clerk" and task["kind"] == "curation"
-    date_evidence = next(
-        e for e in task["evidence"] if e["label"].startswith("invoice_date")
+
+def test_an_ambiguous_name_waits_for_a_steward_and_asserts_nothing(world):
+    _vendors(world)
+    before = len(world.graph.find("Vendor"))
+    world.sync.deliver(SyncRequest.model_validate({
+        "source": "legacy-ap-extract",
+        "vendors": [{"external_id": "L-77", "name": "Acme Industial Inc"}],
+    }), actor="system:test")
+    # No new vendor, no new link: a batch feed escalates without asserting.
+    assert len(world.graph.find("Vendor")) == before
+    task = next(
+        t for t in world.tasks.list(kind="match_review") if "Acme" in t.title
     )
-    assert "2026-08-20" in date_evidence["value"]
-    assert "08/20/2026" in date_evidence["value"]
+    assert task.queue == "vendor-stewardship" and task.status == "open"
 
-
-def test_verifying_the_ensemble_writes_the_exemplar_and_posts(client):
-    row = _submit_unknown(client)
-    _decide(
-        client, row["task_id"], "corrected",
-        note="Fields verified against the paper invoice.",
-        correction="due_date confirmed off the remittance stub",
+    decided = world.tasks.decide(
+        task.id, "approved", "steward@customer.example",
+        note="Same company, misspelled in the legacy extract.",
     )
-    # The exemplar now exists in the knowledge layer, for real.
-    asset = deps._service.repo.get("vendor-exemplar-meridian-freight")
-    assert asset is not None
-    assert "INV-3320" in asset.content  # the invoice-number format
-    assert "Correction applied" in asset.content  # corrected → provenance line
+    result = world.sync.apply_match_decision(decided)
+    assert result["action"] == "linked"
+    acme = world.graph.get(object_id("Vendor", "Acme Industrial Inc."))
+    sources = {
+        str(other.props.get("source"))
+        for _, other in world.graph.neighbors(acme.id, "identified_as", "out")
+    }
+    assert "legacy-ap-extract" in sources
 
-    resumed = client.get(f"/api/v1/payables/{row['id']}").json()
-    assert resumed["state"] == "posted"  # $940.00 is under the limit
-    assert resumed["exemplar_ref"].startswith(
-        "knowledge:vendor-exemplar-meridian-freight@rev"
+
+def test_the_invoice_path_resolves_against_the_master(world):
+    _vendors(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial nopo invoice=ACME-9 lines=PPE-GLV:1 total=80.00",
     )
-    assert [e["step_id"] for e in resumed["journal"]][-5:] == [
-        "k1", "a2", "r2", "a1", "e1",
-    ]
+    assert record.vendor_resolution == "linked"
+    assert record.vendor_id == object_id("Vendor", "Acme Industrial Inc.")
+    assert record.vendor_method in ("normalized-name", "fuzzy-name", "tax-id")
 
 
-def test_verified_vendor_takes_the_one_shot_path_next_time(client):
-    first = _submit_unknown(client)
-    assert first["extraction_path"] == "ensemble"
-    _decide(client, first["task_id"], "approved", note="Looks right.")
-
-    second = _submit_unknown(client, total="815.50")
-    assert second["extraction_path"] == "one-shot"
-    assert second["state"] == "posted"
-    assert "m1" in [e["step_id"] for e in second["journal"]]
-    assert "m2a" not in [e["step_id"] for e in second["journal"]]
-
-
-def test_rejected_verification_denies_and_writes_no_exemplar(client):
-    row = _submit_unknown(client, slug="harvest-catering", total="450.00")
-    _decide(client, row["task_id"], "rejected", note="Not a real invoice.")
-    resumed = client.get(f"/api/v1/payables/{row['id']}").json()
-    assert resumed["state"] == "denied"
-    assert resumed["verdict_reason"] == "document rejected; no exemplar written"
-    assert deps._service.repo.get("vendor-exemplar-harvest-catering") is None
+def test_an_unknown_vendor_is_minted_onboarding(world):
+    _vendors(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="new.pdf",
+        hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:1 total=80.00",
+    )
+    assert record.vendor_resolution == "new"
+    vendor = world.graph.get(record.vendor_id)
+    assert vendor.props["status"] == "onboarding"
 
 
-def test_verified_ensemble_over_limit_still_needs_the_review(client):
-    row = _submit_unknown(client, slug="titanium-tooling", total="3900.00")
-    _decide(client, row["task_id"], "approved", note="Exemplar verified.")
-    resumed = client.get(f"/api/v1/payables/{row['id']}").json()
-    # The exemplar is written, but the posting rule still elevates the amount.
-    assert resumed["state"] == "pending"
-    assert deps._service.repo.get("vendor-exemplar-titanium-tooling") is not None
-    assert [e["step_id"] for e in resumed["journal"]][-4:] == [
-        "k1", "a2", "r2", "k2",
-    ]
-    _decide(client, resumed["task_id"], "approved", note="Contract amount.")
-    assert (
-        client.get(f"/api/v1/payables/{row['id']}").json()["state"] == "posted"
+# ---- extraction paths and the flywheel ------------------------------------
+
+
+def test_known_vendor_takes_the_one_shot_path(world):
+    _vendors(world)
+    _orders(world)
+    _receipts(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-2 lines=STL-0250:2,FAS-M12:3",
+    )
+    assert record.extraction_path == "one-shot"
+    assert record.exemplar_ref.startswith("knowledge:vendor-exemplar-acme-industrial")
+    assert record.state == "posted"
+    run = world.engine.get(record.run_id)
+    assert {s.step_id for s in run.steps} >= {"m1", "z1", "x1", "r1", "m2", "c1", "c2"}
+    assert not any(s.step_id.startswith("m2a") for s in run.steps)
+
+
+def test_unknown_vendor_runs_the_ensemble_and_verifying_writes_the_exemplar(world):
+    _vendors(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="mer.pdf",
+        hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 total=190.00",
+    )
+    assert record.extraction_path == "ensemble"
+    assert record.state == "pending"
+    run = world.engine.get(record.run_id)
+    assert {"m2a", "m2b", "m2c", "x2"} <= {s.step_id for s in run.steps}
+    task = world.tasks.get(record.task_id)
+    assert task.kind == "curation" and task.queue == "ap-clerk"
+
+    decided = world.tasks.decide(
+        task.id, "approved", "dana@customer.example", note="Fields verified.",
+    )
+    world.payables.resume_for_task(decided)
+    # The exemplar is a real governed-knowledge write, keyed by the vendor id.
+    shelf = [a for a in world.knowledge.repo.all() if "exemplar" in a.tags]
+    assert any("meridian" in a.id for a in shelf)
+    vendor = world.graph.get(record.vendor_id)
+    # A human vouched for it, so the vendor graduates out of onboarding.
+    assert vendor.props["status"] == "active"
+
+
+def test_the_next_invoice_from_a_verified_vendor_is_one_shot(world):
+    _vendors(world)
+    first = world.payables.submit(
+        "ap@customer.example", filename="mer1.pdf",
+        hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 total=190.00",
+    )
+    decided = world.tasks.decide(first.task_id, "approved", "dana@customer.example")
+    world.payables.resume_for_task(decided)
+    # The posting gate for the no-PO invoice, then done with the first run.
+    run = world.engine.get(first.run_id)
+    if run.status == "suspended":
+        world.payables.resume_for_task(
+            world.tasks.decide(run.open_task_id, "approved", "dana@customer.example")
+        )
+
+    second = world.payables.submit(
+        "ap@customer.example", filename="mer2.pdf",
+        hint="newvendor=meridian-supply nopo invoice=MER-2 lines=PPE-GLV:1 total=112.00",
+    )
+    assert second.extraction_path == "one-shot"
+    assert second.vendor_id == first.vendor_id
+    assert "meridian" in second.exemplar_ref
+
+
+def test_a_rejected_verification_denies_and_writes_no_exemplar(world):
+    _vendors(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="mer.pdf",
+        hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 total=190.00",
+    )
+    decided = world.tasks.decide(
+        record.task_id, "rejected", "dana@customer.example",
+        note="Not our invoice — wrong company entirely.",
+    )
+    resumed = world.payables.resume_for_task(decided)
+    assert resumed.state == "denied"
+    assert not any(
+        "meridian" in a.id for a in world.knowledge.repo.all() if "exemplar" in a.tags
     )
 
 
-# ---- governance: the rule reads the document at run time ----
+# ---- the three-way match --------------------------------------------------
 
 
-def test_editing_the_policy_changes_the_flow_without_code(client, owner):
-    asset = client.get(
-        "/api/v1/assets/invoice-posting-policy", headers=owner
-    ).json()
-    tightened = asset["content"].replace(
-        "Auto-post limit: $2,500.00", "Auto-post limit: $500.00"
+def test_a_clean_invoice_matches_its_po_and_receipt(world):
+    _vendors(world)
+    _orders(world)
+    _receipts(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-3 lines=STL-0250:2,FAS-M12:3",
     )
-    assert tightened != asset["content"]
-    resp = client.put(
-        "/api/v1/assets/invoice-posting-policy",
-        json={"content": tightened},
-        headers=owner,
+    assert record.match_verdict == "matched"
+    assert record.state == "posted"
+    # The match is *retained*, not recomputed: there is a MatchSet object and
+    # one link per pairing.
+    match = world.graph.get(record.match_ref.split("/")[1].split("@")[0])
+    assert match.props["verdict"] == "matched"
+    assert match.props["matched_lines"] == len(record.lines)
+    pairings = world.graph.neighbors(match.id, "matches_invoice_line", "out")
+    assert len(pairings) == len(record.lines)
+    assert all(link.props["verdict"] in ("matched", "allowed-no-po")
+               for link, _ in pairings)
+
+
+def test_a_price_variance_holds_the_invoice_and_a_correction_releases_it(world):
+    _vendors(world)
+    _orders(world)
+    _receipts(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-4 "
+             "lines=STL-0250:2,FAS-M12:3 pricebump",
     )
-    assert resp.status_code == 200
+    assert record.match_verdict == "variance"
+    assert record.state == "pending"
+    assert "off the PO's" in record.verdict_reason
 
-    row = client.post(
-        "/api/v1/payables",
-        json={"note": "vendor=acme-industrial total=800.00 invoice=INV-2060"},
-        headers=owner,
-    ).json()
-    assert row["state"] == "pending"
-    assert "$500.00 auto-post limit" in row["verdict_reason"]
-    assert row["post_limit_usd"] == 500.0
-
-
-# ---- gates ----
-
-
-def test_key_may_read_but_not_submit(client, owner):
-    from app.api_keys import InMemoryApiKeyDirectory
-    from app.identities import IdentityService, InMemoryMachineIdentityDirectory
-    from app.users import InMemoryUserDirectory
-
-    deps._user_directory = InMemoryUserDirectory()
-    deps._api_key_directory = InMemoryApiKeyDirectory()
-    deps._identity_service = IdentityService(
-        deps._user_directory, InMemoryMachineIdentityDirectory()
+    decided = world.tasks.decide(
+        record.task_id, "corrected", "dana@customer.example",
+        note="Vendor billed the old list price.",
+        payload={"lines": [{"ordinal": 1, "unit_price_usd": 486.00}]},
     )
-    identity = client.post(
-        "/api/v1/identities",
-        json={"display_name": "AP bot", "role": "admin"},
-        headers=owner,
-    ).json()
-    minted = client.post(
-        "/api/v1/api-keys",
-        json={"name": "CI", "identity_uid": identity["uid"]},
-        headers=owner,
-    ).json()
-    key = {"X-API-Key": minted["token"]}
-    assert client.get("/api/v1/payables", headers=key).status_code == 200
-    resp = client.post(
-        "/api/v1/payables", json={"note": "total=10"}, headers=key
+    resumed = world.payables.resume_for_task(decided)
+    # The correction re-runs the match rather than overriding it.
+    assert resumed.match_verdict == "matched"
+    assert resumed.state == "posted"
+    run = world.engine.get(record.run_id)
+    assert "c1_1" in {s.step_id for s in run.steps}
+
+
+def test_billing_more_than_was_received_is_a_quantity_variance(world):
+    _vendors(world)
+    _orders(world)
+    _receipts(world, short=1.0)
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-5 lines=STL-0250:2,FAS-M12:3",
     )
-    assert resp.status_code == 403
+    assert record.match_verdict == "variance"
+    assert any(
+        p["verdict"] == "quantity-variance" for p in record.match_pairings
+    )
 
 
-def test_unauthenticated_is_refused(client, monkeypatch):
-    monkeypatch.setattr(settings, "auth_backend", "firebase")
-    assert client.get("/api/v1/payables").status_code == 401
+def test_an_invoice_with_no_purchase_order_is_unmatched_not_broken(world):
+    _vendors(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial nopo invoice=ACME-6 lines=PPE-GLV:1 total=80.00",
+    )
+    assert record.match_verdict == "unmatched"
+    assert record.state == "pending"
+    assert "no purchase order" in record.verdict_reason
+
+
+def test_freight_needs_no_po_line_within_the_allowance():
+    tolerances = MatchTolerances(freight_allowance_usd=150.0)
+    result = match_invoice(
+        [
+            MatchLine(ordinal=1, sku="STL-0250", description="steel plate",
+                      quantity=2, unit_price_usd=100.0, amount_usd=200.0),
+            MatchLine(ordinal=2, sku="FRT-STD", description="Freight and handling",
+                      quantity=1, unit_price_usd=60.0, amount_usd=60.0,
+                      kind="freight"),
+        ],
+        [MatchLine(ordinal=1, parent_number="PO-1", sku="STL-0250",
+                   description="steel plate", quantity=2, unit_price_usd=100.0,
+                   amount_usd=200.0)],
+        [MatchLine(ordinal=1, parent_number="RR-1", sku="STL-0250",
+                   description="steel plate", quantity=2)],
+        tolerances,
+    )
+    assert result.verdict == "matched"
+    assert result.pairings[1].verdict == "allowed-no-po"
+
+
+def test_goods_not_booked_in_block_rather_than_vary():
+    tolerances = MatchTolerances(receiving_required_above_usd=500.0)
+    result = match_invoice(
+        [MatchLine(ordinal=1, sku="STL-0250", description="steel plate",
+                   quantity=2, unit_price_usd=486.0, amount_usd=972.0)],
+        [MatchLine(ordinal=1, parent_number="PO-1", sku="STL-0250",
+                   description="steel plate", quantity=2, unit_price_usd=486.0,
+                   amount_usd=972.0)],
+        [],  # nothing received yet
+        tolerances,
+    )
+    # A sequencing state, and a different verdict from a variance.
+    assert result.verdict == "blocked"
+    assert result.pairings[0].verdict == "no-receipt"
+
+
+# ---- the anomaly screen ---------------------------------------------------
+
+
+def test_the_screen_says_so_when_there_is_no_history(world):
+    _vendors(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial nopo invoice=ACME-7 lines=PPE-GLV:1 total=80.00",
+    )
+    assert record.anomaly_findings == []
+    assert "no history" in record.anomaly_basis
+
+
+def test_an_outlier_is_measured_against_this_vendor(world):
+    _vendors(world)
+    _orders(world)
+    _receipts(world)
+    for number in ("ACME-A", "ACME-B", "ACME-C"):
+        world.payables.submit(
+            "ap@customer.example", filename="acme.pdf",
+            hint=f"vendor=acme-industrial po=PO-7741 invoice={number} "
+                 "lines=STL-0250:2,FAS-M12:3",
+        )
+    world.anomaly.rebuild()
+    profile = world.anomaly.profile_for(object_id("Vendor", "Acme Industrial Inc."))
+    assert profile.invoices == 3 and profile.median_usd > 0
+
+    big = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-BIG "
+             "lines=STL-0375:12 total=9800.00",
+    )
+    kinds = {f["kind"] for f in big.anomaly_findings}
+    assert "amount-outlier" in kinds
+    assert str(profile.median_usd)[:4] in big.anomaly_basis.replace(",", "")
+
+
+def test_a_duplicate_total_inside_the_window_is_flagged(world):
+    _vendors(world)
+    _orders(world)
+    _receipts(world)
+    first = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-D1 "
+             "lines=STL-0250:2,FAS-M12:3",
+    )
+    world.anomaly.rebuild()
+    second = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint=f"vendor=acme-industrial po=PO-7741 invoice=ACME-D2 "
+             f"lines=STL-0250:2,FAS-M12:3 total={first.total_usd:.2f}",
+    )
+    kinds = {f["kind"] for f in second.anomaly_findings}
+    assert "duplicate-suspect" in kinds
+    assert second.state == "pending"
+
+
+def test_profiles_are_derived_and_rebuildable(world):
+    _vendors(world)
+    _orders(world)
+    _receipts(world)
+    world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-E lines=STL-0250:2,FAS-M12:3",
+    )
+    world.anomaly.rebuild()
+    before = world.anomaly.profile_for(object_id("Vendor", "Acme Industrial Inc."))
+    world.anomaly.store._items.clear()  # nothing here is a source of truth
+    assert world.anomaly.profile_for(before.vendor_id) is None
+    world.anomaly.rebuild()
+    after = world.anomaly.profile_for(before.vendor_id)
+    assert after.invoices == before.invoices
+    assert after.median_usd == before.median_usd
+
+
+# ---- seeding and the API -------------------------------------------------
+
+
+def test_seed_builds_a_matchable_world(world):
+    seeded = seed_payables_if_empty(world.payables, sync=world.sync)
+    assert seeded > 0
+    assert seed_payables_if_empty(world.payables, sync=world.sync) == 0
+
+    rows = world.payables.list()
+    assert len(rows) == seeded
+    assert all(row.run_id for row in rows)
+    stats = world.payables.stats()
+    assert stats.one_shot and stats.ensemble
+    assert stats.matched  # the PO and receiving feeds landed, so matches happen
+    assert stats.anomalies  # and the screen found something
+    # Vendors, orders and receipts all arrived through their sync Flows.
+    assert len(world.graph.find("Vendor")) >= 4
+    assert world.graph.find("PurchaseOrder") and world.graph.find("ReceivingReport")
+    sources = {s.source for s in world.sync.sources()}
+    assert {"erp-vendors", "erp-purchasing", "wms-receiving"} <= sources
+
+
+def test_a_redelivery_changes_nothing(world):
+    _vendors(world)
+    before = world.graph.stats()
+    _vendors(world)
+    after = world.graph.stats()
+    assert after["objects"] == before["objects"]
+    vendor_runs = world.engine.list(flow_id="vendor-sync")
+    assert vendor_runs[0].outputs["unchanged"] == 2
+
+
+def test_api_exposes_the_table_the_match_and_the_vendors(client, world):
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    rows = client.get("/api/v1/payables").json()
+    assert rows and any(r["match_pairings"] for r in rows)
+    stats = client.get("/api/v1/payables/stats").json()
+    assert stats["total"] == len(rows)
+
+    vendors = client.get("/api/v1/graph/vendors").json()
+    acme = next(v for v in vendors if "Acme" in v["label"])
+    assert len(acme["source_records"]) >= 2  # ERP and procurement
+    assert acme["has_exemplar"]
+    assert acme["invoices"] >= 1
+
+    sources = client.get("/api/v1/sources").json()
+    assert {s["kind"] for s in sources} >= {
+        "vendors", "purchase-orders", "receiving-reports"
+    }

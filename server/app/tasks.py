@@ -74,6 +74,13 @@ class TaskDecision(BaseModel):
     note: str = ""
     # For `corrected`: the value the human supplied in place of the proposal.
     correction: str = ""
+    # For `corrected` on a structured review: the patch the reviewer applied —
+    # edited field values, added or removed lines, a supplied purpose. A prose
+    # `correction` string cannot carry "split this receipt into two lines", and
+    # that is exactly what a compound receipt needs, so the structured payload
+    # travels beside it. Shape is per flow; the flow that raised the Task is
+    # the only thing that interprets it.
+    payload: dict = Field(default_factory=dict)
     decided_by: str = ""
     decided_at_iso: str = ""
 
@@ -231,6 +238,7 @@ class TaskService:
         decided_by: str,
         note: str = "",
         correction: str = "",
+        payload: dict | None = None,
     ) -> Task:
         """The human's judgment, recorded durably and attributed.
 
@@ -248,6 +256,7 @@ class TaskService:
                     verdict=verdict,
                     note=note,
                     correction=correction,
+                    payload=payload or {},
                     decided_by=decided_by,
                     decided_at_iso=utcnow().isoformat(),
                 ),
@@ -300,79 +309,21 @@ def _seed_tasks() -> list[Task]:
     """A demo backlog across the three streams, tied to the seeded world.
 
     Ids are stable slugs (not random) so the seed is idempotent per backend
-    and a demo script can name them. Two tasks pair with the two seeded
-    pending rows in the reimbursements table (task_reimb_seed_08/09), so
-    deciding them visibly resumes those runs.
+    and a demo script can name them.
+
+    The elevated-reimbursement tasks that used to be written by hand here are
+    gone: the seeded expense runs suspend for real, so the engine raises those
+    Tasks itself and deciding one genuinely resumes its run. What is left is
+    the work no live flow produces yet.
     """
     return [
-        # ---- HITL proper: elevated reimbursements and an exception ----
-        Task(
-            id="task_reimb_seed_08",
-            kind="decision",
-            title="Elevated reimbursement: harbor-hotel $487.90",
-            summary=(
-                "The needs-elevation rule routed this receipt for review: "
-                "$487.90 exceeds the $200.00 auto-approval limit."
-            ),
-            queue="expense-review",
-            priority="normal",
-            flow_id="expense-reimbursement",
-            case_ref="reimb_seed_08",
-            refs=["knowledge:expense-approval-policy"],
-            evidence=[
-                TaskEvidence(label="Vendor", value="harbor-hotel"),
-                TaskEvidence(label="Amount", value="$487.90"),
-                TaskEvidence(label="Category", value="lodging"),
-                TaskEvidence(label="Extraction confidence", value="0.90"),
-                TaskEvidence(
-                    label="Auto-approval limit", value="$200.00 (governed)"
-                ),
-            ],
-            proposal=TaskProposal(
-                action="record-reimbursement",
-                target="reimbursements",
-                summary="Record reimb_seed_08 as approved and schedule payout",
-            ),
-            resumes="this run resumes at record-reimbursement",
-            created_at_iso=_ago_iso(46),
-        ),
-        Task(
-            id="task_reimb_seed_09",
-            kind="decision",
-            title="Elevated reimbursement: corner-bistro $182.40",
-            summary=(
-                "The needs-elevation rule routed this receipt for review: "
-                "extraction confidence 0.61 is below 0.80. The amount itself "
-                "is within the auto-approval limit."
-            ),
-            queue="expense-review",
-            priority="normal",
-            flow_id="expense-reimbursement",
-            case_ref="reimb_seed_09",
-            refs=["knowledge:expense-approval-policy"],
-            evidence=[
-                TaskEvidence(label="Vendor", value="corner-bistro"),
-                TaskEvidence(label="Amount", value="$182.40"),
-                TaskEvidence(label="Category", value="meals"),
-                TaskEvidence(label="Extraction confidence", value="0.61"),
-                TaskEvidence(
-                    label="Why low", value="crumpled thermal paper; total inferred"
-                ),
-            ],
-            proposal=TaskProposal(
-                action="record-reimbursement",
-                target="reimbursements",
-                summary="Record reimb_seed_09 as approved and schedule payout",
-            ),
-            resumes="this run resumes at record-reimbursement",
-            created_at_iso=_ago_iso(5),
-        ),
+        # ---- HITL proper: an exception, plus curation and resolution ----
         Task(
             id="task_payout_3307",
             kind="exception",
             title="Payout export rejected an approved reimbursement",
             summary=(
-                "Transient retries exhausted pushing reimb_seed_03 to the "
+                "Transient retries exhausted pushing run_er_seed03 to the "
                 "payroll export: duplicate employee cost-center row. Nothing "
                 "is rolled back; the approval stands and the export needs a "
                 "human call."
@@ -380,7 +331,7 @@ def _seed_tasks() -> list[Task]:
             queue="expense-review",
             priority="high",
             flow_id="expense-reimbursement",
-            case_ref="reimb_seed_03",
+            case_ref="run_er_seed03",
             refs=["knowledge:expense-approval-policy"],
             evidence=[
                 TaskEvidence(label="Succeeded", value="reimbursements table, ledger"),
@@ -412,7 +363,7 @@ def _seed_tasks() -> list[Task]:
             queue="data-steward",
             priority="normal",
             flow_id="expense-reimbursement",
-            case_ref="reimb_seed_01",
+            case_ref="run_er_seed01",
             refs=["vendor:corner-bistro@rev3"],
             evidence=[
                 TaskEvidence(
@@ -560,7 +511,7 @@ def _seed_tasks() -> list[Task]:
             summary="Over the auto-approval limit; conference rate confirmed.",
             queue="expense-review",
             flow_id="expense-reimbursement",
-            case_ref="reimb_seed_03",
+            case_ref="run_er_seed03",
             status="done",
             refs=["knowledge:expense-approval-policy"],
             evidence=[TaskEvidence(label="Amount", value="$612.00")],
@@ -584,7 +535,7 @@ def _seed_tasks() -> list[Task]:
             summary="Low extraction confidence; amount verified off the card feed.",
             queue="expense-review",
             flow_id="expense-reimbursement",
-            case_ref="reimb_seed_07",
+            case_ref="run_er_seed08",
             status="done",
             refs=["knowledge:expense-approval-policy"],
             evidence=[

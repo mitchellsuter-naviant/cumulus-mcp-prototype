@@ -18,6 +18,7 @@ from .deps import (
     get_employee_service,
     get_payable_service,
     get_reimbursement_service,
+    get_sync_service,
     get_task_service,
 )
 from .tasks import (
@@ -39,6 +40,11 @@ class TaskDecisionRequest(BaseModel):
     verdict: TaskVerdict
     note: str = Field(default="", max_length=2000)
     correction: str = Field(default="", max_length=2000)
+    # The structured half of a `corrected` decision: edited field values, added
+    # or removed lines, a chosen entity id. A prose correction cannot say
+    # "split this receipt into two lines", and that is exactly what a compound
+    # receipt needs. Interpreted only by the flow that raised the Task.
+    payload: dict = Field(default_factory=dict)
 
 
 def _require_human(principal: Principal) -> None:
@@ -94,6 +100,7 @@ def decide_task(
             decided_by=principal.uid,
             note=body.note,
             correction=body.correction,
+            payload=body.payload,
         )
         # The resume half of suspend/resume: a decision on a task raised by a
         # live runner resumes that run. Each hook no-ops on unrelated tasks,
@@ -103,6 +110,9 @@ def decide_task(
             get_reimbursement_service().apply_task_decision,
             get_payable_service().apply_task_decision,
             get_employee_service().apply_task_decision,
+            # A steward's entity-resolution decision is the *first* write on
+            # that record: a batch sync asserts nothing while the Task is open.
+            get_sync_service().apply_match_decision,
         ):
             try:
                 resume(decided)

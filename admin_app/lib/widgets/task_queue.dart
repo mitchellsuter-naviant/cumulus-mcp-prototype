@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/task.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'review_screens.dart';
 import 'side_drawer.dart';
 import 'ui_kit.dart';
 
@@ -397,7 +398,31 @@ class _TaskDetailState extends State<_TaskDetail> {
     super.dispose();
   }
 
-  Future<void> _decide(String verdict) async {
+  /// Open the bespoke review screen for this task, if it has one.
+  ///
+  /// The drawer is for triage — read the evidence, approve or reject. Anything
+  /// that needs a person to *edit the facts* (correct an amount, split a
+  /// receipt, pick the right vendor) happens in a full screen, because doing
+  /// it in a 380px drawer would be a worse job badly done.
+  Future<void> _openReview() async {
+    final outcome = await openReviewScreen(
+      context: context,
+      api: widget.api,
+      task: widget.task,
+    );
+    if (outcome == null || !mounted) return;
+    await _decide(
+      outcome.verdict,
+      note: outcome.note,
+      payload: outcome.payload,
+    );
+  }
+
+  Future<void> _decide(
+    String verdict, {
+    String? note,
+    Map<String, dynamic> payload = const {},
+  }) async {
     setState(() {
       _busy = true;
       _error = null;
@@ -406,8 +431,9 @@ class _TaskDetailState extends State<_TaskDetail> {
       final decided = await widget.api.decideTask(
         widget.task.id,
         verdict: verdict,
-        note: _note.text.trim(),
+        note: (note ?? _note.text).trim(),
         correction: _correction.text.trim(),
+        payload: payload,
       );
       widget.onDecided(decided);
     } on ApiException catch (e) {
@@ -525,6 +551,25 @@ class _TaskDetailState extends State<_TaskDetail> {
               padding: const EdgeInsets.only(bottom: 12),
               child: Text('On decide: ${task.resumes}', style: CumulusText.meta),
             ),
+          if (task.isOpen && _hasReviewScreen(task)) ...[
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: _busy ? null : _openReview,
+                icon: const Icon(Icons.open_in_full, size: 16),
+                label: Text(_reviewLabel(task)),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Opens the full screen, where the facts themselves can be '
+              'corrected — the checks then run again over what you changed.',
+              style: CumulusText.meta,
+            ),
+            const SizedBox(height: 14),
+            const Divider(height: 1),
+            const SizedBox(height: 14),
+          ],
           if (task.isOpen) ...[
             TextField(
               controller: _note,
@@ -613,4 +658,19 @@ class _TaskDetailState extends State<_TaskDetail> {
       ),
     );
   }
+}
+
+/// Which tasks have a bespoke review screen. Everything else gets the drawer's
+/// approve/reject, which is the honest affordance when there is nothing
+/// structured to edit.
+bool _hasReviewScreen(QueueTask task) =>
+    task.kind == 'match_review' ||
+    task.flowId == 'expense-reimbursement' ||
+    task.flowId == 'accounts-payable';
+
+String _reviewLabel(QueueTask task) {
+  if (task.kind == 'match_review') return 'Open the match review';
+  if (task.flowId == 'expense-reimbursement') return 'Open the expense review';
+  if (task.kind == 'curation') return 'Open the extraction verification';
+  return 'Open the invoice review';
 }

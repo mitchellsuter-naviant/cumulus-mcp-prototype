@@ -4,6 +4,7 @@ import '../models/reimbursement.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'mini_charts.dart';
+import 'run_workbench.dart';
 import 'ui_kit.dart';
 
 /// The Expense Reimbursement workspace: the reimbursements table.
@@ -134,6 +135,11 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
                 value: '\$${stats.approvedUsd.toStringAsFixed(2)}',
                 caption: 'committed via the gateway',
               ),
+              StatTile(
+                label: 'Lines',
+                value: '${stats.lines}',
+                caption: '${stats.humanCorrected} corrected by a reviewer',
+              ),
             ],
           ),
           const SizedBox(height: 16),
@@ -147,6 +153,14 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
               height: 140,
               showTitle: false,
             ),
+          ),
+          const SizedBox(height: 16),
+          FlowRunsCard(
+            api: widget.api,
+            flowId: 'expense-reimbursement',
+            subtitle:
+                'the durable journal each request came out of — gates, '
+                'governed reads, and replays · click one to open it',
           ),
           const SizedBox(height: 16),
           Wrap(
@@ -200,10 +214,45 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(r.vendor, style: CumulusText.rowTitle),
+                      Row(
+                        children: [
+                          Flexible(
+                            child: Text(r.vendor, style: CumulusText.rowTitle),
+                          ),
+                          if (r.lines.length > 1) ...[
+                            const SizedBox(width: 8),
+                            StatusBadge(
+                              '${r.lines.length} lines',
+                              dense: true,
+                            ),
+                          ],
+                          if (r.lines.any((line) => line.isSplit)) ...[
+                            const SizedBox(width: 6),
+                            const Tooltip(
+                              message:
+                                  'The submitter claimed less than the receipt '
+                                  'total — their own split, and legitimate.',
+                              child: StatusBadge(
+                                'split',
+                                tone: CumulusTone.teal,
+                                dense: true,
+                              ),
+                            ),
+                          ],
+                          if (r.reviewRounds > 0) ...[
+                            const SizedBox(width: 6),
+                            StatusBadge(
+                              '${r.reviewRounds} review round(s)',
+                              tone: CumulusTone.accent,
+                              dense: true,
+                            ),
+                          ],
+                        ],
+                      ),
                       const SizedBox(height: 2),
                       Text(
-                        '${r.date} · ${r.category} · ${r.employee}',
+                        '${r.date} · ${r.category} · ${r.employee}'
+                        '${r.documents.length > 1 ? ' · ${r.documents.length} documents' : ''}',
                         style: CumulusText.meta,
                       ),
                     ],
@@ -262,12 +311,56 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(r.verdictReason, style: CumulusText.body),
-          const SizedBox(height: 8),
+          if (r.commentary.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            const FieldLabel(
+              'Submitter\u2019s commentary',
+              hint: 'a governed input to the run, not a note on the side',
+            ),
+            Text('\u201c${r.commentary}\u201d', style: CumulusText.body),
+          ],
+          if (r.escalations.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            const FieldLabel(
+              'Why it was elevated',
+              hint: 'typed, because each reason needs a different fix',
+            ),
+            for (final escalation in r.escalations)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  children: [
+                    StatusBadge(
+                      escalation.kind,
+                      tone: CumulusTone.warn,
+                      dense: true,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(escalation.detail, style: CumulusText.meta),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+          if (r.lines.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const FieldLabel(
+              'Lines',
+              hint:
+                  'facts, not documents — a compound receipt yields several, '
+                  'and a reviewer can add one',
+            ),
+            for (final line in r.lines) _lineRow(r, line),
+          ],
+          const SizedBox(height: 12),
           Wrap(
             spacing: 6,
             runSpacing: 6,
             children: [
               _monoChip(r.policyRef),
+              if (r.runId.isNotEmpty) _monoChip(r.runId),
+              if (r.graphRef.isNotEmpty) _monoChip(r.graphRef),
               _monoChip('limit \$${r.policyLimitUsd.toStringAsFixed(2)}'),
               if (r.model.isNotEmpty) _monoChip(r.model),
               if (r.taskId.isNotEmpty) _monoChip(r.taskId),
@@ -309,6 +402,89 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
             const SizedBox(height: 6),
             Text('“${r.decisionNote}”', style: CumulusText.body),
           ],
+        ],
+      ),
+    );
+  }
+
+  /// One line, with the two amounts side by side. The gap between them is the
+  /// submitter's own split, and showing both is what makes it legible rather
+  /// than looking like a mis-extraction.
+  Widget _lineRow(Reimbursement r, ExpenseLine line) {
+    final document = r.documents.firstWhere(
+      (d) => d.documentId == line.documentId,
+      orElse: () => const DocumentSlot(
+        documentId: '', filename: '', note: '', byteSize: 0, mediaType: '',
+      ),
+    );
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 24,
+            child: Text('${line.ordinal}.', style: CumulusText.meta),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        '${line.vendor} · ${line.category}',
+                        style: CumulusText.body.copyWith(fontSize: 12.5),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    StatusBadge(
+                      line.origin,
+                      tone: line.isHuman
+                          ? CumulusTone.violet
+                          : CumulusTone.neutral,
+                      dense: true,
+                    ),
+                    if (line.correctedBy.isNotEmpty) ...[
+                      const SizedBox(width: 6),
+                      Text('by ${line.correctedBy}', style: CumulusText.meta),
+                    ],
+                  ],
+                ),
+                if (line.purpose.isNotEmpty)
+                  Text(line.purpose, style: CumulusText.meta),
+                if (document.filename.isNotEmpty)
+                  Text(
+                    '${document.filename}'
+                    '${document.note.isEmpty ? '' : ' — \u201c${document.note}\u201d'}',
+                    style: CumulusText.meta,
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          SizedBox(
+            width: 96,
+            child: Text(
+              '\$${line.documentTotalUsd.toStringAsFixed(2)}',
+              textAlign: TextAlign.right,
+              style: CumulusText.meta.copyWith(
+                decoration: line.isSplit ? TextDecoration.lineThrough : null,
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 96,
+            child: Text(
+              '\$${line.requestedUsd.toStringAsFixed(2)}',
+              textAlign: TextAlign.right,
+              style: CumulusText.body.copyWith(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
         ],
       ),
     );

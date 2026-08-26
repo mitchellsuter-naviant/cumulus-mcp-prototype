@@ -154,6 +154,12 @@ Requires the **MCP Python SDK 2.x** (`mcp.server.MCPServer`). The 1.x API
 | `TASKS_COLLECTION` | `tasks` | Firestore collection for the Task Queue |
 | `REIMBURSEMENTS_COLLECTION` | `reimbursements` | Firestore collection for the reimbursements table |
 | `EMPLOYEE_COLLECTION` | `employee` | Firestore collection prefix for profiles and PTO |
+| `GRAPH_OBJECTS_COLLECTION` | `graph_objects` | Canonical Objects — the entity layer |
+| `GRAPH_LINKS_COLLECTION` | `graph_links` | Typed, reversible Links between them |
+| `RUNS_COLLECTION` | `flow_runs` | Durable Flow runs: the journal a suspended run resumes from |
+| `DOCUMENTS_COLLECTION` | `documents` | Submitted artifacts and the regions an extraction read |
+| `DOCUMENT_MAX_BYTES` | `700000` | Refuse artifacts larger than the document-store adapter can hold |
+| `VENDOR_PROFILES_COLLECTION` | `vendor_profiles` | Derived per-vendor statistics behind the anomaly screen |
 | `RECEIPT_BACKEND` | follows `ANSWER_BACKEND` | `none` (deterministic stub) or `vertex` (multimodal receipt reading) |
 | `RECEIPT_MODEL` | `gemini-2.5-flash` | Vertex model for receipt extraction |
 | `AUTH_BACKEND` | `none` | `none` (dev: everyone is owner) or `firebase` (verify ID tokens) |
@@ -298,6 +304,28 @@ revision. Push them explicitly:
 
 Idempotent, and each update is a real revision bump — which is what a governed
 knowledge change should be. Pass filenames to push only some of them.
+
+### Reshaped collections
+
+The flow rewrite changed the stored shape of the tasks, reimbursements and
+payables collections, and the seeds only run against an *empty* collection. So
+`deploy.sh` pins those three to a generation (`tasks_v3`, `reimbursements_v3`,
+`payables_v3`, overridable with `COLLECTION_GENERATION`). Pointing at the old
+ones would leave stale rows in place and skip the seed that builds the graph,
+the runs and the Tasks that belong with them — a deployment that looks fine and
+demonstrates nothing. The graph, run, document and profile collections are new,
+so they need no pinning.
+
+The generation is set inside `deploy.sh` rather than applied by hand afterwards
+because `--set-env-vars` replaces the whole environment: an override added to a
+live revision is silently dropped by the next deploy.
+
+New and edited seed documents also need pushing, because `seed_if_empty` never
+touches a non-empty corpus:
+
+```bash
+./deploy/upsert_knowledge.py <SERVICE_URL> "$(cat deploy/.admin_api_key)"
+```
 
 ### Redeploying just the server
 
@@ -578,7 +606,262 @@ decision is a real, attributed write — the stand-in for the curation-ledger
 entry the doctrine requires. Nothing actually resumes yet; each task's
 `resumes` field says what would happen once a real engine lands.
 
+## The map: entities, runs, collections
+
+Three pieces of machinery the two live flows sit on. They were added together
+because each was the thing blocking the others.
+
+### Durable runs (`server/app/runs.py`)
+
+A run is stored state, and its journal of completed steps *is* the run — the
+Python frame is disposable. Re-entering a flow body **replays** completed steps
+from the journal instead of re-executing them, which is what makes the
+interesting behaviour possible:
+
+- A **gate** (`ctx.gate`) raises a Task and suspends. When the Task is decided,
+  the same gate returns the decision and execution continues past it. Several
+  gates in one flow work by construction — the AP flow uses three.
+- A **correction re-runs the checks.** A reviewer fixes an amount, the Rule runs
+  again over the corrected facts, and the run either finishes or asks again
+  (capped, so it stops asking rather than looping).
+- **Restart-safe.** A suspended run holds no compute; it is a document with a
+  cursor. `POST /api/v1/runs/{id}/resume` exists for the narrow case where the
+  process died between the decision write and the resume, and is idempotent
+  because completed steps replay.
+- **Retry-then-escalate.** `ctx.step(..., retries=n, escalate_queue=…)` retries
+  a transient failure in place, then hands the error to a person as an
+  exception Task rather than failing silently.
+
+Everything non-deterministic — model calls, id minting, clock reads — has to
+happen *inside* a step, or a replay would not be exact.
+
+### The entity layer (`server/app/graph.py`, `ontology.py`)
+
+Canonical Objects, typed Links, retained Claims.
+
+- An Object's id is **derived from a declared natural key**, so the same
+  real-world thing seen twice resolves to one entity — and a replayed step
+  mints the same id rather than a duplicate.
+- Field values are the **resolution of claims**, not a write. Every value
+  arrives as a Claim carrying its source and confidence; `props` is those claims
+  reduced under the ontology's precedence order (`human` → `erp` →
+  `procurement` → `flow` → `model`). Losing claims stay on the record, so two
+  systems disagreeing about a vendor's payment terms is a normal state you can
+  look at, and changing precedence **re-resolves history rather than rewriting
+  it**.
+- Links are typed, directional, carry a confidence and a method, and are
+  **reversible**: withdrawing an identity assertion writes an end to its
+  validity instead of deleting it.
+
+The ontology is declared in Python and exported to the corpus as the
+`enterprise-ontology` document, so the document a person reads and the schema
+the system runs cannot drift. `GET /api/v1/graph/ontology` returns the
+declaration with live instance counts beside each type.
+
+Why Firestore and not a graph database: every traversal here is a bounded walk
+from a known root (`Employee --submitted--> ExpenseRequest
+--has_expense_line--> ExpenseLine`), which is point-lookup work. The seam to
+reconsider is unbounded-hop traversal, and `graph.traverse` takes a *declared*
+path specifically so that stays visible.
+
+Not everything is a link, and the `Claim` is why. In a pure triple world,
+attaching "the model said this, at 10:02, with 0.97 confidence" to a value
+needs reification — wrapping the statement in another statement — which is what
+makes RDF provenance miserable in practice. A Claim *is* that reification, done
+once and made first-class, so every fact carries its source without the store
+paying for it on reads. What earns its own object, then, is not "is it a fact"
+but **does it have its own identity and its own edges**: a line item does (it
+is evidenced by a document region and pairs to a PO line), a total does not,
+and a *state with a cause* gets an object behind it — `paid` is a projection of
+`Invoice --settled_by--> Payment` existing, not a field someone set. A
+`last_modified` is not a fact about the invoice at all; it is a fact about the
+record, and lives on the claim.
+
+### The TBox is enforced, and that is the testing story
+
+`ontology.py` is not a description any more — it is a constraint. Every write
+is validated against it, and `strict` (the default) *refuses* the write rather
+than logging it:
+
+- an object type or link type that is not declared;
+- a claim on a field the type does not declare, or a non-numeric value on a
+  field declared `money`/`number`;
+- a link whose endpoints are the wrong types;
+- a link that breaks the declared cardinality.
+
+Cardinality is declared only where a second edge would definitely be a bug:
+`one-to-many` constrains the inbound side ("an invoice has one issuing
+vendor", "a line has one parent"), `many-to-one` the outbound ("a purchase
+order is placed with one vendor"), and `many-to-many` is chosen deliberately
+where a second edge is legitimate — a request reviewed twice can be decided by
+two people. Turning validation on immediately found four cardinalities that
+were declared the wrong way round and six fields the flows wrote that the
+ontology never mentioned; both are fixed, which is the point.
+
+`GET /api/v1/graph/invariants` sweeps the whole graph. This is the tier of
+testing that needs no per-case labels: the invariants hold for every object and
+edge, so a duplicate vendor, an orphaned line, or an edge pointing at the wrong
+type is caught without anyone having written an assertion about it. The seeded
+world is asserted to have zero violations.
+
+### Provenance: the actor, and the act
+
+A claim records **who** asserted a value (`source`: `human:dana@…`,
+`erp:erp-vendors`, `model:stub-extractor`) and **which act** wrote it
+(`run_id` + `step_id`). Links carry the same pair. With both, "why does this
+invoice say $1,425.25" resolves to a step in a journal rather than to a
+category.
+
+The other half of that join is the **write-set**: a step records what it wrote
+(`graph:Invoice/…@rev2`, `link:issued/…`, `document:…`, `knowledge:…@rev1`)
+alongside what it read. Runs had always recorded their read-set; without the
+write-set they could not say what they *changed*, which is the half an auditor
+actually asks about — and it is what lets the console show the graph assembling
+itself step by step.
+
+Writes go through `GraphService.writer(run_id, step_id)`, a view of the service
+bound to the act doing the writing: it stamps the provenance and accumulates
+the refs, so a flow cannot write to the graph without saying who and when.
+
+### Collections and retention (`server/app/data_collections.py`)
+
+Retention, custody and authoritativeness are properties of a **set**, not of a
+row — "keep approved receipts for two years" is a sentence about a Collection.
+So Collections are declared in Python, exported as the `data-collections`
+document, and `retention_until` is stamped on every artifact at write time.
+`GET /api/v1/documents/expiring` reports what is past its horizon; the purge
+pass is *not* built, and saying so is better than implying otherwise.
+
+### Inbound sync as Flows (`server/app/sync.py`)
+
+`POST /api/v1/sources/deliver` accepts a push of vendors, purchase orders or
+receiving reports and runs the matching sync Flow. The rules that matter:
+
+- Rows **land exactly as delivered** before resolution, so changing the
+  matching rules re-resolves without re-fetching.
+- A byte-identical redelivery is counted `unchanged` and disturbs nothing;
+  passing `idempotency_key` makes a retried delivery re-enter the same run,
+  replay its steps and change nothing.
+- **A batch feed never suspends for one ambiguous row.** An unclear match lands,
+  asserts nothing, and raises a `match_review` Task; the steward's decision is
+  the first write. (A per-case flow does the opposite and blocks, because
+  posting against the wrong vendor is not recoverable.)
+
+`GET /api/v1/sources` is assembled from the sync runs themselves — there is no
+second bookkeeping store to disagree with them.
+
+### Entity resolution (`server/app/resolution.py`)
+
+One resolver, two callers: the vendor sync when an ERP row arrives, and the AP
+flow when a ModelCall has read candidate names off an invoice. One piece of
+machinery so the two can never disagree about what counts as a match, which is
+the failure mode that produces two vendors named Acme.
+
+Thresholds are governed knowledge (`entity-resolution-policy`): auto-link at
+0.92, steward review from 0.70, mint below. The scoring blends exact token
+overlap, character similarity, and token-wise soft overlap — three signals
+because a typo, a word reorder and an extra word each defeat a different one.
+
+## Evals: a per-flow spec over the shared model
+
+`server/app/evals.py` + `server/app/eval_specs.py`, exported to the corpus as
+`flow-eval-specs`.
+
+There is **one** enterprise model — a global `Invoice`, a global `Vendor` — and
+a flow's eval is an **overlay** on it saying which parts that flow is
+answerable for and how tightly to judge them. The spec carries the match
+policy; the case carries only the values:
+
+    Invoice.invoice_number   exact
+    Invoice.total_usd        approx ±0.01
+    Invoice.due_date         ignore          (the vendor's terms, not ours)
+    Vendor.name              fuzzy >= 0.90   (a model read it off a page)
+    issued                   exists
+    has_invoice_line         count
+
+Three things follow. Cases stop repeating themselves — one decision about how
+strictly to compare a total, applied everywhere. Adding a field to the ontology
+cannot silently start failing cases, because unlisted fields are ignored unless
+a spec says `unlisted_fields: require` and asks to be told about drift. And the
+spec is reviewable on its own: "what does the AP flow promise about an Invoice"
+is a document rather than an inference over fifty cases. `ignore` is as
+load-bearing as the rest and is shown, not hidden — a due date is the vendor's
+payment terms, so grading it would be grading the wrong system.
+
+**Checkpoints** are the other half. A spec evaluates the world at points *in*
+the run: after `z1` the vendor must be resolved and nothing extracted yet;
+after `a1` the Invoice, its lines and the MatchSet must exist. That works
+without snapshots because claims and links record the step that wrote them, so
+the state as of a step is the resolution of the claims whose step came no
+later — point-in-time reconstruction, and the direct payoff of recording
+provenance. Trajectory rules are scoped the same way, so `step_absent m2` at
+`z1` means "not yet" rather than "never".
+
+Because the flows write the graph once, at commit, a run held at a gate never
+reaches the `committed` checkpoint — so declaring it in a case *is* the
+assertion that this invoice should have posted, and a case for a held invoice
+asserts the entities are **absent** instead. That pins the rule that nothing is
+committed until the gate is answered. (Writing entities earlier as drafts is
+the doctrine's Draft-Object status-gating, and would let a held invoice be
+visible as an entity; it is not built, and it would need the anomaly profile to
+filter drafts.)
+
+**Isolation, and why separate collections was the call.** Object ids derive
+from natural keys, so an eval fixture named "Acme Industrial Inc." *is* the
+production vendor id. An unisolated run would append `model:` claims to a real
+vendor and — the one that actually matters — feed eval invoices into the
+`vendor_payment_profile` that real invoices are judged against, changing flow
+behaviour rather than a number on a screen. So every case runs in its own
+in-memory world with the corpus copied in (frozen for the run and writable, so
+a flow that promotes an exemplar cannot promote a real one), and the revisions
+it read are recorded on the result — two pass rates are only comparable when
+they measured the same knowledge.
+
+A fixture is expressed as **the deliveries the real feeds would have made**, so
+a precondition is established the way production established it and the sync
+flows are exercised on the way in. Fixtures and expectations are written in
+**natural keys, never ids** — that is the part that would be hard to undo, and
+it is what lets a case promoted from a real run need no rewriting. `$run` and an
+empty key cover the keys that are minted rather than authored.
+
+The TBox invariant sweep runs per case at no authoring cost, so a structural
+bug fails a case even when no expectation named it.
+
+`GET /api/v1/evals` lists the specs with how much of the model each grades;
+`POST /api/v1/evals/{spec}/run` runs them. Launching is `admin+` but **not**
+human-gated: a CI key launching an eval is the point of having keys, and it is
+the one write in this API where a credential doing the work is correct.
+
 ## Reimbursements (the live flow)
+
+Rebuilt on the run engine and the graph. A submission is **N documents plus the
+submitter's own commentary**, and a document is **not** a line:
+
+- Each document carries its own note, and the note is a real input: "I am only
+  requesting $75 of the $110 — I ordered wine on my own tab" lowers what that
+  line claims, and the journal records that the number came from the note.
+  Claiming *less* than the receipt is legitimate and needs nobody; claiming more
+  is always elevated.
+- A compound receipt yields **two lines from one document**, and a reviewer can
+  add a line the extraction missed. Lines are facts with an `evidenced_by` edge
+  back to the artifact they were read from.
+- Escalation reasons are **typed** (`over-limit`, `extraction-uncertain`,
+  `restricted-category`, `purpose-missing`, `amount-mismatch`) because they need
+  different fixes, and the review screen edits the facts rather than overriding
+  the rule. A correction re-runs the Rule; a `purpose-missing` fix that leaves
+  the invoice still over the limit correctly asks again.
+- The run writes the graph: `Employee --submitted--> ExpenseRequest
+  --has_expense_line--> ExpenseLine --evidenced_by--> Document`. A
+  human-corrected value lands as a `human:` claim outranking the model's, with
+  the model's original reading still on the record.
+- Two governed values were added to the policy document: a purpose is required
+  above $75.00, and a requested-amount tolerance of $0.50.
+
+Submission lives in the Employee Hub (drag several receipts in at once); the
+Workspace is read-and-act. The seed history is produced by *running the flow* —
+twelve real runs with real journals, documents, graph objects and Task
+decisions — so a bug in the flow shows up at startup rather than on the first
+live submission.
 
 The one seeded flow, `expense-reimbursement`, is also the prototype's first
 **live** execution path. `POST /api/v1/reimbursements` runs the same steps
@@ -608,12 +891,20 @@ rows on first start; live submissions append.
 
 ## Accounts payable (the second live flow)
 
-`accounts-payable` handles inbound vendor invoices, and its interesting move
-is that **the extraction strategy depends on what the knowledge layer knows**:
+`accounts-payable` resolves, extracts, matches, screens and posts. **A vendor is
+an entity, not a slug** — the previous version matched a slug against exemplar
+asset ids, which made the knowledge shelf the primary key and meant one company
+in two systems was two vendors.
 
-1. **classify-vendor (ModelCall)** names the vendor and resolves it to a slug.
-2. **load-exemplar (transform)** looks for `vendor-exemplar-{slug}` in the
-   knowledge layer.
+1. **read-vendor-candidates (ModelCall)** does one narrow job: strip every party
+   named on the page. Deciding which entity that text refers to is the
+   resolver's job against the vendor master, not the model's against its memory.
+2. **resolve-vendor (resolve)** fuzzy-matches the master. A confident match
+   links; an unknown name mints an `onboarding` vendor; an ambiguous one
+   **suspends the run** for a clerk, because posting against the wrong vendor is
+   not recoverable.
+3. **load-exemplar (transform)** looks for the exemplar keyed by the *canonical
+   vendor id*.
 3. **Known vendor → one-shot**: a single extraction pass using the exemplar
    as the template — cheap, confident, boring in the right way.
 4. **Unknown vendor → ensemble**: three independent model extractions, an
@@ -624,18 +915,55 @@ is that **the extraction strategy depends on what the knowledge layer knows**:
    governed knowledge write — so the vendor graduates from unknown to known
    and the *next* invoice takes the one-shot path. This is the doctrine's
    unknown-vendor flywheel, running.
-5. **three-way-match** and **fraud-screen** are declared **placeholders** in
-   the export and journaled as such — honest about what isn't automated yet.
-6. **post-or-review (Rule)** reads governed values from the
+5. **three-way-match (check)** pairs each invoice line against the PO line that
+   ordered it and the receiving line that booked it in — both landed by their
+   own sync Flows — and **retains the comparison as a `MatchSet` object** with
+   the variance and the tolerance that judged it. Three misses are modelled
+   distinctly because they mean different things: a goods line with no PO line
+   is a variance, a freight line under the governed allowance is normal, and
+   goods not booked in yet is a *sequencing* state (`blocked`), not an error.
+6. **anomaly-screen (check)** replaces the fraud placeholder. It scores the
+   invoice against *this vendor's own history* from the derived
+   `vendor_payment_profile` — amount outlier, first-time-large, suspected
+   duplicate, out-of-cadence, round-number — because "unusual" only has a
+   useful definition per vendor. Derived statistics are data; the thresholds
+   that judge them are governed knowledge in the policy document.
+7. **post-or-review (Rule)** reads governed values from the
    `invoice-posting-policy` asset at run time (auto-post limit $2,500,
-   classification floor 0.75); under the limit posts to the AP ledger,
-   otherwise a review Task whose decision resumes the run.
+   classification floor 0.75, match tolerances, anomaly thresholds). Under the
+   limit and clean, it posts; otherwise a review Task, and a clerk's correction
+   **re-runs the match** rather than overriding it.
 
-The table lives in the **Accounts Payable** workspace, beside the Expense
-Reimbursement one. Locally the stub readers honor hints (`vendor=acme-industrial total=1840
-invoice=ACME-INV-20881 po=PO-7741`; an unrecognized vendor name takes the
-ensemble path); with `RECEIPT_BACKEND=vertex` the extractions are real
-multimodal calls.
+**The flywheel still closes, and now it is provable.** Verifying an ensemble
+writes the exemplar keyed by the canonical vendor id and graduates the vendor
+out of `onboarding`; the *next* invoice from that vendor takes the one-shot
+path. The seeded world demonstrates it end to end (`run_ap_seed04` ensemble →
+`run_ap_seed05` one-shot, same vendor).
+
+The table lives in the **Accounts Payable** workspace, which also shows the
+vendor master — one row per canonical vendor carrying every source system's id
+for it. Locally the stub readers honor hints so every branch is drivable
+without a credential:
+
+| Hint | What it exercises |
+| --- | --- |
+| `vendor=acme-industrial` | a known vendor, resolved against the master |
+| `newvendor=meridian-supply` | an unknown vendor, stably named — run it twice to watch the flywheel close |
+| `po=PO-7741 lines=STL-0250:2,FAS-M12:3` | bills that PO exactly, so the three-way match really matches |
+| `pricebump` | a unit price 8% off the PO — price variance |
+| `overbill` | bills more than was received — quantity variance |
+| `nopo` | no purchase order — `unmatched` |
+| `blurry` | drops confidence below the governed floor |
+| `total=9800.00` | over the auto-post limit, and an amount outlier once the vendor has history |
+
+With `RECEIPT_BACKEND=vertex` the extractions are real multimodal calls.
+
+The AP world is seeded the same way as the expense history: four vendors
+arrive through a real `vendor-sync` delivery (plus a byte-identical
+redelivery, a cross-system match that auto-links, and a misspelling that waits
+for a steward), the purchase orders and receiving reports arrive through their
+own sync Flows, and every invoice is an actual run whose Tasks are decided
+through the path a clerk would use.
 
 ## Employee Hub
 
@@ -665,11 +993,20 @@ Inside the dev container there is no display, so use the web-server device and
 your host browser instead — see [.devcontainer/README.md](.devcontainer/README.md).
 
 The left rail has four stops: **Knowledge layer** (Library, the governed
-corpus, and Data, the dataset registry), **Flows**, **Workspaces** — a
-dropdown, because a workspace is a business view onto rows a flow wrote
-rather than a plane of the map — and **Identities, access & keys**. The
-Employee Hub hangs off the account avatar and the Task Queue off the top bar,
-since both are asked for from every section rather than being one.
+corpus, and Data — four lenses over Collections, Sources, Entities and
+Documents), **Flows**, **Workspaces** — a dropdown, because a workspace is a
+business view onto rows a flow wrote rather than a plane of the map — and
+**Identities, access & keys**. The Employee Hub hangs off the account avatar
+and the Task Queue off the top bar, since both are asked for from every
+section rather than being one.
+
+Each workspace shows the **Flow runs** list above its table: a run carries the
+gates, the read-set and the replay count, which a row cannot. Clicking a run
+opens its journal step by step. Tasks with something structured to edit open a
+**full review screen** from the queue rather than deciding in the drawer —
+correcting an amount, splitting a receipt into two lines, adding a line the
+model missed, or picking the right vendor — because doing that in a 380px
+drawer would be a worse job badly done.
 
 Hosted build (what `deploy.sh` runs):
 

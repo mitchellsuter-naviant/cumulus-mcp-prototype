@@ -56,6 +56,37 @@ class Settings:
         self.payables_collection: str = os.environ.get(
             "PAYABLES_COLLECTION", "payables"
         )
+        # ---- The entity layer ------------------------------------------------
+        # Canonical Objects and typed Links (see graph.py). Two collections,
+        # no joins: every traversal is a bounded walk from a known root, which
+        # is what a document store does well. The seam to reconsider if
+        # traversals ever stop being bounded.
+        self.graph_objects_collection: str = os.environ.get(
+            "GRAPH_OBJECTS_COLLECTION", "graph_objects"
+        )
+        self.graph_links_collection: str = os.environ.get(
+            "GRAPH_LINKS_COLLECTION", "graph_links"
+        )
+        # Durable Flow runs: the journal a suspended run resumes from.
+        self.runs_collection: str = os.environ.get("RUNS_COLLECTION", "flow_runs")
+        # Submitted artifacts (receipts, invoices) with their extracted regions.
+        # Custody is "copy": the bytes live in the map, under the retention the
+        # owning Collection declares.
+        self.documents_collection: str = os.environ.get(
+            "DOCUMENTS_COLLECTION", "documents"
+        )
+        # A Firestore document caps at ~1MiB, and a base64 payload inflates by
+        # a third. Past this the Document Store capability needs a blob-store
+        # adapter (GCS) rather than the document-store one — the capability is
+        # the same either way, which is the point of naming it a capability.
+        self.document_max_bytes: int = int(
+            os.environ.get("DOCUMENT_MAX_BYTES", "700000")
+        )
+        # Per-vendor rolling statistics behind the anomaly screen. Derived, so
+        # rebuildable: delete it and the profile Flow recomputes from the graph.
+        self.vendor_profiles_collection: str = os.environ.get(
+            "VENDOR_PROFILES_COLLECTION", "vendor_profiles"
+        )
         # The receipt reader behind the flow's extract-receipt ModelCall.
         # Follows ANSWER_BACKEND unless set explicitly, so a deployment that
         # can answer can also read receipts with no extra configuration.

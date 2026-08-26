@@ -1167,10 +1167,20 @@ const reimbursementsGroup = EndpointGroup(
           'categories are parsed from the expense-approval-policy asset at '
           'run time — edit the document and the flow behaves differently.',
       params: [
-        ApiParam('image_base64', 'string', description: 'Receipt image bytes.'),
+        ApiParam('documents', 'array', description:
+            'One entry per artifact: `{content_base64, filename, note, hint}`. '
+            'The note is a real input to the run — the projection reads a '
+            'stated claim out of it ("only requesting \$75 of the \$110") and '
+            'the journal quotes it.'),
+        ApiParam('commentary', 'string', description:
+            'The submitter\'s framing of the whole request. A stated purpose '
+            'here is what keeps a line above the governed threshold from '
+            'needing a reviewer.'),
+        ApiParam('image_base64', 'string', description:
+            'Single-document shorthand, still accepted.'),
         ApiParam('filename', 'string'),
         ApiParam('note', 'string',
-            description: 'Shown to reviewers; extraction hint locally.'),
+            description: 'Single-document shorthand for the note above.'),
       ],
       responseExample: '''{
   "id": "reimb_18bcbface3",
@@ -1186,7 +1196,11 @@ const reimbursementsGroup = EndpointGroup(
   "journal": [{"step_id": "t1", "name": "ReceiptSubmitted", "kind": "trigger",
                "summary": "receipt submitted by dev"}]
 }''',
-      errors: [ApiError(403, 'Minted API keys cannot submit reimbursements.')],
+      errors: [
+        ApiError(403, 'Minted API keys cannot submit reimbursements.'),
+        ApiError(413,
+            'A document exceeds this deployment\'s document-store limit.'),
+      ],
     ),
     Endpoint(
       method: 'GET',
@@ -1477,6 +1491,457 @@ const healthGroup = EndpointGroup(
   ],
 );
 
+// ---- Runs ---------------------------------------------------------------------
+
+const runsGroup = EndpointGroup(
+  title: 'Flow runs',
+  blurb:
+      'The durable journal. A run is stored state whose completed steps *are* '
+      'the run: re-entering the body replays them instead of re-executing, '
+      'which is what lets a flow suspend for a person, be corrected, re-run '
+      'its checks and drive to finished — across a restart. Reads only: runs '
+      'are started by triggers and advanced by Task decisions, never by a '
+      'POST from outside.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/runs',
+      summary: 'Runs, newest first — the list a workspace shows.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam('flow_id', 'string', where: 'query'),
+        ApiParam('status', 'string', where: 'query',
+            description: '`running`, `suspended`, `succeeded`, `failed`.'),
+        ApiParam('limit', 'int', where: 'query', defaultValue: '50'),
+      ],
+      responseExample: '''[{
+  "id": "run_er_seed11",
+  "flow_id": "expense-reimbursement",
+  "status": "suspended",
+  "case_ref": "run_er_seed11",
+  "steps": 7,
+  "model_calls": 1,
+  "open_task_id": "task_run_er_seed11_k1",
+  "suspended_at_step": "k1",
+  "resume_count": 0,
+  "refs": ["knowledge:expense-approval-policy@rev1"]
+}]''',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/runs/stats',
+      summary:
+          'Counts by status, audited ModelCall spend, and how often a person '
+          'was needed.',
+      auth: ApiAuth.reader,
+      params: [ApiParam('flow_id', 'string', where: 'query')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/runs/{id}',
+      summary:
+          'One run: every step, its output, the read-set it used, and the '
+          'decision that released each gate.',
+      auth: ApiAuth.reader,
+      errors: [ApiError(404, 'Run not found.')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/runs/{id}/steps',
+      summary: 'Just the steps, for a trace view.',
+      auth: ApiAuth.reader,
+      errors: [ApiError(404, 'Run not found.')],
+    ),
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/runs/{id}/resume',
+      summary:
+          'Drive a run whose gate was decided but which was interrupted before '
+          'it could resume.',
+      auth: ApiAuth.admin,
+      notes:
+          'Idempotent by construction: completed steps replay, so a run that '
+          'is already finished — or still genuinely waiting — comes back '
+          'unchanged. This exists for the narrow case where the process died '
+          'between the decision write and the resume.',
+      errors: [ApiError(404, 'Run not found.')],
+    ),
+  ],
+);
+
+// ---- The entity layer ---------------------------------------------------------
+
+const graphGroup = EndpointGroup(
+  title: 'Entity layer',
+  blurb:
+      'Canonical Objects, typed Links, and retained Claims. An Object\'s id is '
+      'derived from a declared natural key, so the same real-world thing seen '
+      'twice resolves to one entity; its field values are the *resolution* of '
+      'claims from every source, under the ontology\'s precedence order, with '
+      'the losing claims kept. Read-only over HTTP on purpose: the graph is '
+      'written by Flows, through Actions.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/graph/ontology',
+      summary:
+          'The declared ontology, with live instance counts beside each type.',
+      auth: ApiAuth.reader,
+      notes:
+          'Declaration and reality in one payload — a declared type with zero '
+          'instances is a promise nothing has kept yet. Generated from '
+          '`server/app/ontology.py`, which is also exported to the corpus as '
+          'the `enterprise-ontology` document.',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/graph/stats',
+      summary:
+          'Object and link counts by type, and how many objects have sources '
+          'that disagree.',
+      auth: ApiAuth.reader,
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/graph/objects',
+      summary: 'Browse objects of one type.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam('type', 'string', where: 'query',
+            description: '`Vendor`, `Invoice`, `ExpenseLine`, …'),
+        ApiParam('q', 'string', where: 'query',
+            description: 'Substring over the label and natural key.'),
+        ApiParam('limit', 'int', where: 'query', defaultValue: '100'),
+      ],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/graph/objects/{id}',
+      summary:
+          'One object: resolved fields, every claim, the fields where sources '
+          'disagree, and its edges.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam('link_type', 'string', where: 'query',
+            description: 'Restrict the edges to one type.'),
+      ],
+      errors: [ApiError(404, 'Object not found.')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/graph/vendors',
+      summary:
+          'The vendor master: one row per canonical vendor, carrying every '
+          'source system\'s id for it.',
+      auth: ApiAuth.reader,
+      notes:
+          'The column that matters is `source_records`. When a vendor was a '
+          'slug used to look up an exemplar asset, the same company in two '
+          'systems was two vendors and merging them merged nothing.',
+      responseExample: '''[{
+  "id": "vendor_5c1b0f9a3e21",
+  "label": "Acme Industrial Inc.",
+  "status": "active",
+  "tax_id": "94-2711883",
+  "source_records": [
+    {"source": "erp-vendors", "external_id": "V-10041", "confidence": 1.0,
+     "method": "exact", "live": true},
+    {"source": "procurement-coupa", "external_id": "C-5501",
+     "confidence": 1.0, "method": "exact", "live": true}
+  ],
+  "invoices": 3,
+  "has_exemplar": true,
+  "conflict_fields": ["payment_terms"]
+}]''',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/graph/employees/{email}/expenses',
+      summary:
+          'How much this employee has submitted — a traversal, not a search.',
+      auth: ApiAuth.reader,
+      notes:
+          'Two hops and a sum: `Employee --submitted--> ExpenseRequest '
+          '--has_expense_line--> ExpenseLine`. No document contains this '
+          'number, so no amount of retrieval would find it; the answer carries '
+          'the path that produced it. An unknown employee is an empty rollup, '
+          'not a 404.',
+      params: [
+        ApiParam('days', 'int', where: 'query', defaultValue: '180'),
+      ],
+    ),
+  ],
+);
+
+// ---- Collections, documents, sources ------------------------------------------
+
+const dataGroup = EndpointGroup(
+  title: 'Data governance',
+  blurb:
+      'Collections are the unit governance hangs off: retention, custody and '
+      'authoritativeness are properties of a *set*, not of a row, so they are '
+      'declared in `server/app/data_collections.py`, exported to the corpus, '
+      'and stamped on every row at write time. Documents are the artifacts a '
+      'decision was made from. Sources are the inbound feeds, assembled from '
+      'the sync runs themselves.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/collections',
+      summary:
+          'The registry, with live counts. A count the server cannot get '
+          'honestly is null, not zero.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam('role', 'string', where: 'query',
+            description: '`knowledge` or `data`.'),
+      ],
+      responseExample: '''[{
+  "id": "audit-documents",
+  "name": "Audit documents",
+  "role": "data",
+  "kind": "documents",
+  "origin": "flow-written",
+  "custody": "copy",
+  "retention": "P2Y",
+  "authoritative": true,
+  "container": "documents",
+  "rows": 12,
+  "rows_caption": "artifacts"
+}]''',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/collections/{id}',
+      summary: 'One Collection.',
+      auth: ApiAuth.reader,
+      errors: [ApiError(404, 'Collection not found.')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/documents',
+      summary: 'Stored artifacts, without their bytes.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam('kind', 'string', where: 'query',
+            description: '`receipt`, `invoice`, …'),
+        ApiParam('run_id', 'string', where: 'query'),
+      ],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/documents/expiring',
+      summary: 'Artifacts past their Collection\'s retention horizon.',
+      auth: ApiAuth.reader,
+      notes:
+          'Reported, not swept. The policy is declared and the date computed; '
+          'the purge pass is not built, and saying so is better than implying '
+          'otherwise.',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/documents/{id}',
+      summary:
+          'One artifact with the regions an extraction read out of it.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam('include_bytes', 'bool', where: 'query', defaultValue: 'false',
+            description: 'Bytes are opt-in; the regions are the useful part.'),
+      ],
+      errors: [ApiError(404, 'Document not found.')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/documents/{id}/content',
+      summary: 'The artifact itself, for a review screen to draw boxes over.',
+      auth: ApiAuth.reader,
+      errors: [
+        ApiError(404,
+            'No stored bytes — the run was hint-driven and carried no file.'),
+      ],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/sources',
+      summary: 'One row per inbound feed and kind.',
+      auth: ApiAuth.reader,
+      notes:
+          'Assembled from the sync runs, not from a second bookkeeping store — '
+          'inventing one would guarantee the two disagree. A feed that has '
+          'never run does not appear.',
+    ),
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/sources/deliver',
+      status: 202,
+      summary: 'A push from an external system: vendors, POs, or receipts.',
+      auth: ApiAuth.admin,
+      notes:
+          'The one write here that an API key *should* make — a feed is a '
+          'machine act, the opposite of a Task decision. Pass '
+          '`idempotency_key` and a retried delivery re-enters the same run, '
+          'replays its steps and changes nothing, which is what makes an '
+          'at-least-once transport safe to point at this. Rows land exactly as '
+          'delivered before resolution, so changing the matching rules '
+          're-resolves without re-fetching; an ambiguous row raises a steward '
+          'Task and the feed keeps going.',
+      params: [
+        ApiParam('source', 'string', required: true,
+            description: 'e.g. `erp-vendors`. Maps to a precedence bucket.'),
+        ApiParam('watermark', 'string',
+            description: 'The source\'s own cursor, echoed onto the run.'),
+        ApiParam('idempotency_key', 'string'),
+        ApiParam('vendors', 'array'),
+        ApiParam('purchase_orders', 'array'),
+        ApiParam('receiving_reports', 'array'),
+      ],
+      requestExample: '''{
+  "source": "erp-vendors",
+  "watermark": "2026-08-01T00:00:00Z",
+  "idempotency_key": "erp-vendors-001",
+  "vendors": [
+    {"external_id": "V-10041", "name": "Acme Industrial Inc.",
+     "tax_id": "94-2711883", "status": "active", "payment_terms": "NET30"}
+  ]
+}''',
+      responseExample: '''{
+  "source": "erp-vendors",
+  "runs": [{"flow_id": "vendor-sync", "run_id": "run_sync_1f2c3d4e5a",
+            "status": "succeeded", "replayed": false,
+            "landed": 1, "unchanged": 0, "linked": 0, "created": 1,
+            "awaiting_steward": 0}]
+}''',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/vendor-profiles',
+      summary:
+          'The derived anomaly baseline: how each vendor\'s invoices normally '
+          'look.',
+      auth: ApiAuth.reader,
+      notes:
+          'Derived data, and nothing here is a source of truth — delete the '
+          'collection and the profile Flow rebuilds it from the invoice graph. '
+          'The *thresholds* that judge these numbers are governed knowledge in '
+          'the invoice-posting-policy document, which is the reusable split: '
+          'derived statistics are data, the thresholds that judge them are '
+          'knowledge.',
+    ),
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/vendor-profiles/refresh',
+      summary: 'Run the windowed profile Flow now.',
+      auth: ApiAuth.admin,
+      params: [
+        ApiParam('window_days', 'int', where: 'query', defaultValue: '365'),
+      ],
+    ),
+  ],
+);
+
+// ---- Evals --------------------------------------------------------------------
+
+const evalsGroup = EndpointGroup(
+  title: 'Evals',
+  blurb:
+      'A per-flow eval spec is an **overlay on the enterprise model**: the '
+      'ontology says what an Invoice is; the spec says which parts of it a '
+      'given flow establishes, how tightly to compare each field, which edges '
+      'matter, and — through checkpoints — at which point in a run to look. '
+      'Cases supply only the values, so the match policy is decided once. '
+      'Every case runs in its own isolated in-memory world with the corpus '
+      'copied in: object ids derive from natural keys, so an unisolated run '
+      'would append claims to real entities and feed eval invoices into the '
+      'anomaly baseline real invoices are judged against.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/evals',
+      summary: 'The specs, with how much of the model each one grades.',
+      auth: ApiAuth.reader,
+      params: [ApiParam('flow_id', 'string', where: 'query')],
+      responseExample: '''[{
+  "id": "accounts-payable-core",
+  "flow_id": "accounts-payable",
+  "version": 1,
+  "checkpoints": 3,
+  "cases": 5,
+  "graded_fields": 18,
+  "ignored_fields": 8,
+  "graded_links": 6
+}]''',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/evals/{spec_id}',
+      summary:
+          'The whole contract: checkpoints, per-field match rules, graded '
+          'edges, trajectory rules.',
+      auth: ApiAuth.reader,
+      notes:
+          'Match rules are `exact` (numbers compare as numbers), `approx` with '
+          'a tolerance, `fuzzy` with a similarity floor for values a model '
+          'reads off a page, `one_of`, `present`, `absent`, and `ignore`. '
+          '`ignore` is used deliberately — a due date is the vendor\'s payment '
+          'terms, so grading it would be grading the wrong system. Generated '
+          'from `server/app/eval_specs.py`, which is also exported to the '
+          'corpus as `flow-eval-specs`.',
+      errors: [ApiError(404, 'No such spec.')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/evals/{spec_id}/cases',
+      summary: 'The cases, with their fixtures and scripted gate decisions.',
+      auth: ApiAuth.reader,
+      notes:
+          'A fixture is expressed as the deliveries the real feeds would have '
+          'made, so the precondition is established the way production '
+          'established it — and in natural keys, never ids, so a case promoted '
+          'from a real run needs no rewriting.',
+      errors: [ApiError(404, 'No such spec.')],
+    ),
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/evals/{spec_id}/run',
+      summary: 'Run the cases and grade them against the spec.',
+      auth: ApiAuth.admin,
+      notes:
+          'Admin, but **not** human-gated: a CI key launching an eval is the '
+          'point of having keys, and it is the one write in this API where a '
+          'credential doing the work is correct. Each case gets a fresh world; '
+          'the TBox invariant sweep runs per case at no authoring cost, so a '
+          'structural bug fails the case even when no expectation named it.',
+      params: [
+        ApiParam('case_id', 'string', where: 'query',
+            description: 'Run one case instead of the set.'),
+      ],
+      responseExample: '''{
+  "spec_id": "accounts-payable-core",
+  "passed": 5,
+  "failed": 0,
+  "assertions": 74,
+  "failed_assertions": 0,
+  "invariant_violations": 0,
+  "result": {"cases": [{"case_id": "ap-known-vendor-clean", "passed": true,
+                        "run_status": "succeeded", "assertions": []}]}
+}''',
+      errors: [ApiError(404, 'No such spec.')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/evals/{spec_id}/result',
+      summary: 'The most recent result in this server process.',
+      auth: ApiAuth.reader,
+      notes:
+          'Not persisted, on purpose: a pass rate only means something against '
+          'the knowledge revisions it read, and each result records them. '
+          'Storing numbers nobody can compare would be worse than storing '
+          'none.',
+      errors: [ApiError(404, 'Nothing has been run in this process yet.')],
+    ),
+  ],
+);
+
 const restGroups = <EndpointGroup>[
   knowledgeGroup,
   searchGroup,
@@ -1488,6 +1953,10 @@ const restGroups = <EndpointGroup>[
   reimbursementsGroup,
   payablesGroup,
   employeeGroup,
+  runsGroup,
+  graphGroup,
+  evalsGroup,
+  dataGroup,
   apiKeysGroup,
   healthGroup,
 ];

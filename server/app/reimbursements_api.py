@@ -14,10 +14,12 @@ from pydantic import BaseModel, Field
 
 from .auth import Principal, get_principal, require_reader
 from .deps import get_reimbursement_service
+from .documents import DocumentTooLargeError
 from .reimbursements import (
     ReimbursementRequest,
     ReimbursementState,
     ReimbursementStats,
+    SubmittedDocument,
 )
 
 log = logging.getLogger("cumulus.reimbursements.api")
@@ -25,12 +27,34 @@ log = logging.getLogger("cumulus.reimbursements.api")
 router = APIRouter(prefix="/api/v1/reimbursements", tags=["reimbursements"])
 
 
+class SubmittedDocumentBody(BaseModel):
+    """One artifact in a submission, with the submitter's note about it.
+
+    The note is a real input to the run — the projection reads a stated claim
+    out of it ("only requesting $75 of the $110") and the journal quotes it —
+    so it travels per document rather than per submission.
+    """
+
+    content_base64: str = Field(default="", max_length=8_000_000)
+    filename: str = Field(default="", max_length=200)
+    note: str = Field(default="", max_length=1000)
+    # Local-dev steering for the stub extractor (`total=64.20 compound`). No
+    # meaning in a deployment with a real reader.
+    hint: str = Field(default="", max_length=200)
+
+
 class ReimbursementSubmit(BaseModel):
-    # A receipt image, base64-encoded. Optional so text-hint demos work
-    # without a file; the reader treats hint/filename as extraction input.
+    """A submission: several documents, and the submitter's own framing.
+
+    The single-document fields are still accepted, because one receipt is the
+    common case and there is no reason to make a caller wrap it in a list.
+    """
+
+    documents: list[SubmittedDocumentBody] = Field(default_factory=list, max_length=20)
+    commentary: str = Field(default="", max_length=4000)
     image_base64: str = Field(default="", max_length=8_000_000)
     filename: str = Field(default="", max_length=200)
-    note: str = Field(default="", max_length=500)
+    note: str = Field(default="", max_length=1000)
 
 
 def _require_human(principal: Principal) -> None:
@@ -81,17 +105,34 @@ def submit_reimbursement(
 ) -> ReimbursementRequest:
     require_reader(principal)
     _require_human(principal)
-    request = get_reimbursement_service().submit(
-        employee=principal.uid,
-        image_b64=body.image_base64,
-        filename=body.filename,
-        hint=body.note,
-    )
+    documents = [
+        SubmittedDocument(
+            content_b64=d.content_base64, filename=d.filename, note=d.note,
+            hint=d.hint,
+        )
+        for d in body.documents
+    ]
+    try:
+        request = get_reimbursement_service().submit(
+            employee=principal.uid,
+            documents=documents,
+            commentary=body.commentary,
+            image_b64=body.image_base64,
+            filename=body.filename,
+            hint=body.note,
+        )
+    except DocumentTooLargeError as exc:
+        # 413 rather than 500: the caller can act on this, and the limit is a
+        # property of the deployment's document-store adapter, so say it.
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     log.info(
         "Reimbursement submitted via API",
         extra={
             "reimbursementId": request.id,
+            "runId": request.run_id,
             "state": request.state,
+            "documents": len(request.documents),
+            "lines": len(request.lines),
             "actor": principal.uid,
         },
     )

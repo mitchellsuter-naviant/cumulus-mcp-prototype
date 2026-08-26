@@ -7,7 +7,7 @@ import '../widgets/command_palette.dart';
 import '../widgets/cumulus_shell.dart';
 import '../widgets/task_queue.dart';
 import 'api_docs_screen.dart';
-import '../widgets/dataset_registry.dart';
+import '../widgets/data_plane.dart';
 import '../widgets/payables_view.dart';
 import '../widgets/reimbursements_view.dart';
 import '../widgets/ui_kit.dart';
@@ -257,7 +257,7 @@ class _KnowledgeSectionState extends State<_KnowledgeSection> {
                 index: selected,
                 children: [
                   widget.library,
-                  DatasetRegistryView(
+                  DataPlaneView(
                     api: widget.api,
                     onOpenExpenseWorkspace: () =>
                         widget.onOpenWorkspace(_expenseWorkspaceIndex),

@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
+import '../models/graph.dart';
 import '../models/payable.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'run_workbench.dart';
 import 'ui_kit.dart';
 
 /// The Accounts Payable workspace: the AP invoices table, the
@@ -29,6 +31,7 @@ class PayablesView extends StatefulWidget {
 
 class _PayablesViewState extends State<PayablesView> {
   List<PayableInvoice>? _rows;
+  List<VendorRecord>? _vendors;
   PayableStats? _stats;
   String? _error;
   String _lens = 'all';
@@ -56,10 +59,17 @@ class _PayablesViewState extends State<PayablesView> {
     try {
       final rows = await widget.api.listPayables();
       final stats = await widget.api.payableStats();
+      // The vendor master is a separate read on purpose: it is the entity
+      // layer, not the table, and the invoices resolve against it.
+      final vendors = await widget.api
+          .listVendors()
+          .then<List<VendorRecord>?>((v) => v)
+          .catchError((_) => null);
       if (mounted) {
         setState(() {
           _rows = rows;
           _stats = stats;
+          _vendors = vendors;
           _error = null;
         });
       }
@@ -160,6 +170,11 @@ class _PayablesViewState extends State<PayablesView> {
                   caption: 'known vendors, from exemplars'),
               StatTile(label: 'Ensemble', value: '${stats.ensemble}',
                   caption: 'unknown vendors, 3 models + human'),
+              StatTile(label: 'Matched', value: '${stats.matched}',
+                  caption: '${stats.matchVariance} variance · '
+                      '${stats.matchBlocked} not received yet'),
+              StatTile(label: 'Anomalies', value: '${stats.anomalies}',
+                  caption: 'unusual for that vendor'),
             ],
           ),
           const SizedBox(height: 16),
@@ -213,6 +228,17 @@ class _PayablesViewState extends State<PayablesView> {
                 ],
               ],
             ),
+          ),
+          const SizedBox(height: 16),
+          if (_vendors != null && _vendors!.isNotEmpty)
+            _VendorMasterCard(vendors: _vendors!),
+          const SizedBox(height: 16),
+          FlowRunsCard(
+            api: widget.api,
+            flowId: 'accounts-payable',
+            subtitle:
+                'resolve → extract → match → screen → post, with every gate '
+                'and governed read · click one to open it',
           ),
           const SizedBox(height: 16),
           Wrap(
@@ -287,6 +313,30 @@ class _PayablesViewState extends State<PayablesView> {
                       : CumulusTone.violet,
                   dense: true,
                 ),
+                if (r.matchVerdict.isNotEmpty) ...[
+                  const SizedBox(width: 6),
+                  Tooltip(
+                    message: r.matchSummary,
+                    child: StatusBadge(
+                      r.matchVerdict,
+                      tone: _matchTone(r.matchVerdict),
+                      dense: true,
+                    ),
+                  ),
+                ],
+                if (r.anomalyFindings.isNotEmpty) ...[
+                  const SizedBox(width: 6),
+                  Tooltip(
+                    message: r.anomalyFindings
+                        .map((f) => f.detail)
+                        .join('\n'),
+                    child: StatusBadge(
+                      '${r.anomalyFindings.length} anomaly',
+                      tone: CumulusTone.danger,
+                      dense: true,
+                    ),
+                  ),
+                ],
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
@@ -340,13 +390,80 @@ class _PayablesViewState extends State<PayablesView> {
               if (r.exemplarRef.isNotEmpty) _monoChip(r.exemplarRef),
               if (r.policyRef.isNotEmpty) _monoChip(r.policyRef),
               _monoChip('limit \$${r.postLimitUsd.toStringAsFixed(2)}'),
-              _monoChip('classifier ${r.vendorConfidence.toStringAsFixed(2)}'),
-              _monoChip('3-way match: ${r.threeWayMatch}'),
-              _monoChip('fraud screen: ${r.fraudScreen}'),
+              if (r.runId.isNotEmpty) _monoChip(r.runId),
+              if (r.graphRef.isNotEmpty) _monoChip(r.graphRef),
+              if (r.matchRef.isNotEmpty) _monoChip(r.matchRef),
               if (r.taskId.isNotEmpty) _monoChip(r.taskId),
               if (r.decidedBy.isNotEmpty) _monoChip('decided by ${r.decidedBy}'),
             ],
           ),
+          const SizedBox(height: 12),
+          const FieldLabel(
+            'Vendor resolution',
+            hint: 'names off the page, then one canonical entity',
+          ),
+          Row(
+            children: [
+              StatusBadge(
+                r.vendorResolution.isEmpty ? 'unresolved' : r.vendorResolution,
+                tone: switch (r.vendorResolution) {
+                  'linked' => CumulusTone.success,
+                  'new' => CumulusTone.warn,
+                  'review' => CumulusTone.danger,
+                  _ => CumulusTone.neutral,
+                },
+                dense: true,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '${r.vendorCandidates.isEmpty ? "no candidates read" : r.vendorCandidates.join(", ")}'
+                  '${r.vendorMethod.isEmpty ? '' : ' → ${r.vendorMethod} at ${r.vendorConfidence.toStringAsFixed(2)}'}',
+                  style: CumulusText.meta,
+                ),
+              ),
+            ],
+          ),
+          if (r.lines.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const FieldLabel('Invoice lines'),
+            for (var i = 0; i < r.lines.length; i++) _invoiceLine(i + 1, r.lines[i]),
+          ],
+          if (r.matchPairings.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            FieldLabel(
+              'Three-way match',
+              hint: r.matchSummary,
+            ),
+            for (final pairing in r.matchPairings) _pairingRow(pairing),
+          ],
+          if (r.anomalyBasis.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            FieldLabel(
+              'Anomaly screen',
+              hint: r.anomalyBasis,
+            ),
+            if (r.anomalyFindings.isEmpty)
+              Text(
+                'Nothing unusual for this vendor.',
+                style: CumulusText.meta,
+              )
+            else
+              for (final finding in r.anomalyFindings)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Row(
+                    children: [
+                      StatusBadge(finding.kind, tone: CumulusTone.danger,
+                          dense: true),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(finding.detail, style: CumulusText.meta),
+                      ),
+                    ],
+                  ),
+                ),
+          ],
           if (r.candidates.isNotEmpty) ...[
             const SizedBox(height: 12),
             const FieldLabel('Ensemble candidates'),
@@ -431,6 +548,116 @@ class _PayablesViewState extends State<PayablesView> {
     );
   }
 
+  Widget _invoiceLine(int ordinal, InvoiceLine line) => Padding(
+    padding: const EdgeInsets.only(bottom: 4),
+    child: Row(
+      children: [
+        SizedBox(width: 24, child: Text('$ordinal.', style: CumulusText.meta)),
+        SizedBox(
+          width: 96,
+          child: Text(line.sku, style: CumulusText.mono.copyWith(fontSize: 11)),
+        ),
+        Expanded(
+          child: Text(
+            line.description,
+            style: CumulusText.body.copyWith(fontSize: 12.5),
+          ),
+        ),
+        if (line.kind != 'goods') ...[
+          StatusBadge(line.kind, dense: true),
+          const SizedBox(width: 8),
+        ],
+        SizedBox(
+          width: 60,
+          child: Text(
+            line.quantity == 0 ? '—' : '×${_qty(line.quantity)}',
+            textAlign: TextAlign.right,
+            style: CumulusText.meta,
+          ),
+        ),
+        SizedBox(
+          width: 92,
+          child: Text(
+            '\$${line.unitPriceUsd.toStringAsFixed(2)}',
+            textAlign: TextAlign.right,
+            style: CumulusText.meta,
+          ),
+        ),
+        SizedBox(
+          width: 96,
+          child: Text(
+            '\$${line.amountUsd.toStringAsFixed(2)}',
+            textAlign: TextAlign.right,
+            style: CumulusText.body.copyWith(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+
+  /// One pairing of the retained match. The reason is the whole value: a clerk
+  /// needs "billed 3 but 2 was received on RR-5510", not a boolean.
+  Widget _pairingRow(MatchPairing pairing) => Padding(
+    padding: const EdgeInsets.only(bottom: 5),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 24,
+          child: Text('${pairing.invoiceOrdinal}.', style: CumulusText.meta),
+        ),
+        SizedBox(
+          width: 132,
+          child: StatusBadge(
+            pairing.verdict,
+            tone: pairing.clean ? CumulusTone.success : CumulusTone.warn,
+            dense: true,
+          ),
+        ),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                pairing.reason,
+                style: CumulusText.body.copyWith(fontSize: 12.5),
+              ),
+              Text(
+                [
+                  if (pairing.poNumber.isNotEmpty)
+                    'PO ${pairing.poNumber} line ${pairing.poOrdinal} '
+                        '(×${_qty(pairing.poQuantity)} at '
+                        '\$${pairing.poUnitPriceUsd.toStringAsFixed(2)})',
+                  if (pairing.receiptNumber.isNotEmpty)
+                    'received ×${_qty(pairing.receivedQuantity)} on '
+                        '${pairing.receiptNumber}',
+                  if (pairing.priceVariancePct > 0)
+                    '${pairing.priceVariancePct.toStringAsFixed(1)}% price '
+                        'variance',
+                ].join('  ·  '),
+                style: CumulusText.meta,
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+
+  static String _qty(double value) =>
+      value == value.roundToDouble() ? '${value.toInt()}' : '$value';
+
+  static CumulusTone _matchTone(String verdict) => switch (verdict) {
+    'matched' => CumulusTone.success,
+    'variance' => CumulusTone.warn,
+    'blocked' => CumulusTone.accent,
+    'unmatched' => CumulusTone.danger,
+    _ => CumulusTone.neutral,
+  };
+
   Widget _monoChip(String text) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
     decoration: BoxDecoration(
@@ -440,4 +667,161 @@ class _PayablesViewState extends State<PayablesView> {
     ),
     child: Text(text, style: CumulusText.mono.copyWith(fontSize: 11)),
   );
+}
+
+/// The vendor master, as the AP workspace needs to see it.
+///
+/// The column that matters is `sources`: one canonical vendor carrying every
+/// external system's id for it. That is the thing that was impossible when a
+/// vendor was a slug used to look up an exemplar asset — the same company in
+/// two systems was two vendors, and merging them merged nothing.
+class _VendorMasterCard extends StatefulWidget {
+  final List<VendorRecord> vendors;
+
+  const _VendorMasterCard({required this.vendors});
+
+  @override
+  State<_VendorMasterCard> createState() => _VendorMasterCardState();
+}
+
+class _VendorMasterCardState extends State<_VendorMasterCard> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final vendors = widget.vendors;
+    final withExemplar = vendors.where((v) => v.hasExemplar).length;
+    final conflicted = vendors.where((v) => v.conflictFields.isNotEmpty).length;
+    final multiSource =
+        vendors.where((v) => v.sourceRecords.length > 1).length;
+    final shown = _expanded ? vendors : vendors.take(5).toList();
+    return ListCard(
+      title: 'Vendor master',
+      subtitle:
+          '${vendors.length} canonical vendor(s) · $withExemplar with an '
+          'exemplar (one-shot path) · $multiSource known to more than one '
+          'system · $conflicted with sources that disagree',
+      headerTrailing: vendors.length > 5
+          ? TextButton(
+              onPressed: () => setState(() => _expanded = !_expanded),
+              child: Text(_expanded ? 'Show fewer' : 'Show all'),
+            )
+          : null,
+      children: [
+        for (final vendor in shown)
+          CumulusListRow(
+            leading: Monogram(
+              vendor.label.isEmpty ? '?' : vendor.label.substring(0, 1),
+              tone: vendor.status == 'active'
+                  ? CumulusTone.teal
+                  : CumulusTone.warn,
+            ),
+            title: Row(
+              children: [
+                Flexible(child: Text(vendor.label)),
+                const SizedBox(width: 10),
+                StatusBadge(
+                  vendor.status,
+                  tone: vendor.status == 'active'
+                      ? CumulusTone.success
+                      : CumulusTone.warn,
+                  dense: true,
+                ),
+                if (vendor.hasExemplar) ...[
+                  const SizedBox(width: 6),
+                  const Tooltip(
+                    message:
+                        'A verified one-shot template exists, so this vendor’s '
+                        'invoices take the single-pass path.',
+                    child: StatusBadge('exemplar', tone: CumulusTone.accent,
+                        dense: true),
+                  ),
+                ],
+                if (vendor.conflictFields.isNotEmpty) ...[
+                  const SizedBox(width: 6),
+                  Tooltip(
+                    message:
+                        'Sources disagree on ${vendor.conflictFields.join(", ")}. '
+                        'Both claims are kept; precedence decides which '
+                        'resolves.',
+                    child: StatusBadge(
+                      '${vendor.conflictFields.length} conflict(s)',
+                      tone: CumulusTone.warn,
+                      dense: true,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  [
+                    if (vendor.taxId.isNotEmpty) 'tax ${vendor.taxId}',
+                    if (vendor.paymentTerms.isNotEmpty) vendor.paymentTerms,
+                    '${vendor.invoices} invoice(s) '
+                        '(\$${vendor.invoicedUsd.toStringAsFixed(2)})',
+                    '${vendor.purchaseOrders} PO(s)',
+                    if (vendor.aliases.isNotEmpty)
+                      'also seen as ${vendor.aliases.join(", ")}',
+                  ].join('  ·  '),
+                ),
+                const SizedBox(height: 5),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  children: [
+                    for (final source in vendor.sourceRecords)
+                      Tooltip(
+                        message:
+                            '${source.method} match at '
+                            '${source.confidence.toStringAsFixed(2)}'
+                            '${source.live ? '' : ' — withdrawn by a steward'}',
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: source.live
+                                ? CumulusColors.surface
+                                : CumulusColors.surfaceMuted,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(
+                              color: source.live
+                                  ? CumulusColors.border
+                                  : CumulusColors.borderStrong,
+                            ),
+                          ),
+                          child: Text(
+                            '${source.source}:${source.externalId}',
+                            style: CumulusText.mono.copyWith(
+                              fontSize: 11,
+                              decoration: source.live
+                                  ? null
+                                  : TextDecoration.lineThrough,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ],
+            ),
+            trailing: [
+              SizedBox(
+                width: 150,
+                child: Text(
+                  vendor.ref,
+                  textAlign: TextAlign.end,
+                  style: CumulusText.mono,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+      ],
+    );
+  }
 }
