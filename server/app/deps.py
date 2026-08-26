@@ -15,6 +15,24 @@ from .teams import TeamService, build_team_directory
 from .usage import AssetUsageStore, build_asset_usage_store
 from .users import UserDirectory, build_user_directory
 from .flows import FlowService, build_flow_service, seed_flows_if_empty
+from .tasks import TaskService, build_task_service, seed_tasks_if_empty
+from .reimbursements import (
+    ReimbursementService,
+    build_receipt_reader,
+    build_reimbursement_service,
+    seed_reimbursements_if_empty,
+)
+from .employee import (
+    EmployeeService,
+    build_employee_service,
+    seed_employee_if_empty,
+)
+from .payables import (
+    PayableService,
+    build_invoice_reader,
+    build_payable_service,
+    seed_payables_if_empty,
+)
 
 log = logging.getLogger("cumulus.deps")
 
@@ -28,6 +46,10 @@ _identity_service: IdentityService | None = None
 _team_service: TeamService | None = None
 _asset_usage: AssetUsageStore | None = None
 _flow_service: FlowService | None = None
+_task_service: TaskService | None = None
+_reimbursement_service: ReimbursementService | None = None
+_employee_service: EmployeeService | None = None
+_payable_service: PayableService | None = None
 # The generative backend is expensive to construct (a Vertex client) and holds
 # no request state, so it is cached; the AnswerService wrapper around it is
 # cheap and is rebuilt per call so it can never hold a stale KnowledgeService.
@@ -166,6 +188,117 @@ def get_flow_service() -> FlowService:
                 seed_flows_if_empty(service)
                 _flow_service = service
     return _flow_service
+
+
+def get_task_service() -> TaskService:
+    global _task_service
+    if _task_service is None:
+        service = build_task_service(
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.tasks_collection,
+        )
+        with _lock:
+            if _task_service is None:
+                seed_tasks_if_empty(service)
+                _task_service = service
+    return _task_service
+
+
+def get_reimbursement_service() -> ReimbursementService:
+    global _reimbursement_service
+    if _reimbursement_service is None:
+        # Dependencies resolved before the lock: `_lock` is not reentrant.
+        knowledge = get_service()
+        tasks = get_task_service()
+        try:
+            reader = build_receipt_reader(
+                settings.receipt_backend,
+                settings.firestore_project,
+                settings.answer_location,
+                settings.receipt_model,
+            )
+        except Exception:
+            log.exception(
+                "Receipt backend unavailable; falling back to the stub reader",
+                extra={"backend": settings.receipt_backend},
+            )
+            reader = build_receipt_reader("none", None, "", "")
+        service = build_reimbursement_service(
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.reimbursements_collection,
+            reader,
+            knowledge,
+            tasks,
+        )
+        with _lock:
+            if _reimbursement_service is None:
+                seed_reimbursements_if_empty(service)
+                _reimbursement_service = service
+    return _reimbursement_service
+
+
+def get_payable_service() -> PayableService:
+    global _payable_service
+    if _payable_service is None:
+        # Dependencies resolved before the lock: `_lock` is not reentrant.
+        knowledge = get_service()
+        tasks = get_task_service()
+        try:
+            reader = build_invoice_reader(
+                settings.receipt_backend,
+                settings.firestore_project,
+                settings.answer_location,
+                settings.receipt_model,
+            )
+        except Exception:
+            log.exception(
+                "Invoice reader backend unavailable; falling back to the stub",
+                extra={"backend": settings.receipt_backend},
+            )
+            reader = build_invoice_reader("none", None, "", "")
+        service = build_payable_service(
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.payables_collection,
+            reader,
+            knowledge,
+            tasks,
+        )
+        with _lock:
+            if _payable_service is None:
+                seed_payables_if_empty(service)
+                _payable_service = service
+    return _payable_service
+
+
+def get_employee_service() -> EmployeeService:
+    global _employee_service
+    if _employee_service is None:
+        # Dependencies resolved before the lock: `_lock` is not reentrant.
+        knowledge = get_service()
+        tasks = get_task_service()
+        teams = get_team_service()
+        if _answer_backend is _MISSING:
+            backend = _build_answer_backend()
+            with _lock:
+                if globals()["_answer_backend"] is _MISSING:
+                    globals()["_answer_backend"] = backend
+        service = build_employee_service(
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.employee_collection,
+            knowledge,
+            tasks,
+            answer_backend=_answer_backend,
+            teams=teams,
+        )
+        with _lock:
+            if _employee_service is None:
+                seed_employee_if_empty(service)
+                _employee_service = service
+    return _employee_service
 
 
 def _build_answer_backend():

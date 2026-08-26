@@ -20,6 +20,18 @@ All employee expenses must be approved according to the thresholds below.
 | $500 – $5,000 | Department head |
 | Over $5,000 | VP of Finance |
 
+## Automated reimbursement
+
+The expense-reimbursement flow reads this section as governed values. Edits
+here change what the flow does — no code changes, and every edit is logged.
+
+- Auto-approval limit: $200.00 per receipt. At or under this limit a
+  confidently extracted, in-policy receipt is approved without review.
+- Minimum extraction confidence: 0.80. Below this the request is elevated
+  to the expense-review queue regardless of amount.
+- Restricted categories: alcohol, gifts, entertainment. These are always
+  elevated for human review.
+
 ## Submission rules
 
 - Expenses must be submitted within 30 days of being incurred.

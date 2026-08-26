@@ -42,6 +42,29 @@ class Settings:
         self.test_runs_collection: str = os.environ.get(
             "TEST_RUNS_COLLECTION", "flow_test_runs"
         )
+        # The Task Queue: units of human judgment, routed through queues.
+        self.tasks_collection: str = os.environ.get("TASKS_COLLECTION", "tasks")
+        # The reimbursements table (the expense-reimbursement flow's output)
+        # and the Employee Hub's profile/PTO stores.
+        self.reimbursements_collection: str = os.environ.get(
+            "REIMBURSEMENTS_COLLECTION", "reimbursements"
+        )
+        self.employee_collection: str = os.environ.get(
+            "EMPLOYEE_COLLECTION", "employee"
+        )
+        # The AP invoices table (the accounts-payable flow's output).
+        self.payables_collection: str = os.environ.get(
+            "PAYABLES_COLLECTION", "payables"
+        )
+        # The receipt reader behind the flow's extract-receipt ModelCall.
+        # Follows ANSWER_BACKEND unless set explicitly, so a deployment that
+        # can answer can also read receipts with no extra configuration.
+        self.receipt_backend: str = os.environ.get(
+            "RECEIPT_BACKEND", os.environ.get("ANSWER_BACKEND", "none")
+        )
+        self.receipt_model: str = os.environ.get(
+            "RECEIPT_MODEL", "gemini-2.5-flash"
+        )
         # "none" (default, local dev: everyone is owner) or "firebase".
         self.auth_backend: str = os.environ.get("AUTH_BACKEND", "none")
         # "memory" (default) or "firebase" — where platform users live.
