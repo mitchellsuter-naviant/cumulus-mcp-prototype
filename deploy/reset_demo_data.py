@@ -49,10 +49,28 @@ TARGETS = [
     # these would leave that pointer dangling.
     "payables",
     "reimbursements",
+    # The generation the flow rewrite reshaped, pinned by deploy.sh.
+    "tasks_v3",
+    "reimbursements_v3",
+    "payables_v3",
+    # The entity layer, the run journals, the artifacts, and the derived
+    # profile. These have to go *with* the tables above rather than instead of
+    # them: the rows are a projection of the runs, the runs reference the
+    # objects, and the objects are what the anomaly profile is computed from.
+    # Clearing one and not the others is worse than clearing none — it leaves a
+    # graph full of invoices no row or run accounts for.
+    "graph_objects",
+    "graph_links",
+    "flow_runs",
+    "documents",
+    "vendor_profiles",
 ]
 
 # Named so a reader knows the omission is deliberate rather than an oversight.
 PRESERVED = [
+    # `assets` above all: the corpus is authored, and it is also where
+    # `upsert_knowledge.py` puts governed documents that a reseed must read.
+    # Wiping it would make the reseed build a world against default values.
     "assets", "asset_embeddings", "asset_usage", "teams", "users",
     "api_keys", "api_key_usage", "identities",
     "employee_profiles", "employee_pto",
