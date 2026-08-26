@@ -52,6 +52,16 @@ StepType = Literal["trigger", "modelcall", "rule", "task", "action", "event", "t
 GoldenSource = Literal[
     "correction-set", "exemplar", "human-authored", "promoted-from-run"
 ]
+# How a fact assertion is graded. `judge` is itself a governed ModelCall.
+FactOp = Literal["equals", "approx", "one_of", "judge"]
+# What kind of step establishes a contract fact — the derivation key the
+# producer map uses, so labels never name a step id.
+FactKind = Literal["extraction", "verdict", "commit", "synthesis"]
+AssertionVerdict = Literal["pass", "fail", "review"]
+Grader = Literal["deterministic", "judge", "human"]
+# Pinned: the case's read-set is served back (reproducible regression run).
+# Live: the flow reads today's knowledge layer (a different kind of question).
+ReadMode = Literal["pinned", "live"]
 RunStatus = Literal["completed", "waiting_on_human", "escalated", "failed"]
 VersionStatus = Literal["active", "archived", "draft"]
 # What changed about a step between two versions, for the canvas diff overlay.
@@ -164,6 +174,9 @@ class FlowDefinition(BaseModel):
     # Published history plus at most one open draft. `steps` above stays the
     # active version's steps, so every existing reader keeps working.
     versions: list[FlowVersion] = Field(default_factory=list)
+    # The declared canonical facts this flow establishes — the stable spine
+    # ground truth attaches to (defined below; resolved via model_rebuild).
+    contract: "FlowContract" = Field(default_factory=lambda: FlowContract())
 
     def version_history(self) -> list[FlowVersion]:
         """Newest first, with the active version synthesized if absent."""
@@ -199,10 +212,101 @@ class FlowDefinition(BaseModel):
         )
 
 
+# ---- the flow contract: the stable spine labels attach to -----------------
+
+
+class ContractFact(BaseModel):
+    """One canonical fact a Flow establishes, expressed against the ontology.
+
+    Ground truth keys to these paths, never to step ids — a document's
+    line_items[1].amount is true regardless of which ModelCall happens to
+    capture it, so relabelling on every topology change would be labelling
+    the wrong thing. `kind` + `stage` are the derivation key the producer map
+    uses to project a fact onto whatever steps the current version has.
+    """
+
+    path: str
+    type: str = "string"  # money | string | ref | verdict | bool | int
+    kind: FactKind = "extraction"
+    # Which step of that kind produces it, in declaration order (0-based).
+    stage: int = 0
+    description: str = ""
+
+
+class FlowContract(BaseModel):
+    facts: list[ContractFact] = Field(default_factory=list)
+
+
+def producer_map(contract: FlowContract, steps: list[FlowStep]) -> dict[str, str]:
+    """{fact path -> step id} for one concrete version's steps.
+
+    Derived from the version's topology (in the real engine, from journal
+    lineage), never hand-maintained — which is what lets the flow's shape
+    morph without orphaning a single label. A fact no step can produce maps
+    to "", which grading surfaces as a structural gap rather than hiding.
+    """
+    kind_to_type = {
+        "extraction": "modelcall",
+        "synthesis": "modelcall",
+        "verdict": "rule",
+        "commit": "action",
+    }
+    by_type: dict[str, list[FlowStep]] = {}
+    for step in steps:
+        by_type.setdefault(step.type, []).append(step)
+    out: dict[str, str] = {}
+    for fact in contract.facts:
+        candidates = by_type.get(kind_to_type[fact.kind], [])
+        if not candidates:
+            out[fact.path] = ""
+        elif fact.kind == "synthesis":
+            out[fact.path] = candidates[-1].id
+        else:
+            out[fact.path] = candidates[min(fact.stage, len(candidates) - 1)].id
+    return out
+
+
+FlowDefinition.model_rebuild()
+
+
+# ---- golden cases: document + pinned world + assertions --------------------
+
+
+class FactAssertion(BaseModel):
+    """A claim about a canonical fact for this document — 'for exp-20441,
+    receipt.total_usd is 64.20' — graded field-by-field."""
+
+    path: str
+    op: FactOp = "equals"
+    expected: str = ""
+    tolerance: str = ""  # for approx
+    rubric: str = ""  # for judge — the rubric the judge ModelCall grades against
+
+
+class TrajectoryAssertion(BaseModel):
+    """A claim about the path, phrased semantically rather than by step id:
+    which Actions commit, whether human judgment was needed, how it ends."""
+
+    kind: Literal["action_committed", "task_raised", "terminal_status", "waypoint"]
+    expected: str = ""
+
+
+class PinnedRead(BaseModel):
+    """One knowledge/data-layer record the run read, at its revision — captured
+    from the run journal on promotion, or authored as a fixture. Serving these
+    back is what makes a regression run reproducible when the vendor master
+    moves underneath it."""
+
+    ref: str  # e.g. "vendor:acme-industrial@rev12"
+    summary: str = ""
+
+
 class GoldenCase(BaseModel):
     id: str
     name: str
     input_ref: str = ""
+    # Human-readable summary of what a passing run looks like; the structured
+    # truth is `assertions` + `trajectory`.
     expected: str = ""
     source: GoldenSource = "correction-set"
     added_by: str = ""
@@ -214,17 +318,128 @@ class GoldenCase(BaseModel):
     # document reference. Stored as text: it is the customer's fixture, and
     # re-serializing it would quietly change what is being tested.
     payload: str = ""
+    # The fixture artifact itself (an invoice PDF, an email) as a
+    # knowledge-layer asset reference.
+    document_ref: str = ""
+    assertions: list[FactAssertion] = Field(default_factory=list)
+    trajectory: list[TrajectoryAssertion] = Field(default_factory=list)
+    read_set: list[PinnedRead] = Field(default_factory=list)
+    # Set when a human confirmed/corrected the labels in the review screen.
+    reviewed_by: str = ""
+    reviewed_at: datetime | None = None
+
+
+class GoldenSetRevision(BaseModel):
+    version: int
+    at: datetime
+    by: str = ""
+    note: str = ""
+    case_count: int = 0
 
 
 class GoldenSet(BaseModel):
     flow_id: str
     cases: list[GoldenCase] = Field(default_factory=list)
+    # The dataset is a versioned knowledge asset: experiments pin the version
+    # they ran against, so two pass rates are only ever compared when they
+    # measured the same thing.
+    version: int = 1
+    revisions: list[GoldenSetRevision] = Field(default_factory=list)
     # Where the seeded half of the set comes from in the repository. The
     # golden set is governed knowledge that FDEs also author in code, so the
     # console states which file it was seeded from rather than pretending the
     # UI is the only source.
     synced_from: str = ""
     synced_at: datetime | None = None
+
+    def bump(self, by: str, note: str) -> None:
+        self.version += 1
+        self.revisions.append(
+            GoldenSetRevision(
+                version=self.version,
+                at=utcnow(),
+                by=by,
+                note=note,
+                case_count=len(self.cases),
+            )
+        )
+
+
+# ---- correction sets: the flywheel's eval data, per ModelCall ---------------
+
+
+class CorrectionPair(BaseModel):
+    field: str
+    raw: str
+    corrected: str
+    by: str = ""
+    at: datetime = Field(default_factory=utcnow)
+
+
+class CorrectionSet(BaseModel):
+    """The auto-accumulated raw→corrected pairs for one ModelCall step — the
+    crown-jewel eval/tuning dataset the flywheel appends to on every human
+    correction. Step evals grade a prompt/model change against this without
+    running the whole flow."""
+
+    step_id: str
+    step_name: str
+    model: str = ""
+    pairs: int = 0
+    last_appended: datetime | None = None
+    sample: list[CorrectionPair] = Field(default_factory=list)
+
+
+# ---- the case document, rendered for review/labelling -----------------------
+
+
+class DocLine(BaseModel):
+    """One text run on the synthesized document page. Coordinates are
+    normalized 0..1 against a US-letter page."""
+
+    text: str
+    x: float
+    y: float
+    size: float = 12
+    bold: bool = False
+    mono: bool = False
+    muted: bool = False
+
+
+class DocRegion(BaseModel):
+    """A grounded field: where on the page a contract fact's value sits.
+    box = [x, y, w, h], normalized. In the real system these come off the
+    extraction ModelCall's grounding output."""
+
+    path: str
+    box: list[float]
+    value: str
+    confidence: float = 1.0
+
+
+class CaseDocument(BaseModel):
+    case_id: str
+    title: str
+    kind: str = "generic"  # expense | generic
+    lines: list[DocLine] = Field(default_factory=list)
+    regions: list[DocRegion] = Field(default_factory=list)
+
+
+class AssertionResult(BaseModel):
+    """One assertion, graded for one (case, version) pair and localized to the
+    step that owns the fact in this version's producer map."""
+
+    kind: Literal["fact", "trajectory"]
+    label: str  # the fact path, or the trajectory claim in words
+    op: str = "equals"
+    expected: str = ""
+    actual: str = ""
+    verdict: AssertionVerdict = "pass"
+    grader: Grader = "deterministic"
+    # "" when the claim has no single owning step (a trajectory terminal), or
+    # when no step in this version can produce the fact — a structural gap.
+    step_id: str = ""
+    baseline_verdict: AssertionVerdict | None = None
 
 
 class TestCaseResult(BaseModel):
@@ -240,10 +455,34 @@ class TestCaseResult(BaseModel):
     baseline_passed: bool | None = None
     baseline_cost_usd: float = 0.0
     baseline_duration_ms: int = 0
+    # Assertion-level grading: which facts diverged and at which step, so a
+    # failure points at the thing to change rather than just counting.
+    assertions: list[AssertionResult] = Field(default_factory=list)
 
     @property
     def regressed(self) -> bool:
         return self.baseline_passed is True and not self.passed
+
+
+class StepStat(BaseModel):
+    """Pass/fail of the assertions one step owns, across the whole run — the
+    number the canvas heatmap paints on that node."""
+
+    step_id: str
+    step_name: str = ""
+    step_type: str = ""
+    passed: int = 0
+    failed: int = 0
+    baseline_passed: int = 0
+    baseline_failed: int = 0
+
+
+class GateResult(BaseModel):
+    """The promotion gate, stated rather than implied: no regressions, and at
+    least as many cases passing as the baseline."""
+
+    passed: bool
+    reasons: list[str] = Field(default_factory=list)
 
 
 class TestRun(BaseModel):
@@ -269,6 +508,20 @@ class TestRun(BaseModel):
     # Doctrinal constant: the harness never commits an Action. Kept on the
     # record so the audit trail states it rather than implying it.
     writes_suppressed: bool = True
+    # Which revision of the golden set this experiment measured — pass rates
+    # are only comparable when this matches.
+    dataset_version: int = 0
+    # Pinned read-sets by default; a live-reads run is a different question
+    # and is labelled as one.
+    reads: ReadMode = "pinned"
+    # Per-step aggregates over assertion results — the canvas eval lens.
+    step_stats: list[StepStat] = Field(default_factory=list)
+    gate: GateResult | None = None
+    # Assertions the grader could not decide; each raises a review Task.
+    reviews_raised: int = 0
+    # Set when the experiment was auto-launched by applying a recommendation,
+    # so the card can show its measured (not estimated) delta.
+    launched_for: str = ""
 
 
 class Recommendation(BaseModel):
@@ -1038,6 +1291,166 @@ def audit_entries(defn: FlowDefinition, limit: int) -> list[AuditEntry]:
 
 
 # ---------------------------------------------------------------------------
+# Correction sets (synthesized from the flywheel's telemetry)
+# ---------------------------------------------------------------------------
+
+
+def correction_sets(defn: FlowDefinition) -> list[CorrectionSet]:
+    """Per-ModelCall correction sets: every human correction the flywheel
+    auto-appended over the last 30 days, with a sample of recent pairs.
+
+    Synthesized deterministically like the rest of the telemetry — the
+    contract (a per-step, auto-accumulated eval dataset) is the real part.
+    """
+    usage = usage_series(defn, 30)
+    total_corrections = sum(d.tasks_raised for d in usage)
+    model_steps = [s for s in defn.steps if s.type == "modelcall"]
+    if not model_steps:
+        return []
+    fields_by_step: dict[str, list[str]] = {}
+    pmap = producer_map(defn.contract, defn.steps)
+    for fact in defn.contract.facts:
+        step_id = pmap.get(fact.path, "")
+        if step_id:
+            fields_by_step.setdefault(step_id, []).append(fact.path)
+    out: list[CorrectionSet] = []
+    for i, step in enumerate(model_steps):
+        rng = _h(f"{defn.id}:corrections:{step.id}")
+        # The first extraction step absorbs most human corrections.
+        share = 0.7 if i == 0 else 0.3 / max(1, len(model_steps) - 1)
+        pairs = int(total_corrections * share)
+        fields = fields_by_step.get(step.id) or [f"{defn.id}.output"]
+        sample = []
+        for n in range(min(3, max(1, pairs))):
+            field = fields[n % len(fields)]
+            base = 900 + int(_hex(f"{step.id}:{n}", 4), 16) % 9000
+            sample.append(
+                CorrectionPair(
+                    field=field,
+                    raw=str(base),
+                    corrected=str(base + rng.randint(-40, 60)),
+                    by=_REVIEWERS[(n + i) % len(_REVIEWERS)],
+                    at=utcnow() - timedelta(hours=rng.uniform(2, 200)),
+                )
+            )
+        out.append(
+            CorrectionSet(
+                step_id=step.id,
+                step_name=step.name,
+                model=step.config.get("model", ""),
+                pairs=pairs,
+                last_appended=(
+                    utcnow() - timedelta(hours=rng.uniform(1, 30))
+                    if pairs
+                    else None
+                ),
+                sample=sample,
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Case document synthesis (the review/labelling surface's raw material)
+# ---------------------------------------------------------------------------
+
+
+def _fact_value(case: GoldenCase, path: str, default: str = "") -> str:
+    return next((a.expected for a in case.assertions if a.path == path), default)
+
+
+def case_document(defn: FlowDefinition, case: GoldenCase) -> CaseDocument:
+    """The fixture document behind a golden case, with grounded regions.
+
+    In the real system the artifact is the stored asset and the regions come
+    off the extraction ModelCall's grounding output; here both are synthesized
+    coherently so the review screen is real even though the receipt is not.
+    """
+    rng = _h(f"{defn.id}:{case.id}:doc")
+    lines: list[DocLine] = []
+    regions: list[DocRegion] = []
+
+    def put(text: str, x: float, y: float, *, size: float = 11, bold: bool = False,
+            mono: bool = False, muted: bool = False) -> None:
+        lines.append(DocLine(text=text, x=x, y=y, size=size, bold=bold,
+                             mono=mono, muted=muted))
+
+    def ground(path: str, x: float, y: float, value: str, *,
+               w: float = 0.16, h: float = 0.028) -> None:
+        if not value:
+            return
+        regions.append(
+            DocRegion(
+                path=path,
+                # Lines are placed by their top edge; the box hugs the text
+                # with a small halo on each side.
+                box=[x - 0.008, y - 0.006, w, h],
+                value=value,
+                confidence=round(rng.uniform(0.82, 0.99), 2),
+            )
+        )
+
+    if defn.id == "expense-reimbursement":
+        vendor = _fact_value(case, "receipt.vendor", "corner-bistro")
+        date_str = _fact_value(case, "receipt.date", "2026-08-14")
+        total = _fact_value(case, "receipt.total_usd", "64.20")
+        category = _fact_value(case, "receipt.category", "meals")
+        vendor_display = vendor.replace("-", " ").title()
+        put(vendor_display, 0.07, 0.08, size=17, bold=True)
+        put("312 Lakeshore Ave · Madison WI 53703", 0.07, 0.115, size=9, muted=True)
+        put("RECEIPT", 0.72, 0.08, size=13, bold=True, muted=True)
+        put(date_str, 0.72, 0.11, size=10, mono=True)
+        ground("receipt.vendor", 0.07, 0.08, vendor, w=0.30, h=0.034)
+        ground("receipt.date", 0.72, 0.11, date_str, w=0.16)
+        put("CATEGORY", 0.07, 0.19, size=8.5, bold=True, muted=True)
+        put(category, 0.07, 0.215, size=10, mono=True)
+        ground("receipt.category", 0.07, 0.215, category, w=0.18)
+        item_names = [
+            "House salad", "Grilled entrée", "Sparkling water", "Service charge",
+        ]
+        put("ITEM", 0.07, 0.30, size=8.5, bold=True, muted=True)
+        put("AMOUNT", 0.80, 0.30, size=8.5, bold=True, muted=True)
+        row_y = 0.335
+        for idx in range(2 + int(_hex(case.id, 2), 16) % 3):
+            put(item_names[idx % len(item_names)], 0.07, row_y, size=10)
+            put(f"${rng.uniform(6, 40):.2f}", 0.80, row_y, size=10, mono=True)
+            row_y += 0.035
+        put("TOTAL", 0.62, row_y + 0.04, size=10, bold=True)
+        put(f"${total}", 0.80, row_y + 0.04, size=12, bold=True, mono=True)
+        ground("receipt.total_usd", 0.80, row_y + 0.04, total, w=0.13, h=0.032)
+        put("Thank you — retain this receipt for reimbursement",
+            0.07, 0.92, size=8.5, muted=True)
+        return CaseDocument(
+            case_id=case.id,
+            title=f"{vendor_display} · {date_str}",
+            kind="expense",
+            lines=lines,
+            regions=regions,
+        )
+
+    # Generic fixture: the document is a structured sheet of the case's facts.
+    put(case.name, 0.07, 0.08, size=16, bold=True)
+    put(f"fixture {case.input_ref or case.id} · {defn.name or defn.id}",
+        0.07, 0.115, size=9, muted=True)
+    y = 0.19
+    for a in case.assertions:
+        put(a.path, 0.07, y, size=9, muted=True, mono=True)
+        put(a.expected, 0.48, y, size=10.5, mono=True)
+        ground(a.path, 0.48, y, a.expected, w=0.34)
+        y += 0.045
+    if case.expected:
+        put("EXPECTED OUTCOME", 0.07, y + 0.03, size=8.5, bold=True, muted=True)
+        put(case.expected, 0.07, y + 0.06, size=10)
+    return CaseDocument(
+        case_id=case.id,
+        title=case.name,
+        kind="generic",
+        lines=lines,
+        regions=regions,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Version diffing
 # ---------------------------------------------------------------------------
 
@@ -1443,6 +1856,20 @@ class FlowService:
         if any(c.id == case.id for c in golden.cases):
             raise ValueError(f"Golden case already exists: {case.id}")
         golden.cases.append(case)
+        golden.bump(case.added_by, f"added {case.id} · {case.source}")
+        return self.golden_sets.put(golden)
+
+    def import_golden_cases(
+        self, flow_id: str, cases: list[GoldenCase], by: str
+    ) -> GoldenSet:
+        """Bulk upload — many cases, one dataset revision."""
+        golden = self.golden_set(flow_id)
+        existing = {c.id for c in golden.cases}
+        clash = [c.id for c in cases if c.id in existing]
+        if clash:
+            raise ValueError(f"Golden case already exists: {', '.join(clash)}")
+        golden.cases.extend(cases)
+        golden.bump(by, f"imported {len(cases)} cases")
         return self.golden_sets.put(golden)
 
     def remove_golden_case(self, flow_id: str, case_id: str) -> GoldenSet:
@@ -1451,6 +1878,39 @@ class FlowService:
         if len(remaining) == len(golden.cases):
             raise ValueError(f"Golden case not found: {case_id}")
         golden.cases = remaining
+        golden.bump("", f"removed {case_id}")
+        return self.golden_sets.put(golden)
+
+    def review_golden_case(
+        self, flow_id: str, case_id: str, corrections: dict[str, str], by: str
+    ) -> GoldenSet:
+        """A human confirmed/corrected the case's labels in the review screen.
+
+        Corrections update the assertions' expected values; a confirmation
+        with no corrections still stamps the reviewer. Either way the dataset
+        version moves, because what a pass means changed (or was vouched for).
+        """
+        golden = self.golden_set(flow_id)
+        case = next((c for c in golden.cases if c.id == case_id), None)
+        if case is None:
+            raise ValueError(f"Golden case not found: {case_id}")
+        corrected: list[str] = []
+        for path, value in corrections.items():
+            assertion = next((a for a in case.assertions if a.path == path), None)
+            if assertion is None:
+                case.assertions.append(FactAssertion(path=path, expected=value))
+                corrected.append(path)
+            elif assertion.expected != value:
+                assertion.expected = value
+                corrected.append(path)
+        case.reviewed_by = by
+        case.reviewed_at = utcnow()
+        note = (
+            f"reviewed {case_id} · corrected {', '.join(corrected)}"
+            if corrected
+            else f"reviewed {case_id} · confirmed as labelled"
+        )
+        golden.bump(by, note)
         return self.golden_sets.put(golden)
 
     # ---- test harness ----
@@ -1461,6 +1921,8 @@ class FlowService:
         candidate_version: str,
         baseline_version: str,
         launched_by: str,
+        reads: ReadMode = "pinned",
+        launched_for: str = "",
     ) -> TestRun:
         defn = self.require(flow_id)
         golden = self.golden_set(flow_id)
@@ -1479,6 +1941,9 @@ class FlowService:
             baseline_version=baseline_version or defn.active_version().display(),
             launched_by=launched_by,
             total_cases=len(golden.cases),
+            dataset_version=golden.version,
+            reads=reads,
+            launched_for=launched_for,
         )
         self.test_runs.put(run)
         thread = threading.Thread(
@@ -1517,28 +1982,138 @@ class FlowService:
             return 1.0
         return weight(version.steps) / base
 
-    def _grade(
-        self, defn: FlowDefinition, case: GoldenCase, version: str, factor: float
-    ) -> tuple[bool, float, int]:
-        """Deterministic verdict for one (case, version) pair.
+    # Case-level target pass rate by provenance; individual assertions are
+    # graded at rate**(1/n) so a many-assertion case is not punished for
+    # being thoroughly labelled.
+    _SOURCE_RATES = {
+        "correction-set": 0.94,
+        "exemplar": 0.84,
+        "human-authored": 0.90,
+        "promoted-from-run": 0.92,
+    }
 
-        Keyed by version, so the same candidate always reproduces the same
-        result — the property any eval worth trusting has to have — while a
-        different candidate genuinely can diverge.
+    # Verdict-ish expected values flip to their counterpart when they diverge,
+    # so a failure reads like a wrong branch, not like noise.
+    _FLIP = {
+        "pass": "review", "review": "pass", "approve": "elevate",
+        "elevate": "approve", "standard": "escalate", "escalate": "standard",
+        "accept": "review", "true": "false", "false": "true",
+        "completed": "escalated", "matched": "mismatched",
+        "post": "review", "one-shot": "ensemble", "ensemble": "one-shot",
+        # A committed Action that should not have committed flips to "none";
+        # "none" itself flips to the flow's own terminal commit, derived from
+        # its steps in `_diverged` rather than hard-coded here.
+        "record-reimbursement": "none", "post-to-ap": "none",
+    }
+
+    @staticmethod
+    def _traj_label(t: TrajectoryAssertion) -> str:
+        return {
+            "action_committed": "actions committed",
+            "task_raised": "human task raised",
+            "terminal_status": "terminal status",
+            "waypoint": "waypoint",
+        }[t.kind]
+
+    @staticmethod
+    def _flat_assertions(
+        case: GoldenCase,
+    ) -> list[tuple[str, str, str, str]]:
+        """(kind, label, op, expected) for every claim this case makes.
+
+        A legacy case with no structured assertions degrades to one waypoint
+        derived from its prose expectation, so old datasets keep grading.
         """
-        rng = _h(f"{defn.id}:{case.id}:{version}")
-        base = {
-            "correction-set": 0.94,
-            "exemplar": 0.84,
-            "human-authored": 0.90,
-            "promoted-from-run": 0.92,
-        }
-        passed = rng.random() < base.get(case.source, 0.9)
-        cost = round(defn.profile.cost_per_run * rng.uniform(0.5, 1.1) * factor, 3)
+        out: list[tuple[str, str, str, str]] = []
+        for a in case.assertions:
+            out.append(("fact", a.path, a.op, a.expected))
+        for t in case.trajectory:
+            out.append(
+                ("trajectory", FlowService._traj_label(t), "equals", t.expected)
+            )
+        if not out:
+            out.append(
+                ("trajectory", "waypoint", "equals",
+                 case.expected or "matches the recorded outcome")
+            )
+        return out
+
+    def _diverged(self, defn: FlowDefinition, expected: str, key: str) -> str:
+        """A plausible wrong answer for `expected`, deterministic per key."""
+        rng = _h(key)
+        lowered = expected.strip().lower()
+        if lowered == "none":
+            # An Action committed that should not have: name this flow's own
+            # terminal commit, derived from its steps.
+            action = next(
+                (s for s in reversed(defn.steps) if s.type == "action"), None
+            )
+            return action.name if action else "(an Action committed)"
+        flip = self._FLIP.get(lowered)
+        if flip is not None:
+            return flip
+        cleaned = expected.replace(",", "").replace("$", "").replace("−", "-")
+        try:
+            value = float(cleaned)
+        except ValueError:
+            return "(diverged — output did not match the golden answer)"
+        skew = rng.choice([0.9, 1.1, 0.88, 1.13])
+        decimals = len(cleaned.split(".")[1]) if "." in cleaned else 0
+        return f"{value * skew:.{decimals}f}"
+
+    def _grade_case(
+        self,
+        defn: FlowDefinition,
+        case: GoldenCase,
+        version: str,
+        factor: float,
+        pmap: dict[str, str],
+        traj_steps: dict[str, str],
+        live: bool,
+    ) -> tuple[list[AssertionResult], bool, float, int]:
+        """Assertion-by-assertion verdicts for one (case, version) pair.
+
+        Keyed by (flow, case, assertion, version) — the same candidate always
+        reproduces the same result, a different candidate genuinely can
+        diverge, and a live-reads run is honestly a different experiment.
+        """
+        flat = self._flat_assertions(case)
+        rate = self._SOURCE_RATES.get(case.source, 0.9)
+        per_assertion = rate ** (1.0 / len(flat))
+        results: list[AssertionResult] = []
+        for kind, label, op, expected in flat:
+            key = f"{defn.id}:{case.id}:{version}:{label}" + (":live" if live else "")
+            arng = _h(key)
+            ok = arng.random() < per_assertion
+            verdict: AssertionVerdict = "pass"
+            grader: Grader = "judge" if op == "judge" else "deterministic"
+            actual = expected
+            if not ok:
+                # An uncertain judge escalates to a human review Task instead
+                # of guessing — ambiguity is judgment work, not noise.
+                if op == "judge" and arng.random() < 0.5:
+                    verdict, grader = "review", "human"
+                    actual = "(judge uncertain — review task raised)"
+                else:
+                    verdict = "fail"
+                    actual = self._diverged(defn, expected, key + ":actual")
+            step_id = (
+                pmap.get(label, "") if kind == "fact" else traj_steps.get(label, "")
+            )
+            results.append(
+                AssertionResult(
+                    kind=kind, label=label, op=op, expected=expected,
+                    actual=actual, verdict=verdict, grader=grader,
+                    step_id=step_id,
+                )
+            )
+        passed = all(r.verdict == "pass" for r in results)
+        crng = _h(f"{defn.id}:{case.id}:{version}:cost")
+        cost = round(defn.profile.cost_per_run * crng.uniform(0.5, 1.1) * factor, 3)
         # A cheaper model is also a faster one, roughly; enough to make the
         # latency column move in the direction the cost column moves.
-        duration = int(rng.uniform(1200, 6500) * (0.75 + 0.25 * factor))
-        return passed, cost, duration
+        duration = int(crng.uniform(1200, 6500) * (0.75 + 0.25 * factor))
+        return results, passed, cost, duration
 
     def _execute_test_run(
         self, test_id: str, defn: FlowDefinition, cases: list[GoldenCase]
@@ -1547,7 +2122,10 @@ class FlowService:
 
         Each case is graded against BOTH the candidate and the baseline, so
         the comparison is like-for-like rather than candidate-versus-
-        remembered-numbers, and a regression is visible per case.
+        remembered-numbers, and a regression is visible per case. Fact
+        failures are localized to the step that owns the fact in the
+        candidate's producer map — the projection that keeps labels stable
+        while the topology morphs.
         """
         run = self.test_runs.get(test_id)
         if run is None:
@@ -1555,13 +2133,39 @@ class FlowService:
         try:
             candidate_factor = self._version_cost_factor(defn, run.candidate_version)
             baseline_factor = self._version_cost_factor(defn, run.baseline_version)
+            candidate = next(
+                (v for v in defn.version_history()
+                 if v.display() == run.candidate_version),
+                None,
+            )
+            steps = candidate.steps if candidate else defn.steps
+            pmap = producer_map(defn.contract, steps)
+            traj_steps = {
+                "actions committed": next(
+                    (s.id for s in steps if s.type == "action"), ""
+                ),
+                "human task raised": next(
+                    (s.id for s in steps if s.type == "task"), ""
+                ),
+            }
+            step_index = {s.id: s for s in steps}
+            live = run.reads == "live"
             for case in cases:
                 time.sleep(self.test_seconds_per_case)
-                passed, cost, duration = self._grade(
-                    defn, case, run.candidate_version, candidate_factor
+                results, passed, cost, duration = self._grade_case(
+                    defn, case, run.candidate_version, candidate_factor,
+                    pmap, traj_steps, live,
                 )
-                base_passed, base_cost, base_duration = self._grade(
-                    defn, case, run.baseline_version, baseline_factor
+                base_results, base_passed, base_cost, base_duration = (
+                    self._grade_case(
+                        defn, case, run.baseline_version, baseline_factor,
+                        pmap, traj_steps, live,
+                    )
+                )
+                for res, base in zip(results, base_results):
+                    res.baseline_verdict = base.verdict
+                first_fail = next(
+                    (r for r in results if r.verdict != "pass"), None
                 )
                 run.results.append(
                     TestCaseResult(
@@ -1570,17 +2174,17 @@ class FlowService:
                         passed=passed,
                         expected=case.expected,
                         actual=case.expected if passed else (
-                            "diverged: " + (
-                                "took the automatic path where a Task was expected"
-                                if "Task" in case.expected
-                                else "extracted value did not match the golden answer"
-                            )
+                            f"{first_fail.label}: expected {first_fail.expected}, "
+                            f"got {first_fail.actual}"
+                            if first_fail
+                            else "diverged"
                         ),
                         cost_usd=cost,
                         duration_ms=duration,
                         baseline_passed=base_passed,
                         baseline_cost_usd=base_cost,
                         baseline_duration_ms=base_duration,
+                        assertions=results,
                     )
                 )
                 run.passed = sum(1 for r in run.results if r.passed)
@@ -1591,12 +2195,56 @@ class FlowService:
                 )
                 run.cost_delta_usd = round(run.cost_usd - run.baseline_cost_usd, 3)
                 run.regressions = sum(1 for r in run.results if r.regressed)
+                run.reviews_raised = sum(
+                    1
+                    for r in run.results
+                    for a in r.assertions
+                    if a.verdict == "review"
+                )
                 done = len(run.results)
                 run.latency_delta_ms = int(
                     sum(r.duration_ms - r.baseline_duration_ms for r in run.results)
                     / max(1, done)
                 )
+                # Step aggregates, recomputed as results land so the heatmap
+                # fills in while the run is still going.
+                stats: dict[str, StepStat] = {}
+                for result in run.results:
+                    for a in result.assertions:
+                        if not a.step_id:
+                            continue
+                        stat = stats.get(a.step_id)
+                        if stat is None:
+                            step = step_index.get(a.step_id)
+                            stat = StepStat(
+                                step_id=a.step_id,
+                                step_name=step.name if step else a.step_id,
+                                step_type=step.type if step else "",
+                            )
+                            stats[a.step_id] = stat
+                        if a.verdict == "pass":
+                            stat.passed += 1
+                        else:
+                            stat.failed += 1
+                        if a.baseline_verdict == "pass":
+                            stat.baseline_passed += 1
+                        elif a.baseline_verdict is not None:
+                            stat.baseline_failed += 1
+                run.step_stats = list(stats.values())
                 self.test_runs.put(run)
+            reasons: list[str] = []
+            if run.regressions:
+                reasons.append(
+                    f"{run.regressions} regression"
+                    f"{'s' if run.regressions != 1 else ''} against "
+                    f"{run.baseline_version}"
+                )
+            if run.passed < run.baseline_passed:
+                reasons.append(
+                    f"candidate passes {run.passed}/{run.total_cases}, "
+                    f"below the baseline's {run.baseline_passed}"
+                )
+            run.gate = GateResult(passed=not reasons, reasons=reasons)
             run.status = "completed"
             run.finished_at = utcnow()
             self.test_runs.put(run)
@@ -1608,6 +2256,7 @@ class FlowService:
                     "baselinePassed": run.baseline_passed,
                     "regressions": run.regressions,
                     "costDelta": run.cost_delta_usd,
+                    "gatePassed": run.gate.passed,
                 },
             )
         except Exception:
@@ -1646,416 +2295,451 @@ def _ago(days: int) -> datetime:
 def _seed_definitions() -> list[FlowDefinition]:
     return [
         FlowDefinition(
-            id="invoice-intake",
-            name="Invoice intake",
+            id="expense-reimbursement",
+            name="Expense reimbursement",
             description=(
-                "Extracts, validates and routes vendor invoices; pauses for AP "
-                "judgment when a Rule says the amount needs review."
-            ),
-            team="finance-ops",
-            status="active",
-            version=14,
-            tags=["ap", "extraction", "erp"],
-            queues=["ap-clerk"],
-            workspace="ap-workspace",
-            roi_minutes_per_run=8,
-            model_budget_usd_per_run=0.35,
-            authored_by="fde:m.suter",
-            created_at=_ago(160),
-            updated_at=_ago(12),
-            profile=SeedProfile(
-                base_runs=52, cost_per_run=0.22, tokens_per_run=5200,
-                task_rate=0.071, escalate_rate=0.004, fail_rate=0.003,
-                active_seconds=42, case_prefix="inv",
-            ),
-            steps=[
-                FlowStep(
-                    id="t1", type="trigger", name="InvoiceReceived",
-                    summary="starts one run per invoice landed by the mail-intake flow",
-                    config={"event": "InvoiceReceived", "source": "mail-intake"},
-                    next=["m1"],
-                ),
-                FlowStep(
-                    id="m1", type="modelcall", name="extract-invoice",
-                    summary="extracts amount, vendor, PO and line items from the document",
-                    config={"model": "claude-sonnet-5", "prompt": "invoice-extraction v9"},
-                    next=["r1"],
-                ),
-                FlowStep(
-                    id="r1", type="rule", name="amount-threshold",
-                    summary="is the amount over the $10,000 review threshold?",
-                    config={"rule_type": "threshold", "threshold": "$10,000"},
-                    next=["a1", "k1"], branch_labels=["pass", "review"],
-                ),
-                FlowStep(
-                    id="k1", type="task", name="confirm-extraction",
-                    summary="a person confirms or corrects the extraction; the run suspends in place",
-                    config={"queue": "ap-clerk"},
-                    next=["a1"],
-                ),
-                FlowStep(
-                    id="a1", type="action", name="post-to-erp",
-                    summary="guarded write of the approved invoice to the ERP",
-                    config={"target": "erp", "gateway": "action-gateway"},
-                    next=["e1"],
-                ),
-                FlowStep(
-                    id="e1", type="event", name="InvoicePosted",
-                    summary="emitted on commit; corrections flow back decoupled via ExtractionCorrected",
-                    config={"event": "InvoicePosted"},
-                ),
-            ],
-        ),
-        FlowDefinition(
-            id="expense-triage",
-            name="Expense triage",
-            description=(
-                "One ModelCall policy check on each expense report; approves "
-                "in-policy spend and raises a Task for the rest."
+                "Reads a submitted receipt image with a ModelCall, checks it against "
+                "the governed expense policy in the knowledge layer, elevates to human "
+                "review when policy or confidence demands it, and records the request "
+                "with its state in the reimbursements table."
             ),
             team="finance-ops",
             status="active",
             version=9,
-            tags=["expenses", "policy"],
+            tags=["expenses", "reimbursement", "vision"],
             queues=["expense-review"],
             workspace="ap-workspace",
-            roi_minutes_per_run=5,
-            model_budget_usd_per_run=0.20,
-            authored_by="fde:m.suter",
-            created_at=_ago(120),
-            updated_at=_ago(30),
-            profile=SeedProfile(
-                base_runs=45, cost_per_run=0.12, tokens_per_run=2600,
-                task_rate=0.11, escalate_rate=0.002, fail_rate=0.002,
-                active_seconds=18, case_prefix="exp",
-            ),
-            steps=[
-                FlowStep(
-                    id="t1", type="trigger", name="ExpenseSubmitted",
-                    summary="one run per submitted report",
-                    config={"event": "ExpenseSubmitted"}, next=["m1"],
-                ),
-                FlowStep(
-                    id="m1", type="modelcall", name="policy-check",
-                    summary="checks the report against the expense policy in the knowledge layer",
-                    config={"model": "claude-haiku-4-5", "prompt": "expense-policy v5"},
-                    next=["r1"],
-                ),
-                FlowStep(
-                    id="r1", type="rule", name="policy-verdict",
-                    summary="in policy, and under the manager-approval limit?",
-                    config={"rule_type": "match-condition"},
-                    next=["a1", "k1"], branch_labels=["approve", "review"],
-                ),
-                FlowStep(
-                    id="k1", type="task", name="review-expense",
-                    summary="a reviewer decides the flagged report with the model's findings attached",
-                    config={"queue": "expense-review"}, next=["a1"],
-                ),
-                FlowStep(
-                    id="a1", type="action", name="record-decision",
-                    summary="guarded write of the approval or rejection",
-                    config={"target": "expense-system"}, next=["e1"],
-                ),
-                FlowStep(
-                    id="e1", type="event", name="ExpenseDecided",
-                    summary="emitted on commit", config={"event": "ExpenseDecided"},
-                ),
-            ],
-        ),
-        FlowDefinition(
-            id="contract-review",
-            name="Contract review",
-            description=(
-                "Multi-model pipeline on inbound contracts: clause extraction, "
-                "then an independent risk review, then legal judgment on anything "
-                "over the risk threshold."
-            ),
-            team="legal",
-            status="active",
-            version=6,
-            tags=["contracts", "risk", "multi-model"],
-            queues=["legal-review"],
-            workspace="deal-room",
-            roi_minutes_per_run=45,
-            model_budget_usd_per_run=4.00,
-            authored_by="fde:k.osei",
-            created_at=_ago(95),
-            updated_at=_ago(5),
-            profile=SeedProfile(
-                # Counterparty paper is genuinely hard: enough escalations and
-                # hard failures to sit below the fleet's success bar.
-                base_runs=7, cost_per_run=2.40, tokens_per_run=48000,
-                task_rate=0.42, escalate_rate=0.045, fail_rate=0.03,
-                active_seconds=210, case_prefix="ctr",
-            ),
-            steps=[
-                FlowStep(
-                    id="t1", type="trigger", name="ContractUploaded",
-                    summary="one run per contract landing in the deal room",
-                    config={"event": "ContractUploaded"}, next=["m1"],
-                ),
-                FlowStep(
-                    id="m1", type="modelcall", name="clause-extraction",
-                    summary="extracts and classifies every clause against the playbook ontology",
-                    config={"model": "claude-sonnet-5", "prompt": "clause-extraction v11"},
-                    next=["x1"],
-                ),
-                FlowStep(
-                    id="x1", type="transform", name="clause-normalizer",
-                    summary="maps extracted clauses onto canonical clause Objects and Links",
-                    config={"language": "python"}, next=["m2"],
-                ),
-                FlowStep(
-                    id="m2", type="modelcall", name="risk-review",
-                    summary="independent second model scores deviation from the standard terms",
-                    config={"model": "claude-opus-5", "prompt": "risk-review v4"},
-                    next=["r1"],
-                ),
-                FlowStep(
-                    id="r1", type="rule", name="risk-threshold",
-                    summary="is any clause scored above the escalation threshold?",
-                    config={"rule_type": "threshold", "threshold": "risk ≥ 0.6"},
-                    next=["a1", "k1"], branch_labels=["standard", "escalate"],
-                ),
-                FlowStep(
-                    id="k1", type="task", name="legal-review",
-                    summary="counsel reviews the flagged clauses with both models' reasoning attached",
-                    config={"queue": "legal-review"}, next=["a1"],
-                ),
-                FlowStep(
-                    id="a1", type="action", name="file-review-summary",
-                    summary="guarded write of the review summary into the deal room",
-                    config={"target": "deal-room"}, next=["e1"],
-                ),
-                FlowStep(
-                    id="e1", type="event", name="ContractReviewed",
-                    summary="emitted on commit", config={"event": "ContractReviewed"},
-                ),
-            ],
-        ),
-        FlowDefinition(
-            id="deal-brief",
-            name="Deal brief",
-            description=(
-                "Synthesizes a deal-room briefing from CRM state, correspondence "
-                "and the knowledge layer whenever a deal changes stage."
-            ),
-            team="sales-ops",
-            status="draft",
-            version=2,
-            tags=["sales", "synthesis"],
-            queues=[],
-            workspace="deal-room",
-            roi_minutes_per_run=25,
-            model_budget_usd_per_run=1.50,
-            authored_by="fde:k.osei",
-            created_at=_ago(18),
-            updated_at=_ago(2),
-            profile=SeedProfile(
-                base_runs=0.8, cost_per_run=1.10, tokens_per_run=26000,
-                task_rate=0.0, escalate_rate=0.0, fail_rate=0.05,
-                active_seconds=95, case_prefix="deal",
-            ),
-            steps=[
-                FlowStep(
-                    id="t1", type="trigger", name="DealStageChanged",
-                    summary="fires when a deal moves stage in the CRM",
-                    config={"event": "DealStageChanged"}, next=["x1"],
-                ),
-                FlowStep(
-                    id="x1", type="transform", name="gather-context",
-                    summary="pulls the deal Object, its Links, and related knowledge assets",
-                    config={"language": "python"}, next=["m1"],
-                ),
-                FlowStep(
-                    id="m1", type="modelcall", name="synthesize-brief",
-                    summary="writes the briefing with citations into the graph",
-                    config={"model": "claude-opus-5", "prompt": "deal-brief v2"},
-                    next=["a1"],
-                ),
-                FlowStep(
-                    id="a1", type="action", name="post-to-workspace",
-                    summary="guarded write of the brief into the Deal Room workspace",
-                    config={"target": "deal-room"},
-                ),
-            ],
-        ),
-        FlowDefinition(
-            id="vendor-master-sync",
-            name="Vendor master sync",
-            description=(
-                "Keeps the canonical vendor list in agreement with the ERP: lands "
-                "changes, entity-matches them to canonical Objects, and resolves "
-                "claim conflicts by precedence."
-            ),
-            team="data-platform",
-            status="active",
-            version=11,
-            tags=["mdm", "sync", "erp"],
-            queues=["data-steward"],
-            workspace="",
-            roi_minutes_per_run=2,
+            roi_minutes_per_run=6,
             model_budget_usd_per_run=0.25,
-            authored_by="fde:r.nakamura",
+            authored_by="fde:m.suter",
             created_at=_ago(140),
-            updated_at=_ago(21),
+            updated_at=_ago(9),
             profile=SeedProfile(
-                base_runs=22, cost_per_run=0.11, tokens_per_run=2200,
-                task_rate=0.05, escalate_rate=0.002, fail_rate=0.002,
-                weekend_factor=1.0, active_seconds=25, case_prefix="batch",
+                base_runs=48, cost_per_run=0.14, tokens_per_run=5200,
+                task_rate=0.12, escalate_rate=0.004, fail_rate=0.002,
+                active_seconds=20, case_prefix="exp",
             ),
+            contract=FlowContract(facts=[
+                ContractFact(path="receipt.vendor", type="string", kind="extraction"),
+                ContractFact(path="receipt.date", type="string", kind="extraction"),
+                ContractFact(path="receipt.total_usd", type="money", kind="extraction"),
+                ContractFact(path="receipt.category", type="string", kind="extraction",
+                             description="policy category the spend falls under"),
+                ContractFact(path="reimbursement.verdict", type="verdict", kind="verdict",
+                             description="approve automatically, or elevate to review"),
+                ContractFact(path="reimbursement.recorded", type="bool", kind="commit",
+                             description="row written to the reimbursements table with its state"),
+            ]),
             steps=[
-                FlowStep(
-                    id="t1", type="trigger", name="every-2h",
-                    summary="windowing timer event through the standard Trigger mechanism",
-                    config={"event": "timer:2h"}, next=["x1"],
-                ),
-                FlowStep(
-                    id="x1", type="transform", name="land-erp-changes",
-                    summary="lands the change feed as bulk observations with per-revision lineage",
-                    config={"language": "python", "transport": "change-feed"},
-                    next=["m1"],
-                ),
-                FlowStep(
-                    id="m1", type="modelcall", name="match-assist",
-                    summary="scores ambiguous vendor-name matches the deterministic keys cannot settle",
-                    config={"model": "claude-haiku-4-5"}, next=["r1"],
-                ),
-                FlowStep(
-                    id="r1", type="rule", name="match-confidence",
-                    summary="accept the identity Link automatically above 0.85 confidence?",
-                    config={"rule_type": "threshold", "threshold": "0.85"},
-                    next=["a1", "k1"], branch_labels=["accept", "review"],
-                ),
-                FlowStep(
-                    id="k1", type="task", name="confirm-match",
-                    summary="a data steward confirms low-confidence merges; reversal info retained",
-                    config={"queue": "data-steward"}, next=["a1"],
-                ),
-                FlowStep(
-                    id="a1", type="action", name="upsert-canonical",
-                    summary="resolution writes: winning claims recorded with why; losers retained",
-                    config={"target": "graph"}, next=["e1"],
-                ),
-                FlowStep(
-                    id="e1", type="event", name="VendorMasterReconciled",
-                    summary="summarizing event per window — never per record",
-                    config={"event": "VendorMasterReconciled"},
-                ),
+                FlowStep(id="t1", type="trigger", name="ReceiptSubmitted",
+                         summary="one run per submitted receipt",
+                         config={"event": "ReceiptSubmitted"}, next=["m1"]),
+                FlowStep(id="m1", type="modelcall", name="extract-receipt",
+                         summary="reads the receipt image: vendor, date, total, category — with a confidence per field",
+                         config={"model": "claude-sonnet-5", "prompt": "receipt-extraction v9"},
+                         next=["x1"]),
+                FlowStep(id="x1", type="transform", name="read-policy",
+                         summary="gathers the governed policy values (auto-approval limit, category caps) from the knowledge layer for the rule — rules never fetch",
+                         config={"source": "knowledge:expense-approval-policy"}, next=["r1"]),
+                FlowStep(id="r1", type="rule", name="needs-elevation",
+                         summary="within the policy's auto-approval limit, an allowed category, and confidently extracted?",
+                         config={"rule_type": "threshold", "source": "knowledge:expense-approval-policy@rev5"},
+                         next=["a1", "k1"], branch_labels=["approve", "elevate"]),
+                FlowStep(id="k1", type="task", name="elevate-review",
+                         summary="a reviewer decides the elevated request with the extraction and the policy findings attached",
+                         config={"queue": "expense-review"}, next=["a1"]),
+                FlowStep(id="a1", type="action", name="record-reimbursement",
+                         summary="guarded write of the request and its state into the reimbursements table",
+                         config={"target": "reimbursements", "gateway": "action-gateway"}, next=["e1"]),
+                FlowStep(id="e1", type="event", name="ReimbursementRecorded",
+                         summary="emitted on commit", config={"event": "ReimbursementRecorded"}),
             ],
         ),
         FlowDefinition(
-            id="document-embedder",
-            name="Document embedder",
+            id="accounts-payable",
+            name="Accounts payable",
             description=(
-                "Parses, chunks and embeds landed documents into the knowledge "
-                "layer; derived vectors carry their source-plus-recipe derivation record."
+                "Classifies the vendor on an inbound invoice, extracts one-shot from "
+                "the vendor's exemplar in the knowledge layer — or, for an unknown "
+                "vendor, runs three independent extractions, adjudicates them, and "
+                "raises a Task to verify the new exemplar — then posts under the "
+                "governed auto-post limit. Three-way match and fraud screening are "
+                "declared placeholders until the PO and receiving feeds land."
             ),
-            team="data-platform",
+            team="finance-ops",
             status="active",
-            version=8,
-            tags=["knowledge", "embeddings"],
-            queues=[],
-            workspace="",
-            roi_minutes_per_run=1,
-            model_budget_usd_per_run=0.30,
-            authored_by="fde:r.nakamura",
-            created_at=_ago(130),
-            updated_at=_ago(44),
+            version=5,
+            tags=["ap", "invoices", "vision", "ensemble"],
+            queues=["ap-clerk"],
+            workspace="ap-workspace",
+            roi_minutes_per_run=9,
+            model_budget_usd_per_run=0.60,
+            authored_by="fde:m.suter",
+            created_at=_ago(90),
+            updated_at=_ago(4),
             profile=SeedProfile(
-                base_runs=10, cost_per_run=0.19, tokens_per_run=9500,
-                task_rate=0.0, escalate_rate=0.0, fail_rate=0.006,
-                weekend_factor=1.0, active_seconds=60, case_prefix="doc",
+                base_runs=34, cost_per_run=0.31, tokens_per_run=9800,
+                task_rate=0.16, escalate_rate=0.005, fail_rate=0.003,
+                active_seconds=35, case_prefix="inv",
             ),
+            contract=FlowContract(facts=[
+                ContractFact(path="invoice.vendor_id", type="ref", kind="extraction",
+                             description="canonical vendor the classifier resolves to"),
+                ContractFact(path="invoice.invoice_number", type="string", kind="extraction"),
+                ContractFact(path="invoice.invoice_date", type="string", kind="extraction"),
+                ContractFact(path="invoice.po_number", type="string", kind="extraction"),
+                ContractFact(path="invoice.total_usd", type="money", kind="extraction"),
+                ContractFact(path="invoice.extraction_path", type="string", kind="verdict",
+                             description="one-shot from the exemplar, or ensemble for an unknown vendor"),
+                ContractFact(path="invoice.verdict", type="verdict", kind="verdict",
+                             description="post automatically, or route to review"),
+                ContractFact(path="invoice.posted", type="bool", kind="commit"),
+            ]),
             steps=[
-                FlowStep(
-                    id="t1", type="trigger", name="DocumentLanded",
-                    summary="event-triggered on each landed document",
-                    config={"event": "DocumentLanded"}, next=["x1"],
-                ),
-                FlowStep(
-                    id="x1", type="transform", name="parse-and-chunk",
-                    summary="extracts text and splits it on the chunking policy in the Mapping",
-                    config={"language": "python"}, next=["m1"],
-                ),
-                FlowStep(
-                    id="m1", type="modelcall", name="summarize-for-index",
-                    summary="writes the retrieval summary and tags for each chunk",
-                    config={"model": "claude-haiku-4-5"}, next=["a1"],
-                ),
-                FlowStep(
-                    id="a1", type="action", name="register-derived-dataset",
-                    summary="records the derived vectors with {from, fromVersion, recipe}",
-                    config={"target": "knowledge-layer"}, next=["e1"],
-                ),
-                FlowStep(
-                    id="e1", type="event", name="DocumentIndexed",
-                    summary="emitted per document", config={"event": "DocumentIndexed"},
-                ),
+                FlowStep(id="t1", type="trigger", name="InvoiceReceived",
+                         summary="one run per inbound invoice",
+                         config={"event": "InvoiceReceived"}, next=["m0"]),
+                FlowStep(id="m0", type="modelcall", name="classify-vendor",
+                         summary="names the vendor and resolves it to a canonical slug, with confidence",
+                         config={"model": "claude-haiku-4-5", "prompt": "vendor-classifier v4"},
+                         next=["x1"]),
+                FlowStep(id="x1", type="transform", name="load-exemplar",
+                         summary="looks up the vendor's one-shot exemplar in the knowledge layer — the flow gathers; rules never fetch",
+                         config={"source": "knowledge:vendor-exemplar-{vendor}"}, next=["r1"]),
+                FlowStep(id="r1", type="rule", name="exemplar-known",
+                         summary="does a verified exemplar exist for this vendor?",
+                         config={"rule_type": "match-condition"},
+                         next=["m1", "m2a"], branch_labels=["one-shot", "ensemble"]),
+                FlowStep(id="m1", type="modelcall", name="extract-one-shot",
+                         summary="extracts number, dates, PO and total using the vendor exemplar as the one-shot template",
+                         config={"model": "claude-sonnet-5", "prompt": "invoice-extraction-oneshot v7"},
+                         next=["x3"]),
+                FlowStep(id="m2a", type="modelcall", name="extract-a",
+                         summary="independent blind extraction — first of three, because no exemplar exists yet",
+                         config={"model": "claude-sonnet-5", "prompt": "invoice-extraction v7"},
+                         next=["m2b"]),
+                FlowStep(id="m2b", type="modelcall", name="extract-b",
+                         summary="independent blind extraction — different model, same document",
+                         config={"model": "gemini-2.5-flash", "prompt": "invoice-extraction v7"},
+                         next=["m2c"]),
+                FlowStep(id="m2c", type="modelcall", name="extract-c",
+                         summary="independent blind extraction — third opinion",
+                         config={"model": "claude-haiku-4-5", "prompt": "invoice-extraction v7"},
+                         next=["x2"]),
+                FlowStep(id="x2", type="transform", name="adjudicate",
+                         summary="merges the three candidates field-by-field: majority wins, near-equal amounts agree, and every disagreement is recorded as a conflict for the human",
+                         config={"language": "python"}, next=["k1"]),
+                FlowStep(id="k1", type="task", name="verify-exemplar",
+                         summary="a clerk verifies the adjudicated fields and the proposed exemplar; corrections seed the correction set — the vendor graduates from unknown to known",
+                         config={"queue": "ap-clerk"}, next=["a2"]),
+                FlowStep(id="a2", type="action", name="save-exemplar",
+                         summary="writes the verified exemplar into the knowledge layer — a governed knowledge write, ledgered like any other",
+                         config={"target": "knowledge-layer", "gateway": "action-gateway"}, next=["x3"]),
+                FlowStep(id="x3", type="transform", name="three-way-match",
+                         summary="placeholder — will match invoice ↔ purchase order ↔ receiving record when the PO and receiving feeds land",
+                         config={"status": "placeholder"}, next=["x4"]),
+                FlowStep(id="x4", type="transform", name="fraud-screen",
+                         summary="placeholder — will score bank-detail changes, duplicate invoices, and round-number anomalies",
+                         config={"status": "placeholder"}, next=["r2"]),
+                FlowStep(id="r2", type="rule", name="post-or-review",
+                         summary="under the governed auto-post limit, with a confident classification?",
+                         config={"rule_type": "threshold", "source": "knowledge:invoice-posting-policy"},
+                         next=["a1", "k2"], branch_labels=["post", "review"]),
+                FlowStep(id="k2", type="task", name="review-invoice",
+                         summary="a clerk decides the flagged invoice with the extraction and policy findings attached",
+                         config={"queue": "ap-clerk"}, next=["a1"]),
+                FlowStep(id="a1", type="action", name="post-to-ap",
+                         summary="guarded write of the posting into the AP ledger",
+                         config={"target": "ap-ledger", "gateway": "action-gateway"}, next=["e1"]),
+                FlowStep(id="e1", type="event", name="InvoicePosted",
+                         summary="emitted on commit", config={"event": "InvoicePosted"}),
             ],
         ),
     ]
+
+
+def case_from_run(defn: FlowDefinition, run: RunDetail) -> GoldenCase:
+    """Build a golden case out of a real execution — the flywheel in miniature.
+
+    The case captures the trigger payload, the reads the run made (off the
+    journal, at their revisions — the pinned world that makes the regression
+    run reproducible), and assertions derived from what the run actually did.
+    A human refines them in the review screen; this is the starting point.
+    """
+    amount = _amount_for(run.case_ref)
+    raised = run.tasks_raised > 0
+    assertions: list[FactAssertion] = []
+    for fact in defn.contract.facts:
+        if fact.kind == "extraction" and fact.type == "money":
+            assertions.append(
+                FactAssertion(path=fact.path, expected=f"{amount}.00")
+            )
+        elif fact.kind == "verdict" and fact.type == "verdict":
+            # Only verdict-typed facts take a pass/review label; a string-typed
+            # verdict (e.g. which extraction path ran) is not knowable from the
+            # summary alone, so it is left for the human to label in review.
+            assertions.append(
+                FactAssertion(
+                    path=fact.path, expected="review" if raised else "pass"
+                )
+            )
+    # The flow's terminal commit — the last Action — is the one the
+    # trajectory claim is about.
+    action = next((s for s in reversed(defn.steps) if s.type == "action"), None)
+    trajectory = [
+        TrajectoryAssertion(
+            kind="task_raised", expected="true" if raised else "false"
+        ),
+        TrajectoryAssertion(
+            kind="action_committed",
+            expected=(
+                action.name if action and run.actions_committed else "none"
+            ),
+        ),
+    ]
+    reads = [
+        PinnedRead(
+            ref=f"{defn.id}:context@rev{int(_hex(run.id, 3), 16) % 40 + 1}",
+            summary="knowledge-layer records this run read, captured from "
+                    "its journal",
+        ),
+    ]
+    return GoldenCase(
+        id="",  # assigned by the caller
+        name=f"Promoted {run.case_ref}",
+        input_ref=run.case_ref,
+        expected="matches the recorded outcome",
+        source="promoted-from-run",
+        run_id=run.id,
+        payload=run.steps[0].input_preview if run.steps else "",
+        document_ref=f"asset:{run.case_ref}.pdf",
+        assertions=assertions,
+        trajectory=trajectory,
+        read_set=reads,
+    )
+
+
+def _reads(*pairs: tuple[str, str]) -> list[PinnedRead]:
+    return [PinnedRead(ref=r, summary=s) for r, s in pairs]
+
+
+def _facts(*pairs: tuple[str, str]) -> list[FactAssertion]:
+    return [FactAssertion(path=p, expected=e) for p, e in pairs]
+
+
+def _traj(*pairs: tuple[str, str]) -> list[TrajectoryAssertion]:
+    return [TrajectoryAssertion(kind=k, expected=e) for k, e in pairs]
+
+
+# Structured labels for the seeded fixtures, keyed by input_ref. Assertions
+# key to contract fact paths (never step ids); reads pin the world the case
+# was captured in.
+_SEED_CASE_EXTRAS: dict[str, dict] = {
+    # ---- expense-reimbursement ----
+    "exp-fixture-001": {
+        "assertions": _facts(
+            ("receipt.vendor", "corner-bistro"),
+            ("receipt.date", "2026-08-14"),
+            ("receipt.total_usd", "64.20"),
+            ("receipt.category", "meals"),
+            ("reimbursement.verdict", "approve"),
+        ),
+        "trajectory": _traj(
+            ("task_raised", "false"),
+            ("action_committed", "record-reimbursement"),
+        ),
+        "reads": _reads(
+            ("knowledge:expense-approval-policy@rev5", "governed expense policy"),
+        ),
+    },
+    "exp-fixture-004": {
+        "assertions": _facts(
+            ("receipt.vendor", "harborview-hotel"),
+            ("receipt.total_usd", "612.00"),
+            ("receipt.category", "lodging"),
+            ("reimbursement.verdict", "elevate"),
+        ),
+        "trajectory": _traj(
+            ("task_raised", "true"),
+            ("action_committed", "record-reimbursement"),
+        ),
+        "reads": _reads(
+            ("knowledge:expense-approval-policy@rev5", "governed expense policy"),
+        ),
+    },
+    "exp-fixture-007": {
+        "assertions": [
+            FactAssertion(path="reimbursement.verdict", expected="elevate"),
+            FactAssertion(
+                path="receipt.total_usd", op="judge",
+                expected="elevated rather than guessed",
+                rubric="the thermal-paper total is barely legible; a "
+                       "low-confidence extraction must elevate, not invent "
+                       "a number",
+            ),
+        ],
+        "trajectory": _traj(
+            ("task_raised", "true"),
+            ("waypoint", "low-confidence extraction elevated"),
+        ),
+        "reads": _reads(
+            ("knowledge:expense-approval-policy@rev5", "governed expense policy"),
+        ),
+    },
+    "exp-fixture-010": {
+        "assertions": _facts(
+            ("receipt.total_usd", "48.30"),
+            ("receipt.category", "mileage"),
+            ("reimbursement.verdict", "approve"),
+        ),
+        "trajectory": _traj(
+            ("task_raised", "false"),
+            ("action_committed", "record-reimbursement"),
+        ),
+        "reads": _reads(
+            ("knowledge:expense-approval-policy@rev5", "governed expense policy"),
+            ("knowledge:mileage-rate@2026", "governed mileage rate"),
+        ),
+    },
+    "exp-fixture-013": {
+        "assertions": _facts(
+            ("receipt.category", "entertainment"),
+            ("reimbursement.verdict", "elevate"),
+        ),
+        "trajectory": _traj(
+            ("task_raised", "true"),
+            ("waypoint", "policy §4.2 (alcohol cap) cited"),
+        ),
+        "reads": _reads(
+            ("knowledge:expense-approval-policy@rev5", "governed expense policy"),
+        ),
+    },
+    "exp-fixture-016": {
+        "assertions": _facts(("reimbursement.verdict", "elevate")),
+        "trajectory": _traj(
+            ("task_raised", "true"),
+            ("waypoint", "receipt requested"),
+        ),
+        "reads": _reads(
+            ("knowledge:expense-approval-policy@rev5", "governed expense policy"),
+        ),
+    },
+    # ---- accounts-payable ----
+    "ap-fixture-001": {
+        "assertions": _facts(
+            ("invoice.vendor_id", "vendor:acme-industrial"),
+            ("invoice.invoice_number", "INV-88412"),
+            ("invoice.invoice_date", "2026-08-02"),
+            ("invoice.po_number", "PO-4471"),
+            ("invoice.total_usd", "1840.00"),
+            ("invoice.extraction_path", "one-shot"),
+            ("invoice.verdict", "post"),
+        ),
+        "trajectory": _traj(
+            ("task_raised", "false"),
+            ("action_committed", "post-to-ap"),
+        ),
+        "reads": _reads(
+            ("knowledge:vendor-exemplar-acme-industrial@rev1",
+             "vendor exemplar — one-shot template"),
+            ("knowledge:invoice-posting-policy@rev1", "governed posting policy"),
+        ),
+    },
+    "ap-fixture-004": {
+        "assertions": _facts(
+            ("invoice.vendor_id", "vendor:acme-industrial"),
+            ("invoice.total_usd", "6120.00"),
+            ("invoice.extraction_path", "one-shot"),
+            ("invoice.verdict", "review"),
+        ),
+        "trajectory": _traj(
+            ("task_raised", "true"),
+            ("action_committed", "post-to-ap"),
+        ),
+        "reads": _reads(
+            ("knowledge:vendor-exemplar-acme-industrial@rev1",
+             "vendor exemplar — one-shot template"),
+            ("knowledge:invoice-posting-policy@rev1", "governed posting policy"),
+        ),
+    },
+    "ap-fixture-007": {
+        # First contact: no exemplar exists yet, so the pinned world holds the
+        # posting policy but deliberately no vendor exemplar.
+        "assertions": _facts(
+            ("invoice.extraction_path", "ensemble"),
+            ("invoice.verdict", "post"),
+        ),
+        "trajectory": _traj(
+            ("task_raised", "true"),
+            ("waypoint", "exemplar verified by clerk and saved to the knowledge layer"),
+            ("action_committed", "post-to-ap"),
+        ),
+        "reads": _reads(
+            ("knowledge:invoice-posting-policy@rev1", "governed posting policy"),
+        ),
+    },
+    "ap-fixture-010": {
+        "assertions": _facts(
+            ("invoice.invoice_date", "2026-07-30"),
+            ("invoice.extraction_path", "ensemble"),
+        ),
+        "trajectory": _traj(
+            ("task_raised", "true"),
+            ("waypoint", "adjudicator picked the ISO date and recorded the conflict"),
+        ),
+        "reads": _reads(
+            ("knowledge:invoice-posting-policy@rev1", "governed posting policy"),
+        ),
+    },
+}
 
 
 def _seed_golden_cases(flow_id: str) -> list[GoldenCase]:
+    # Six cases — deliberately below the coverage recommendation's bar of 8,
+    # so the "golden set is thin" insight has something real to point at.
     catalogs: dict[str, list[tuple[str, str, str, GoldenSource]]] = {
-        "invoice-intake": [
-            ("Standard invoice · single PO", "inv-fixture-001", "amount $2,340 · vendor acme-industrial · automatic path", "correction-set"),
-            ("Multi-page scan · rotated", "inv-fixture-007", "amount $18,905 · review path (over threshold)", "correction-set"),
-            ("Unknown vendor · first contact", "inv-fixture-011", "Task raised · vendor profile seeded", "exemplar"),
-            ("Credit memo (negative amount)", "inv-fixture-014", "amount −$1,120 · no ERP post", "correction-set"),
-            ("Duplicate of a posted invoice", "inv-fixture-019", "flagged duplicate · no Action committed", "human-authored"),
-            ("Handwritten total, printed lines", "inv-fixture-022", "amount $4,010 · automatic path", "correction-set"),
-            ("Currency mismatch (EUR invoice)", "inv-fixture-025", "amount €3,300 converted · review path", "correction-set"),
-            ("Missing PO number", "inv-fixture-028", "Task raised · PO lookup suggested", "exemplar"),
+        "expense-reimbursement": [
+            ("In-policy team lunch, clear receipt", "exp-fixture-001", "total $64.20 · approved automatically", "correction-set"),
+            ("Hotel night above the city cap", "exp-fixture-004", "$612/night vs $290 cap · elevated", "correction-set"),
+            ("Blurry thermal-paper receipt", "exp-fixture-007", "low extraction confidence · elevated", "exemplar"),
+            ("Mileage at the current governed rate", "exp-fixture-010", "auto-approved · rate read from policy", "correction-set"),
+            ("Alcohol line item over cap", "exp-fixture-013", "elevated · policy §4.2 cited", "correction-set"),
+            ("Missing receipt over $75", "exp-fixture-016", "elevated · receipt requested", "human-authored"),
         ],
-        "expense-triage": [
-            ("In-policy meal, receipts attached", "exp-fixture-001", "approved automatically", "correction-set"),
-            ("Alcohol line item over cap", "exp-fixture-004", "Task raised · policy §4.2 cited", "correction-set"),
-            ("Missing receipt over $75", "exp-fixture-009", "Task raised · receipt requested", "human-authored"),
-            ("Mileage at the current rate", "exp-fixture-012", "approved automatically", "correction-set"),
-            ("Split personal/business hotel", "exp-fixture-015", "Task raised · split proposed", "exemplar"),
-        ],
-        "contract-review": [
-            ("Standard MSA, no deviations", "ctr-fixture-001", "risk < 0.6 · standard path", "correction-set"),
-            ("Uncapped liability clause", "ctr-fixture-003", "Task raised · clause 8 flagged ≥ 0.6", "correction-set"),
-            ("Non-standard IP assignment", "ctr-fixture-006", "Task raised · clause 11 flagged", "human-authored"),
-            ("Auto-renewal buried in annex", "ctr-fixture-009", "clause extracted · renewal Link created", "exemplar"),
-            ("Redlined counterparty paper", "ctr-fixture-012", "Task raised · 3 clauses flagged", "correction-set"),
-            ("Order form referencing master", "ctr-fixture-013", "risk < 0.6 · linked to master Object", "correction-set"),
-        ],
-        "vendor-master-sync": [
-            ("Exact tax-id match", "vm-fixture-001", "identity Link confidence 1.0 · auto-accept", "correction-set"),
-            ("Fuzzy name, same address", "vm-fixture-004", "confidence 0.78 · Task raised for steward", "correction-set"),
-            ("Merged vendor un-merge", "vm-fixture-007", "reversal info applied · claims retained", "human-authored"),
-            ("Conflicting credit limits", "vm-fixture-010", "precedence rule resolves to ERP claim", "correction-set"),
-        ],
-        "document-embedder": [
-            ("Markdown policy document", "doc-fixture-001", "12 chunks · summary and tags written", "correction-set"),
-            ("Scanned PDF, OCR path", "doc-fixture-003", "text extracted · 9 chunks", "correction-set"),
-            ("Empty file", "doc-fixture-005", "no chunks · DocumentIndexed with count 0", "human-authored"),
+        "accounts-payable": [
+            ("Known vendor · clean scan", "ap-fixture-001", "one-shot from exemplar · $1,840 posted", "correction-set"),
+            ("Known vendor · over the auto-post limit", "ap-fixture-004", "$6,120 · review path", "correction-set"),
+            ("Unknown vendor · first contact", "ap-fixture-007", "ensemble ×3 · exemplar verified by clerk", "exemplar"),
+            ("Ensemble date-format conflict", "ap-fixture-010", "adjudicator picks ISO · conflict recorded", "correction-set"),
+            ("Missing PO number", "ap-fixture-013", "review path · PO lookup suggested", "human-authored"),
+            ("Duplicate of a posted invoice", "ap-fixture-016", "flagged · no Action committed", "human-authored"),
         ],
     }
-    return [
-        GoldenCase(
-            id=f"gc-{i + 1:03d}",
-            name=name,
-            input_ref=ref,
-            expected=expected,
-            source=source,
-            added_by="system:seed",
+    out: list[GoldenCase] = []
+    for i, (name, ref, expected, source) in enumerate(catalogs.get(flow_id, [])):
+        extras = _SEED_CASE_EXTRAS.get(ref, {})
+        out.append(
+            GoldenCase(
+                id=f"gc-{i + 1:03d}",
+                name=name,
+                input_ref=ref,
+                expected=expected,
+                source=source,
+                added_by="system:seed",
+                document_ref=f"asset:{ref}.pdf",
+                assertions=extras.get("assertions", []),
+                trajectory=extras.get("trajectory", []),
+                read_set=extras.get("reads", []),
+            )
         )
-        for i, (name, ref, expected, source) in enumerate(catalogs.get(flow_id, []))
-    ]
+    return out
 
 
 # Definitions that seed an open draft, and how that draft differs from the
-# active version. Enough to exercise every diff indicator on the canvas:
-# a modified node, an added node, and a removed one.
+# active version — an added node plus a modified one, so the canvas diff
+# overlay has real indicators to paint.
 _SEED_DRAFTS: dict[str, str] = {
-    "invoice-intake": "add-duplicate-check",
-    "contract-review": "cheaper-risk-review",
+    "expense-reimbursement": "add-duplicate-check",
 }
 
 
@@ -2108,35 +2792,20 @@ def _seed_version_history(defn: FlowDefinition) -> list[FlowVersion]:
         return versions
 
     draft_steps = [s.model_copy(deep=True) for s in active_steps]
-    if recipe == "add-duplicate-check":
-        # A new deterministic guard in front of the model call, so the trigger
-        # is modified (its `next` moves) and the guard itself is added.
-        draft_steps = [
-            s.model_copy(update={"next": ["x0"]}) if s.id == "t1" else s
-            for s in draft_steps
-        ]
-        guard = FlowStep(
-            id="x0", type="transform", name="duplicate-check",
-            summary="rejects an invoice already posted, before any model runs",
-            config={"language": "python"}, next=["m1"],
-        )
-        draft_steps.insert(1, guard)
-        notes = "Adds a deterministic duplicate guard ahead of extraction."
-    else:
-        # Swap the second-opinion model for a cheaper one and drop the
-        # normalizer that the extraction step now does inline.
-        draft_steps = [
-            s.model_copy(update={"config": {**s.config, "model": "claude-sonnet-5"}})
-            if s.id == "m2"
-            else s
-            for s in draft_steps
-        ]
-        draft_steps = [
-            s.model_copy(update={"next": ["m2"]}) if s.id == "m1" else s
-            for s in draft_steps
-            if s.id != "x1"
-        ]
-        notes = "Cheaper second-opinion model; normalizer folded into extraction."
+    # add-duplicate-check: a new deterministic guard in front of the model
+    # call, so the trigger is modified (its `next` moves) and the guard
+    # itself is added.
+    draft_steps = [
+        s.model_copy(update={"next": ["x0"]}) if s.id == "t1" else s
+        for s in draft_steps
+    ]
+    guard = FlowStep(
+        id="x0", type="transform", name="duplicate-check",
+        summary="rejects a receipt already reimbursed, before any model runs",
+        config={"language": "python"}, next=["m1"],
+    )
+    draft_steps.insert(1, guard)
+    notes = "Adds a deterministic duplicate guard ahead of extraction."
 
     versions.append(
         FlowVersion(
@@ -2169,6 +2838,16 @@ def seed_flows_if_empty(service: FlowService) -> int:
                     GoldenSet(
                         flow_id=defn.id,
                         cases=cases,
+                        version=1,
+                        revisions=[
+                            GoldenSetRevision(
+                                version=1,
+                                at=utcnow() - timedelta(hours=2),
+                                by="cumulus eval push",
+                                note="seeded from the repository export",
+                                case_count=len(cases),
+                            )
+                        ],
                         # FDEs author golden cases in code as well as in the
                         # console; naming the file keeps the console honest
                         # about not being the only source.

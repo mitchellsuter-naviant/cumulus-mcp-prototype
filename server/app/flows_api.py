@@ -16,13 +16,22 @@ from .deps import get_flow_service
 from .models import utcnow
 from .flows import (
     AuditEntry,
+    CaseDocument,
+    ContractFact,
+    CorrectionSet,
+    FactAssertion,
     GoldenCase,
+    GoldenSet,
+    GoldenSetRevision,
     GoldenSource,
+    PinnedRead,
+    ReadMode,
     Recommendation,
     RunDetail,
     RunSummary,
     StepDiff,
     TestRun,
+    TrajectoryAssertion,
     UsageDay,
     FlowDefinition,
     FlowExistsError,
@@ -31,8 +40,12 @@ from .flows import (
     FlowStep,
     FlowVersion,
     audit_entries,
+    case_document,
+    case_from_run,
+    correction_sets,
     find_run,
     open_tasks,
+    producer_map,
     recent_runs,
     usage_series,
 )
@@ -147,24 +160,57 @@ class GoldenCaseCreate(BaseModel):
     # A JSON fixture pasted or uploaded from the console. Held verbatim —
     # re-serializing would quietly change what is under test.
     payload: str = Field(default="", max_length=20000)
+    document_ref: str = Field(default="", max_length=200)
+    assertions: list[FactAssertion] = Field(default_factory=list)
+    trajectory: list[TrajectoryAssertion] = Field(default_factory=list)
+    read_set: list[PinnedRead] = Field(default_factory=list)
+
+
+class GoldenImport(BaseModel):
+    """Bulk upload: one JSON object per line, the same shape the Python SDK's
+    `cumulus eval push` emits."""
+
+    jsonl: str = Field(min_length=1, max_length=400_000)
+
+
+class CaseReview(BaseModel):
+    """A human's pass over the case's labels: path -> corrected expected
+    value. Empty corrections = confirmed as labelled."""
+
+    corrections: dict[str, str] = Field(default_factory=dict)
 
 
 class GoldenSetPublic(BaseModel):
     flow_id: str
     cases: list[GoldenCase] = Field(default_factory=list)
+    version: int = 1
+    revisions: list[GoldenSetRevision] = Field(default_factory=list)
     synced_from: str = ""
     synced_at: str = ""
+
+
+class ContractPublic(BaseModel):
+    flow_id: str
+    version_label: str
+    facts: list[ContractFact] = Field(default_factory=list)
+    # {fact path -> step id} for the requested version — derived, so it is
+    # served next to the facts rather than stored anywhere.
+    producer_map: dict[str, str] = Field(default_factory=dict)
 
 
 class AppliedRecommendation(BaseModel):
     recommendation_id: str
     draft: FlowVersion
     summary: str
+    # The experiment auto-launched against the staged draft, when the golden
+    # set allows one — the estimated saving becomes a measured one.
+    test_run_id: str = ""
 
 
 class TestRunLaunch(BaseModel):
     candidate_version: str = Field(default="", max_length=60)
     baseline_version: str = Field(default="", max_length=60)
+    reads: ReadMode = "pinned"
 
 
 class FlowUsage(BaseModel):
@@ -586,6 +632,21 @@ def apply_recommendation(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    # Close the loop: the staged draft is immediately measured against the
+    # golden set, so the card's estimated saving becomes a verified delta.
+    # No golden set = no experiment; the response says which happened.
+    test_run_id = ""
+    try:
+        test_run = service.launch_test_run(
+            flow_id,
+            candidate_version=draft.display(),
+            baseline_version="",
+            launched_by=principal.email or principal.uid,
+            launched_for=rec.id,
+        )
+        test_run_id = test_run.id
+    except ValueError:
+        pass
     change = rec.proposed_change or {}
     return AppliedRecommendation(
         recommendation_id=rec.id,
@@ -594,10 +655,64 @@ def apply_recommendation(
             f"{change.get('field', 'setting')} on {rec.step_name or change.get('step_id', '')} "
             f"set to {change.get('to', '')} in {draft.display()}"
         ),
+        test_run_id=test_run_id,
     )
 
 
+# ---- contract & correction sets ---------------------------------------------
+
+
+@router.get("/{flow_id}/contract", response_model=ContractPublic)
+def flow_contract(
+    flow_id: str,
+    version: int | None = Query(
+        default=None, description="Version to project onto; defaults to active."
+    ),
+    principal: Principal = Depends(get_principal),
+) -> ContractPublic:
+    """The declared canonical facts, plus the derived producer map.
+
+    The facts are the stable spine labels attach to; the map is recomputed
+    per version from its topology, which is what lets the flow's shape morph
+    without relabelling a single case.
+    """
+    require_reader(principal)
+    defn = _get_or_404(flow_id)
+    target = (
+        defn.find_version(version) if version is not None else defn.active_version()
+    )
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"Version not found: v{version}")
+    return ContractPublic(
+        flow_id=flow_id,
+        version_label=target.display(),
+        facts=defn.contract.facts,
+        producer_map=producer_map(defn.contract, target.steps),
+    )
+
+
+@router.get("/{flow_id}/correction-sets", response_model=list[CorrectionSet])
+def flow_correction_sets(
+    flow_id: str, principal: Principal = Depends(get_principal)
+) -> list[CorrectionSet]:
+    """Per-ModelCall correction sets — the flywheel's auto-accumulated
+    raw→corrected pairs, the step-eval dataset."""
+    require_reader(principal)
+    return correction_sets(_get_or_404(flow_id))
+
+
 # ---- golden set ------------------------------------------------------------
+
+
+def _golden_public(flow_id: str, golden: GoldenSet) -> GoldenSetPublic:
+    return GoldenSetPublic(
+        flow_id=flow_id,
+        cases=golden.cases,
+        version=golden.version,
+        revisions=golden.revisions,
+        synced_from=golden.synced_from,
+        synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
+    )
 
 
 @router.get("/{flow_id}/golden-set", response_model=GoldenSetPublic)
@@ -606,13 +721,7 @@ def golden_set(
 ) -> GoldenSetPublic:
     require_reader(principal)
     _get_or_404(flow_id)
-    golden = get_flow_service().golden_set(flow_id)
-    return GoldenSetPublic(
-        flow_id=flow_id,
-        cases=golden.cases,
-        synced_from=golden.synced_from,
-        synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
-    )
+    return _golden_public(flow_id, get_flow_service().golden_set(flow_id))
 
 
 @router.post("/{flow_id}/golden-set", response_model=GoldenSetPublic, status_code=201)
@@ -623,7 +732,7 @@ def add_golden_case(
 ) -> GoldenSetPublic:
     require_role(principal, "admin")
     _require_human(principal)
-    _get_or_404(flow_id)
+    defn = _get_or_404(flow_id)
     service = get_flow_service()
     existing = service.golden_set(flow_id).cases
     # Promoting a run is the flywheel in miniature: the execution that needed
@@ -640,7 +749,27 @@ def add_golden_case(
         added_by=principal.email or principal.uid,
         run_id=payload.run_id,
         payload=payload.payload,
+        document_ref=payload.document_ref,
+        assertions=payload.assertions,
+        trajectory=payload.trajectory,
+        read_set=payload.read_set,
     )
+    # A promotion with no explicit labels is enriched from the run's journal:
+    # assertions from what it did, the read-set from what it read.
+    if payload.run_id and not payload.assertions:
+        detail = find_run(defn, payload.run_id)
+        if detail is not None:
+            template = case_from_run(defn, detail)
+            case = case.model_copy(
+                update={
+                    "assertions": template.assertions,
+                    "trajectory": template.trajectory,
+                    "read_set": template.read_set,
+                    "document_ref": case.document_ref or template.document_ref,
+                    "payload": case.payload or template.payload,
+                    "input_ref": case.input_ref or template.input_ref,
+                }
+            )
     try:
         golden = service.add_golden_case(flow_id, case)
     except ValueError as exc:
@@ -655,12 +784,123 @@ def add_golden_case(
             "actor": principal.uid,
         },
     )
-    return GoldenSetPublic(
-        flow_id=flow_id,
-        cases=golden.cases,
-        synced_from=golden.synced_from,
-        synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
+    return _golden_public(flow_id, golden)
+
+
+@router.post(
+    "/{flow_id}/golden-set/import",
+    response_model=GoldenSetPublic,
+    status_code=201,
+)
+def import_golden_cases(
+    flow_id: str,
+    payload: GoldenImport,
+    principal: Principal = Depends(get_principal),
+) -> GoldenSetPublic:
+    """Bulk upload: JSONL, one case per line. Many cases, one dataset revision."""
+    import json as _json
+
+    require_role(principal, "admin")
+    _require_human(principal)
+    _get_or_404(flow_id)
+    service = get_flow_service()
+    existing = len(service.golden_set(flow_id).cases)
+    actor = principal.email or principal.uid
+    cases: list[GoldenCase] = []
+    for n, line in enumerate(payload.jsonl.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = GoldenCaseCreate.model_validate(_json.loads(line))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422, detail=f"Line {n + 1}: {exc}"
+            )
+        cases.append(
+            GoldenCase(
+                id=f"gc-{existing + len(cases) + 1:03d}-"
+                f"{utcnow().strftime('%H%M%S')}",
+                name=row.name,
+                input_ref=row.input_ref,
+                expected=row.expected,
+                source=row.source,
+                added_by=actor,
+                run_id=row.run_id,
+                payload=row.payload,
+                document_ref=row.document_ref,
+                assertions=row.assertions,
+                trajectory=row.trajectory,
+                read_set=row.read_set,
+            )
+        )
+    if not cases:
+        raise HTTPException(status_code=422, detail="No cases in the upload.")
+    try:
+        golden = service.import_golden_cases(flow_id, cases, actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    log.info(
+        "Golden cases imported",
+        extra={"flowId": flow_id, "count": len(cases), "actor": principal.uid},
     )
+    return _golden_public(flow_id, golden)
+
+
+@router.get(
+    "/{flow_id}/golden-set/{case_id}/document", response_model=CaseDocument
+)
+def golden_case_document(
+    flow_id: str, case_id: str, principal: Principal = Depends(get_principal)
+) -> CaseDocument:
+    """The fixture document behind a case, with grounded field regions — the
+    review screen's raw material."""
+    require_reader(principal)
+    defn = _get_or_404(flow_id)
+    case = next(
+        (c for c in get_flow_service().golden_set(flow_id).cases if c.id == case_id),
+        None,
+    )
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"Golden case not found: {case_id}")
+    return case_document(defn, case)
+
+
+@router.post(
+    "/{flow_id}/golden-set/{case_id}/review", response_model=GoldenSetPublic
+)
+def review_golden_case(
+    flow_id: str,
+    case_id: str,
+    payload: CaseReview,
+    principal: Principal = Depends(get_principal),
+) -> GoldenSetPublic:
+    """A human confirmed or corrected the case's labels in the review screen.
+
+    Corrections update the assertions' expected values and move the dataset
+    version — what a pass means changed, or was vouched for. Either way the
+    review is a ledgered human decision.
+    """
+    require_role(principal, "admin")
+    _require_human(principal)
+    _get_or_404(flow_id)
+    try:
+        golden = get_flow_service().review_golden_case(
+            flow_id, case_id, payload.corrections,
+            principal.email or principal.uid,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    log.info(
+        "Golden case reviewed",
+        extra={
+            "flowId": flow_id,
+            "caseId": case_id,
+            "corrections": len(payload.corrections),
+            "actor": principal.uid,
+        },
+    )
+    return _golden_public(flow_id, golden)
 
 
 @router.delete("/{flow_id}/golden-set/{case_id}", response_model=GoldenSetPublic)
@@ -678,12 +918,7 @@ def remove_golden_case(
         "Golden case removed",
         extra={"flowId": flow_id, "caseId": case_id, "actor": principal.uid},
     )
-    return GoldenSetPublic(
-        flow_id=flow_id,
-        cases=golden.cases,
-        synced_from=golden.synced_from,
-        synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
-    )
+    return _golden_public(flow_id, golden)
 
 
 # ---- test harness ----------------------------------------------------------
@@ -718,6 +953,7 @@ def launch_test_run(
             payload.candidate_version,
             payload.baseline_version,
             launched_by=principal.email or principal.uid,
+            reads=payload.reads,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

@@ -5,9 +5,17 @@ profile, so the interesting assertions are about the *contract*: rollups agree
 with their series, journals agree with their summaries, and the governance
 gates (admin writes, human-only management, no deleting active definitions)
 hold.
+
+The seeded fleet is two flows — expense-reimbursement (the workhorse most
+behavioural tests exercise) and accounts-payable (a branching, ensemble-shaped
+definition that keeps the fleet-level rollups honest). Shape-derived
+behaviours neither seed exhibits (windowed triggering, canonical-graph writes)
+are covered by synthetic definitions constructed inline, because the behaviour
+belongs to the shape, not to any particular seed.
 """
 
 import time
+from datetime import timedelta
 
 import pytest
 
@@ -47,20 +55,25 @@ def owner(monkeypatch):
 
 def test_seeded_fleet_lists(client):
     rows = client.get("/api/v1/flows").json()
-    ids = {r["id"] for r in rows}
-    assert "invoice-intake" in ids and "vendor-master-sync" in ids
+    assert {r["id"] for r in rows} == {"expense-reimbursement", "accounts-payable"}
     # One kind of authored logic: nothing in the payload types a flow.
     assert not any("kind" in r for r in rows)
     # Sorted by 30-day spend, descending — the list doubles as the cost report.
     costs = [r["cost_30d_usd"] for r in rows]
     assert costs == sorted(costs, reverse=True)
+    assert all(c > 0 for c in costs)
 
 
 def test_list_filters(client):
-    hits = client.get("/api/v1/flows", params={"q": "invoice"}).json()
-    assert {r["id"] for r in hits} == {"invoice-intake"}
-    active = client.get("/api/v1/flows", params={"status": "draft"}).json()
-    assert active and all(r["status"] == "draft" for r in active)
+    hits = client.get("/api/v1/flows", params={"q": "receipt"}).json()
+    assert {r["id"] for r in hits} == {"expense-reimbursement"}
+    invoices = client.get("/api/v1/flows", params={"q": "invoice"}).json()
+    assert {r["id"] for r in invoices} == {"accounts-payable"}
+    active = client.get("/api/v1/flows", params={"status": "active"}).json()
+    assert active and all(r["status"] == "active" for r in active)
+    # Both seeds belong to finance-ops, so the team filter returns the fleet.
+    team = client.get("/api/v1/flows", params={"team": "finance-ops"}).json()
+    assert {r["id"] for r in team} == {"expense-reimbursement", "accounts-payable"}
     none = client.get("/api/v1/flows", params={"team": "no-such-team"}).json()
     assert none == []
 
@@ -68,34 +81,88 @@ def test_list_filters(client):
 def test_behaviour_is_derived_from_shape_not_a_type(client):
     """The retired Workflow/DataFlow split is replaced by derived signals.
 
-    `vendor-master-sync` is woken by a timer and commits into the graph, so it
-    is doing bulk work and resolves competing claims — and the code decides
-    that by reading its trigger and its Action target, not a label.
+    The seeded flow is woken by a business event and writes to an operational
+    table, so it is per-case work: not windowed, no canonical-graph commits.
+    A flow woken by a timer that commits into the graph is bulk work — and the
+    code decides that by reading its trigger and its Action target, not a
+    label, so a synthetic definition is enough to prove the signal.
     """
-    from app.flows import is_windowed, writes_canonical
+    from app.flows import FlowDefinition, FlowStep, is_windowed, writes_canonical
 
     service = deps._flow_service
-    bulk = service.require("vendor-master-sync")
-    per_case = service.require("invoice-intake")
+    per_case = service.require("expense-reimbursement")
+    assert not is_windowed(per_case)
+    assert not writes_canonical(per_case)
 
-    assert is_windowed(bulk) and not is_windowed(per_case)
-    assert writes_canonical(bulk) and not writes_canonical(per_case)
+    windowed = FlowDefinition(
+        id="nightly-graph-sync",
+        name="Nightly graph sync",
+        steps=[
+            FlowStep(
+                id="t1", type="trigger", name="every-night",
+                summary="windowing timer event", config={"event": "timer:24h"},
+                next=["a1"],
+            ),
+            FlowStep(
+                id="a1", type="action", name="upsert-canonical",
+                summary="resolution writes into the canonical graph",
+                config={"target": "graph"},
+            ),
+        ],
+    )
+    assert is_windowed(windowed) and writes_canonical(windowed)
 
-    # And the audit trail follows the derived signal, not a type.
-    entries = client.get("/api/v1/flows/vendor-master-sync/audit").json()
-    assert any(e["kind"] == "resolution" for e in entries)
-    others = client.get("/api/v1/flows/invoice-intake/audit").json()
-    assert not any(e["kind"] == "resolution" for e in others)
+    # And the audit trail follows the derived signal, not a type: a per-case
+    # flow ledgers decisions and gateway commits, never claim resolutions.
+    entries = client.get("/api/v1/flows/expense-reimbursement/audit").json()
+    kinds = {e["kind"] for e in entries}
+    assert "decision" in kinds and "action" in kinds
+    assert "resolution" not in kinds
 
 
 def test_detail_carries_declarative_steps(client):
-    detail = client.get("/api/v1/flows/invoice-intake").json()
+    detail = client.get("/api/v1/flows/expense-reimbursement").json()
     types = [s["type"] for s in detail["steps"]]
     assert types[0] == "trigger" and "modelcall" in types and "action" in types
     # The transparency bar: every step carries a plain-language summary.
     assert all(s["summary"] for s in detail["steps"])
     assert detail["golden_cases"] > 0
     assert client.get("/api/v1/flows/nope").status_code == 404
+
+
+def test_accounts_payable_export_declares_its_branches_and_placeholders(client):
+    """The Tier-2 export states the flow's real shape: the exemplar rule fans
+    out to a one-shot path and a three-model ensemble, and the steps that do
+    not exist yet say so instead of pretending."""
+    from app.flows import is_windowed, writes_canonical
+
+    detail = client.get("/api/v1/flows/accounts-payable").json()
+    by_id = {s["id"]: s for s in detail["steps"]}
+
+    # The ensemble branch: known vendors extract one-shot from the exemplar,
+    # unknown vendors fan out to three independent extractions.
+    rule = by_id["r1"]
+    assert rule["type"] == "rule"
+    assert rule["next"] == ["m1", "m2a"]
+    assert rule["branch_labels"] == ["one-shot", "ensemble"]
+    ensemble = [by_id["m2a"], by_id["m2b"], by_id["m2c"]]
+    assert all(s["type"] == "modelcall" for s in ensemble)
+    # Three independent opinions means more than one model.
+    assert len({s["config"]["model"] for s in ensemble}) > 1
+
+    # Declared placeholders, not silent gaps: the transparency bar means the
+    # export admits what is not built yet.
+    placeholders = [
+        s for s in detail["steps"] if s["config"].get("status") == "placeholder"
+    ]
+    assert {s["id"] for s in placeholders} == {"x3", "x4"}
+    assert all(s["type"] == "transform" and s["summary"] for s in placeholders)
+
+    # Shape-derived signals: woken per invoice, writes to the AP ledger and
+    # the knowledge layer — never the canonical graph, never on a window.
+    defn = deps._flow_service.require("accounts-payable")
+    assert not is_windowed(defn)
+    assert not writes_canonical(defn)
 
 
 def test_register_update_delete_lifecycle(client, owner):
@@ -145,7 +212,7 @@ def test_writes_require_admin_role(client, monkeypatch):
         resp = client.post("/api/v1/flows", json={"id": "x-flow"})
         assert resp.status_code == 403
         assert client.patch(
-            "/api/v1/flows/invoice-intake", json={"status": "paused"}
+            "/api/v1/flows/expense-reimbursement", json={"status": "paused"}
         ).status_code == 403
     finally:
         app.dependency_overrides.pop(get_principal, None)
@@ -156,18 +223,29 @@ def test_writes_require_admin_role(client, monkeypatch):
 
 def test_fleet_stats_agree_with_series(client):
     stats = client.get("/api/v1/flows/stats", params={"days": 30}).json()
-    assert stats["definitions"] == 6
+    assert stats["definitions"] == 2
+    # The rollup sums across the whole fleet, and its series agrees with it.
     assert stats["runs"] == sum(day["runs"] for day in stats["series"])
     assert len(stats["series"]) == 30
     assert stats["model_spend_usd"] > 0
     assert 0 < stats["success_rate"] <= 1
     # ROI is derived from governed per-definition assumptions.
     assert stats["hours_returned"] > 0 and stats["roi_usd"] > 0
+    # The fleet number is the sum of the per-flow rollups, nothing more.
+    per_flow = [
+        client.get(f"/api/v1/flows/{fid}/usage", params={"days": 30}).json()
+        for fid in ("expense-reimbursement", "accounts-payable")
+    ]
+    assert stats["runs"] == sum(u["runs"] for u in per_flow)
 
 
 def test_usage_rollup_matches_series_and_is_deterministic(client):
-    first = client.get("/api/v1/flows/invoice-intake/usage", params={"days": 14}).json()
-    again = client.get("/api/v1/flows/invoice-intake/usage", params={"days": 14}).json()
+    first = client.get(
+        "/api/v1/flows/expense-reimbursement/usage", params={"days": 14}
+    ).json()
+    again = client.get(
+        "/api/v1/flows/expense-reimbursement/usage", params={"days": 14}
+    ).json()
     assert first == again  # synthesized, but stable
     assert first["runs"] == sum(d["runs"] for d in first["series"])
     assert first["completed"] <= first["runs"]
@@ -175,10 +253,14 @@ def test_usage_rollup_matches_series_and_is_deterministic(client):
 
 
 def test_run_journal_matches_summary(client):
-    runs = client.get("/api/v1/flows/invoice-intake/runs", params={"limit": 10}).json()
+    runs = client.get(
+        "/api/v1/flows/expense-reimbursement/runs", params={"limit": 10}
+    ).json()
     assert runs
     run = runs[0]
-    detail = client.get(f"/api/v1/flows/invoice-intake/runs/{run['id']}").json()
+    detail = client.get(
+        f"/api/v1/flows/expense-reimbursement/runs/{run['id']}"
+    ).json()
     assert detail["id"] == run["id"]
     assert detail["status"] == run["status"]
     # Every ModelCall in the journal is an audited record with model + tokens.
@@ -188,12 +270,15 @@ def test_run_journal_matches_summary(client):
     step_types = {s["type"] for s in detail["steps"]}
     assert "trigger" in step_types and "modelcall" in step_types
     assert (
-        client.get("/api/v1/flows/invoice-intake/runs/run_000000").status_code == 404
+        client.get(
+            "/api/v1/flows/expense-reimbursement/runs/run_000000"
+        ).status_code
+        == 404
     )
 
 
 def test_audit_trail_names_actors_and_ledger(client):
-    entries = client.get("/api/v1/flows/invoice-intake/audit").json()
+    entries = client.get("/api/v1/flows/expense-reimbursement/audit").json()
     assert entries
     kinds = {e["kind"] for e in entries}
     assert "action" in kinds  # gateway commits always appear
@@ -208,16 +293,16 @@ def test_audit_trail_names_actors_and_ledger(client):
 
 def test_golden_set_add_and_remove(client, owner):
     before = client.get(
-        "/api/v1/flows/invoice-intake/golden-set", headers=owner
+        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
     ).json()
     # The set names the repository file its seeded half came from, so the
     # console never implies it is the only source of golden cases.
-    assert before["synced_from"].endswith("invoice-intake.json")
+    assert before["synced_from"].endswith("expense-reimbursement.json")
     assert before["synced_at"]
 
     added = client.post(
-        "/api/v1/flows/invoice-intake/golden-set",
-        json={"name": "Zero-amount invoice", "expected": "rejected · no Action"},
+        "/api/v1/flows/expense-reimbursement/golden-set",
+        json={"name": "Zero-total receipt", "expected": "rejected · no Action"},
         headers=owner,
     )
     assert added.status_code == 201
@@ -227,25 +312,61 @@ def test_golden_set_add_and_remove(client, owner):
     assert new_case["source"] == "human-authored"
 
     removed = client.delete(
-        f"/api/v1/flows/invoice-intake/golden-set/{new_case['id']}", headers=owner
+        f"/api/v1/flows/expense-reimbursement/golden-set/{new_case['id']}",
+        headers=owner,
     )
     assert removed.status_code == 200
     assert len(removed.json()["cases"]) == len(before["cases"])
     assert (
         client.delete(
-            "/api/v1/flows/invoice-intake/golden-set/gc-does-not-exist",
+            "/api/v1/flows/expense-reimbursement/golden-set/gc-does-not-exist",
             headers=owner,
         ).status_code
         == 404
     )
 
 
+def test_accounts_payable_golden_set_is_seeded_and_synced(client, owner):
+    golden = client.get(
+        "/api/v1/flows/accounts-payable/golden-set", headers=owner
+    ).json()
+    assert golden["synced_from"].endswith("accounts-payable.json")
+    assert golden["synced_at"]
+    # Six cases — deliberately under the coverage bar, like the expense seed.
+    assert len(golden["cases"]) == 6
+    by_ref = {c["input_ref"]: c for c in golden["cases"]}
+    # The clean-scan fixture carries structured labels: facts on invoice.*
+    # paths, a trajectory naming the terminal commit, and a pinned world.
+    clean = by_ref["ap-fixture-001"]
+    paths = {a["path"] for a in clean["assertions"]}
+    assert {"invoice.total_usd", "invoice.extraction_path", "invoice.verdict"} <= paths
+    assert all(a["path"].startswith("invoice.") for a in clean["assertions"])
+    committed = next(
+        t for t in clean["trajectory"] if t["kind"] == "action_committed"
+    )
+    assert committed["expected"] == "post-to-ap"
+    refs = {r["ref"] for r in clean["read_set"]}
+    assert "knowledge:vendor-exemplar-acme-industrial@rev1" in refs
+    assert "knowledge:invoice-posting-policy@rev1" in refs
+    # First contact: no exemplar exists yet, so none is pinned.
+    first_contact = by_ref["ap-fixture-007"]
+    assert {r["ref"] for r in first_contact["read_set"]} == {
+        "knowledge:invoice-posting-policy@rev1"
+    }
+    assert any(
+        a["path"] == "invoice.extraction_path" and a["expected"] == "ensemble"
+        for a in first_contact["assertions"]
+    )
+
+
 def test_promoting_a_run_tags_the_case_and_keeps_the_pointer(client, owner):
     run = client.get(
-        "/api/v1/flows/invoice-intake/runs", params={"limit": 1}, headers=owner
+        "/api/v1/flows/expense-reimbursement/runs",
+        params={"limit": 1},
+        headers=owner,
     ).json()[0]
     added = client.post(
-        "/api/v1/flows/invoice-intake/golden-set",
+        "/api/v1/flows/expense-reimbursement/golden-set",
         json={
             "name": f"Promoted {run['case_ref']}",
             "expected": "matches the recorded outcome",
@@ -268,7 +389,7 @@ def test_promoting_a_run_tags_the_case_and_keeps_the_pointer(client, owner):
 
 def test_version_history_and_draft(client, owner):
     versions = client.get(
-        "/api/v1/flows/invoice-intake/versions", headers=owner
+        "/api/v1/flows/expense-reimbursement/versions", headers=owner
     ).json()
     assert [v["version"] for v in versions] == sorted(
         [v["version"] for v in versions], reverse=True
@@ -280,23 +401,43 @@ def test_version_history_and_draft(client, owner):
     # A version is a full snapshot, never a delta.
     assert all(v["steps"] for v in versions)
 
-    detail = client.get("/api/v1/flows/invoice-intake", headers=owner).json()
-    assert detail["active_version_label"] == "v14"
-    assert detail["draft_version_label"] == "v15-draft"
+    detail = client.get(
+        "/api/v1/flows/expense-reimbursement", headers=owner
+    ).json()
+    assert detail["active_version_label"] == "v9"
+    assert detail["draft_version_label"] == "v10-draft"
     assert detail["version_count"] == len(versions)
 
     assert (
         client.get(
-            "/api/v1/flows/invoice-intake/versions/999", headers=owner
+            "/api/v1/flows/expense-reimbursement/versions/999", headers=owner
         ).status_code
         == 404
     )
 
 
+def test_accounts_payable_history_has_no_open_draft(client, owner):
+    """A draft is an open piece of work, not furniture every flow ships with:
+    accounts-payable seeds two archived revisions and the active one, only."""
+    versions = client.get(
+        "/api/v1/flows/accounts-payable/versions", headers=owner
+    ).json()
+    assert [(v["version"], v["status"]) for v in versions] == [
+        (5, "active"), (4, "archived"), (3, "archived")
+    ]
+    # Full snapshots here too — every revision carries the whole map.
+    assert all(v["steps"] for v in versions)
+
+    detail = client.get("/api/v1/flows/accounts-payable", headers=owner).json()
+    assert detail["active_version_label"] == "v5"
+    assert detail["draft_version_label"] == ""
+    assert detail["version_count"] == 3
+
+
 def test_version_diff_marks_added_removed_and_modified(client, owner):
-    # invoice-intake's seeded draft inserts a guard ahead of the model call.
+    # The seeded draft inserts a duplicate guard ahead of the model call.
     diff = client.get(
-        "/api/v1/flows/invoice-intake/versions/15/diff", headers=owner
+        "/api/v1/flows/expense-reimbursement/versions/10/diff", headers=owner
     ).json()
     by_id = {d["step"]["id"]: d for d in diff}
     assert by_id["x0"]["change"] == "added"
@@ -305,21 +446,37 @@ def test_version_diff_marks_added_removed_and_modified(client, owner):
     assert "next" in by_id["t1"]["changed_fields"]
     assert by_id["a1"]["change"] == "unchanged"
 
-    # contract-review's draft drops the normalizer, which must still appear.
-    ctr = client.get(
-        "/api/v1/flows/contract-review/versions/7/diff", headers=owner
-    ).json()
-    removed = [d for d in ctr if d["change"] == "removed"]
-    assert [d["step"]["id"] for d in removed] == ["x1"]
-    modified = {d["step"]["id"] for d in ctr if d["change"] == "modified"}
-    assert "m2" in modified  # cheaper second-opinion model
-
     # An archived version differs from the live one only in governed knowledge.
     older = client.get(
-        "/api/v1/flows/invoice-intake/versions/13/diff", headers=owner
+        "/api/v1/flows/expense-reimbursement/versions/8/diff", headers=owner
     ).json()
     changed = [d for d in older if d["change"] == "modified"]
     assert changed and all(d["changed_fields"] == ["config"] for d in changed)
+
+
+def test_diff_keeps_removed_steps_as_ghosts():
+    """A draft that deletes a step must still show it — "what did this draft
+    delete" is exactly the question a reviewer asks of the canvas."""
+    from app.flows import FlowStep, FlowVersion, diff_versions
+
+    trigger = FlowStep(
+        id="t1", type="trigger", name="ReceiptSubmitted",
+        config={"event": "ReceiptSubmitted"}, next=["x1"],
+    )
+    normalizer = FlowStep(
+        id="x1", type="transform", name="normalize", next=["a1"],
+    )
+    action = FlowStep(id="a1", type="action", name="record")
+    baseline = FlowVersion(version=1, steps=[trigger, normalizer, action])
+    candidate = FlowVersion(
+        version=2,
+        steps=[trigger.model_copy(update={"next": ["a1"]}), action],
+    )
+    diff = diff_versions(candidate, baseline)
+    removed = [d for d in diff if d.change == "removed"]
+    # The ghost carries the *baseline* step, appended after the live ones.
+    assert [d.step.id for d in removed] == ["x1"]
+    assert diff[-1].change == "removed"
 
 
 # ---- recommendations ----
@@ -327,7 +484,7 @@ def test_version_diff_marks_added_removed_and_modified(client, owner):
 
 def test_recommendations_carry_evidence_and_apply_to_a_draft(client, owner):
     recs = client.get(
-        "/api/v1/flows/invoice-intake/recommendations", headers=owner
+        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
     ).json()
     assert recs
     for rec in recs:
@@ -336,13 +493,19 @@ def test_recommendations_carry_evidence_and_apply_to_a_draft(client, owner):
     savings = [r["estimated_monthly_savings_usd"] for r in recs]
     assert savings == sorted(savings, reverse=True)
 
-    downgrade = next((r for r in recs if r["kind"] == "model-downgrade"), None)
-    assert downgrade is not None, recs
+    # With ~1,400 runs/30d at ~$0.14 on one claude-sonnet-5 call and a 99%+
+    # success rate, the telemetry earns exactly these three cards: a one-rung
+    # downgrade, a standing-prompt cache, and thin golden coverage (6 < 8).
+    assert {r["kind"] for r in recs} == {
+        "model-downgrade", "prompt-cache", "coverage"
+    }
+
+    downgrade = next(r for r in recs if r["kind"] == "model-downgrade")
     assert downgrade["proposed_change"]["from"] == "claude-sonnet-5"
     assert downgrade["proposed_change"]["to"] == "claude-haiku-4-5"
 
     applied = client.post(
-        f"/api/v1/flows/invoice-intake/recommendations/{downgrade['id']}/apply",
+        f"/api/v1/flows/expense-reimbursement/recommendations/{downgrade['id']}/apply",
         headers=owner,
     )
     assert applied.status_code == 200, applied.text
@@ -353,35 +516,98 @@ def test_recommendations_carry_evidence_and_apply_to_a_draft(client, owner):
         s for s in draft["steps"] if s["id"] == downgrade["proposed_change"]["step_id"]
     )
     assert step["config"]["model"] == "claude-haiku-4-5"
-    live = client.get("/api/v1/flows/invoice-intake", headers=owner).json()
+    live = client.get("/api/v1/flows/expense-reimbursement", headers=owner).json()
     active_step = next(
         s for s in live["steps"] if s["id"] == downgrade["proposed_change"]["step_id"]
     )
     assert active_step["config"]["model"] == "claude-sonnet-5"
 
 
-def test_downgrade_is_withheld_while_the_flow_is_failing(client, owner):
+def test_accounts_payable_recommendations_follow_its_own_telemetry(client, owner):
+    """Cards are derived per flow: accounts-payable earns a prompt cache on
+    the classifier, a one-rung downgrade on each claude-sonnet-5 extraction
+    (the haiku steps have no cheaper rung; gemini has no mapped path), and
+    the thin-coverage advisory (6 < 8). Spend per run sits under its $0.60
+    budget and the trigger is per-invoice, so neither the budget nor the
+    batching card fires."""
+    recs = client.get(
+        "/api/v1/flows/accounts-payable/recommendations", headers=owner
+    ).json()
+    assert {r["kind"] for r in recs} == {
+        "model-downgrade", "prompt-cache", "coverage"
+    }
+    downgrades = [r for r in recs if r["kind"] == "model-downgrade"]
+    assert {r["step_id"] for r in downgrades} == {"m1", "m2a"}
+    for card in downgrades:
+        assert card["proposed_change"]["from"] == "claude-sonnet-5"
+        assert card["proposed_change"]["to"] == "claude-haiku-4-5"
+    cache = next(r for r in recs if r["kind"] == "prompt-cache")
+    assert cache["step_id"] == "m0"
+    # Every card still carries its evidence, and money sorts the list.
+    assert all(r["evidence"] for r in recs)
+    savings = [r["estimated_monthly_savings_usd"] for r in recs]
+    assert savings == sorted(savings, reverse=True)
+
+
+def test_downgrade_is_withheld_while_the_flow_is_failing():
     """Spending less on something that is not working is not a saving.
 
-    contract-review runs on the most expensive model in the fleet, so it is
-    the obvious downgrade candidate on cost alone — but it completes ~93% of
-    runs, below the bar, so the card is deliberately not offered.
+    A flow on an expensive model is the obvious downgrade candidate on cost
+    alone — but below the success bar the right move is to fix quality, so
+    the card is deliberately not offered. The seeded flow succeeds, so the
+    failing shape is constructed synthetically.
     """
-    recs = client.get(
-        "/api/v1/flows/contract-review/recommendations", headers=owner
-    ).json()
+    from app.flows import (
+        FlowDefinition,
+        FlowStep,
+        SeedProfile,
+        recommendations,
+        usage_series,
+    )
+    from app.models import utcnow
+
+    failing = FlowDefinition(
+        id="counterparty-paper-review",
+        name="Counterparty paper review",
+        status="active",
+        created_at=utcnow() - timedelta(days=90),
+        profile=SeedProfile(
+            base_runs=7, cost_per_run=2.40, tokens_per_run=48000,
+            task_rate=0.42, escalate_rate=0.045, fail_rate=0.03,
+            active_seconds=210,
+        ),
+        steps=[
+            FlowStep(
+                id="t1", type="trigger", name="PaperUploaded",
+                config={"event": "PaperUploaded"}, next=["m1"],
+            ),
+            FlowStep(
+                id="m1", type="modelcall", name="risk-review",
+                config={"model": "claude-sonnet-5"}, next=["a1"],
+            ),
+            FlowStep(id="a1", type="action", name="file-summary",
+                     config={"target": "deal-room"}),
+        ],
+    )
+    usage = usage_series(failing, 30)
+    runs = sum(d.runs for d in usage)
+    completed = sum(d.completed for d in usage)
+    assert completed / runs < 0.97  # genuinely below the bar
+    recs = recommendations(failing, usage, golden_cases=6)
     assert recs  # other insights still surface
-    assert not [r for r in recs if r["kind"] == "model-downgrade"]
+    assert not [r for r in recs if r.kind == "model-downgrade"]
 
 
 def test_advisory_recommendation_cannot_be_applied(client, owner):
     recs = client.get(
-        "/api/v1/flows/document-embedder/recommendations", headers=owner
+        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
     ).json()
-    advisory = next((r for r in recs if r["proposed_change"] is None), None)
-    assert advisory is not None, recs
+    # The coverage card is advisory: adding golden cases is judgment work,
+    # not a mechanical edit the console can stage into a draft.
+    advisory = next(r for r in recs if r["kind"] == "coverage")
+    assert advisory["proposed_change"] is None
     resp = client.post(
-        f"/api/v1/flows/document-embedder/recommendations/{advisory['id']}/apply",
+        f"/api/v1/flows/expense-reimbursement/recommendations/{advisory['id']}/apply",
         headers=owner,
     )
     assert resp.status_code == 409
@@ -390,15 +616,16 @@ def test_advisory_recommendation_cannot_be_applied(client, owner):
 
 def test_unknown_recommendation_is_404(client, owner):
     resp = client.post(
-        "/api/v1/flows/invoice-intake/recommendations/nope/apply", headers=owner
+        "/api/v1/flows/expense-reimbursement/recommendations/nope/apply",
+        headers=owner,
     )
     assert resp.status_code == 404
 
 
 def test_test_run_executes_against_golden_set(client, owner):
     launched = client.post(
-        "/api/v1/flows/invoice-intake/test-runs",
-        json={"candidate_version": "v15-draft"},
+        "/api/v1/flows/expense-reimbursement/test-runs",
+        json={"candidate_version": "v10-draft"},
         headers=owner,
     )
     assert launched.status_code == 202, launched.text
@@ -409,7 +636,8 @@ def test_test_run_executes_against_golden_set(client, owner):
     # The simulated harness runs case-by-case in the background.
     for _ in range(100):
         run = client.get(
-            f"/api/v1/flows/invoice-intake/test-runs/{run['id']}", headers=owner
+            f"/api/v1/flows/expense-reimbursement/test-runs/{run['id']}",
+            headers=owner,
         ).json()
         if run["status"] == "completed":
             break
@@ -420,19 +648,20 @@ def test_test_run_executes_against_golden_set(client, owner):
     assert run["cost_usd"] > 0
 
     listed = client.get(
-        "/api/v1/flows/invoice-intake/test-runs", headers=owner
+        "/api/v1/flows/expense-reimbursement/test-runs", headers=owner
     ).json()
     assert any(r["id"] == run["id"] for r in listed)
 
     # Same candidate, same golden set -> same verdicts (evals must reproduce).
     rerun = client.post(
-        "/api/v1/flows/invoice-intake/test-runs",
-        json={"candidate_version": "v15-draft"},
+        "/api/v1/flows/expense-reimbursement/test-runs",
+        json={"candidate_version": "v10-draft"},
         headers=owner,
     ).json()
     for _ in range(100):
         rerun = client.get(
-            f"/api/v1/flows/invoice-intake/test-runs/{rerun['id']}", headers=owner
+            f"/api/v1/flows/expense-reimbursement/test-runs/{rerun['id']}",
+            headers=owner,
         ).json()
         if rerun["status"] == "completed":
             break
@@ -443,14 +672,15 @@ def test_test_run_executes_against_golden_set(client, owner):
 def test_test_run_compares_candidate_against_baseline(client, owner):
     """Every case is graded twice, so the comparison is like-for-like."""
     launched = client.post(
-        "/api/v1/flows/contract-review/test-runs",
-        json={"candidate_version": "v7-draft", "baseline_version": "v6"},
+        "/api/v1/flows/expense-reimbursement/test-runs",
+        json={"candidate_version": "v10-draft", "baseline_version": "v9"},
         headers=owner,
     ).json()
     run = launched
     for _ in range(200):
         run = client.get(
-            f"/api/v1/flows/contract-review/test-runs/{run['id']}", headers=owner
+            f"/api/v1/flows/expense-reimbursement/test-runs/{run['id']}",
+            headers=owner,
         ).json()
         if run["status"] == "completed":
             break
@@ -474,22 +704,23 @@ def test_test_run_compares_candidate_against_baseline(client, owner):
 def test_applied_downgrade_shows_up_as_a_cost_saving(client, owner):
     """The recommender loop has to close: apply, run, see the delta."""
     recs = client.get(
-        "/api/v1/flows/invoice-intake/recommendations", headers=owner
+        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
     ).json()
     downgrade = next(r for r in recs if r["kind"] == "model-downgrade")
     client.post(
-        f"/api/v1/flows/invoice-intake/recommendations/{downgrade['id']}/apply",
+        f"/api/v1/flows/expense-reimbursement/recommendations/{downgrade['id']}/apply",
         headers=owner,
     )
     run = client.post(
-        "/api/v1/flows/invoice-intake/test-runs", json={}, headers=owner
+        "/api/v1/flows/expense-reimbursement/test-runs", json={}, headers=owner
     ).json()
     # Launching with no explicit versions picks up the draft and the live one.
-    assert run["candidate_version"] == "v15-draft"
-    assert run["baseline_version"] == "v14"
+    assert run["candidate_version"] == "v10-draft"
+    assert run["baseline_version"] == "v9"
     for _ in range(200):
         run = client.get(
-            f"/api/v1/flows/invoice-intake/test-runs/{run['id']}", headers=owner
+            f"/api/v1/flows/expense-reimbursement/test-runs/{run['id']}",
+            headers=owner,
         ).json()
         if run["status"] == "completed":
             break
@@ -501,9 +732,241 @@ def test_applied_downgrade_shows_up_as_a_cost_saving(client, owner):
 
 
 def test_test_run_refused_without_golden_set(client, owner):
-    # deal-brief is seeded with no golden cases.
+    # A freshly registered definition has no golden cases yet.
+    created = client.post(
+        "/api/v1/flows",
+        json={"id": "receipt-archiver", "name": "Receipt archiver"},
+        headers=owner,
+    )
+    assert created.status_code == 201
     resp = client.post(
-        "/api/v1/flows/deal-brief/test-runs", json={}, headers=owner
+        "/api/v1/flows/receipt-archiver/test-runs", json={}, headers=owner
     )
     assert resp.status_code == 409
     assert "golden set" in resp.json()["detail"].lower()
+
+
+# ---- flow contract + producer map ----
+
+
+def test_contract_facts_and_derived_producer_map(client):
+    contract = client.get("/api/v1/flows/expense-reimbursement/contract").json()
+    paths = {f["path"] for f in contract["facts"]}
+    assert "receipt.total_usd" in paths
+    assert "reimbursement.verdict" in paths
+    # The producer map is derived per version: extraction facts land on the
+    # ModelCall, verdicts on the Rule, commits on the Action.
+    pmap = contract["producer_map"]
+    assert pmap["receipt.total_usd"] == "m1"
+    assert pmap["reimbursement.verdict"] == "r1"
+    assert pmap["reimbursement.recorded"] == "a1"
+
+    # Projecting the same contract onto the draft (which inserts a transform
+    # ahead of extraction) re-derives the map — no label moved.
+    draft = client.get(
+        "/api/v1/flows/expense-reimbursement/contract", params={"version": 10}
+    ).json()
+    assert draft["version_label"] == "v10-draft"
+    assert draft["producer_map"]["receipt.total_usd"] == "m1"
+
+
+def test_correction_sets_per_modelcall(client):
+    sets = client.get(
+        "/api/v1/flows/expense-reimbursement/correction-sets"
+    ).json()
+    # One ModelCall in the flow, so exactly one auto-accumulated set.
+    assert [s["step_id"] for s in sets] == ["m1"]
+    only = sets[0]
+    assert only["step_name"] == "extract-receipt"
+    assert only["model"] == "claude-sonnet-5"
+    assert only["pairs"] > 0 and only["sample"]
+    # Correction pairs key to contract fact paths, never to step internals.
+    contract_paths = {
+        "receipt.vendor", "receipt.date", "receipt.total_usd", "receipt.category"
+    }
+    assert {p["field"] for p in only["sample"]} <= contract_paths
+
+
+# ---- dataset versioning ----
+
+
+def test_golden_set_is_versioned_and_mutations_bump_it(client, owner):
+    before = client.get(
+        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
+    ).json()
+    assert before["version"] == 1
+    assert before["revisions"][0]["note"].startswith("seeded")
+
+    added = client.post(
+        "/api/v1/flows/expense-reimbursement/golden-set",
+        json={"name": "Zero-total receipt", "expected": "rejected"},
+        headers=owner,
+    ).json()
+    assert added["version"] == 2
+    assert added["revisions"][-1]["note"].startswith("added")
+
+    case_id = added["cases"][-1]["id"]
+    removed = client.delete(
+        f"/api/v1/flows/expense-reimbursement/golden-set/{case_id}",
+        headers=owner,
+    ).json()
+    assert removed["version"] == 3
+
+
+def test_bulk_import_is_one_revision(client, owner):
+    lines = "\n".join(
+        [
+            '{"name": "Batch case A", "expected": "approved",'
+            ' "assertions": [{"path": "reimbursement.verdict", "expected": "approve"}]}',
+            '{"name": "Batch case B", "expected": "elevated",'
+            ' "trajectory": [{"kind": "task_raised", "expected": "true"}]}',
+        ]
+    )
+    before = client.get(
+        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
+    ).json()
+    out = client.post(
+        "/api/v1/flows/expense-reimbursement/golden-set/import",
+        json={"jsonl": lines},
+        headers=owner,
+    )
+    assert out.status_code == 201, out.text
+    golden = out.json()
+    assert len(golden["cases"]) == len(before["cases"]) + 2
+    assert golden["version"] == before["version"] + 1
+    assert "imported 2 cases" in golden["revisions"][-1]["note"]
+    # A malformed line names its line number.
+    bad = client.post(
+        "/api/v1/flows/expense-reimbursement/golden-set/import",
+        json={"jsonl": '{"name": "ok"}\n{"nope": true}'},
+        headers=owner,
+    )
+    assert bad.status_code == 422
+    assert "Line 2" in bad.json()["detail"]
+
+
+# ---- review screen raw material ----
+
+
+def test_case_document_grounds_the_asserted_facts(client, owner):
+    golden = client.get(
+        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
+    ).json()
+    case = next(c for c in golden["cases"] if c["input_ref"] == "exp-fixture-001")
+    doc = client.get(
+        f"/api/v1/flows/expense-reimbursement/golden-set/{case['id']}/document",
+        headers=owner,
+    ).json()
+    assert doc["kind"] == "expense"
+    assert doc["lines"]
+    region_paths = {r["path"] for r in doc["regions"]}
+    assert "receipt.total_usd" in region_paths
+    assert "receipt.vendor" in region_paths
+    for region in doc["regions"]:
+        x, y, w, h = region["box"]
+        assert 0 <= x <= 1 and 0 <= y <= 1 and w > 0 and h > 0
+
+
+def test_review_corrects_labels_and_bumps_the_dataset(client, owner):
+    golden = client.get(
+        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
+    ).json()
+    case = next(c for c in golden["cases"] if c["input_ref"] == "exp-fixture-001")
+    out = client.post(
+        f"/api/v1/flows/expense-reimbursement/golden-set/{case['id']}/review",
+        json={"corrections": {"receipt.total_usd": "65.10"}},
+        headers=owner,
+    ).json()
+    assert out["version"] == golden["version"] + 1
+    reviewed = next(c for c in out["cases"] if c["id"] == case["id"])
+    assert reviewed["reviewed_by"]
+    fixed = next(
+        a for a in reviewed["assertions"] if a["path"] == "receipt.total_usd"
+    )
+    assert fixed["expected"] == "65.10"
+
+
+# ---- assertion-level grading ----
+
+
+def _finish(client, owner, flow_id, run):
+    for _ in range(200):
+        run = client.get(
+            f"/api/v1/flows/{flow_id}/test-runs/{run['id']}", headers=owner
+        ).json()
+        if run["status"] == "completed":
+            return run
+        time.sleep(0.05)
+    raise AssertionError("test run never completed")
+
+
+def test_experiment_localizes_failures_and_states_its_gate(client, owner):
+    launched = client.post(
+        "/api/v1/flows/expense-reimbursement/test-runs",
+        json={"candidate_version": "v10-draft"},
+        headers=owner,
+    ).json()
+    # The experiment pins the dataset revision it measures.
+    assert launched["dataset_version"] == 1
+    assert launched["reads"] == "pinned"
+    run = _finish(client, owner, "expense-reimbursement", launched)
+
+    # Every case grades assertion-by-assertion, each localized to the step
+    # that owns the fact in the candidate's producer map.
+    result = run["results"][0]
+    assert result["assertions"]
+    fact_steps = {
+        a["step_id"] for a in result["assertions"] if a["kind"] == "fact"
+    }
+    assert fact_steps <= {"m1", "r1", "a1", ""}
+    # Step aggregates exist for the heatmap, and the gate is stated.
+    assert run["step_stats"]
+    stat = next(s for s in run["step_stats"] if s["step_id"] == "m1")
+    assert stat["passed"] + stat["failed"] > 0
+    assert run["gate"] is not None
+    expected_gate = run["regressions"] == 0 and run["passed"] >= run["baseline_passed"]
+    assert run["gate"]["passed"] == expected_gate
+
+
+def test_apply_recommendation_auto_launches_the_experiment(client, owner):
+    recs = client.get(
+        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
+    ).json()
+    downgrade = next(r for r in recs if r["kind"] == "model-downgrade")
+    applied = client.post(
+        f"/api/v1/flows/expense-reimbursement/recommendations/{downgrade['id']}/apply",
+        headers=owner,
+    ).json()
+    # The loop closes: apply stages the draft AND measures it.
+    assert applied["test_run_id"]
+    run = client.get(
+        f"/api/v1/flows/expense-reimbursement/test-runs/{applied['test_run_id']}",
+        headers=owner,
+    ).json()
+    assert run["launched_for"] == downgrade["id"]
+    assert run["candidate_version"] == applied["draft"]["label"]
+    run = _finish(client, owner, "expense-reimbursement", run)
+    # The draft names a cheaper model, so the measured delta is a saving.
+    assert run["cost_delta_usd"] < 0
+
+
+def test_promoting_a_run_captures_labels_and_the_pinned_world(client, owner):
+    run = client.get(
+        "/api/v1/flows/expense-reimbursement/runs",
+        params={"limit": 1},
+        headers=owner,
+    ).json()[0]
+    added = client.post(
+        "/api/v1/flows/expense-reimbursement/golden-set",
+        json={"name": f"Promoted {run['case_ref']}", "run_id": run["id"]},
+        headers=owner,
+    ).json()
+    case = added["cases"][-1]
+    assert case["source"] == "promoted-from-run"
+    # Enriched from the journal: fact assertions against the contract, a
+    # trajectory, and the reads the run made at their revisions.
+    paths = {a["path"] for a in case["assertions"]}
+    assert "receipt.total_usd" in paths
+    assert any(t["kind"] == "task_raised" for t in case["trajectory"])
+    assert case["read_set"] and "@" in case["read_set"][0]["ref"]
+    assert case["payload"]
