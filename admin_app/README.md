@@ -10,8 +10,13 @@ what is specific to the Flutter app.
 
 ```bash
 flutter pub get
-flutter run -d chrome --dart-define=API_BASE_URL=http://localhost:8080
+flutter run -d chrome --dart-define=API_BASE_URL=http://localhost:8080 --dart-define=DEV_AUTH=true
 ```
+
+`DEV_AUTH=true` skips the Firebase sign-in gate (the committed
+`firebase_options.dart` is real, so without it the app demands a Firebase
+login even against a local server running `AUTH_BACKEND=none`). Local use
+only — never set it on a hosted build.
 
 Inside the dev container there is no display — use
 `-d web-server --web-port 3000 --web-hostname 0.0.0.0` and your host browser.
@@ -22,6 +27,7 @@ Inside the dev container there is no display — use
 | --- | --- | --- |
 | `API_BASE_URL` | `http://localhost:8080` | Base URL of the FastAPI server |
 | `API_KEY` | empty | `X-API-Key` machine credential — **local use only** |
+| `DEV_AUTH` | `false` | Skip the Firebase gate for local dev — **local use only** |
 
 > **Do not set `API_KEY` for a hosted build.** A dart-define is compiled into the
 > JavaScript bundle and is readable by anyone who loads the page, and the key

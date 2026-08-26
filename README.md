@@ -127,6 +127,11 @@ Local dev uses the in-memory backend and auto-seeds from [server/seed](server/se
 - Users: `GET/POST /api/v1/users`, `PUT /api/v1/users/{uid}/role`, `DELETE /api/v1/users/{uid}`, `GET /api/v1/users/me`
 - Identities: `GET/POST /api/v1/identities`, `PUT /api/v1/identities/{uid}/role`, `DELETE /api/v1/identities/{uid}`
 - Flows: `GET/POST /api/v1/flows`, `GET /api/v1/flows/stats`, `GET/PATCH/DELETE /api/v1/flows/{id}`, `GET .../usage`, `GET .../runs`, `GET .../runs/{run_id}`, `GET .../audit`, `GET/POST .../golden-set`, `DELETE .../golden-set/{case_id}`, `GET/POST .../test-runs`, `GET .../test-runs/{test_id}` — see [Flows](#flows)
+- Tasks: `GET /api/v1/tasks`, `GET /api/v1/tasks/stats`, `GET /api/v1/tasks/{id}`, `POST /api/v1/tasks/{id}/decide` — see [Tasks](#tasks)
+- Reimbursements: `GET/POST /api/v1/reimbursements`, `GET .../stats`, `GET .../{id}` — see [Reimbursements](#reimbursements-the-live-flow)
+- Accounts payable: `GET/POST /api/v1/payables`, `GET .../stats`, `GET .../{id}` — see [Accounts payable](#accounts-payable-the-second-live-flow)
+- Refs: `GET /api/v1/refs/{ref}` — resolve `knowledge:{id}@rev{n}` read-set references; every asset carries a `revision` that bumps on write
+- Employee Hub: `GET /api/v1/employee/me`, `GET/POST /api/v1/employee/pto`, `POST /api/v1/employee/hr-chat` — see [Employee Hub](#employee-hub)
 - MCP: `POST /mcp/` — tools `list_docs`, `get_doc`, `search_docs`, `get_context`; resource template `kb://{doc_id}`
 - A2A: `POST /a2a` with JSON-RPC `message/send`; agent card at `/.well-known/agent-card.json`
 
@@ -146,6 +151,11 @@ Requires the **MCP Python SDK 2.x** (`mcp.server.MCPServer`). The 1.x API
 | `FLOWS_COLLECTION` | `flows` | Firestore collection for Flow definitions |
 | `GOLDEN_SETS_COLLECTION` | `flow_golden_sets` | Firestore collection for golden sets |
 | `TEST_RUNS_COLLECTION` | `flow_test_runs` | Firestore collection for harness test runs |
+| `TASKS_COLLECTION` | `tasks` | Firestore collection for the Task Queue |
+| `REIMBURSEMENTS_COLLECTION` | `reimbursements` | Firestore collection for the reimbursements table |
+| `EMPLOYEE_COLLECTION` | `employee` | Firestore collection prefix for profiles and PTO |
+| `RECEIPT_BACKEND` | follows `ANSWER_BACKEND` | `none` (deterministic stub) or `vertex` (multimodal receipt reading) |
+| `RECEIPT_MODEL` | `gemini-2.5-flash` | Vertex model for receipt extraction |
 | `AUTH_BACKEND` | `none` | `none` (dev: everyone is owner) or `firebase` (verify ID tokens) |
 | `USER_BACKEND` | follows `AUTH_BACKEND` | `memory` or `firebase` — where platform users live |
 | `SEED_DIR` | `server/seed` | Seed docs loaded when store is empty |
@@ -272,6 +282,22 @@ and create the first owner:
 
 `deploy.sh` is the single source of truth for deployment. It writes the generated
 key to `deploy/.admin_api_key` (gitignored) and reuses it on later runs.
+
+### Shipping new or edited governed knowledge
+
+The live flows read their governed values — the expense auto-approval limit,
+the invoice auto-post limit, the PTO window — out of knowledge-layer documents
+at run time. But `seed_if_empty` only runs against an *empty* corpus, so
+editing a file in [server/seed/](server/seed/) and redeploying does **not**
+update a deployment that already has documents: the flow keeps reading the old
+revision. Push them explicitly:
+
+```bash
+./deploy/upsert_knowledge.py <SERVICE_URL> "$(cat deploy/.admin_api_key)"
+```
+
+Idempotent, and each update is a real revision bump — which is what a governed
+knowledge change should be. Pass filenames to push only some of them.
 
 ### Redeploying just the server
 
@@ -417,8 +443,8 @@ selector**, pause/test actions):
 | Tab | What it holds |
 | --- | --- |
 | **Overview** | Five KPI tiles across the top, then the definition (metadata and governed ROI assumptions) beside one daily chart whose measure is chosen from a dropdown — runs, model spend, tokens, or human judgment. Whichever measure is on screen, hovering a day tooltips all four, so answering "and what did that day cost?" never means switching charts. |
-| **Flow canvas** | A full-bleed workbench, split down the middle. On the left, the declarative export as an interactive DAG flowing **north to south** on an infinite dotted field — pan, zoom, click, branch-labelled edges, distinct node types. (The dots are painted in viewport space from the viewer's transform, not inside the transformed child: a pattern drawn on the child stops at the graph's bounds and never repaints as you move, so the field would sit still while the graph slid over it and run out at the edges.) On the right, two tabs: **Definition** shows the selected node's exported configuration, and **Runs** lists recent executions. Selecting a run traces its actual path through the graph (steps it never reached fade to ghosts, traversed edges light up in the accent) and collapses the list into a compact header with a back button, so the payloads get the rest of the column: clicking a step on the path shows what went in and what came out — prompt, raw response, model, tokens, cost, rule verdict, deciding human, gateway ledger ref. **Promote to golden set** sits in that header. Selecting a draft in the top-bar version selector overlays the diff instead (green glow added, red removed, amber modified). |
-| **Evaluation & optimization** | Golden dataset on the left with its code-sync banner; the test harness top right (candidate vs baseline, **Run suite**); the cost & performance recommender bottom right, each card carrying its evidence and an **Apply to draft version** action. |
+| **Flow canvas** | A full-bleed workbench, split down the middle. On the left, the declarative export as an interactive DAG flowing **north to south** on an infinite dotted field — pan, zoom, click, branch-labelled edges, distinct node types. (The dots are painted in viewport space from the viewer's transform, not inside the transformed child: a pattern drawn on the child stops at the graph's bounds and never repaints as you move, so the field would sit still while the graph slid over it and run out at the edges.) On the right, three tabs: **Definition** shows the selected node's exported configuration; **Runs** lists recent executions — selecting one traces its actual path through the graph (steps it never reached fade to ghosts, traversed edges light up in the accent) and collapses the list into a compact header, so clicking a step shows what went in and what came out (prompt, raw response, model, tokens, cost, rule verdict, deciding human, gateway ledger ref), with **Promote to golden set** in that header; and **Eval** paints a selected experiment onto the graph as a heatmap — each node shows the pass rate of the assertions it owns, clicking a hot node lists its failing assertions with expected-vs-actual diffs. Selecting a draft in the top-bar version selector overlays the diff instead (green glow added, red removed, amber modified). |
+| **Evaluation & optimization** | Two columns. **Datasets** on the left: the golden dataset as a *versioned* knowledge asset (revision history, provenance chips, JSONL upload, the `cumulus eval push` command — authoring lives in code; the console curates), and the per-ModelCall **correction sets** the flywheel accumulates. **Experiments** on the right: candidate vs baseline over a pinned dataset revision (pinned or live reads), a pass-rate trend, per-run **gate** verdicts, and the recommender — each card carrying its evidence and an **Apply & measure** action that stages the draft *and* auto-launches the experiment, so the estimate becomes a measured delta. |
 
 The run-path trace is derived from the journal rather than from step status
 alone, because status is ambiguous: when a Rule branches to both an Action and
@@ -450,12 +476,36 @@ It is kept deliberately close to DOCTRINE.md:
 - **Audit** is the run journal plus the ledger view: Task decisions (with the
   decider), Action Gateway commits (with ledger refs), resolutions, and
   knowledge changes.
-- The **golden set** is a knowledge-role Dataset seeded from the correction
-  set; the **test harness** grades a candidate version against it with writes
-  suppressed — no Action reaches the gateway from a test run, and grading is
-  deterministic per (case, candidate) so evals reproduce. Every case is graded
-  against the baseline too, so the comparison is like-for-like and a
-  *regression* (baseline passed, candidate did not) is visible per case.
+- Ground truth keys to the **flow contract** — the declared canonical facts a
+  flow establishes (`invoice.line_items[1].amount`), never to step ids. Each
+  version carries a *derived* producer map ({fact path → step id}, read off
+  the topology; in a real engine, off journal lineage), so grading projects
+  stable labels onto whatever the current shape is: the flow can be
+  refactored freely without relabelling a single case.
+- A **golden case** pins its whole world: the fixture document, the trigger
+  payload, fact assertions (equals / approx / one-of / judge-with-rubric),
+  trajectory assertions (actions committed, task raised, terminal state), and
+  the **read-set** — the knowledge-layer records the run read, at their
+  revisions, captured off the journal on promotion. Experiments serve those
+  reads back (`pinned`, the default), so a regression grade is reproducible
+  even when the vendor master moves; `live` reads are a visibly different
+  kind of run. The golden set itself is **versioned**, and every experiment
+  records the dataset revision it measured.
+- The **test harness** grades assertion-by-assertion with writes suppressed —
+  no Action reaches the gateway from a test run, and grading is deterministic
+  per (case, candidate) so evals reproduce. Every case is graded against the
+  baseline too, so the comparison is like-for-like, a *regression* (baseline
+  passed, candidate did not) is visible per case, and the **promotion gate**
+  is stated on the run: no regressions, pass rate at or above the baseline.
+  Failures localize to the step owning the fact, which is what the canvas
+  eval lens paints. A judge that cannot decide raises a review Task rather
+  than guessing.
+- The **review screen** (open any golden case) shows the fixture document
+  with its grounded field regions — bounding boxes over the values — beside
+  the case's labels; confirming or correcting them is a ledgered human pass
+  that moves the dataset version. It is the same surface that captures
+  corrections from live Tasks and onboards a new flow by labelling its first
+  documents.
 - A **version** is a full snapshot of the declarative export, never a delta —
   a chain of deltas is exactly the opaque artifact the transparency bar rules
   out. Exactly one version is active; at most one draft is open.
@@ -465,18 +515,21 @@ It is kept deliberately close to DOCTRINE.md:
   already succeeding — spending less on something that is failing is not a
   saving — and applying a card edits the **draft**, never the live version, so
   the change has to survive the golden set before it becomes what runs.
+  Applying also auto-launches the experiment against that draft, so the card
+  reports a measured delta and a gate verdict, not just an estimate.
 - ROI figures derive from per-definition assumptions (`roi_minutes_per_run`,
   `roi_hourly_rate_usd`) — governed knowledge, editable in the console,
   logged on change.
 
-**Prototype honesty:** there is no execution engine in this repo yet, so run
-telemetry (runs, journals, spend, audit entries) is *synthesized
-deterministically* from each definition's seed profile — stable across
-restarts and identical on every backend. Definitions, golden sets, and test
-runs are real stored state (`flows`, `flow_golden_sets`, `flow_test_runs`
-collections; in-memory for local dev). The registry
-seeds a six-definition demo fleet on first start when empty. When a real
-engine lands, the synthesis functions in
+**Prototype honesty:** the Flows section's run telemetry (runs, journals,
+spend, audit entries) is *synthesized deterministically* from the
+definition's seed profile — stable across restarts and identical on every
+backend. Definitions, golden sets, and test runs are real stored state
+(`flows`, `flow_golden_sets`, `flow_test_runs` collections; in-memory for
+local dev). The registry seeds **one** definition on first start:
+`expense-reimbursement`, the flow that also has a *real* execution path —
+see [Reimbursements](#reimbursements-the-live-flow). When a full engine
+lands, the synthesis functions in
 [server/app/flows.py](server/app/flows.py) (`usage_series`,
 `recent_runs`, `find_run`, `audit_entries`) are the seams to replace — the
 REST contract and the console stay as they are.
@@ -484,6 +537,121 @@ REST contract and the console stay as they are.
 Management is admin-gated, and minted API keys may read everything but never
 reshape the registry (same posture as teams); launching a test run is the one
 admin write a key *may* do, so CI can kick off evals.
+
+## Tasks
+
+The Task Queue is the console's human-in-the-loop spine: *an agent proposes, a
+person decides, the system resumes.* It is global rather than a nav section —
+an inbox icon in the top bar's account cluster, badged with the open count
+(red when anything is high priority), because judgment is requested from
+wherever you are, not from a place you visit. Opening it slides in **My
+Tasks**: open tasks grouped by Queue (the doctrinal unit of work
+distribution), high priority first, oldest first within a band, plus a
+Decided view where the record lives on.
+
+Three streams raise tasks, and all three are knowledge-layer streams:
+
+| Stream | Kinds | The decision produces |
+| --- | --- | --- |
+| HITL proper | `decision`, `exception` | a gateway-committed Action; the run resumes |
+| Entity resolution | `match_review` | a confirmed (or reversed) identity Link |
+| Governed knowledge | `curation`, `eval_review` | a ledgered knowledge revision |
+
+Every task carries its world — evidence rows, the refs it rests on in the
+read-set namespaces (`knowledge:…@rev`, `vendor:…`, `graph:…`), and the
+proposed action — so the decision takes seconds. Deciding
+(`POST /api/v1/tasks/{id}/decide` with `approved` / `rejected` / `corrected`
+plus an optional note) is durable, attributed, and **once-only**: a second
+decision gets HTTP 409, because the second decider must learn the judgment
+already happened.
+
+Two governance rules at the API boundary:
+
+- **Minted API keys may read the queue but never decide** (403). A key
+  deciding a Task would be an agent approving its own proposal.
+- Reads are `user`+ — deciding an item in your queue is clerk work, not
+  registry administration, so it is deliberately *not* admin-gated.
+
+**Prototype honesty:** tasks are real stored state (`tasks` collection;
+in-memory locally) seeded with a demo backlog tied to the seeded fleet, and a
+decision is a real, attributed write — the stand-in for the curation-ledger
+entry the doctrine requires. Nothing actually resumes yet; each task's
+`resumes` field says what would happen once a real engine lands.
+
+## Reimbursements (the live flow)
+
+The one seeded flow, `expense-reimbursement`, is also the prototype's first
+**live** execution path. `POST /api/v1/reimbursements` runs the same steps
+the Tier-2 export declares, synchronously:
+
+1. **extract-receipt (ModelCall)** — with `RECEIPT_BACKEND=vertex`, a
+   multimodal model reads the receipt image; locally a deterministic stub
+   honors hints (`total=64.20 category=meals vendor=corner-bistro`, and the
+   word `blurry` drops confidence below the floor), so the whole pipeline is
+   drivable without a credential.
+2. **read-policy (transform)** — the auto-approval limit, minimum extraction
+   confidence, and restricted categories are parsed *at run time* from the
+   `expense-approval-policy` knowledge asset. **Editing that document in the
+   console changes what the flow does** — no code change; this is the
+   governed-knowledge demo, and there is a test asserting it.
+3. **needs-elevation (Rule)** — a pure check over the gathered inputs;
+   in-policy receipts are approved and recorded, everything else suspends
+   into a real Task in the `expense-review` queue.
+4. **Deciding the Task resumes the run** — the reimbursement's state commits
+   (`approved`/`denied`), the decider and note land on the row, and the run
+   journal completes through the Action step.
+
+Every row carries its journal, so the **Expense Reimbursement** workspace
+(the reimbursements table) can show provenance per row: which policy was
+read, what the rule said, who decided. The table seeds nine decided/pending
+rows on first start; live submissions append.
+
+## Accounts payable (the second live flow)
+
+`accounts-payable` handles inbound vendor invoices, and its interesting move
+is that **the extraction strategy depends on what the knowledge layer knows**:
+
+1. **classify-vendor (ModelCall)** names the vendor and resolves it to a slug.
+2. **load-exemplar (transform)** looks for `vendor-exemplar-{slug}` in the
+   knowledge layer.
+3. **Known vendor → one-shot**: a single extraction pass using the exemplar
+   as the template — cheap, confident, boring in the right way.
+4. **Unknown vendor → ensemble**: three independent model extractions, an
+   **adjudicator** that merges them field-by-field (majority wins, amounts
+   within a cent agree, disagreements recorded as conflicts), then a
+   **verify-exemplar Task** to the `ap-clerk` queue. On approval, the flow
+   **writes the verified exemplar into the knowledge layer** — a real
+   governed knowledge write — so the vendor graduates from unknown to known
+   and the *next* invoice takes the one-shot path. This is the doctrine's
+   unknown-vendor flywheel, running.
+5. **three-way-match** and **fraud-screen** are declared **placeholders** in
+   the export and journaled as such — honest about what isn't automated yet.
+6. **post-or-review (Rule)** reads governed values from the
+   `invoice-posting-policy` asset at run time (auto-post limit $2,500,
+   classification floor 0.75); under the limit posts to the AP ledger,
+   otherwise a review Task whose decision resumes the run.
+
+The table lives in the **Accounts Payable** workspace, beside the Expense
+Reimbursement one. Locally the stub readers honor hints (`vendor=acme-industrial total=1840
+invoice=ACME-INV-20881 po=PO-7741`; an unrecognized vendor name takes the
+ensemble path); with `RECEIPT_BACKEND=vertex` the extractions are real
+multimodal calls.
+
+## Employee Hub
+
+Opened from the account menu (upper right): the one-stop personal page —
+PTO balance and a request form, benefits, expense submission, and the **HR
+Agent**. Two governed behaviors worth knowing:
+
+- **PTO follows the flow pattern in miniature.** Requests of 3 working days
+  or fewer auto-approve (the window is a governed value parsed from the
+  `pto-policy` asset); longer requests raise a Task to the `hr` queue, and
+  the HR decision resumes the request and deducts the balance.
+- **The HR Agent is grounded and cited.** With `ANSWER_BACKEND=vertex` it
+  plans with tools over the knowledge layer; locally it degrades to
+  retrieval over the `people/` taxonomy plus the caller's own structured
+  facts (balance, pending requests, benefits), and labels itself
+  `"backend": "retrieval"` rather than pretending.
 
 ## Flutter admin app
 
@@ -496,12 +664,27 @@ flutter run -d chrome --dart-define=API_BASE_URL=http://localhost:8080
 Inside the dev container there is no display, so use the web-server device and
 your host browser instead — see [.devcontainer/README.md](.devcontainer/README.md).
 
+The left rail has four stops: **Knowledge layer** (Library, the governed
+corpus, and Data, the dataset registry), **Flows**, **Workspaces** — a
+dropdown, because a workspace is a business view onto rows a flow wrote
+rather than a plane of the map — and **Identities, access & keys**. The
+Employee Hub hangs off the account avatar and the Task Queue off the top bar,
+since both are asked for from every section rather than being one.
+
 Hosted build (what `deploy.sh` runs):
 
 ```bash
-flutter build web --release --dart-define=API_BASE_URL=<SERVICE_URL>
-firebase deploy --only hosting
+cd admin_app && flutter build web --release --dart-define=API_BASE_URL=<SERVICE_URL>
+../deploy/deploy_hosting.py                    # not `firebase deploy` — see below
 ```
+
+`firebase deploy --only hosting` needs the firebase CLI's own interactive
+login, which a dev container does not have, and it rejects Application Default
+Credentials without a quota project.
+[deploy/deploy_hosting.py](deploy/deploy_hosting.py) does the same work over
+the Hosting REST API using the `gcloud` token you already have, so anyone who
+has run `gcloud auth login` can deploy. `deploy.sh` still uses the CLI, which
+works on a workstation where you have logged in.
 
 ### API reference
 

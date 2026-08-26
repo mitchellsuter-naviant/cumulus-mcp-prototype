@@ -155,6 +155,38 @@ const knowledgeGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
+      path: '/api/v1/refs/{ref}',
+      summary: 'Resolve a read-set reference like knowledge:{id}@rev{n}.',
+      auth: ApiAuth.reader,
+      notes:
+          'The seam between the two halves of the prototype: pinned read-sets, '
+          'task refs, and run journals speak in these strings, and this '
+          'endpoint dereferences them. Every asset carries a `revision` that '
+          'bumps on write; a stale pin resolves to the current revision with '
+          '`pinned_available: false` (retained history is a later step). '
+          'Namespaces without a store yet (`graph:`, `vendor:`, `po:`) answer '
+          '`resolved: false` honestly.',
+      params: [
+        ApiParam('ref', 'string', where: 'path', required: true,
+            description: 'e.g. knowledge:expense-approval-policy@rev5'),
+      ],
+      responseExample: '''{
+  "ref": "knowledge:expense-approval-policy@rev5",
+  "namespace": "knowledge",
+  "id": "expense-approval-policy",
+  "resolved": true,
+  "requested_revision": 5,
+  "current_revision": 5,
+  "pinned_available": true,
+  "asset": {"id": "expense-approval-policy", "title": "Expense Approval Policy"}
+}''',
+      errors: [
+        ApiError(404, 'Unknown knowledge ref.'),
+        ApiError(422, 'Unparseable ref.'),
+      ],
+    ),
+    Endpoint(
+      method: 'GET',
       path: '/api/v1/assets/{asset_id}',
       summary: 'One asset with its full content and metadata.',
       auth: ApiAuth.reader,
@@ -1110,6 +1142,317 @@ const flowsGroup = EndpointGroup(
   ],
 );
 
+// ---- Reimbursements ----------------------------------------------------------
+
+const reimbursementsGroup = EndpointGroup(
+  title: 'Reimbursements',
+  blurb:
+      'The expense-reimbursement flow\'s live run and its output table. '
+      'Submitting a receipt runs extraction → policy check → rule '
+      'synchronously; an elevated request suspends into a Task and the '
+      'human\'s decision resumes it. Every row carries its run journal.',
+  endpoints: [
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/reimbursements',
+      status: 201,
+      summary: 'Submit a receipt — one live run of the flow.',
+      auth: ApiAuth('user+', keysRefused: true),
+      notes:
+          'With RECEIPT_BACKEND=vertex the image is read by a multimodal '
+          'ModelCall; locally a deterministic stub honors hints like '
+          '`total=64.20 category=meals vendor=corner-bistro` (and the word '
+          '`blurry` drops confidence) so the pipeline is drivable without a '
+          'credential. The rule\'s limit, confidence floor, and restricted '
+          'categories are parsed from the expense-approval-policy asset at '
+          'run time — edit the document and the flow behaves differently.',
+      params: [
+        ApiParam('image_base64', 'string', description: 'Receipt image bytes.'),
+        ApiParam('filename', 'string'),
+        ApiParam('note', 'string',
+            description: 'Shown to reviewers; extraction hint locally.'),
+      ],
+      responseExample: '''{
+  "id": "reimb_18bcbface3",
+  "employee": "dev",
+  "vendor": "harbor-hotel",
+  "total_usd": 480.0,
+  "category": "lodging",
+  "confidence": 0.9,
+  "state": "pending",
+  "verdict_reason": "\$480.00 exceeds the \$200.00 auto-approval limit",
+  "policy_ref": "knowledge:expense-approval-policy",
+  "task_id": "task_reimb_18bcbface3",
+  "journal": [{"step_id": "t1", "name": "ReceiptSubmitted", "kind": "trigger",
+               "summary": "receipt submitted by dev"}]
+}''',
+      errors: [ApiError(403, 'Minted API keys cannot submit reimbursements.')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/reimbursements',
+      summary: 'The table, newest first.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam('state', 'string', where: 'query',
+            description: '`approved`, `pending`, or `denied`.'),
+        ApiParam('mine', 'bool', where: 'query',
+            description: 'Only the caller\'s own requests.'),
+      ],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/reimbursements/stats',
+      summary: 'Counts by state, approved spend, auto-approval share.',
+      auth: ApiAuth.reader,
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/reimbursements/{id}',
+      summary: 'One request with its full run journal.',
+      auth: ApiAuth.reader,
+      errors: [ApiError(404, 'Reimbursement not found.')],
+    ),
+  ],
+);
+
+// ---- Accounts payable ---------------------------------------------------------
+
+const payablesGroup = EndpointGroup(
+  title: 'Accounts payable',
+  blurb:
+      'The accounts-payable flow\'s live run and its table. A known vendor is '
+      'a one-shot extraction against its exemplar in the knowledge layer; an '
+      'unknown vendor runs a three-model ensemble, an adjudicator merges the '
+      'candidates, and a clerk verifies the new exemplar before anything '
+      'posts. Three-way match and fraud screening are declared placeholders.',
+  endpoints: [
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/payables',
+      status: 201,
+      summary: 'Submit an invoice — one live run of the flow.',
+      auth: ApiAuth('user+', keysRefused: true),
+      notes:
+          'Locally the stub readers honor hints (`vendor=acme-industrial '
+          'total=1840 invoice=ACME-INV-20881 po=PO-7741`); an unrecognized '
+          'vendor takes the ensemble path. The auto-post limit and '
+          'classification floor parse from the invoice-posting-policy asset '
+          'at run time.',
+      params: [
+        ApiParam('image_base64', 'string'),
+        ApiParam('filename', 'string'),
+        ApiParam('note', 'string', description: 'Hint text / reviewer note.'),
+      ],
+      errors: [ApiError(403, 'Minted API keys cannot submit invoices.')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/payables',
+      summary: 'The table, newest first.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam('state', 'string', where: 'query',
+            description: '`posted`, `pending`, or `denied`.'),
+      ],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/payables/stats',
+      summary: 'Counts by state and by extraction path, posted spend.',
+      auth: ApiAuth.reader,
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/payables/{id}',
+      summary: 'One invoice with candidates, conflicts, and its run journal.',
+      auth: ApiAuth.reader,
+      errors: [ApiError(404, 'Invoice not found.')],
+    ),
+  ],
+);
+
+// ---- Employee Hub ------------------------------------------------------------
+
+const employeeGroup = EndpointGroup(
+  title: 'Employee Hub',
+  blurb:
+      'Personal surface: profile, PTO, and the HR agent. PTO follows the flow '
+      'pattern in miniature — requests over the governed auto-approval window '
+      '(parsed from the pto-policy asset) raise a Task to the hr queue, and '
+      'the decision resumes the request.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/employee/me',
+      summary: 'The caller\'s profile: PTO balance, accrual, benefits.',
+      auth: ApiAuth.reader,
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/employee/pto',
+      summary: 'The caller\'s PTO requests, newest first.',
+      auth: ApiAuth.reader,
+    ),
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/employee/pto',
+      status: 201,
+      summary: 'Request time off — auto-approves within the governed window.',
+      auth: ApiAuth('user+', keysRefused: true),
+      params: [
+        ApiParam('start_date', 'string', required: true,
+            description: 'ISO date.'),
+        ApiParam('end_date', 'string', required: true, description: 'ISO date.'),
+        ApiParam('days', 'number', required: true,
+            description: 'Working days requested.'),
+        ApiParam('note', 'string'),
+      ],
+      errors: [ApiError(403, 'Minted API keys cannot request PTO.')],
+    ),
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/employee/hr-chat',
+      summary: 'Ask the HR Agent — grounded on people/ knowledge, cited.',
+      auth: ApiAuth.reader,
+      notes:
+          'With ANSWER_BACKEND=vertex the agent plans with tools over the '
+          'knowledge layer; locally it degrades to retrieval plus the '
+          'caller\'s structured facts, honestly labelled '
+          '`"backend": "retrieval"`. Citations name real asset ids.',
+      params: [
+        ApiParam('message', 'string', required: true),
+      ],
+      responseExample: '''{
+  "reply": "PTO balance: 17.5 days (accruing 1.67/month)…",
+  "citations": [{"id": "pto-policy", "title": "Paid Time Off Policy"}],
+  "backend": "retrieval"
+}''',
+    ),
+  ],
+);
+
+// ---- Tasks -----------------------------------------------------------------
+
+const _taskShape = '''{
+  "id": "task_mdm_0071",
+  "kind": "match_review",
+  "title": "Low-confidence vendor match: “Acme Ind. LLC”",
+  "queue": "data-steward",
+  "priority": "normal",
+  "status": "open",
+  "flow_id": "vendor-master-sync",
+  "case_ref": "erp-vend-88410",
+  "refs": ["vendor:acme-industrial@rev12"],
+  "evidence": [{"label": "Method", "value": "fuzzy_name · confidence 0.71"}],
+  "proposal": {
+    "action": "confirm-identity-link",
+    "target": "graph",
+    "summary": "Link erp-vend-88410 → vendor:acme-industrial (reversible)"
+  },
+  "resumes": "vendor-master-sync window closes with the match recorded",
+  "created_at_iso": "2026-08-25T09:14:02.000Z",
+  "decision": null
+}''';
+
+const tasksGroup = EndpointGroup(
+  title: 'Tasks',
+  blurb:
+      'The Task Queue — the unit of human judgment, routed through Queues. '
+      'An agent proposes, a person decides, the system resumes. Reads are '
+      'user+; deciding is human-only, so minted keys are refused: a key '
+      'deciding a task would be an agent approving its own proposal.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/tasks',
+      summary:
+          'Every task, open before done, high priority first among open, '
+          'oldest first within a band.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam(
+          'status',
+          'string',
+          where: 'query',
+          description: '`open` or `done`.',
+        ),
+        ApiParam(
+          'queue',
+          'string',
+          where: 'query',
+          description: 'Filter to one queue, e.g. `data-steward`.',
+        ),
+        ApiParam(
+          'kind',
+          'string',
+          where: 'query',
+          description:
+              '`decision`, `match_review`, `curation`, `eval_review`, '
+              'or `exception`.',
+        ),
+      ],
+      responseExample: '[$_taskShape]',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/tasks/stats',
+      summary: 'Open counts for the top-bar badge; only open tasks count.',
+      auth: ApiAuth.reader,
+      responseExample: '''{
+  "open": 9,
+  "high_priority": 3,
+  "by_queue": {"ap-clerk": 2, "data-steward": 2, "knowledge-curation": 2},
+  "by_kind": {"decision": 3, "match_review": 2, "curation": 2}
+}''',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/tasks/{id}',
+      summary: 'One task with its evidence, refs, and proposed action.',
+      auth: ApiAuth.reader,
+      responseExample: _taskShape,
+      errors: [ApiError(404, 'Task not found.')],
+    ),
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/tasks/{id}/decide',
+      summary: 'Record a human judgment; the task is closed and attributed.',
+      auth: ApiAuth('user+', keysRefused: true),
+      notes:
+          'Once-only: a second decision returns 409 so the second decider '
+          'learns the judgment already happened. The decision is durable, '
+          'attributed state — the prototype\'s stand-in for the curation '
+          'ledger entry every human decision must land as.',
+      params: [
+        ApiParam(
+          'verdict',
+          'string',
+          required: true,
+          description: '`approved`, `rejected`, or `corrected`.',
+        ),
+        ApiParam(
+          'note',
+          'string',
+          description: 'Recorded alongside the verdict.',
+        ),
+        ApiParam(
+          'correction',
+          'string',
+          description: 'What the human supplied in place of the proposal.',
+        ),
+      ],
+      requestExample:
+          '{"verdict": "approved", "note": "Matches the PO; posting."}',
+      errors: [
+        ApiError(403, 'Minted API keys cannot decide tasks.'),
+        ApiError(404, 'Task not found.'),
+        ApiError(409, 'Task already decided.'),
+      ],
+    ),
+  ],
+);
+
 const healthGroup = EndpointGroup(
   title: 'Health',
   blurb: 'Unauthenticated on purpose — Cloud Run and uptime probes need it.',
@@ -1141,6 +1484,10 @@ const restGroups = <EndpointGroup>[
   identitiesGroup,
   teamsGroup,
   flowsGroup,
+  tasksGroup,
+  reimbursementsGroup,
+  payablesGroup,
+  employeeGroup,
   apiKeysGroup,
   healthGroup,
 ];
