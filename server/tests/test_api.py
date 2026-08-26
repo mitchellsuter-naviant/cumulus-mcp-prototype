@@ -19,15 +19,17 @@ def client(_client):
 def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    assert resp.json()["assets"] == 5
+    assert resp.json()["assets"] == 9
 
 
 def test_list_and_prefix_filter(client):
-    assert len(client.get("/api/v1/assets").json()) == 5
+    assert len(client.get("/api/v1/assets").json()) == 9
     finance = client.get("/api/v1/assets", params={"prefix": "finance"}).json()
     assert {a["id"] for a in finance} == {
         "expense-approval-policy",
         "travel-booking-guideline",
+        "invoice-posting-policy",
+        "vendor-exemplar-acme-industrial",
     }
 
 
@@ -341,3 +343,31 @@ def test_parse_seed_file_without_frontmatter():
     assert asset.title == "Vpn Setup Note"
     assert asset.content_type == "text/plain"
     assert asset.content == "Just a note."
+
+
+def test_revision_bumps_on_update_and_resolver_dereferences(client):
+    before = client.get("/api/v1/assets/vpn-setup-note").json()
+    assert before["revision"] == 1
+    client.put(
+        "/api/v1/assets/vpn-setup-note",
+        json={"content": before["content"] + "\nrev bump"},
+    )
+    after = client.get("/api/v1/assets/vpn-setup-note").json()
+    assert after["revision"] == 2
+
+    # The resolver: current pin resolves cleanly...
+    ok = client.get("/api/v1/refs/knowledge:vpn-setup-note@rev2").json()
+    assert ok["resolved"] and ok["pinned_available"]
+    # ...a stale pin is honest about missing history...
+    stale = client.get("/api/v1/refs/knowledge:vpn-setup-note@rev1").json()
+    assert stale["resolved"] and stale["pinned_available"] is False
+    assert stale["current_revision"] == 2
+    # ...namespaces without a store say so rather than pretending...
+    graph = client.get("/api/v1/refs/graph:msa-master-7781@rev2").json()
+    assert graph["resolved"] is False and "entity graph" in graph["note"]
+    # ...and garbage is a 422, unknown knowledge a 404.
+    assert client.get("/api/v1/refs/nonsense").status_code == 422
+    assert (
+        client.get("/api/v1/refs/knowledge:nope@rev1").status_code
+        == 404
+    )

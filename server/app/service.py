@@ -161,7 +161,13 @@ class KnowledgeService:
         # validators — otherwise PUT could store a `path` that POST rejects.
         try:
             asset = Asset.model_validate(
-                {**current.model_dump(), **changes, "updated_at": utcnow()}
+                {
+                    **current.model_dump(),
+                    **changes,
+                    "updated_at": utcnow(),
+                    # Every write is a new revision; refs pin against this.
+                    "revision": current.revision + 1,
+                }
             )
         except ValidationError as exc:
             # errors() carries the original exception object in `ctx`, which is
@@ -648,6 +654,11 @@ def parse_seed_file(name: str, text: str) -> Asset:
                 continue
             key, _, value = line.partition(":")
             key, value = key.strip(), value.strip()
+            # A value containing a colon has to be quoted to survive the
+            # partition above ("Vendor exemplar: Acme Industrial"); strip the
+            # quoting so it does not end up in the stored title.
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1].strip()
             if key in _LIST_FIELDS:
                 meta[key] = [v.strip() for v in value.split(",") if v.strip()]
             elif value:

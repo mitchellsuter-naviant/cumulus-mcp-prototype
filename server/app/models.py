@@ -34,6 +34,12 @@ class Asset(BaseModel):
     supersedes: str | None = None
     superseded_by: str | None = None
     status: Status = "draft"
+    # Bumps on every content/metadata write. This is what `knowledge:{id}@revN`
+    # references pin to: read-sets, task refs, and run journals all stamp the
+    # revision they actually read, so a decision is explainable against the
+    # document as it was — not as it is. (Full revision *history* is a later
+    # step; the counter is the seam that makes the refs real today.)
+    revision: int = 1
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -56,6 +62,7 @@ class Asset(BaseModel):
             owner=self.owner,
             tags=self.tags,
             status=self.status,
+            revision=self.revision,
             updated_at=self.updated_at,
         )
 
@@ -70,6 +77,7 @@ class AssetSummary(BaseModel):
     owner: str
     tags: list[str]
     status: Status
+    revision: int = 1
     updated_at: datetime
 
 

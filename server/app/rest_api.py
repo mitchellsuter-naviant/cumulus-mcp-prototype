@@ -6,6 +6,7 @@ the asset — see teams.py for why authority has those two axes.
 """
 
 import logging
+import re
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -97,6 +98,58 @@ def list_assets(
 def asset_tree(principal: Principal = Depends(get_principal)) -> dict:
     require_reader(principal)
     return get_service().tree()
+
+
+@router.get("/refs/{ref:path}")
+def resolve_ref(ref: str, principal: Principal = Depends(get_principal)) -> dict:
+    """Resolve a read-set-namespace reference (`knowledge:{id}@rev{n}`).
+
+    This is the seam that joins the two halves of the prototype: pinned
+    read-sets, task refs, and run journals all speak in these strings, and
+    this endpoint dereferences them. Only the `knowledge:` namespace has a
+    store today; `vendor:`/`graph:`/`po:` answer honestly that theirs lands
+    with the entity store. A requested revision older than the current one
+    resolves to the current document with `pinned_available: false` — the
+    counter is real, retained history is not yet.
+    """
+    require_reader(principal)
+    match = re.fullmatch(r"([a-z]+):([a-z0-9\-]+)(?:@rev(\d+)|@(\d{4}))?", ref)
+    if match is None:
+        raise HTTPException(status_code=422, detail=f"Unparseable ref: {ref}")
+    namespace, ref_id, rev, year = match.groups()
+    requested = int(rev) if rev else None
+    if namespace != "knowledge":
+        return {
+            "ref": ref,
+            "namespace": namespace,
+            "id": ref_id,
+            "resolved": False,
+            "note": (
+                f"No store answers the '{namespace}:' namespace yet — it "
+                "lands with the entity graph."
+            ),
+        }
+    asset = get_service().repo.get(ref_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail=f"Unknown knowledge ref: {ref}")
+    return {
+        "ref": ref,
+        "namespace": namespace,
+        "id": ref_id,
+        "resolved": True,
+        "requested_revision": requested,
+        "current_revision": asset.revision,
+        "pinned_available": requested is None or requested == asset.revision,
+        "note": (
+            ""
+            if requested is None or requested == asset.revision
+            else (
+                f"Revision {requested} is not retained; serving the current "
+                f"rev{asset.revision}. Retained history is the next seam."
+            )
+        ),
+        "asset": asset.summary().model_dump(mode="json"),
+    }
 
 
 @router.get("/assets/{asset_id}", response_model=Asset)
