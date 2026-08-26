@@ -366,6 +366,23 @@ class CommandCatalog extends ChangeNotifier {
       icon: Icons.groups_outlined,
       intent: OpenSectionIntent(2),
     ),
+    // The workspaces. Section indices, like the three above, mirror the
+    // constants in home_shell.dart — they are the shell's vocabulary, and the
+    // palette navigates in it.
+    CatalogEntry(
+      label: 'Expense Reimbursement',
+      detail: 'workspace — requests, decisions, spend',
+      keywords: 'workspace expenses reimbursement receipts claims spend',
+      icon: Icons.folder_outlined,
+      intent: OpenSectionIntent(4),
+    ),
+    CatalogEntry(
+      label: 'Accounts Payable',
+      detail: 'workspace — invoices, exemplars, posting',
+      keywords: 'workspace ap accounts payable invoices vendors posting',
+      icon: Icons.folder_outlined,
+      intent: OpenSectionIntent(5),
+    ),
   ];
 
   Future<void> ensureLoaded() async {

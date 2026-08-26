@@ -7,15 +7,25 @@ import 'screens/login_screen.dart';
 import 'services/auth_service.dart';
 import 'theme/cumulus_theme.dart';
 
+/// Local development against a server running AUTH_BACKEND=none:
+/// `flutter run --dart-define=DEV_AUTH=true` skips the Firebase gate the
+/// committed firebase_options would otherwise impose. Compile-time only —
+/// a hosted build never sets it.
+const bool _devAuth = bool.fromEnvironment('DEV_AUTH');
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-  } catch (_) {
-    // Placeholder firebase_options: run without auth against a dev server.
+  if (_devAuth) {
     AuthService.instance.devMode = true;
+  } else {
+    try {
+      await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform,
+      );
+    } catch (_) {
+      // Placeholder firebase_options: run without auth against a dev server.
+      AuthService.instance.devMode = true;
+    }
   }
   AuthService.instance.bind();
   runApp(const CumulusAdminApp());

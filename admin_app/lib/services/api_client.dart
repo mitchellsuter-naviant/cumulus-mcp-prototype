@@ -8,7 +8,11 @@ import '../models/asset.dart';
 import '../models/identity.dart';
 import '../models/platform_user.dart';
 import '../models/team.dart';
+import '../models/employee.dart';
 import '../models/flow.dart';
+import '../models/payable.dart';
+import '../models/reimbursement.dart';
+import '../models/task.dart';
 import 'auth_service.dart';
 
 /// Configure at build/run time:
@@ -437,6 +441,220 @@ class ApiClient {
         .toList();
   }
 
+  // ---- reimbursements ----
+
+  Future<List<Reimbursement>> listReimbursements({String? state}) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/reimbursements', {
+          if (state != null && state.isNotEmpty) 'state': state,
+        }),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => Reimbursement.fromJson(j as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<ReimbursementStats> reimbursementStats() async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/reimbursements/stats'), headers: await _headers()),
+    );
+    _check(resp);
+    return ReimbursementStats.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// Triggers one live run of the expense-reimbursement flow. The image is
+  /// optional; the note doubles as extraction input for the local stub reader.
+  Future<Reimbursement> submitReimbursement({
+    String imageBase64 = '',
+    String filename = '',
+    String note = '',
+  }) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/reimbursements'),
+        headers: await _headers(),
+        body: jsonEncode({
+          if (imageBase64.isNotEmpty) 'image_base64': imageBase64,
+          if (filename.isNotEmpty) 'filename': filename,
+          if (note.isNotEmpty) 'note': note,
+        }),
+      ),
+      // A vision ModelCall is legitimately slower than a CRUD call.
+      timeout: const Duration(seconds: 60),
+    );
+    _check(resp);
+    return Reimbursement.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  // ---- accounts payable ----
+
+  Future<List<PayableInvoice>> listPayables({String? state}) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/payables', {
+          if (state != null && state.isNotEmpty) 'state': state,
+        }),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => PayableInvoice.fromJson(j as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<PayableStats> payableStats() async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/payables/stats'), headers: await _headers()),
+    );
+    _check(resp);
+    return PayableStats.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  /// One live run of the accounts-payable flow: classify → exemplar one-shot
+  /// or three-model ensemble → placeholders → post or review.
+  Future<PayableInvoice> submitInvoice({
+    String imageBase64 = '',
+    String filename = '',
+    String note = '',
+  }) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/payables'),
+        headers: await _headers(),
+        body: jsonEncode({
+          if (imageBase64.isNotEmpty) 'image_base64': imageBase64,
+          if (filename.isNotEmpty) 'filename': filename,
+          if (note.isNotEmpty) 'note': note,
+        }),
+      ),
+      // Up to three vision ModelCalls plus adjudication.
+      timeout: const Duration(seconds: 90),
+    );
+    _check(resp);
+    return PayableInvoice.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  // ---- employee hub ----
+
+  Future<EmployeeProfile> employeeProfile() async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/employee/me'), headers: await _headers()),
+    );
+    _check(resp);
+    return EmployeeProfile.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  Future<List<PtoRequest>> listPtoRequests() async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/employee/pto'), headers: await _headers()),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => PtoRequest.fromJson(j as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<PtoRequest> requestPto({
+    required String startDate,
+    required String endDate,
+    required double days,
+    String note = '',
+  }) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/employee/pto'),
+        headers: await _headers(),
+        body: jsonEncode({
+          'start_date': startDate,
+          'end_date': endDate,
+          'days': days,
+          if (note.isNotEmpty) 'note': note,
+        }),
+      ),
+    );
+    _check(resp);
+    return PtoRequest.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  Future<HrChatReply> hrChat(String message) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/employee/hr-chat'),
+        headers: await _headers(),
+        body: jsonEncode({'message': message}),
+      ),
+      // A planner-backed answer can take a while.
+      timeout: const Duration(seconds: 60),
+    );
+    _check(resp);
+    return HrChatReply.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  // ---- tasks ----
+
+  /// The Task Queue: open judgments first, high priority first among them.
+  Future<List<QueueTask>> listTasks({
+    String? status,
+    String? queue,
+    String? kind,
+  }) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/tasks', {
+          if (status != null && status.isNotEmpty) 'status': status,
+          if (queue != null && queue.isNotEmpty) 'queue': queue,
+          if (kind != null && kind.isNotEmpty) 'kind': kind,
+        }),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => QueueTask.fromJson(j as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Open counts for the top-bar badge; only open tasks are counted.
+  Future<TaskStats> taskStats() async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/tasks/stats'), headers: await _headers()),
+    );
+    _check(resp);
+    return TaskStats.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  /// Record a human judgment. The server refuses API keys (403) and a second
+  /// decision on the same task (409).
+  Future<QueueTask> decideTask(
+    String id, {
+    required String verdict,
+    String note = '',
+    String correction = '',
+  }) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/tasks/$id/decide'),
+        headers: await _headers(),
+        body: jsonEncode({
+          'verdict': verdict,
+          if (note.isNotEmpty) 'note': note,
+          if (correction.isNotEmpty) 'correction': correction,
+        }),
+      ),
+    );
+    _check(resp);
+    return QueueTask.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
   // ---- flows ----
 
   /// The fleet: every Flow and DataFlow definition with 30-day rollups,
@@ -616,9 +834,9 @@ class ApiClient {
         .toList();
   }
 
-  /// Stages a recommendation into the draft version — never the live one.
-  /// Returns the draft it landed in.
-  Future<FlowVersion> applyRecommendation(
+  /// Stages a recommendation into the draft version — never the live one —
+  /// and reports the experiment auto-launched to measure it.
+  Future<AppliedRecommendation> applyRecommendation(
     String id,
     String recommendationId,
   ) async {
@@ -629,8 +847,39 @@ class ApiClient {
       ),
     );
     _check(resp);
-    final body = jsonDecode(resp.body) as Map<String, dynamic>;
-    return FlowVersion.fromJson(body['draft'] as Map<String, dynamic>);
+    return AppliedRecommendation.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// The declared canonical facts plus the derived producer map for one
+  /// version (the active one when [version] is null).
+  Future<FlowContractInfo> flowContract(String id, {int? version}) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/flows/$id/contract', {
+          if (version != null) 'version': '$version',
+        }),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return FlowContractInfo.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  Future<List<CorrectionSet>> flowCorrectionSets(String id) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/flows/$id/correction-sets'),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => CorrectionSet.fromJson(j as Map<String, dynamic>))
+        .toList();
   }
 
   Future<GoldenSetInfo> flowGoldenSet(String id) async {
@@ -690,6 +939,53 @@ class ApiClient {
     );
   }
 
+  /// Bulk upload: JSONL, one case per line — many cases, one dataset revision.
+  Future<GoldenSetInfo> importGoldenCases(String id, String jsonl) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/flows/$id/golden-set/import'),
+        headers: await _headers(),
+        body: jsonEncode({'jsonl': jsonl}),
+      ),
+    );
+    _check(resp);
+    return GoldenSetInfo.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// The fixture document behind a case, with grounded field regions.
+  Future<CaseDocument> goldenCaseDocument(String id, String caseId) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/flows/$id/golden-set/$caseId/document'),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return CaseDocument.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  /// Records a human's pass over the case's labels. An empty [corrections]
+  /// map confirms the case as labelled; either way the dataset version moves.
+  Future<GoldenSetInfo> reviewGoldenCase(
+    String id,
+    String caseId, {
+    Map<String, String> corrections = const {},
+  }) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/flows/$id/golden-set/$caseId/review'),
+        headers: await _headers(),
+        body: jsonEncode({'corrections': corrections}),
+      ),
+    );
+    _check(resp);
+    return GoldenSetInfo.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
   Future<List<TestRun>> flowTestRuns(String id) async {
     final resp = await _send(
       _http.get(
@@ -709,6 +1005,7 @@ class ApiClient {
     String id, {
     String candidateVersion = '',
     String baselineVersion = '',
+    String reads = 'pinned',
   }) async {
     final resp = await _send(
       _http.post(
@@ -717,6 +1014,7 @@ class ApiClient {
         body: jsonEncode({
           'candidate_version': candidateVersion,
           'baseline_version': baselineVersion,
+          'reads': reads,
         }),
       ),
     );

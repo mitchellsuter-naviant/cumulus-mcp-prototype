@@ -5,15 +5,48 @@ import '../theme/cumulus_theme.dart';
 import 'command_palette.dart';
 
 /// One stop on the left rail.
+///
+/// A stop either shows a section — [index] names it — or opens a dropdown of
+/// [children], each of which shows one. The rail stopped being positional
+/// when workspaces arrived: there are now more sections than stops, so a stop
+/// carries the index it selects rather than being identified by its place in
+/// the list.
 class RailDestination {
   final IconData icon;
   final String label;
   final int badge;
 
+  /// The section this stop shows. Null on a dropdown stop — its children
+  /// carry the indices instead.
+  final int? index;
+
+  /// Non-empty when this stop opens a panel rather than selecting a section.
+  final List<RailChild> children;
+
   const RailDestination({
     required this.icon,
     required this.label,
+    this.index,
+    this.children = const [],
     this.badge = 0,
+  });
+
+  bool get isMenu => children.isNotEmpty;
+}
+
+/// One row of a dropdown stop's panel — a workspace, in the one case the
+/// console has today.
+class RailChild {
+  final IconData icon;
+  final String label;
+  final String? detail;
+  final int index;
+
+  const RailChild({
+    required this.label,
+    required this.index,
+    this.icon = Icons.folder_outlined,
+    this.detail,
   });
 }
 
@@ -38,6 +71,20 @@ class CumulusShell extends StatefulWidget {
   /// Opens the API reference from the help menu.
   final VoidCallback? onOpenApiDocs;
 
+  /// Opens the Employee Hub from the account menu.
+  final VoidCallback? onOpenEmployeeHub;
+
+  /// True while the Employee Hub is the visible section. The hub owns no rail
+  /// destination — it is personal, not a workstream — so the account button
+  /// carries the active ring instead, and the rail correctly shows nothing
+  /// selected.
+  final bool employeeHubActive;
+
+  /// The Task Queue button — lives in the account cluster because judgment is
+  /// requested from every screen, not from a section. The application supplies
+  /// it (it needs the ApiClient); the shell only places it.
+  final Widget? taskButton;
+
   final Widget child;
 
   const CumulusShell({
@@ -50,6 +97,9 @@ class CumulusShell extends StatefulWidget {
     this.accountLabel,
     this.onSignOut,
     this.onOpenApiDocs,
+    this.onOpenEmployeeHub,
+    this.employeeHubActive = false,
+    this.taskButton,
     required this.child,
   });
 
@@ -135,6 +185,9 @@ class _CumulusShellState extends State<CumulusShell> {
                     accountLabel: widget.accountLabel,
                     onSignOut: widget.onSignOut,
                     onOpenApiDocs: widget.onOpenApiDocs,
+                    onOpenEmployeeHub: widget.onOpenEmployeeHub,
+                    employeeHubActive: widget.employeeHubActive,
+                    taskButton: widget.taskButton,
                   ),
                   Expanded(
                     child: Row(
@@ -195,6 +248,9 @@ class _TopBar extends StatelessWidget {
   final String? accountLabel;
   final VoidCallback? onSignOut;
   final VoidCallback? onOpenApiDocs;
+  final VoidCallback? onOpenEmployeeHub;
+  final bool employeeHubActive;
+  final Widget? taskButton;
 
   const _TopBar({
     required this.palette,
@@ -202,6 +258,9 @@ class _TopBar extends StatelessWidget {
     this.accountLabel,
     this.onSignOut,
     this.onOpenApiDocs,
+    this.onOpenEmployeeHub,
+    this.employeeHubActive = false,
+    this.taskButton,
   });
 
   @override
@@ -226,9 +285,18 @@ class _TopBar extends StatelessWidget {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
+                if (taskButton != null) ...[
+                  taskButton!,
+                  const SizedBox(width: 10),
+                ],
                 _HelpButton(onOpenApiDocs: onOpenApiDocs),
                 const SizedBox(width: 10),
-                _AccountButton(label: accountLabel, onSignOut: onSignOut),
+                _AccountButton(
+                  label: accountLabel,
+                  onSignOut: onSignOut,
+                  onOpenEmployeeHub: onOpenEmployeeHub,
+                  hubActive: employeeHubActive,
+                ),
               ],
             ),
           ),
@@ -514,8 +582,15 @@ class _HelpButton extends StatelessWidget {
 class _AccountButton extends StatelessWidget {
   final String? label;
   final VoidCallback? onSignOut;
+  final VoidCallback? onOpenEmployeeHub;
+  final bool hubActive;
 
-  const _AccountButton({this.label, this.onSignOut});
+  const _AccountButton({
+    this.label,
+    this.onSignOut,
+    this.onOpenEmployeeHub,
+    this.hubActive = false,
+  });
 
   String get _initials {
     final source = (label ?? '').trim();
@@ -535,7 +610,10 @@ class _AccountButton extends StatelessWidget {
     return PopupMenuButton<String>(
       tooltip: label ?? 'Account',
       offset: const Offset(0, 44),
-      onSelected: (_) => onSignOut?.call(),
+      onSelected: (value) {
+        if (value == 'signout') onSignOut?.call();
+        if (value == 'employee-hub') onOpenEmployeeHub?.call();
+      },
       itemBuilder: (context) => [
         PopupMenuItem<String>(
           enabled: false,
@@ -543,6 +621,31 @@ class _AccountButton extends StatelessWidget {
           child: Text(label ?? 'Signed in', style: CumulusText.meta),
         ),
         const PopupMenuDivider(),
+        PopupMenuItem<String>(
+          value: 'employee-hub',
+          height: 52,
+          child: Row(
+            children: [
+              const Icon(
+                Icons.badge_outlined,
+                size: 16,
+                color: CumulusColors.inkSecondary,
+              ),
+              const SizedBox(width: 10),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('Employee Hub', style: TextStyle(fontSize: 13)),
+                  Text(
+                    'PTO, benefits, and the HR Agent',
+                    style: CumulusText.sectionSubtitle,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
         const PopupMenuItem<String>(
           value: 'signout',
           height: 40,
@@ -560,18 +663,20 @@ class _AccountButton extends StatelessWidget {
         height: 34,
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: CumulusColors.surface,
+          color: hubActive ? CumulusColors.ink : CumulusColors.surface,
           shape: BoxShape.circle,
-          border: Border.all(color: CumulusColors.border),
+          border: Border.all(
+            color: hubActive ? CumulusColors.ink : CumulusColors.border,
+          ),
           boxShadow: CumulusShadows.card,
         ),
         child: Text(
           _initials.toUpperCase(),
-          style: const TextStyle(
+          style: TextStyle(
             fontSize: 11.5,
             fontWeight: FontWeight.w700,
             letterSpacing: 0.4,
-            color: CumulusColors.inkSecondary,
+            color: hubActive ? Colors.white : CumulusColors.inkSecondary,
           ),
         ),
       ),
@@ -606,12 +711,19 @@ class _Rail extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            for (var i = 0; i < destinations.length; i++)
-              _RailButton(
-                destination: destinations[i],
-                selected: i == selectedIndex,
-                onTap: () => onSelected(i),
-              ),
+            for (final destination in destinations)
+              if (destination.isMenu)
+                _RailMenuButton(
+                  destination: destination,
+                  selectedIndex: selectedIndex,
+                  onSelected: onSelected,
+                )
+              else
+                _RailButton(
+                  destination: destination,
+                  selected: destination.index == selectedIndex,
+                  onTap: () => onSelected(destination.index!),
+                ),
           ],
         ),
       ),
@@ -640,53 +752,172 @@ class _RailButton extends StatelessWidget {
         verticalOffset: -2,
         margin: const EdgeInsets.only(left: 60),
         child: Material(
-          color: selected ? CumulusColors.accentSoft : Colors.transparent,
+          color: Colors.transparent,
           borderRadius: BorderRadius.circular(12),
           child: InkWell(
             onTap: onTap,
             borderRadius: BorderRadius.circular(12),
             hoverColor: CumulusColors.surfaceMuted,
-            child: SizedBox(
-              width: 40,
-              height: 40,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  Icon(
-                    destination.icon,
-                    size: 19,
-                    color: selected
-                        ? CumulusColors.accent
-                        : CumulusColors.inkMuted,
-                  ),
-                  if (destination.badge > 0)
-                    Positioned(
-                      top: 5,
-                      right: 4,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 4,
-                          vertical: 1,
-                        ),
-                        decoration: BoxDecoration(
-                          color: CumulusColors.ink,
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: Text(
-                          '${destination.badge}',
-                          style: const TextStyle(
-                            fontSize: 8.5,
-                            fontWeight: FontWeight.w700,
-                            color: Colors.white,
-                          ),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
+            child: _RailGlyph(destination: destination, selected: selected),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// A dropdown stop: the icon opens a panel of workspaces hanging off the
+/// right edge of the rail. The stop itself is never a destination — it carries
+/// the active ring only while one of its children is the visible section, so
+/// the rail still shows exactly one selection.
+class _RailMenuButton extends StatelessWidget {
+  final RailDestination destination;
+  final int selectedIndex;
+  final ValueChanged<int> onSelected;
+
+  const _RailMenuButton({
+    required this.destination,
+    required this.selectedIndex,
+    required this.onSelected,
+  });
+
+  bool get _active =>
+      destination.children.any((child) => child.index == selectedIndex);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+      child: PopupMenuButton<int>(
+        tooltip: destination.label,
+        // Hangs to the right of the rail rather than below it, so the panel
+        // reads as a drawer opening out of the stop it belongs to.
+        offset: const Offset(46, -6),
+        position: PopupMenuPosition.over,
+        constraints: const BoxConstraints(minWidth: 236, maxWidth: 300),
+        onSelected: onSelected,
+        itemBuilder: (context) => [
+          PopupMenuItem<int>(
+            enabled: false,
+            height: 34,
+            child: Text(
+              destination.label.toUpperCase(),
+              style: CumulusText.statLabel,
+            ),
+          ),
+          for (final child in destination.children)
+            PopupMenuItem<int>(
+              value: child.index,
+              height: child.detail == null ? 46 : 56,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: _RailChildRow(
+                child: child,
+                active: child.index == selectedIndex,
+              ),
+            ),
+        ],
+        child: _RailGlyph(destination: destination, selected: _active),
+      ),
+    );
+  }
+}
+
+class _RailChildRow extends StatelessWidget {
+  final RailChild child;
+  final bool active;
+
+  const _RailChildRow({required this.child, required this.active});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: active ? CumulusColors.surfaceMuted : Colors.transparent,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            child.icon,
+            size: 16,
+            color: active ? CumulusColors.accent : CumulusColors.inkMuted,
+          ),
+          const SizedBox(width: 11),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  child.label,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: active ? FontWeight.w600 : FontWeight.w500,
+                    color: CumulusColors.ink,
+                  ),
+                ),
+                if (child.detail != null)
+                  Text(child.detail!, style: CumulusText.sectionSubtitle),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The 40×40 icon well shared by both kinds of stop: the active ring, the
+/// glyph, and the badge.
+class _RailGlyph extends StatelessWidget {
+  final RailDestination destination;
+  final bool selected;
+
+  const _RailGlyph({required this.destination, required this.selected});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        color: selected ? CumulusColors.accentSoft : Colors.transparent,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Icon(
+            destination.icon,
+            size: 19,
+            color: selected ? CumulusColors.accent : CumulusColors.inkMuted,
+          ),
+          if (destination.badge > 0)
+            Positioned(
+              top: 5,
+              right: 4,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 4,
+                  vertical: 1,
+                ),
+                decoration: BoxDecoration(
+                  color: CumulusColors.ink,
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  '${destination.badge}',
+                  style: const TextStyle(
+                    fontSize: 8.5,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }

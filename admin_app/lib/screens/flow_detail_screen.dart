@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../models/flow.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import '../widgets/case_review.dart';
 import '../widgets/cumulus_shell.dart';
 import '../widgets/mini_charts.dart';
 import '../widgets/side_drawer.dart';
@@ -74,6 +75,7 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
   List<TestRun> _tests = [];
   List<Recommendation> _recommendations = [];
   List<FlowVersion> _versions = [];
+  List<CorrectionSet> _correctionSets = [];
 
   int? _selectedVersion;
   List<StepDiff> _canvasSteps = [];
@@ -84,9 +86,13 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
   RunDetail? _runDetail;
   bool _loadingRun = false;
 
+  /// The experiment painted on the canvas in the Eval lens.
+  TestRun? _evalRun;
+  bool _liveReads = false;
+
   ChartMeasure _measure = ChartMeasure.runs;
 
-  /// 0 = step definition, 1 = runs and their step payloads.
+  /// 0 = step definition, 1 = runs and their payloads, 2 = eval lens.
   int _rightTab = 0;
 
   bool _loading = true;
@@ -142,20 +148,26 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
         _api.flowTestRuns(id),
         _api.flowVersions(id),
         _api.flowRecommendations(id),
+        _api.flowCorrectionSets(id),
       ]);
       if (!mounted) return;
       final versions = results[5] as List<FlowVersion>;
+      final tests = results[4] as List<TestRun>;
       setState(() {
         _detail = results[0] as FlowDetail;
         _usage = results[1] as FlowUsage;
         _runs = results[2] as List<RunSummary>;
         _golden = results[3] as GoldenSetInfo;
-        _tests = results[4] as List<TestRun>;
+        _tests = tests;
         _versions = versions;
         _recommendations = results[6] as List<Recommendation>;
+        _correctionSets = results[7] as List<CorrectionSet>;
         _selectedVersion ??= (versions.where((v) => v.isDraft).firstOrNull ??
                 versions.where((v) => v.isActive).firstOrNull)
             ?.version;
+        _evalRun = _evalRun == null
+            ? tests.where((t) => !t.running).firstOrNull
+            : tests.where((t) => t.id == _evalRun!.id).firstOrNull ?? _evalRun;
         _loading = false;
       });
       await _loadCanvas();
@@ -201,7 +213,18 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
         try {
           final tests = await _api.flowTestRuns(widget.flowId);
           if (!mounted) return;
-          setState(() => _tests = tests);
+          setState(() {
+            _tests = tests;
+            // Keep the canvas overlay pointed at the same experiment as its
+            // step stats fill in.
+            if (_evalRun != null) {
+              _evalRun =
+                  tests.where((t) => t.id == _evalRun!.id).firstOrNull ??
+                  _evalRun;
+            } else {
+              _evalRun = tests.where((t) => !t.running).firstOrNull;
+            }
+          });
           if (!tests.any((t) => t.running)) {
             _poll?.cancel();
             _poll = null;
@@ -231,15 +254,17 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
     if (_launching) return;
     setState(() => _launching = true);
     try {
-      await _api.launchTestRun(
+      final launched = await _api.launchTestRun(
         widget.flowId,
         candidateVersion: _draftVersion?.display ?? '',
         baselineVersion: _activeVersion?.display ?? '',
+        reads: _liveReads ? 'live' : 'pinned',
       );
       final tests = await _api.flowTestRuns(widget.flowId);
       if (!mounted) return;
       setState(() {
         _tests = tests;
+        _evalRun = tests.where((t) => t.id == launched.id).firstOrNull;
         _tab = 2;
       });
       _ensurePolling();
@@ -672,6 +697,9 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
                   ? '${_activeVersion!.display} (active)'
                   : '',
               runPath: _runPath,
+              evalOverlay: _rightTab == 2 && _evalRun != null
+                  ? EvalOverlay.fromRun(_evalRun!)
+                  : null,
               selectedStepId: _selectedStepId,
               onSelect: (step) => setState(() => _selectedStepId = step?.id),
               onExportSchema:
@@ -696,15 +724,16 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
             child: Align(
               alignment: Alignment.centerLeft,
               child: SegmentedTabs(
-                labels: const ['Definition', 'Runs'],
+                labels: const ['Definition', 'Runs', 'Eval'],
                 selectedIndex: _rightTab,
                 onChanged: (i) => setState(() {
                   _rightTab = i;
                   // Leaving Runs drops the trace with it. The run highlight
                   // belongs to the Runs tab; leaving it on while reading the
                   // definition claims the graph is showing one execution when
-                  // nothing on screen says which.
-                  if (i == 0) {
+                  // nothing on screen says which. The eval heatmap likewise
+                  // paints only while its own tab owns the graph.
+                  if (i != 1) {
                     _selectedRun = null;
                     _runDetail = null;
                   }
@@ -714,7 +743,11 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
           ),
           const Divider(height: 1),
           Expanded(
-            child: _rightTab == 0 ? _definitionPanel() : _runsPanel(),
+            child: switch (_rightTab) {
+              0 => _definitionPanel(),
+              1 => _runsPanel(),
+              _ => _evalPanel(),
+            },
           ),
         ],
       ),
@@ -975,6 +1008,359 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
     );
   }
 
+  // ---- Eval lens (right column, third tab) --------------------------------
+
+  /// The graph as a heatmap for one experiment: pick the experiment here,
+  /// click a hot node on the canvas, and its failing assertions land below.
+  Widget _evalPanel() {
+    if (_tests.isEmpty) {
+      return CumulusEmptyState(
+        icon: Icons.science_outlined,
+        title: 'No experiments yet',
+        message:
+            'Run the suite to grade the candidate against the golden set — '
+            'each step lights up with the pass rate of the facts it owns.',
+        action: OutlinedButton(
+          onPressed: (_isAdmin && !_launching) ? _launchTest : null,
+          child: const Text('Run experiment'),
+        ),
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+          child: Text('EXPERIMENT', style: CumulusText.sectionTitle),
+        ),
+        for (final run in _tests.take(4)) _evalRunOption(run),
+        const Divider(height: 17),
+        Expanded(
+          child: _evalRun == null
+              ? const CumulusEmptyState(
+                  icon: Icons.touch_app_outlined,
+                  title: 'Pick an experiment',
+                  message: 'Select one above to paint it onto the graph.',
+                )
+              : _evalDetail(_evalRun!),
+        ),
+      ],
+    );
+  }
+
+  Widget _evalRunOption(TestRun run) {
+    final selected = _evalRun?.id == run.id;
+    return Material(
+      color: selected
+          ? CumulusColors.surfaceMuted.withValues(alpha: 0.7)
+          : Colors.transparent,
+      child: InkWell(
+        onTap: () => setState(() => _evalRun = run),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+          child: Row(
+            children: [
+              Icon(
+                selected
+                    ? Icons.radio_button_checked
+                    : Icons.radio_button_off,
+                size: 14,
+                color: selected
+                    ? CumulusColors.accent
+                    : CumulusColors.inkMuted,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  '${run.candidateVersion} vs ${run.baselineVersion}'
+                  ' · dataset v${run.datasetVersion}',
+                  overflow: TextOverflow.ellipsis,
+                  style: CumulusText.mono.copyWith(fontSize: 11.5),
+                ),
+              ),
+              const SizedBox(width: 8),
+              if (run.running)
+                Text(
+                  '${run.results.length}/${run.totalCases}…',
+                  style: CumulusText.meta,
+                )
+              else ...[
+                if (run.gate != null)
+                  Icon(
+                    run.gate!.passed
+                        ? Icons.verified_outlined
+                        : Icons.block_outlined,
+                    size: 14,
+                    color: run.gate!.passed
+                        ? CumulusColors.success
+                        : CumulusColors.danger,
+                  ),
+                const SizedBox(width: 6),
+                Text(
+                  '${run.passed}/${run.totalCases}',
+                  style: const TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _evalDetail(TestRun run) {
+    final stepId = _selectedStepId;
+    if (stepId == null) {
+      return ListView(
+        padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+        children: [
+          _gateBanner(run),
+          const SizedBox(height: 14),
+          Text('BY STEP', style: CumulusText.sectionTitle),
+          const SizedBox(height: 4),
+          Text(
+            'assertions graded where their facts are produced — click a '
+            'node on the canvas to see its failures',
+            style: CumulusText.meta,
+          ),
+          const SizedBox(height: 10),
+          for (final stat in run.stepStats) _stepStatRow(stat),
+          if (run.stepStats.isEmpty)
+            Text(
+              run.running
+                  ? 'Grading — stats fill in as cases land.'
+                  : 'No localized assertions in this experiment.',
+              style: CumulusText.meta,
+            ),
+        ],
+      );
+    }
+    // Every assertion this step owns, across all cases; failures first.
+    final owned = <(TestCaseResult, AssertionResult)>[
+      for (final result in run.results)
+        for (final a in result.assertions)
+          if (a.stepId == stepId) (result, a),
+    ];
+    if (owned.isEmpty) {
+      return const CumulusEmptyState(
+        icon: Icons.rule_outlined,
+        title: 'Owns no assertions',
+        message:
+            'No contract fact projects onto this step in the candidate '
+            'version, so the experiment has nothing to say about it.',
+      );
+    }
+    final failing = owned.where((e) => !e.$2.passed).toList();
+    final passing = owned.length - failing.length;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+      children: [
+        Text(
+          '${failing.length} failing · $passing passing on this step',
+          style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 10),
+        for (final (result, a) in failing) _assertionRow(result, a),
+        if (failing.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(13),
+            decoration: BoxDecoration(
+              color: CumulusColors.surfaceMuted,
+              borderRadius: BorderRadius.circular(CumulusRadius.control),
+            ),
+            child: Text(
+              'Every assertion this step owns passed in '
+              '${run.candidateVersion}.',
+              style: CumulusText.meta,
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _gateBanner(TestRun run) {
+    if (run.running) {
+      return Container(
+        padding: const EdgeInsets.all(13),
+        decoration: BoxDecoration(
+          color: CumulusColors.surfaceMuted,
+          borderRadius: BorderRadius.circular(CumulusRadius.control),
+        ),
+        child: Text(
+          'Grading ${run.results.length}/${run.totalCases} cases — the gate '
+          'is stated when the run completes.',
+          style: CumulusText.meta,
+        ),
+      );
+    }
+    final gate = run.gate;
+    if (gate == null) return const SizedBox.shrink();
+    final tone = gate.passed ? CumulusTone.success : CumulusTone.danger;
+    return Container(
+      padding: const EdgeInsets.all(13),
+      decoration: BoxDecoration(
+        color: tone.background,
+        borderRadius: BorderRadius.circular(CumulusRadius.control),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            gate.passed ? Icons.verified_outlined : Icons.block_outlined,
+            size: 16,
+            color: tone.foreground,
+          ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Text(
+              gate.passed
+                  ? 'Gate: promotable — no regressions, at or above the '
+                        'baseline.'
+                  : 'Gate: blocked — ${gate.reasons.join('; ')}.',
+              style: TextStyle(
+                fontSize: 12,
+                height: 1.4,
+                fontWeight: FontWeight.w600,
+                color: tone.foreground,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _stepStatRow(StepStat stat) {
+    final color = evalTone(stat.passRate);
+    return InkWell(
+      onTap: () => setState(() => _selectedStepId = stat.stepId),
+      borderRadius: BorderRadius.circular(CumulusRadius.control),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 138,
+              child: Text(
+                stat.stepName,
+                overflow: TextOverflow.ellipsis,
+                style: CumulusText.mono.copyWith(fontSize: 11.5),
+              ),
+            ),
+            Expanded(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(99),
+                child: LinearProgressIndicator(
+                  minHeight: 7,
+                  value: stat.passRate,
+                  color: color,
+                  backgroundColor: CumulusColors.surfaceMuted,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            SizedBox(
+              width: 64,
+              child: Text(
+                '${stat.passed}/${stat.total}',
+                textAlign: TextAlign.right,
+                style: const TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _assertionRow(TestCaseResult result, AssertionResult a) {
+    final review = a.verdict == 'review';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      decoration: BoxDecoration(
+        color: CumulusColors.surface,
+        borderRadius: BorderRadius.circular(CumulusRadius.control),
+        border: Border.all(
+          color: review ? CumulusColors.accent : CumulusColors.danger,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  result.name,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              StatusBadge(
+                review ? 'review task' : a.grader,
+                dense: true,
+                tone: review ? CumulusTone.accent : CumulusTone.neutral,
+              ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          Text(
+            a.label,
+            style: CumulusText.mono.copyWith(
+              fontSize: 11,
+              color: CumulusColors.inkSecondary,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            'expected ${a.expected}\ngot      ${a.actual}',
+            style: CumulusText.mono.copyWith(fontSize: 11.5, height: 1.5),
+          ),
+          if (_golden?.cases.any((c) => c.id == result.caseId) ?? false)
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  visualDensity: VisualDensity.compact,
+                ),
+                onPressed: () => _openReview(
+                  _golden!.cases.firstWhere((c) => c.id == result.caseId),
+                ),
+                child: const Text('Review case'),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openReview(GoldenCase goldenCase) async {
+    final updated = await showCaseReview(
+      context,
+      api: _api,
+      flowId: widget.flowId,
+      goldenCase: goldenCase,
+      canEdit: _isAdmin,
+    );
+    if (updated != null && mounted) {
+      setState(() => _golden = updated);
+      _snack(
+        'Review saved — golden dataset is now v${updated.version}',
+      );
+    }
+  }
+
   /// The flywheel in miniature: an execution that needed judgment becomes the
   /// case that guards against needing it again.
   Future<void> _promoteRun(RunDetail run) async {
@@ -996,8 +1382,10 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'The case keeps a pointer back to ${run.id}, so a future '
-                'failure on it is traceable to the execution it came from.',
+                'The case keeps a pointer back to ${run.id}, and captures '
+                'the reads the run made off its journal — the pinned world '
+                'that keeps the regression grade reproducible. Refine the '
+                'labels afterwards in the review screen.',
                 style: CumulusText.meta,
               ),
               const SizedBox(height: 16),
@@ -1112,25 +1500,29 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
     return [
       LayoutBuilder(
         builder: (context, constraints) {
-          final golden = _goldenCard();
-          final right = Column(
+          final datasets = Column(
             spacing: 16,
             crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [_harnessCard(), _recommenderCard()],
+            children: [_goldenCard(), _correctionSetsCard()],
+          );
+          final experiments = Column(
+            spacing: 16,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [_experimentsCard(), _recommenderCard()],
           );
           if (constraints.maxWidth < 1120) {
             return Column(
               spacing: 16,
               crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [golden, right],
+              children: [datasets, experiments],
             );
           }
           return Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             spacing: 16,
             children: [
-              Expanded(child: golden),
-              Expanded(child: right),
+              Expanded(child: datasets),
+              Expanded(child: experiments),
             ],
           );
         },
@@ -1143,14 +1535,22 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
     final cases = golden?.cases ?? const <GoldenCase>[];
     return ListCard(
       title: 'Golden dataset',
-      subtitle: '${cases.length} cases · knowledge-role Dataset',
-      headerTrailing: _isAdmin
-          ? TextButton.icon(
-              onPressed: _addGoldenCase,
-              icon: const Icon(Icons.add, size: 15),
-              label: const Text('Add case'),
-            )
-          : null,
+      subtitle:
+          '${cases.length} cases · dataset v${golden?.version ?? 1} · '
+          'knowledge-role Dataset',
+      headerTrailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (golden != null && golden.revisions.isNotEmpty)
+            _RevisionsButton(revisions: golden.revisions),
+          if (_isAdmin)
+            TextButton.icon(
+              onPressed: _importCases,
+              icon: const Icon(Icons.upload_file_outlined, size: 15),
+              label: const Text('Upload'),
+            ),
+        ],
+      ),
       children: [
         if (golden != null && golden.syncedFrom.isNotEmpty)
           Container(
@@ -1166,8 +1566,9 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'Seeded from ${golden.syncedFrom}'
-                    '${golden.syncedAt == null ? '' : ' · synced ${agoLabel(golden.syncedAt!)}'}',
+                    'Authored in code, synced from ${golden.syncedFrom}'
+                    '${golden.syncedAt == null ? '' : ' · ${agoLabel(golden.syncedAt!)}'}'
+                    ' — the console curates; the SDK authors.',
                     style: CumulusText.meta,
                   ),
                 ),
@@ -1179,27 +1580,50 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
             icon: Icons.dataset_outlined,
             title: 'No golden cases yet',
             message:
-                'Promote a run, or add a case by hand, before grading a '
-                'candidate version.',
+                'Seed the set: promote runs from the canvas (labels and the '
+                'pinned read-set come off the journal), upload JSONL from '
+                'your notebook, or push from the SDK.',
           )
         else
           for (final c in cases)
             CumulusListRow(
               leading: SizedBox(
-                width: 96,
+                width: 82,
                 child: Text(
                   c.id,
                   overflow: TextOverflow.ellipsis,
                   style: CumulusText.mono.copyWith(fontSize: 11.5),
                 ),
               ),
-              title: Text(c.name),
+              title: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(c.name, overflow: TextOverflow.ellipsis),
+                  ),
+                  if (c.reviewedBy.isNotEmpty) ...[
+                    const SizedBox(width: 6),
+                    const Tooltip(
+                      message: 'Labels human-reviewed',
+                      child: Icon(
+                        Icons.verified_outlined,
+                        size: 13,
+                        color: CumulusColors.success,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
               subtitle: Text(
-                'expect: ${c.expected}'
-                '${c.runId.isEmpty ? '' : ' · from ${c.runId}'}',
+                c.assertionCount == 0
+                    ? 'expect: ${c.expected}'
+                    : '${c.assertions.length} fact · ${c.trajectory.length} '
+                          'trajectory assertions · ${c.readSet.length} pinned '
+                          'reads${c.runId.isEmpty ? '' : ' · from ${c.runId}'}',
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
               ),
+              onTap: () => _openReview(c),
               trailing: [
                 StatusBadge(
                   c.source,
@@ -1208,8 +1632,16 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
                       ? CumulusTone.accent
                       : CumulusTone.neutral,
                 ),
-                if (_isAdmin) ...[
-                  const SizedBox(width: 6),
+                const SizedBox(width: 6),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                  onPressed: () => _openReview(c),
+                  child: const Text('Review'),
+                ),
+                if (_isAdmin)
                   IconButton(
                     tooltip: 'Remove case',
                     icon: const Icon(Icons.close, size: 14),
@@ -1226,136 +1658,254 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
                       }
                     },
                   ),
+              ],
+            ),
+        Container(
+          margin: const EdgeInsets.fromLTRB(20, 10, 20, 16),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: CumulusColors.surfaceMuted,
+            borderRadius: BorderRadius.circular(CumulusRadius.control),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'cumulus eval push --flow ${widget.flowId} golden/*.jsonl',
+                  style: CumulusText.mono.copyWith(fontSize: 11),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Copy the SDK command',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.copy, size: 13),
+                onPressed: () async {
+                  await Clipboard.setData(
+                    ClipboardData(
+                      text:
+                          'cumulus eval push --flow ${widget.flowId} '
+                          'golden/*.jsonl',
+                    ),
+                  );
+                  _snack('Copied');
+                },
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _correctionSetsCard() {
+    return ListCard(
+      title: 'Correction sets',
+      subtitle:
+          'raw → corrected pairs, auto-appended by the flywheel · one per '
+          'ModelCall',
+      children: [
+        if (_correctionSets.isEmpty)
+          const CumulusEmptyState(
+            icon: Icons.model_training_outlined,
+            title: 'No ModelCalls',
+            message:
+                'This definition invokes no models, so there is nothing for '
+                'human corrections to accumulate against.',
+          )
+        else
+          for (final set in _correctionSets)
+            CumulusListRow(
+              leading: SizedBox(
+                width: 82,
+                child: Text(
+                  set.stepId,
+                  style: CumulusText.mono.copyWith(fontSize: 11.5),
+                ),
+              ),
+              title: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      set.stepName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  if (set.model.isNotEmpty) ...[
+                    const SizedBox(width: 8),
+                    StatusBadge(set.model, dense: true, tone: CumulusTone.violet),
+                  ],
                 ],
+              ),
+              subtitle: Text(
+                set.pairs == 0
+                    ? 'no corrections yet'
+                    : '${set.pairs} pairs · last appended '
+                          '${set.lastAppended == null ? '—' : agoLabel(set.lastAppended!)}',
+              ),
+              onTap: set.sample.isEmpty ? null : () => _openCorrectionSet(set),
+              trailing: [
+                if (set.sample.isNotEmpty)
+                  const Icon(
+                    Icons.chevron_right,
+                    size: 16,
+                    color: CumulusColors.inkMuted,
+                  ),
               ],
             ),
       ],
     );
   }
 
-  Future<void> _addGoldenCase() async {
-    final name = TextEditingController();
-    final expected = TextEditingController();
-    final inputRef = TextEditingController();
-    final payload = TextEditingController();
-    var source = 'human-authored';
-    final saved = await showDialog<bool>(
+  Future<void> _openCorrectionSet(CorrectionSet set) async {
+    await showSideDrawer<void>(
       context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setLocal) => AlertDialog(
-          title: const Text('Add golden case'),
-          content: SizedBox(
-            width: 520,
-            child: SingleChildScrollView(
+      width: 560,
+      title: 'Correction set · ${set.stepName}',
+      subtitle:
+          '${set.pairs} raw → corrected pairs · the step-eval dataset a '
+          'prompt or model change is graded against',
+      builder: (context) => Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (final pair in set.sample)
+            Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(13),
+              decoration: BoxDecoration(
+                color: CumulusColors.surfaceMuted,
+                borderRadius: BorderRadius.circular(CumulusRadius.control),
+              ),
               child: Column(
-                mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  LabeledField(
-                    label: 'Name',
-                    child: TextField(
-                      controller: name,
-                      decoration: const InputDecoration(
-                        hintText: 'e.g. Credit memo (negative amount)',
-                      ),
+                  Text(
+                    pair.field,
+                    style: CumulusText.mono.copyWith(
+                      fontSize: 11,
+                      color: CumulusColors.inkSecondary,
                     ),
                   ),
-                  const SizedBox(height: 14),
-                  LabeledField(
-                    label: 'Expected outcome',
-                    child: TextField(
-                      controller: expected,
-                      decoration: const InputDecoration(
-                        hintText: 'what a passing run must produce',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  LabeledField(
-                    label: 'Input document',
-                    hint: 'a knowledge-layer asset id, kept in the map',
-                    child: TextField(
-                      controller: inputRef,
-                      decoration: const InputDecoration(
-                        hintText: 'e.g. invoice-fixture-042',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  LabeledField(
-                    label: 'JSON payload',
-                    hint: 'optional — stored verbatim',
-                    child: TextField(
-                      controller: payload,
-                      maxLines: 5,
-                      style: CumulusText.mono.copyWith(fontSize: 11.5),
-                      decoration: const InputDecoration(
-                        hintText: '{"amount_usd": 2340, "vendor": "acme"}',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  LabeledField(
-                    label: 'Source',
-                    child: DropdownButtonFormField<String>(
-                      initialValue: source,
-                      items: const [
-                        DropdownMenuItem(
-                          value: 'human-authored',
-                          child: Text('human-authored'),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Text(
+                        pair.raw,
+                        style: CumulusText.mono.copyWith(
+                          fontSize: 12,
+                          color: CumulusColors.inkMuted,
+                          decoration: TextDecoration.lineThrough,
                         ),
-                        DropdownMenuItem(
-                          value: 'correction-set',
-                          child: Text('correction-set'),
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 8),
+                        child: Icon(
+                          Icons.arrow_forward,
+                          size: 13,
+                          color: CumulusColors.inkMuted,
                         ),
-                        DropdownMenuItem(
-                          value: 'exemplar',
-                          child: Text('exemplar'),
+                      ),
+                      Text(
+                        pair.corrected,
+                        style: CumulusText.mono.copyWith(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
                         ),
-                      ],
-                      onChanged: (v) =>
-                          setLocal(() => source = v ?? 'human-authored'),
-                    ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 5),
+                  Text(
+                    'by ${pair.by} · ${agoLabel(pair.at)} · in the curation '
+                    'ledger',
+                    style: CumulusText.meta,
                   ),
                 ],
               ),
             ),
+          Text(
+            'Corrections land here automatically whenever a person corrects '
+            'this step\'s output in a Task — never promoted to canonical '
+            'knowledge without a Rule or a curation decision.',
+            style: CumulusText.meta,
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Add case'),
-            ),
-          ],
-        ),
+        ],
       ),
     );
-    if (saved != true || name.text.trim().isEmpty) return;
+  }
+
+  Future<void> _importCases() async {
+    final controller = TextEditingController();
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Upload cases · JSONL'),
+        content: SizedBox(
+          width: 560,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'One case per line — the same shape `cumulus eval push` '
+                'emits. Assertions key to contract fact paths.',
+                style: CumulusText.meta,
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                maxLines: 9,
+                style: CumulusText.mono.copyWith(fontSize: 11.5),
+                decoration: const InputDecoration(
+                  hintText:
+                      '{"name": "Credit memo", "assertions": [{"path": '
+                      '"invoice.amount_usd", "expected": "-1120.00"}], '
+                      '"trajectory": [{"kind": "task_raised", "expected": '
+                      '"true"}]}',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Import'),
+          ),
+        ],
+      ),
+    );
+    if (saved != true || controller.text.trim().isEmpty) return;
     try {
-      final updated = await _api.addGoldenCase(
+      final updated = await _api.importGoldenCases(
         widget.flowId,
-        name: name.text.trim(),
-        expected: expected.text.trim(),
-        inputRef: inputRef.text.trim(),
-        payload: payload.text.trim(),
-        source: source,
+        controller.text.trim(),
       );
       if (!mounted) return;
       setState(() => _golden = updated);
+      _snack('Imported — golden dataset is now v${updated.version}');
     } on ApiException catch (e) {
       _snack(e.message);
     }
   }
 
-  Widget _harnessCard() {
-    final cases = _golden?.cases.length ?? 0;
+  Widget _experimentsCard() {
+    final golden = _golden;
+    final cases = golden?.cases.length ?? 0;
+    final completed = _tests.where((t) => !t.running).toList();
+    // Oldest → newest, so the trend reads left to right.
+    final trend = completed.reversed
+        .map((t) => (t.passRate * 100).round())
+        .toList();
     return SectionCard(
-      title: 'Test harness',
-      subtitle: 'candidate vs baseline over the golden set · writes suppressed',
+      title: 'Experiments',
+      subtitle:
+          'candidate vs baseline · dataset revision pinned per run · writes '
+          'suppressed',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1389,18 +1939,53 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
             children: [
               FilledButton(
                 onPressed: (_isAdmin && !_launching) ? _launchTest : null,
-                child: Text(_launching ? 'Launching…' : 'Run suite'),
+                child: Text(_launching ? 'Launching…' : 'Run experiment'),
+              ),
+              const SizedBox(width: 10),
+              Tooltip(
+                message: _liveReads
+                    ? 'Reads today\'s knowledge layer — a smoke check, not a '
+                          'comparable regression run'
+                    : 'Each case\'s pinned read-set is served back — '
+                          'reproducible regression grading',
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(99),
+                  onTap: () => setState(() => _liveReads = !_liveReads),
+                  child: StatusBadge(
+                    _liveReads ? 'live reads' : 'pinned reads',
+                    dense: true,
+                    tone: _liveReads ? CumulusTone.warn : CumulusTone.neutral,
+                  ),
+                ),
               ),
               const SizedBox(width: 12),
               Expanded(
                 child: Text(
-                  '$cases cases graded against both versions · test '
-                  'ModelCalls are audited like any other',
+                  '$cases cases · graded against both versions on dataset '
+                  'v${golden?.version ?? 1}',
                   style: CumulusText.meta,
                 ),
               ),
             ],
           ),
+          if (trend.length >= 2) ...[
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Text('PASS-RATE TREND', style: CumulusText.statLabel),
+                const SizedBox(width: 12),
+                Sparkline(values: trend, width: 120, height: 22),
+                const SizedBox(width: 10),
+                Text(
+                  'latest ${trend.last}%',
+                  style: const TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ],
           if (_tests.isNotEmpty) ...[
             const SizedBox(height: 18),
             const Divider(height: 1),
@@ -1418,7 +2003,7 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
   Future<void> _openTestRun(TestRun run) async {
     await showSideDrawer<void>(
       context: context,
-      width: 680,
+      width: 720,
       title: '${run.candidateVersion} vs ${run.baselineVersion}',
       titleBadges: [
         StatusBadge(
@@ -1432,21 +2017,55 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
             tone: CumulusTone.danger,
             dense: true,
           ),
+        if (run.gate != null)
+          StatusBadge(
+            run.gate!.passed ? 'gate: promotable' : 'gate: blocked',
+            tone: run.gate!.passed ? CumulusTone.success : CumulusTone.danger,
+            dense: true,
+          ),
       ],
       subtitle:
           'baseline ${run.baselinePassed}/${run.totalCases} · '
           'cost ${run.costDeltaUsd >= 0 ? '+' : ''}'
           '\$${run.costDeltaUsd.toStringAsFixed(2)} · '
           'latency ${run.latencyDeltaMs >= 0 ? '+' : ''}${run.latencyDeltaMs}ms '
-          'per case · writes suppressed',
-      builder: (context) => _TestRunComparison(run: run),
+          'per case · dataset v${run.datasetVersion} · ${run.reads} reads',
+      actions: [
+        OutlinedButton.icon(
+          icon: const Icon(Icons.account_tree_outlined, size: 15),
+          label: const Text('View on canvas'),
+          onPressed: () {
+            Navigator.of(context).pop();
+            setState(() {
+              _evalRun = run;
+              _tab = 1;
+              _rightTab = 2;
+              _selectedRun = null;
+              _runDetail = null;
+            });
+          },
+        ),
+      ],
+      builder: (context) => _TestRunComparison(
+        run: run,
+        onReviewCase: (caseId) {
+          final goldenCase = _golden?.cases
+              .where((c) => c.id == caseId)
+              .firstOrNull;
+          if (goldenCase == null) return;
+          Navigator.of(context).pop();
+          _openReview(goldenCase);
+        },
+      ),
     );
   }
 
   Widget _recommenderCard() {
     return SectionCard(
       title: 'Cost & performance',
-      subtitle: 'derived from this definition\'s own execution telemetry',
+      subtitle:
+          'derived from this definition\'s own execution telemetry — '
+          'applying stages a draft and measures it',
       child: _recommendations.isEmpty
           ? const CumulusEmptyState(
               icon: Icons.savings_outlined,
@@ -1464,7 +2083,13 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
                     rec: rec,
                     canApply: _isAdmin,
                     applying: _applyingRecommendation == rec.id,
+                    // The experiment the apply auto-launched, once it exists:
+                    // the card's estimate becomes a measurement.
+                    measured: _tests
+                        .where((t) => t.launchedFor == rec.id)
+                        .firstOrNull,
                     onApply: () => _applyRecommendation(rec),
+                    onOpenMeasured: (run) => _openTestRun(run),
                   ),
               ],
             ),
@@ -1474,22 +2099,33 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
   Future<void> _applyRecommendation(Recommendation rec) async {
     setState(() => _applyingRecommendation = rec.id);
     try {
-      final draft = await _api.applyRecommendation(widget.flowId, rec.id);
+      final applied = await _api.applyRecommendation(widget.flowId, rec.id);
       final versions = await _api.flowVersions(widget.flowId);
       final detail = await _api.getFlow(widget.flowId);
+      final tests = await _api.flowTestRuns(widget.flowId);
       if (!mounted) return;
       setState(() {
         _versions = versions;
         _detail = detail;
-        _selectedVersion = draft.version;
+        _tests = tests;
+        _selectedVersion = applied.draft.version;
         _selectedRun = null;
         _runDetail = null;
-        _selectedStepId = rec.stepId.isEmpty ? null : rec.stepId;
-        _rightTab = 0;
-        _tab = 1;
+        if (applied.testRunId.isNotEmpty) {
+          _evalRun = tests
+              .where((t) => t.id == applied.testRunId)
+              .firstOrNull;
+        }
       });
       await _loadCanvas();
-      _snack('Staged in ${draft.display} — run the suite before promoting it');
+      _ensurePolling();
+      _snack(
+        applied.testRunId.isEmpty
+            ? 'Staged in ${applied.draft.display} — add golden cases to '
+                  'measure it'
+            : 'Staged in ${applied.draft.display} — experiment measuring it '
+                  'against the golden set now',
+      );
     } on ApiException catch (e) {
       _snack(e.message);
     } finally {
@@ -1988,6 +2624,75 @@ class _StepRunDetail extends StatelessWidget {
 // Test runs
 // ---------------------------------------------------------------------------
 
+/// The dataset's revision history, as a popup off the golden card header.
+class _RevisionsButton extends StatelessWidget {
+  final List<GoldenSetRevision> revisions;
+
+  const _RevisionsButton({required this.revisions});
+
+  @override
+  Widget build(BuildContext context) {
+    final newest = revisions.reversed.toList();
+    return PopupMenuButton<void>(
+      tooltip: 'Dataset revisions',
+      offset: const Offset(0, 34),
+      itemBuilder: (context) => [
+        for (final rev in newest.take(8))
+          PopupMenuItem<void>(
+            enabled: false,
+            height: 52,
+            child: SizedBox(
+              width: 340,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    'v${rev.version} · ${rev.note}',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: CumulusColors.ink,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '${rev.caseCount} cases · '
+                    '${rev.by.isEmpty ? 'console' : rev.by} · '
+                    '${agoLabel(rev.at)}',
+                    style: CumulusText.meta,
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.history,
+              size: 15,
+              color: CumulusColors.inkSecondary,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              'v${revisions.last.version}',
+              style: CumulusText.mono.copyWith(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _TestRunRow extends StatelessWidget {
   final TestRun run;
   final VoidCallback onOpen;
@@ -2005,11 +2710,55 @@ class _TestRunRow extends StatelessWidget {
         child: Row(
           children: [
             SizedBox(
-              width: 108,
-              child: Text(
-                run.candidateVersion,
-                overflow: TextOverflow.ellipsis,
-                style: CumulusText.mono.copyWith(fontSize: 11.5),
+              width: 20,
+              child: run.running
+                  ? const SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(strokeWidth: 1.6),
+                    )
+                  : Tooltip(
+                      message: run.gate == null
+                          ? ''
+                          : run.gate!.passed
+                          ? 'Gate: promotable'
+                          : 'Gate: ${run.gate!.reasons.join('; ')}',
+                      child: Icon(
+                        run.gate?.passed ?? false
+                            ? Icons.verified_outlined
+                            : Icons.block_outlined,
+                        size: 14,
+                        color: run.gate?.passed ?? false
+                            ? CumulusColors.success
+                            : CumulusColors.danger,
+                      ),
+                    ),
+            ),
+            const SizedBox(width: 6),
+            SizedBox(
+              width: 118,
+              child: Row(
+                children: [
+                  Flexible(
+                    child: Text(
+                      run.candidateVersion,
+                      overflow: TextOverflow.ellipsis,
+                      style: CumulusText.mono.copyWith(fontSize: 11.5),
+                    ),
+                  ),
+                  if (run.launchedFor.isNotEmpty)
+                    const Tooltip(
+                      message: 'Auto-launched by applying a recommendation',
+                      child: Padding(
+                        padding: EdgeInsets.only(left: 4),
+                        child: Icon(
+                          Icons.bolt,
+                          size: 12,
+                          color: CumulusColors.inkMuted,
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
             Expanded(
@@ -2082,14 +2831,59 @@ class _TestRunRow extends StatelessWidget {
 
 class _TestRunComparison extends StatelessWidget {
   final TestRun run;
+  final ValueChanged<String> onReviewCase;
 
-  const _TestRunComparison({required this.run});
+  const _TestRunComparison({required this.run, required this.onReviewCase});
 
   @override
   Widget build(BuildContext context) {
+    final gate = run.gate;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (gate != null) ...[
+          Container(
+            padding: const EdgeInsets.all(13),
+            decoration: BoxDecoration(
+              color: (gate.passed ? CumulusTone.success : CumulusTone.danger)
+                  .background,
+              borderRadius: BorderRadius.circular(CumulusRadius.control),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  gate.passed ? Icons.verified_outlined : Icons.block_outlined,
+                  size: 16,
+                  color: (gate.passed
+                          ? CumulusTone.success
+                          : CumulusTone.danger)
+                      .foreground,
+                ),
+                const SizedBox(width: 9),
+                Expanded(
+                  child: Text(
+                    gate.passed
+                        ? 'Promotable: no regressions against '
+                              '${run.baselineVersion}, pass rate at or above '
+                              'the baseline.'
+                        : 'Blocked: ${gate.reasons.join('; ')}.',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      height: 1.4,
+                      fontWeight: FontWeight.w600,
+                      color: (gate.passed
+                              ? CumulusTone.success
+                              : CumulusTone.danger)
+                          .foreground,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+        ],
         Row(
           children: [
             Expanded(
@@ -2121,71 +2915,196 @@ class _TestRunComparison extends StatelessWidget {
             ),
           ],
         ),
+        if (run.reviewsRaised > 0) ...[
+          const SizedBox(height: 10),
+          Text(
+            '${run.reviewsRaised} assertion'
+            '${run.reviewsRaised == 1 ? '' : 's'} the judge could not decide '
+            '— each raised a review Task instead of guessing.',
+            style: CumulusText.meta,
+          ),
+        ],
+        if (run.stepStats.isNotEmpty) ...[
+          const SizedBox(height: 18),
+          Text('BY STEP', style: CumulusText.sectionTitle),
+          const SizedBox(height: 4),
+          Text(
+            'assertions localized to the step owning each fact in '
+            '${run.candidateVersion}\'s producer map',
+            style: CumulusText.meta,
+          ),
+          const SizedBox(height: 10),
+          for (final stat in run.stepStats)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 7),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 150,
+                    child: Text(
+                      stat.stepName,
+                      overflow: TextOverflow.ellipsis,
+                      style: CumulusText.mono.copyWith(fontSize: 11.5),
+                    ),
+                  ),
+                  Expanded(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(99),
+                      child: LinearProgressIndicator(
+                        minHeight: 7,
+                        value: stat.passRate,
+                        color: evalTone(stat.passRate),
+                        backgroundColor: CumulusColors.surfaceMuted,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  SizedBox(
+                    width: 120,
+                    child: Text(
+                      '${stat.passed}/${stat.total} · was '
+                      '${stat.baselinePassed}/${stat.baselinePassed + stat.baselineFailed}',
+                      textAlign: TextAlign.right,
+                      style: CumulusText.meta,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
         const SizedBox(height: 18),
+        Text('CASES', style: CumulusText.sectionTitle),
+        const SizedBox(height: 6),
         for (final r in run.results)
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 9),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                SizedBox(
-                  width: 108,
-                  child: Wrap(
-                    spacing: 4,
-                    runSpacing: 4,
-                    children: [
-                      StatusBadge(
-                        r.passed ? 'PASS' : 'FAIL',
-                        tone: r.passed ? CumulusTone.success : CumulusTone.danger,
-                        dense: true,
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 108,
+                      child: Wrap(
+                        spacing: 4,
+                        runSpacing: 4,
+                        children: [
+                          StatusBadge(
+                            r.passed ? 'PASS' : 'FAIL',
+                            tone: r.passed
+                                ? CumulusTone.success
+                                : CumulusTone.danger,
+                            dense: true,
+                          ),
+                          if (r.regressed)
+                            const StatusBadge(
+                              'REGRESSED',
+                              tone: CumulusTone.danger,
+                              dense: true,
+                            ),
+                          if (r.improved)
+                            const StatusBadge(
+                              'FIXED',
+                              tone: CumulusTone.success,
+                              dense: true,
+                            ),
+                        ],
                       ),
-                      if (r.regressed)
-                        const StatusBadge(
-                          'REGRESSED',
-                          tone: CumulusTone.danger,
-                          dense: true,
-                        ),
-                      if (r.improved)
-                        const StatusBadge(
-                          'FIXED',
-                          tone: CumulusTone.success,
-                          dense: true,
-                        ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        r.name,
-                        style: const TextStyle(
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w600,
-                        ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            r.name,
+                            style: const TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '${r.assertions.where((a) => a.passed).length}'
+                            '/${r.assertions.length} assertions pass',
+                            style: CumulusText.meta,
+                          ),
+                        ],
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        r.passed
-                            ? 'expect: ${r.expected}'
-                            : 'expect: ${r.expected}\nactual: ${r.actual}',
+                    ),
+                    const SizedBox(width: 12),
+                    SizedBox(
+                      width: 96,
+                      child: Text(
+                        '\$${r.costUsd.toStringAsFixed(3)}\n'
+                        'was \$${r.baselineCostUsd.toStringAsFixed(3)}',
+                        textAlign: TextAlign.right,
                         style: CumulusText.meta,
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 12),
-                SizedBox(
-                  width: 96,
-                  child: Text(
-                    '\$${r.costUsd.toStringAsFixed(3)}\n'
-                    'was \$${r.baselineCostUsd.toStringAsFixed(3)}',
-                    textAlign: TextAlign.right,
-                    style: CumulusText.meta,
+                // The diff that makes a failure actionable: which claim
+                // diverged, what came out instead, and who graded it.
+                for (final a in r.assertions.where((a) => !a.passed))
+                  Container(
+                    margin: const EdgeInsets.only(left: 120, top: 7),
+                    padding: const EdgeInsets.fromLTRB(11, 9, 11, 9),
+                    decoration: BoxDecoration(
+                      color: CumulusColors.surfaceMuted,
+                      borderRadius: BorderRadius.circular(
+                        CumulusRadius.control,
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                a.label,
+                                style: CumulusText.mono.copyWith(
+                                  fontSize: 11,
+                                  color: CumulusColors.inkSecondary,
+                                ),
+                              ),
+                            ),
+                            StatusBadge(
+                              a.verdict == 'review'
+                                  ? 'review task'
+                                  : a.grader,
+                              dense: true,
+                              tone: a.verdict == 'review'
+                                  ? CumulusTone.accent
+                                  : CumulusTone.neutral,
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'expected ${a.expected}\ngot      ${a.actual}',
+                          style: CumulusText.mono.copyWith(
+                            fontSize: 11.5,
+                            height: 1.5,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
+                if (!r.passed)
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                      ),
+                      onPressed: () => onReviewCase(r.caseId),
+                      child: const Text('Review case'),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -2245,13 +3164,21 @@ class _RecommendationCard extends StatelessWidget {
   final Recommendation rec;
   final bool canApply;
   final bool applying;
+
+  /// The experiment auto-launched when this card was applied, if any — the
+  /// measured delta that replaces the estimate.
+  final TestRun? measured;
+
   final VoidCallback onApply;
+  final ValueChanged<TestRun> onOpenMeasured;
 
   const _RecommendationCard({
     required this.rec,
     required this.canApply,
     required this.applying,
+    required this.measured,
     required this.onApply,
+    required this.onOpenMeasured,
   });
 
   @override
@@ -2317,14 +3244,72 @@ class _RecommendationCard extends StatelessWidget {
               ],
             ),
           ),
+          if (measured != null) ...[
+            const SizedBox(height: 10),
+            InkWell(
+              onTap: measured!.running
+                  ? null
+                  : () => onOpenMeasured(measured!),
+              borderRadius: BorderRadius.circular(8),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: measured!.running
+                      ? CumulusColors.surfaceMuted
+                      : (measured!.gate?.passed ?? false)
+                      ? CumulusTone.success.background
+                      : CumulusTone.warn.background,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      measured!.running
+                          ? Icons.hourglass_top_outlined
+                          : Icons.speed_outlined,
+                      size: 14,
+                      color: CumulusColors.inkSecondary,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        measured!.running
+                            ? 'Measuring — '
+                                  '${measured!.results.length}/${measured!.totalCases} '
+                                  'cases graded…'
+                            : 'Measured on ${measured!.totalCases} cases: '
+                                  '${measured!.costDeltaUsd <= 0 ? '' : '+'}'
+                                  '\$${measured!.costDeltaUsd.toStringAsFixed(2)} '
+                                  'cost · ${measured!.passed}/${measured!.totalCases} '
+                                  'pass · gate '
+                                  '${(measured!.gate?.passed ?? false) ? 'promotable' : 'blocked'}',
+                        style: CumulusText.meta.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           Row(
             children: [
               if (rec.applicable)
                 FilledButton(
-                  onPressed: (canApply && !applying) ? onApply : null,
+                  onPressed: (canApply && !applying && measured == null)
+                      ? onApply
+                      : null,
                   child: Text(
-                    applying ? 'Applying…' : 'Apply to draft version',
+                    applying
+                        ? 'Applying…'
+                        : measured == null
+                        ? 'Apply & measure'
+                        : 'Applied',
                   ),
                 )
               else
