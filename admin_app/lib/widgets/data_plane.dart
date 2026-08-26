@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 
 import '../models/data_layer.dart';
 import '../models/graph.dart';
+import '../models/world.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'cumulus_shell.dart';
+import 'instance_map.dart';
 import 'schema_map.dart';
 import 'ui_kit.dart';
 
@@ -21,10 +23,16 @@ import 'ui_kit.dart';
 /// - **Sources** — what each external feed has delivered, assembled from the
 ///   sync runs themselves rather than a second bookkeeping store. A feed with
 ///   no run has never delivered, and this lens cannot pretend otherwise.
-/// - **Entities** — the ontology as declared, with live instance counts beside
-///   each type, and a browser over the objects themselves. A declared type
-///   with zero instances is a promise nothing has kept yet, which is worth
-///   being able to see.
+/// - **Model** — the TBox: the ontology as declared, with live instance counts
+///   beside each type. A declared type with zero instances is a promise
+///   nothing has kept yet, which is worth being able to see.
+/// - **Instances** — the ABox, and its own screen rather than a corner of the
+///   model's. Live instances and the fragments *authored in Python* (every
+///   eval fixture, the demo seed's feed deliveries) are peers here: same
+///   renderer, same model, differing only in whether they were observed or
+///   declared. An authored fragment is shown by running it into a throwaway
+///   world, so what you see is the consequence — which vendor the sync
+///   resolved to, what it escalated — rather than the payload.
 /// - **Documents** — the artifacts, their extracted regions, and what is past
 ///   its retention horizon.
 ///
@@ -50,7 +58,7 @@ class DataPlaneView extends StatefulWidget {
   State<DataPlaneView> createState() => _DataPlaneViewState();
 }
 
-enum _Lens { collections, sources, entities, documents }
+enum _Lens { collections, sources, model, instances, documents }
 
 class _DataPlaneViewState extends State<DataPlaneView> {
   _Lens _lens = _Lens.collections;
@@ -65,10 +73,18 @@ class _DataPlaneViewState extends State<DataPlaneView> {
   String? _error;
   bool _loading = true;
 
-  /// The object type being browsed under the Entities lens.
+  /// The object type being browsed under the Model lens.
   String? _objectType;
   List<GraphObject>? _objects;
   GraphObjectDetail? _selected;
+
+  /// The Instances lens: which ABox is showing, and what it holds.
+  List<AuthoredWorld> _worlds = const [];
+  String _abox = 'live';
+  String? _aboxType;
+  MaterializedWorld? _materialized;
+  bool _loadingAbox = false;
+  WorldObject? _instance;
 
   @override
   void initState() {
@@ -93,6 +109,7 @@ class _DataPlaneViewState extends State<DataPlaneView> {
       attempt(widget.api.listDocuments()),
       attempt(widget.api.documentStats()),
       attempt(widget.api.graphInvariants()),
+      attempt(widget.api.listWorlds()),
     ]);
     if (!mounted) return;
     setState(() {
@@ -104,11 +121,39 @@ class _DataPlaneViewState extends State<DataPlaneView> {
       _documentStats = (results[5] as Map<String, dynamic>?) ?? const {};
       _invariants =
           (results[6] as InvariantReport?) ?? InvariantReport.unknown;
+      _worlds = (results[7] as List<AuthoredWorld>?) ?? const [];
       _loading = false;
       if (_collections == null && _sources == null && _ontology == null) {
         _error = 'The data layer did not answer.';
       }
     });
+  }
+
+  /// Materialize whichever ABox is selected. `live` reads the running graph;
+  /// anything else runs an authored fragment into a throwaway world.
+  Future<void> _loadAbox() async {
+    setState(() {
+      _loadingAbox = true;
+      _instance = null;
+    });
+    try {
+      final loaded = _abox == 'live'
+          ? await widget.api.graphInstances(type: _aboxType)
+          : await widget.api.materializeWorld(_abox);
+      if (mounted) {
+        setState(() {
+          _materialized = loaded;
+          _loadingAbox = false;
+        });
+      }
+    } on ApiException catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = e.message;
+          _loadingAbox = false;
+        });
+      }
+    }
   }
 
   Future<void> _browse(String type) async {
@@ -214,7 +259,7 @@ class _DataPlaneViewState extends State<DataPlaneView> {
               onOpenPayables: widget.onOpenPayablesWorkspace,
             ),
             _Lens.sources => _SourcesLens(sources: sources),
-            _Lens.entities => _EntitiesLens(
+            _Lens.model => _ModelLens(
               ontology: _ontology,
               invariants: _invariants,
               type: _objectType,
@@ -229,6 +274,33 @@ class _DataPlaneViewState extends State<DataPlaneView> {
               }),
               onCloseDetail: () => setState(() => _selected = null),
             ),
+            _Lens.instances => _InstancesLens(
+              worlds: _worlds,
+              selected: _abox,
+              type: _aboxType,
+              typeNames: [
+                for (final t in _ontology?.objects ?? const <OntologyObjectType>[])
+                  if (t.instances > 0) t.name,
+              ],
+              materialized: _materialized,
+              loading: _loadingAbox,
+              instance: _instance,
+              onSelectAbox: (id) {
+                setState(() {
+                  _abox = id;
+                  _aboxType = null;
+                  _materialized = null;
+                });
+                _loadAbox();
+              },
+              onSelectType: (type) {
+                setState(() => _aboxType = type);
+                _loadAbox();
+              },
+              onLoad: _loadAbox,
+              onSelectInstance: (object) =>
+                  setState(() => _instance = object),
+            ),
             _Lens.documents => _DocumentsLens(
               documents: _documents ?? const [],
               stats: _documentStats,
@@ -241,7 +313,8 @@ class _DataPlaneViewState extends State<DataPlaneView> {
   static String _label(_Lens lens) => switch (lens) {
     _Lens.collections => 'COLLECTIONS',
     _Lens.sources => 'SOURCES',
-    _Lens.entities => 'ENTITIES',
+    _Lens.model => 'MODEL · TBOX',
+    _Lens.instances => 'INSTANCES · ABOX',
     _Lens.documents => 'DOCUMENTS',
   };
 
@@ -646,7 +719,7 @@ IconData _iconForSyncKind(String kind) => switch (kind) {
 // Entities
 // ---------------------------------------------------------------------------
 
-class _EntitiesLens extends StatelessWidget {
+class _ModelLens extends StatelessWidget {
   final Ontology? ontology;
   final InvariantReport invariants;
   final String? type;
@@ -657,7 +730,7 @@ class _EntitiesLens extends StatelessWidget {
   final VoidCallback onClear;
   final VoidCallback onCloseDetail;
 
-  const _EntitiesLens({
+  const _ModelLens({
     required this.ontology,
     required this.invariants,
     required this.type,
@@ -1493,6 +1566,568 @@ class _FieldHistoryCard extends StatelessWidget {
                       ],
                     ),
                   ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Instances (ABox)
+// ---------------------------------------------------------------------------
+
+/// The ABox, on its own screen.
+///
+/// Live instances and the fragments authored in Python are peers here, chosen
+/// from one selector and drawn by one renderer. The distinction that matters is
+/// not which store they came from but whether they were **observed** — written
+/// by a Flow through an Action — or **declared**, in an eval fixture or the
+/// demo seed. Both are assertions about instances of the same model.
+///
+/// An authored fragment is *materialized* rather than statically expanded: it
+/// runs into a throwaway world, so what you see includes the resolution the
+/// sync flow performed and the Tasks it escalated. A prediction would show the
+/// payload; this shows the consequence. Nothing real is touched either way,
+/// which is what makes looking a plain read.
+class _InstancesLens extends StatelessWidget {
+  final List<AuthoredWorld> worlds;
+  final String selected;
+  final String? type;
+  final List<String> typeNames;
+  final MaterializedWorld? materialized;
+  final bool loading;
+  final WorldObject? instance;
+  final void Function(String id) onSelectAbox;
+  final void Function(String? type) onSelectType;
+  final VoidCallback onLoad;
+  final void Function(WorldObject object) onSelectInstance;
+
+  const _InstancesLens({
+    required this.worlds,
+    required this.selected,
+    required this.type,
+    required this.typeNames,
+    required this.materialized,
+    required this.loading,
+    required this.instance,
+    required this.onSelectAbox,
+    required this.onSelectType,
+    required this.onLoad,
+    required this.onSelectInstance,
+  });
+
+  bool get _isLive => selected == 'live';
+
+  @override
+  Widget build(BuildContext context) {
+    final world = materialized;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 16,
+      children: [
+        CumulusCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SectionHeader(
+                title: 'Which ABox',
+                subtitle:
+                    'the running graph, or a fragment declared in Python — '
+                    'observed and declared instances of the same model',
+                trailing: OutlinedButton.icon(
+                  onPressed: loading ? null : onLoad,
+                  icon: const Icon(Icons.play_arrow, size: 16),
+                  label: Text(
+                    loading
+                        ? 'Loading…'
+                        : world == null
+                            ? 'Load'
+                            : 'Reload',
+                  ),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  LensChip(
+                    label: 'LIVE GRAPH',
+                    tone: CumulusTone.success,
+                    selected: _isLive,
+                    onTap: () => onSelectAbox('live'),
+                  ),
+                  for (final candidate in worlds)
+                    LensChip(
+                      label: candidate.isSeed
+                          ? 'SEED · ${candidate.name}'
+                          : candidate.id.replaceFirst('eval:', ''),
+                      tone: candidate.isSeed
+                          ? CumulusTone.teal
+                          : CumulusTone.violet,
+                      selected: selected == candidate.id,
+                      onTap: () => onSelectAbox(candidate.id),
+                    ),
+                ],
+              ),
+              if (_isLive) ...[
+                const SizedBox(height: 14),
+                const FieldLabel(
+                  'Focus',
+                  hint:
+                      'a type, plus whatever it connects to — a screen of boxes '
+                      'with no edges answers less than a smaller one that shows '
+                      'how they join',
+                ),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    LensChip(
+                      label: 'EVERYTHING',
+                      selected: type == null,
+                      onTap: () => onSelectType(null),
+                    ),
+                    for (final name in typeNames)
+                      LensChip(
+                        label: name,
+                        selected: type == name,
+                        onTap: () => onSelectType(name),
+                      ),
+                  ],
+                ),
+              ],
+              if (world != null) ...[
+                const SizedBox(height: 14),
+                Text(
+                  world.world.summary,
+                  style: CumulusText.body,
+                ),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 8,
+                  children: [
+                    MetaPill(
+                      '${world.objects.length} object(s)',
+                      tone: CumulusTone.teal,
+                    ),
+                    MetaPill('${world.links.length} link(s)'),
+                    if (world.world.declaredIn.isNotEmpty)
+                      MetaPill(world.world.declaredIn),
+                    if (world.world.owner.isNotEmpty &&
+                        world.world.owner != 'live')
+                      MetaPill(world.world.owner),
+                    if (world.truncated)
+                      const MetaPill('capped', tone: CumulusTone.warn),
+                    if (world.violations.isEmpty)
+                      const MetaPill('conforms', tone: CumulusTone.success)
+                    else
+                      MetaPill(
+                        '${world.violations.length} violation(s)',
+                        tone: CumulusTone.danger,
+                      ),
+                  ],
+                ),
+              ],
+              if (world?.error.isNotEmpty ?? false) ...[
+                const SizedBox(height: 12),
+                ErrorNotice(message: world!.error),
+              ],
+            ],
+          ),
+        ),
+        if (loading)
+          const CumulusCard(child: CumulusLoading())
+        else if (world == null)
+          CumulusCard(
+            child: CumulusEmptyState(
+              icon: Icons.scatter_plot_outlined,
+              title: 'Nothing loaded yet',
+              message:
+                  'Materializing runs the fragment through the real sync '
+                  'flows, so it is a deliberate click rather than something '
+                  'that happens on arrival.',
+            ),
+          )
+        else ...[
+          CumulusCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SectionHeader(
+                  title: 'Instance map',
+                  subtitle:
+                      'laid out by type, in the same places the model diagram '
+                      'puts them — the two views are one picture at two levels',
+                ),
+                const SizedBox(height: 14),
+                InstanceMap(
+                  objects: world.objects,
+                  links: world.links,
+                  selectedId: instance?.id,
+                  onSelect: onSelectInstance,
+                ),
+              ],
+            ),
+          ),
+          if (instance != null) _InstanceDetailCard(object: instance!),
+          if (world.runs.isNotEmpty || world.tasks.isNotEmpty)
+            _ConsequenceCard(world: world),
+          _InstanceInventoryCard(
+            world: world,
+            onSelect: onSelectInstance,
+            selectedId: instance?.id,
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// What the fragment *did*, as opposed to what it says.
+///
+/// The reason a fragment is materialized rather than parsed: a delivery goes
+/// through the real sync flow, so the runs it drove and the Tasks it escalated
+/// are part of what it asserts. A misspelled vendor waiting for a steward is a
+/// property of the fixture, not an accident of the environment.
+class _ConsequenceCard extends StatelessWidget {
+  final MaterializedWorld world;
+
+  const _ConsequenceCard({required this.world});
+
+  @override
+  Widget build(BuildContext context) {
+    return CumulusCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const SectionHeader(
+            title: 'What establishing it did',
+            subtitle:
+                'the fragment ran through the real flows, so these are part of '
+                'what it asserts',
+          ),
+          if (world.runs.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const FieldLabel('Runs it drove'),
+            for (final run in world.runs)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  children: [
+                    StatusBadge(
+                      run.status,
+                      tone: run.status == 'succeeded'
+                          ? CumulusTone.success
+                          : CumulusTone.warn,
+                      dense: true,
+                    ),
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 190,
+                      child: Text(run.flowId, style: CumulusText.body),
+                    ),
+                    Expanded(
+                      child: Text(
+                        '${run.steps} step(s)'
+                        '${run.outputs.isEmpty ? "" : " · ${run.outputs}"}',
+                        style: CumulusText.meta,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+          if (world.tasks.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const FieldLabel(
+              'Judgment it asked for',
+              hint: 'a batch feed escalates rather than guessing, and keeps going',
+            ),
+            for (final task in world.tasks)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  children: [
+                    StatusBadge(task.kind, tone: CumulusTone.warn, dense: true),
+                    const SizedBox(width: 8),
+                    Expanded(child: Text(task.title, style: CumulusText.body)),
+                    const SizedBox(width: 8),
+                    Text(task.queue, style: CumulusText.mono),
+                  ],
+                ),
+              ),
+          ],
+          if (world.violations.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const FieldLabel('Ontology violations'),
+            for (final violation in world.violations)
+              Text(
+                violation,
+                style: CumulusText.meta.copyWith(color: CumulusColors.danger),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _InstanceDetailCard extends StatelessWidget {
+  final WorldObject object;
+
+  const _InstanceDetailCard({required this.object});
+
+  @override
+  Widget build(BuildContext context) {
+    final byField = <String, List<WorldClaim>>{};
+    for (final claim in object.claims) {
+      byField.putIfAbsent(claim.field, () => []).add(claim);
+    }
+    return CumulusCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SectionHeader(
+            title: object.label,
+            subtitle:
+                '${object.type} · ${object.claims.length} claim(s)'
+                '${object.conflictFields.isEmpty ? "" : " · sources disagree on ${object.conflictFields.join(", ")}"}',
+            trailing: MetaPill(object.ref),
+          ),
+          const SizedBox(height: 12),
+          // The pair every natural key raises: what it reads as, and what it
+          // resolves to.
+          Row(
+            children: [
+              SizedBox(
+                width: 150,
+                child: Text('NATURAL KEY', style: CumulusText.statLabel),
+              ),
+              Expanded(
+                child: Text(object.naturalKey, style: CumulusText.body),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              SizedBox(
+                width: 150,
+                child: Text('RESOLVES TO', style: CumulusText.statLabel),
+              ),
+              Expanded(child: Text(object.id, style: CumulusText.mono)),
+            ],
+          ),
+          const SizedBox(height: 14),
+          const FieldLabel(
+            'Fields, and the claims behind them',
+            hint: 'a losing claim is kept, not overwritten',
+          ),
+          for (final entry in byField.entries)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      SizedBox(
+                        width: 150,
+                        child: Text(entry.key, style: CumulusText.mono),
+                      ),
+                      Text(
+                        '${object.props[entry.key] ?? "—"}',
+                        style: CumulusText.body.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      if (entry.value.length > 1) ...[
+                        const SizedBox(width: 8),
+                        StatusBadge(
+                          '${entry.value.length} claims',
+                          tone: CumulusTone.warn,
+                          dense: true,
+                        ),
+                      ],
+                    ],
+                  ),
+                  for (final claim in entry.value)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 150, top: 2),
+                      child: Row(
+                        children: [
+                          SizedBox(
+                            width: 18,
+                            child: claim.resolves
+                                ? Icon(
+                                    Icons.check,
+                                    size: 13,
+                                    color: CumulusTone.success.foreground,
+                                  )
+                                : const SizedBox.shrink(),
+                          ),
+                          SizedBox(
+                            width: 96,
+                            child: StatusBadge(
+                              claim.authority,
+                              tone: claim.authority == 'human'
+                                  ? CumulusTone.violet
+                                  : CumulusTone.neutral,
+                              dense: true,
+                            ),
+                          ),
+                          Expanded(
+                            child: Text(
+                              '${claim.value}  ·  ${claim.source}',
+                              style: CumulusText.meta.copyWith(
+                                color: claim.resolves
+                                    ? CumulusColors.ink
+                                    : CumulusColors.inkMuted,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _InstanceInventoryCard extends StatelessWidget {
+  final MaterializedWorld world;
+  final void Function(WorldObject object) onSelect;
+  final String? selectedId;
+
+  const _InstanceInventoryCard({
+    required this.world,
+    required this.onSelect,
+    required this.selectedId,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final byType = <String, List<WorldObject>>{};
+    for (final object in world.objects) {
+      byType.putIfAbsent(object.type, () => []).add(object);
+    }
+    final types = byType.keys.toList()..sort();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 16,
+      children: [
+        ListCard(
+          title: 'Instances',
+          subtitle:
+              '${world.objects.length} across ${types.length} type(s) · '
+              'click one for its claims',
+          children: [
+            for (final type in types)
+              for (final object in byType[type]!)
+                CumulusListRow(
+                  onTap: () => onSelect(object),
+                  leading: Monogram(
+                    type.substring(0, 1),
+                    tone: object.conflictFields.isEmpty
+                        ? CumulusTone.neutral
+                        : CumulusTone.warn,
+                  ),
+                  title: Row(
+                    children: [
+                      Flexible(child: Text(object.label)),
+                      const SizedBox(width: 10),
+                      StatusBadge(type, dense: true),
+                      if (object.conflictFields.isNotEmpty) ...[
+                        const SizedBox(width: 6),
+                        StatusBadge(
+                          '${object.conflictFields.length} conflict(s)',
+                          tone: CumulusTone.warn,
+                          dense: true,
+                        ),
+                      ],
+                      if (selectedId == object.id) ...[
+                        const SizedBox(width: 6),
+                        const StatusBadge(
+                          'showing',
+                          tone: CumulusTone.accent,
+                          dense: true,
+                        ),
+                      ],
+                    ],
+                  ),
+                  subtitle: Text(
+                    object.props.entries
+                        .take(4)
+                        .map((e) => '${e.key}: ${e.value}')
+                        .join(' · '),
+                  ),
+                  trailing: [
+                    SizedBox(
+                      width: 220,
+                      child: Text(
+                        object.naturalKey,
+                        textAlign: TextAlign.end,
+                        style: CumulusText.mono,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+          ],
+        ),
+        if (world.byLinkType.isNotEmpty)
+          CumulusCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SectionHeader(
+                  title: 'Edges',
+                  subtitle:
+                      'counted by type — the map draws the shape, this names it',
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final entry in world.byLinkType.entries)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: CumulusColors.surfaceMuted,
+                          borderRadius: BorderRadius.circular(7),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(entry.key, style: CumulusText.mono),
+                            const SizedBox(width: 7),
+                            Text(
+                              '${entry.value}',
+                              style: const TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w700,
+                                color: CumulusColors.accentInk,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
               ],
             ),
           ),

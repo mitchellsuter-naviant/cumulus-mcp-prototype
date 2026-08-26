@@ -18,6 +18,7 @@ import '../models/payable.dart';
 import '../models/reimbursement.dart';
 import '../models/run.dart';
 import '../models/task.dart';
+import '../models/world.dart';
 import 'auth_service.dart';
 
 /// Configure at build/run time:
@@ -689,6 +690,32 @@ class ApiClient {
     return QueueTask.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
+  // ---- authored ABoxes ----
+
+  Future<List<AuthoredWorld>> listWorlds() async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/worlds'), headers: await _headers()),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => AuthoredWorld.fromJson(j as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Runs the fragment into a throwaway world and returns what it asserts.
+  /// Not free — the sync flows really run — so it is a separate call from the
+  /// catalog.
+  Future<MaterializedWorld> materializeWorld(String worldId) async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/worlds/$worldId'), headers: await _headers()),
+      timeout: _askTimeout,
+    );
+    _check(resp);
+    return MaterializedWorld.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
   // ---- graph-shaped evals ----
 
   Future<List<EvalSpecSummary>> listEvalSpecs({String? flowId}) async {
@@ -825,6 +852,25 @@ class ApiClient {
     );
     _check(resp);
     return InvariantReport.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// The live ABox in the same shape an authored fragment comes back in, so
+  /// one renderer serves both.
+  Future<MaterializedWorld> graphInstances({String? type, int limit = 400}) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/graph/instances', {
+          if (type != null && type.isNotEmpty) 'type': type,
+          'limit': '$limit',
+        }),
+        headers: await _headers(),
+      ),
+      timeout: _askTimeout,
+    );
+    _check(resp);
+    return MaterializedWorld.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
   }

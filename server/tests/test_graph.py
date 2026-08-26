@@ -283,16 +283,55 @@ def test_object_detail_exposes_claims_and_conflicts(client, world):
     assert "identified_as" in kinds
 
 
+def _api_routes(app):
+    """Every route, following included routers.
+
+    This FastAPI version keeps `include_router` results as wrapper objects
+    rather than flattening them into `app.routes`, so walking `app.routes` and
+    reading `.path` finds nothing — which would make the assertion below pass
+    without testing anything.
+    """
+    seen = []
+
+    def walk(routes):
+        for route in routes:
+            # `include_router` leaves a wrapper that holds the real router on
+            # `original_router`; plain mounts expose `routes` directly.
+            original = getattr(route, "original_router", None)
+            nested = getattr(original, "routes", None) or getattr(route, "routes", None)
+            if nested:
+                walk(nested)
+            elif getattr(route, "path", ""):
+                seen.append(route)
+
+    walk(app.routes)
+    return seen
+
+
 def test_the_graph_is_read_only_over_http(client):
     # No POST/PUT/DELETE on /graph: objects are written by Flows, through
     # Actions. A console that could invent a vendor would be a console that
     # could invent one with no run behind it.
     from app.main import app
 
-    for route in app.routes:
-        path = getattr(route, "path", "")
-        if path.startswith("/api/v1/graph"):
-            assert set(getattr(route, "methods", set())) <= {"GET", "HEAD"}
+    graph_routes = [
+        r for r in _api_routes(app) if r.path.startswith("/api/v1/graph")
+    ]
+    assert graph_routes, "no /api/v1/graph routes found — the walk is broken"
+    for route in graph_routes:
+        assert set(getattr(route, "methods", set())) <= {"GET", "HEAD"}
+
+
+def test_authored_worlds_are_read_only_too(client):
+    """Materializing is a read: it runs into a throwaway world."""
+    from app.main import app
+
+    world_routes = [
+        r for r in _api_routes(app) if r.path.startswith("/api/v1/worlds")
+    ]
+    assert world_routes
+    for route in world_routes:
+        assert set(getattr(route, "methods", set())) <= {"GET", "HEAD"}
 
 
 # ---- TBox conformance ------------------------------------------------------
@@ -513,3 +552,36 @@ def test_edge_lookups_go_by_endpoint_not_a_full_scan(graph):
     assert len(graph.neighbors(vendor.id, "issued", "out")) == 2
     assert len(graph.neighbors(invoice.id, "issued", "in")) == 1
     assert len(graph.neighbors(vendor.id, "issued", "both")) == 2
+
+
+def test_one_source_restating_a_field_is_an_update_not_a_conflict(graph):
+    """A feed re-landing a row stamps a fresh timestamp every time.
+
+    Counting that as a conflict buries the real ones — a disagreement needs two
+    parties, and this is the check that keeps the conflict count meaningful.
+    """
+    record = graph.upsert(
+        "SourceRecord", "erp-vendors:V-1",
+        [
+            Claim(field="landed_at", value="2026-08-01T00:00:00+00:00",
+                  source="erp:erp-vendors", at_iso="2026-08-01T00:00:00+00:00"),
+            Claim(field="landed_at", value="2026-08-03T00:00:00+00:00",
+                  source="erp:erp-vendors", at_iso="2026-08-03T00:00:00+00:00"),
+        ],
+    )
+    assert record.conflicts() == {}
+    # Both readings are still on the record; the newer one resolves.
+    assert len([c for c in record.claims if c.field == "landed_at"]) == 2
+    assert record.props["landed_at"] == "2026-08-03T00:00:00+00:00"
+
+
+def test_two_sources_disagreeing_is_still_a_conflict(graph):
+    record = graph.upsert(
+        "Vendor", "Acme Industrial Inc.",
+        [
+            Claim(field="payment_terms", value="NET30", source="erp:vendors"),
+            Claim(field="payment_terms", value="NET60", source="procurement:coupa"),
+        ],
+    )
+    assert set(record.conflicts()) == {"payment_terms"}
+    assert record.props["payment_terms"] == "NET30"

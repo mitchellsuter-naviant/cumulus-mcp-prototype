@@ -251,3 +251,81 @@ def test_profiles_refresh_on_demand(client, owner, world):
     rows = client.get("/api/v1/vendor-profiles", headers=owner).json()
     assert rows and rows[0]["invoices"] >= rows[-1]["invoices"]
     assert any(r["median_usd"] > 0 for r in rows)
+
+
+# ---- authored ABoxes ------------------------------------------------------
+#
+# A good deal of ABox is written by hand in Python — every eval fixture, and
+# the demo seed's feed deliveries. It was only ever observable through its
+# effects. These assert it is now viewable, and that looking is a read.
+
+
+def test_the_catalog_lists_the_fragments_declared_in_code(client, world):
+    rows = client.get("/api/v1/worlds").json()
+    by_id = {r["id"]: r for r in rows}
+    assert "seed:demo-world" in by_id
+    assert by_id["seed:demo-world"]["kind"] == "seed-world"
+    assert by_id["seed:demo-world"]["declared_in"].endswith("payables.py")
+    fixtures = [r for r in rows if r["kind"] == "eval-fixture"]
+    assert len(fixtures) >= 9
+    # A fragment with neither deliveries nor objects would be nothing to look
+    # at, so it is not listed.
+    assert all(r["deliveries"] or r["direct_objects"] for r in rows)
+
+
+def test_materializing_shows_the_consequence_not_the_payload(client, world):
+    """Run into a throwaway world, not a static expansion of the JSON.
+
+    The difference is the whole value: what comes back includes the resolution
+    the sync flow performed and the Task it escalated, neither of which is in
+    the delivery payload.
+    """
+    body = client.get("/api/v1/worlds/seed:demo-world").json()
+    assert body["error"] == ""
+    assert body["by_type"]["Vendor"] == 4
+    assert body["by_type"]["SourceRecord"] == 12
+    assert body["by_link_type"]["identified_as"] >= 5
+    # The sync flows really ran.
+    assert {r["flow_id"] for r in body["runs"]} == {
+        "vendor-sync", "purchase-order-sync", "receiving-sync"
+    }
+    assert all(r["status"] == "succeeded" for r in body["runs"])
+    # And the misspelled vendor escalated rather than being guessed at.
+    assert [t["kind"] for t in body["tasks"]] == ["match_review"]
+    assert body["violations"] == []
+
+
+def test_a_materialized_object_answers_what_a_natural_key_resolves_to(client, world):
+    body = client.get("/api/v1/worlds/seed:demo-world").json()
+    acme = next(o for o in body["objects"] if o["label"] == "Acme Industrial Inc.")
+    assert acme["natural_key"] == "Acme Industrial Inc."
+    assert acme["id"].startswith("vendor_")
+    assert acme["ref"].startswith(f"graph:Vendor/{acme['id']}")
+    # Two systems asserted a name; one of them resolves and both are kept.
+    names = [c for c in acme["claims"] if c["field"] == "name"]
+    assert len(names) == 2
+    assert sum(1 for c in names if c["resolves"]) == 1
+    assert "name" in acme["conflict_fields"]
+
+
+def test_materializing_touches_nothing_real(client, world):
+    before = world.graph.stats()
+    before_runs = len(world.engine.list())
+    client.get("/api/v1/worlds/seed:demo-world")
+    assert world.graph.stats() == before
+    assert len(world.engine.list()) == before_runs
+
+
+def test_an_expense_fixture_is_thin_and_says_so(client, world):
+    body = client.get(
+        "/api/v1/worlds/eval:expense-in-policy-auto-approves"
+    ).json()
+    # One Employee and no edges — correct, and worth being able to see rather
+    # than inferring from a count.
+    assert body["by_type"] == {"Employee": 1}
+    assert body["links"] == []
+    assert body["objects"][0]["claims"][0]["source"] == "fixture"
+
+
+def test_an_unknown_world_is_a_404(client, world):
+    assert client.get("/api/v1/worlds/eval:nope").status_code == 404

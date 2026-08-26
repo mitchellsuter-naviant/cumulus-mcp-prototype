@@ -107,15 +107,34 @@ class ObjectRecord(BaseModel):
         return f"graph:{self.type}/{self.id}@rev{self.revision}"
 
     def conflicts(self) -> dict[str, list[Claim]]:
-        """Fields where two sources assert different values, both retained."""
+        """Fields where **different** sources assert different values.
+
+        The qualifier is load-bearing. One source restating a field with a new
+        value is an *update* — a feed re-landing a row stamps a fresh
+        `landed_at` every time — and counting that as a conflict buries the
+        real ones in noise. A disagreement needs two parties.
+        """
         by_field: dict[str, list[Claim]] = {}
         for claim in self.claims:
             by_field.setdefault(claim.field, []).append(claim)
-        return {
-            field: claims
-            for field, claims in by_field.items()
-            if len({json.dumps(c.value, sort_keys=True, default=str) for c in claims}) > 1
-        }
+        out: dict[str, list[Claim]] = {}
+        for field, claims in by_field.items():
+            sources = {claim.source for claim in claims}
+            # The value each source currently stands behind: its newest claim.
+            latest = {
+                source: max(
+                    (c for c in claims if c.source == source),
+                    key=lambda c: c.at_iso,
+                ).value
+                for source in sources
+            }
+            distinct = {
+                json.dumps(value, sort_keys=True, default=str)
+                for value in latest.values()
+            }
+            if len(distinct) > 1:
+                out[field] = claims
+        return out
 
 
 class LinkRecord(BaseModel):

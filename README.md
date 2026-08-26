@@ -762,6 +762,34 @@ Thresholds are governed knowledge (`entity-resolution-policy`): auto-link at
 overlap, character similarity, and token-wise soft overlap — three signals
 because a typo, a word reorder and an extra word each defeat a different one.
 
+### Seeing the ABox (`server/app/worlds.py`)
+
+The TBox is declared in `ontology.py` and the console draws it. A good deal of
+**ABox** is declared in Python too — every eval fixture, and the demo seed's
+feed deliveries — and until now it was only ever observable through its
+effects: you could read the fixture source, or read a run's journal afterwards,
+but not look at the instance graph a fragment establishes.
+
+`GET /api/v1/worlds` lists those fragments with where they are declared;
+`GET /api/v1/worlds/{id}` **materializes** one. Materializing is not expanding
+the payload — it builds a throwaway in-memory world, replays the fragment
+through the real sync flows, and reads the graph back. That distinction is the
+whole value: what comes back includes the work establishing it *did* — which
+vendor each source row resolved to, at what score, by what method, and the
+steward Tasks it escalated — none of which is in the fixture text. Every object
+carries both halves of the natural-key question (the key as authored and the id
+it resolves to), every claim says whether it won under precedence, and the TBox
+invariant sweep runs over the result, so a fragment that would violate the
+ontology says so before a case uses it.
+
+`GET /api/v1/graph/instances` returns the **live** ABox in the same shape, which
+is what makes the console honest: the running graph and a declared fixture are
+peers in one renderer rather than two views that merely resemble each other. A
+`type` filter pulls in that type's one-hop neighbours too — a screen of boxes
+with no edges answers less than a smaller one showing how they join.
+
+Both are plain reads. Nothing real is touched by looking.
+
 ## Evals: a per-flow spec over the shared model
 
 `server/app/evals.py` + `server/app/eval_specs.py`, exported to the corpus as
@@ -993,12 +1021,22 @@ Inside the dev container there is no display, so use the web-server device and
 your host browser instead — see [.devcontainer/README.md](.devcontainer/README.md).
 
 The left rail has four stops: **Knowledge layer** (Library, the governed
-corpus, and Data — four lenses over Collections, Sources, Entities and
-Documents), **Flows**, **Workspaces** — a dropdown, because a workspace is a
+corpus, and Data — five lenses: Collections, Sources, **Model · TBox**,
+**Instances · ABox**, and Documents), **Flows**, **Workspaces** — a dropdown, because a workspace is a
 business view onto rows a flow wrote rather than a plane of the map — and
 **Identities, access & keys**. The Employee Hub hangs off the account avatar
 and the Task Queue off the top bar, since both are asked for from every
 section rather than being one.
+
+The two graph lenses are deliberately separate screens rather than one
+diagram with a toggle, because they answer different questions. **Model · TBox**
+is the schema: types, fields, link types with their cardinality, and whether the
+ontology conforms. **Instances · ABox** is what actually exists, and it offers
+the live graph and all ten authored fragments as peers in one list — drawn with
+the *TBox's* geometry, so an instance sits where its type sits on the schema
+map and the two screens are readable against each other. Alongside each authored
+fragment is what establishing it did: the resolutions the sync flows performed
+and the Tasks they escalated.
 
 Each workspace shows the **Flow runs** list above its table: a run carries the
 gates, the read-set and the replay count, which a row cannot. Clicking a run

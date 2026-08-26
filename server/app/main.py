@@ -17,6 +17,7 @@ from . import (
     rest_api,
     runs_api,
     teams_api,
+    worlds_api,
     users_api,
     flows_api,
     tasks_api,
@@ -189,6 +190,7 @@ app.include_router(graph_api.router)
 app.include_router(runs_api.router)
 app.include_router(data_api.router)
 app.include_router(evals_api.router)
+app.include_router(worlds_api.router)
 app.include_router(api_keys_api.router)
 app.include_router(a2a.router)
 

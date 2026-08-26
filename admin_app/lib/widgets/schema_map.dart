@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/graph.dart';
 import '../theme/cumulus_theme.dart';
+import 'graph_layout.dart';
 
 /// The TBox as a diagram: object types as boxes, link types as connectors,
 /// with what is actually in the graph inside each box.
@@ -23,36 +24,17 @@ class SchemaMap extends StatelessWidget {
 
   const SchemaMap({super.key, required this.ontology, this.onBrowse});
 
-  // Column, row. Chosen so that most edges are a straight line to the box on
-  // the right — the layout is the documentation.
-  static const _grid = <String, (int, int)>{
-    'Employee': (0, 0),
-    'ExpenseRequest': (1, 0),
-    'ExpenseLine': (2, 0),
-    'Document': (3, 0),
-    'SourceRecord': (0, 1),
-    'Vendor': (1, 1),
-    'Invoice': (2, 1),
-    'InvoiceLine': (3, 1),
-    'MatchSet': (4, 1),
-    'PurchaseOrder': (1, 2),
-    'PurchaseOrderLine': (2, 2),
-    'ReceivingReport': (1, 3),
-    'ReceivingReportLine': (2, 3),
-  };
-
   static const _boxWidth = 152.0;
   static const _boxHeight = 66.0;
   // Wide enough for a link name to sit in the gutter without a box clipping
   // it — the labels are the diagram's whole vocabulary.
   static const _gapX = 106.0;
   static const _gapY = 38.0;
-  static const _columns = 5;
-  static const _rows = 4;
+  static const _columns = ontologyColumns;
+  static const _rows = ontologyRows;
 
   static Offset _origin(String type) {
-    final cell = _grid[type];
-    if (cell == null) return Offset.zero;
+    final cell = cellFor(type);
     return Offset(
       cell.$1 * (_boxWidth + _gapX),
       cell.$2 * (_boxHeight + _gapY),
@@ -66,10 +48,8 @@ class SchemaMap extends StatelessWidget {
   Widget build(BuildContext context) {
     final width = _columns * _boxWidth + (_columns - 1) * _gapX;
     final height = _rows * _boxHeight + (_rows - 1) * _gapY;
-    final placed = ontology.objects.where((o) => _grid.containsKey(o.name));
-    final edges = ontology.links
-        .where((l) => _grid.containsKey(l.fromType) && _grid.containsKey(l.toType))
-        .toList();
+    final placed = ontology.objects;
+    final edges = ontology.links.toList();
 
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,

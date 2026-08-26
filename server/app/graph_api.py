@@ -232,6 +232,23 @@ def ontology(principal: Principal = Depends(get_principal)) -> OntologyView:
     )
 
 
+@router.get("/instances")
+def instances(
+    type: str | None = Query(default=None),
+    limit: int = Query(default=400, ge=1, le=2000),
+    principal: Principal = Depends(get_principal),
+):
+    """The live ABox in the same shape an authored fragment comes back in.
+
+    One renderer for both, so the running graph and a declared fixture are
+    peers in the console rather than two views that merely resemble each other.
+    """
+    require_reader(principal)
+    from .worlds import project_live
+
+    return project_live(deps.get_graph_service(), type, limit)
+
+
 @router.get("/objects", response_model=list[ObjectSummary])
 def list_objects(
     type: str | None = Query(default=None),

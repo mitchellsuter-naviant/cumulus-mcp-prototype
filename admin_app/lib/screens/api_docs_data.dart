@@ -1942,6 +1942,72 @@ const evalsGroup = EndpointGroup(
   ],
 );
 
+// ---- Authored ABoxes ---------------------------------------------------------
+
+const worldsGroup = EndpointGroup(
+  title: 'Authored ABoxes',
+  blurb:
+      'The ontology is a TBox and the console draws it. A good deal of *ABox* '
+      'is authored too — every eval fixture, and the demo seed\'s feed '
+      'deliveries — and was only ever observable through its effects. These '
+      'endpoints make those fragments viewable, by **materializing** them: '
+      'running each one into a throwaway in-memory world and reading the graph '
+      'back. That is not the same as expanding the payload, and the difference '
+      'is the value — what comes back includes the resolution the sync flow '
+      'performed (which vendor it matched, at what score, by what method) and '
+      'the Tasks it escalated. Nothing real is touched, which is why looking is '
+      'a plain read.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/worlds',
+      summary: 'The ABox fragments declared in code, with where they live.',
+      auth: ApiAuth.reader,
+      responseExample: '''[{
+  "id": "seed:demo-world",
+  "name": "Demo world",
+  "kind": "seed-world",
+  "declared_in": "server/app/payables.py",
+  "owner": "seed_payables_if_empty",
+  "deliveries": 6,
+  "direct_objects": 0
+}]''',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/worlds/{world_id}',
+      summary:
+          'Materialize one fragment: its instances, edges, claims, and what '
+          'establishing it did.',
+      auth: ApiAuth.reader,
+      notes:
+          'Every object carries both halves of the question a natural key '
+          'raises — the key as written and the id it resolves to — and every '
+          'claim says whether it is the one that won under precedence. The '
+          'TBox invariant sweep runs over the result, so a fragment that would '
+          'violate the ontology says so before any case uses it.',
+      errors: [ApiError(404, 'No such world.')],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/graph/instances',
+      summary:
+          'The live ABox, in the same shape an authored fragment comes back in.',
+      auth: ApiAuth.reader,
+      notes:
+          'One renderer for both, so the running graph and a declared fixture '
+          'are peers in the console rather than two views that merely resemble '
+          'each other. A `type` filter pulls in that type\'s one-hop '
+          'neighbours too: a screen of boxes with no edges answers less than a '
+          'smaller one that shows how they join.',
+      params: [
+        ApiParam('type', 'string', where: 'query'),
+        ApiParam('limit', 'int', where: 'query', defaultValue: '400'),
+      ],
+    ),
+  ],
+);
+
 const restGroups = <EndpointGroup>[
   knowledgeGroup,
   searchGroup,
@@ -1955,6 +2021,7 @@ const restGroups = <EndpointGroup>[
   employeeGroup,
   runsGroup,
   graphGroup,
+  worldsGroup,
   evalsGroup,
   dataGroup,
   apiKeysGroup,
