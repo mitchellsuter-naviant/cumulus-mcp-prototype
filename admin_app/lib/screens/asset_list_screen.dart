@@ -233,6 +233,9 @@ class _AssetsSectionState extends State<AssetsSection> {
       );
     }
     return PageBody(
+      // The knowledge-layer gutter: every plane and the section title above
+      // the tabs share one left edge.
+      padding: const EdgeInsets.fromLTRB(28, 20, 28, 40),
       children: [
         _heading(),
         if (_error != null) ErrorNotice(message: _error!, onRetry: _refresh),
@@ -246,10 +249,11 @@ class _AssetsSectionState extends State<AssetsSection> {
 
   Widget _heading() {
     final published = _assets.where((a) => a.status == 'published').length;
-    return PageHeading(
-      // The section title above the tabs already says "Knowledge layer".
-      eyebrow: 'governed corpus · authored',
-      title: 'Assets',
+    return PlaneHeader(
+      summary:
+          'What people wrote: policies, standards, guidelines and notes — the '
+          'documents that argue and carry authority. Exemplars live under '
+          'Learned; generated exports under Ontology.',
       pills: [
         MetaPill('${_assets.length} assets'),
         MetaPill('$published published', tone: CumulusTone.success),

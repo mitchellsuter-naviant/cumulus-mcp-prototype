@@ -96,13 +96,11 @@ class _KnowledgeOverviewState extends State<KnowledgeOverview> {
     return PageBody(
       padding: const EdgeInsets.fromLTRB(28, 20, 28, 40),
       children: [
-        PageHeading(
-          eyebrow: 'four planes, cut by origin',
-          title: 'Overview',
-          subtitle:
-              'What people wrote, what we encoded, what the system learned, '
-              'and what arrived from outside — with the numbers that describe '
-              'the layer as a whole.',
+        PlaneHeader(
+          summary:
+              'Four planes, cut by origin: what people wrote, what we '
+              'encoded, what the system learned, and what arrived from '
+              'outside — with the numbers that describe the layer as a whole.',
           trailing: OutlinedButton.icon(
             onPressed: _loading ? null : _load,
             icon: const Icon(Icons.refresh, size: 16),

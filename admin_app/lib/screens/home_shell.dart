@@ -258,23 +258,28 @@ class _KnowledgeSectionState extends State<_KnowledgeSection> {
           children: [
             // The section title sits above the tabs: the tabs are planes
             // *of* the knowledge layer, and without the title each plane
-            // reads like a top-level destination of its own.
-            Padding(
-              padding: const EdgeInsets.fromLTRB(28, 18, 28, 12),
-              child: Text('Knowledge layer', style: CumulusText.pageTitle),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(28, 0, 28, 0),
-              child: SegmentedTabs(
-                labels: const [
-                  'Overview',
-                  'Library',
-                  'Ontology',
-                  'Learned',
-                  'Sources',
+            // reads like a top-level destination of its own. PageGutter, not
+            // Padding, because the planes below centre their content inside
+            // a max width and the title has to land on the same left edge.
+            PageGutter(
+              padding: const EdgeInsets.fromLTRB(28, 18, 28, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Knowledge layer', style: CumulusText.pageTitle),
+                  const SizedBox(height: 14),
+                  SegmentedTabs(
+                    labels: const [
+                      'Overview',
+                      'Library',
+                      'Ontology',
+                      'Learned',
+                      'Sources',
+                    ],
+                    selectedIndex: selected,
+                    onChanged: (i) => widget.plane.value = i,
+                  ),
                 ],
-                selectedIndex: selected,
-                onChanged: (i) => widget.plane.value = i,
               ),
             ),
             Expanded(

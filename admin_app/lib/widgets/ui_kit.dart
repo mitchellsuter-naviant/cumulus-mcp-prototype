@@ -246,6 +246,38 @@ class StatStrip extends StatelessWidget {
 }
 
 /// Eyebrow · title · trailing pills — the standing head of every page.
+/// A plane's header when the tab bar has already named it.
+///
+/// [PageHeading] gives a screen an eyebrow and a page title, which is right
+/// for a destination. A plane *inside* a titled section is not a destination:
+/// the tab says "Ontology", so a heading that says it again is weight without
+/// information. What is still worth saying is what the plane is for, its
+/// status, and what you can do to it — one line, on one row.
+class PlaneHeader extends StatelessWidget {
+  final String summary;
+  final List<Widget> pills;
+  final Widget? trailing;
+
+  const PlaneHeader({
+    super.key,
+    required this.summary,
+    this.pills = const [],
+    this.trailing,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Expanded(child: Text(summary, style: CumulusText.body)),
+        for (final pill in pills) ...[const SizedBox(width: 10), pill],
+        if (trailing != null) ...[const SizedBox(width: 16), trailing!],
+      ],
+    );
+  }
+}
+
 class PageHeading extends StatelessWidget {
   final String eyebrow;
   final String title;

@@ -201,82 +201,116 @@ class _DataPlaneViewState extends State<DataPlaneView> {
     final sources = _sources ?? const <SourceStatus>[];
 
     final ontologyMode = widget.mode == DataPlaneMode.ontology;
+    // The Entities & Links lens is a two-pane workbench, not a document: it
+    // fills the height and its panes scroll themselves, so the schema stays
+    // on screen while you read down a long link table. Every other lens is a
+    // list that grows, and scrolls as a page.
+    final fillsHeight = ontologyMode && _lens == _Lens.entities;
+
+    final header = <Widget>[
+      PlaneHeader(
+        summary: ontologyMode
+            ? 'The schema (TBox) and what it declares: core entities, the '
+                'links between them, the Collection declarations governance '
+                'hangs off, and the Mappings that bind external systems in.'
+            : 'What arrives from outside: each inbound feed against its '
+                'declared contract, and the artifacts the flows keep as '
+                'evidence.',
+        pills: [
+          if (ontologyMode && _invariants.objectsChecked > 0)
+            // The metrics moved to Overview, but the universal test tier
+            // still belongs where the model is read: a violation is a bug,
+            // and finding out on another screen is too late.
+            MetaPill(
+              _invariants.violations.isEmpty
+                  ? 'conforms'
+                  : '${_invariants.violations.length} violation(s)',
+              tone: _invariants.violations.isEmpty
+                  ? CumulusTone.success
+                  : CumulusTone.danger,
+            ),
+        ],
+        trailing: OutlinedButton.icon(
+          onPressed: _loading ? null : _load,
+          icon: const Icon(Icons.refresh, size: 16),
+          label: const Text('Refresh'),
+        ),
+      ),
+      if (_error != null) ErrorNotice(message: _error!, onRetry: _load),
+      if (!ontologyMode)
+        StatStrip(
+          tiles: [
+            StatTile(
+              label: 'Sources',
+              value: '${sources.length}',
+              caption: sources.isEmpty
+                  ? 'nothing synced yet'
+                  : '${sources.fold<int>(0, (s, r) => s + r.recordsLanded)} '
+                      'records landed',
+            ),
+            StatTile(
+              label: 'Mappings',
+              value: '${_mappings?.mappings.length ?? '—'}',
+              caption: 'declared contracts',
+            ),
+            StatTile(
+              label: 'Artifacts',
+              value: _n(_documentStats['documents']),
+              caption: '${_n(_documentStats['expiring'])} past retention',
+            ),
+            StatTile(
+              label: 'Conflicted',
+              value: _n(_graphStats['conflicted_objects']),
+              caption: 'sources disagree, both kept',
+            ),
+          ],
+        ),
+      Row(
+        children: [
+          for (final lens in _lenses) ...[
+            LensChip(
+              label: _label(lens),
+              selected: _lens == lens,
+              onTap: () => setState(() => _lens = lens),
+            ),
+            const SizedBox(width: 8),
+          ],
+        ],
+      ),
+    ];
+
+    if (fillsHeight) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          PageGutter(
+            padding: const EdgeInsets.fromLTRB(28, 20, 28, 0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 16,
+              children: header,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Expanded(
+            child: PageGutter(
+              padding: const EdgeInsets.fromLTRB(28, 0, 28, 28),
+              child: _loading && _ontology == null
+                  ? const CumulusCard(child: CumulusLoading())
+                  : TBoxExplorer(
+                      ontology: _ontology,
+                      collections: _collections ?? const [],
+                    ),
+            ),
+          ),
+        ],
+      );
+    }
+
     return PageBody(
       padding: const EdgeInsets.fromLTRB(28, 20, 28, 40),
       children: [
-        PageHeading(
-          // The section title above the tabs already says "Knowledge layer".
-          eyebrow: ontologyMode ? 'encoded · declared' : 'synced · inbound',
-          title: ontologyMode ? 'Ontology' : 'Sources',
-          pills: [
-            if (ontologyMode && _invariants.objectsChecked > 0)
-              // The metrics moved to Overview, but the universal test tier
-              // still belongs where the model is read: a violation is a bug,
-              // and finding out on another screen is too late.
-              MetaPill(
-                _invariants.violations.isEmpty
-                    ? 'conforms'
-                    : '${_invariants.violations.length} violation(s)',
-                tone: _invariants.violations.isEmpty
-                    ? CumulusTone.success
-                    : CumulusTone.danger,
-              ),
-          ],
-          subtitle: ontologyMode
-              ? 'What we encoded: the schema (TBox), what exists against it '
-                  '(ABox), the Collection declarations governance hangs off, '
-                  'and the Mappings that bind external systems in.'
-              : 'What arrives from outside: each feed against its declared '
-                  'contract, and the artifacts the flows keep as evidence.',
-          trailing: OutlinedButton.icon(
-            onPressed: _loading ? null : _load,
-            icon: const Icon(Icons.refresh, size: 16),
-            label: const Text('Refresh'),
-          ),
-        ),
-        if (_error != null) ErrorNotice(message: _error!, onRetry: _load),
-        // Metrics for the layer as a whole live on Overview. What is left
-        // here is operational: which feeds ran, and what they landed.
-        if (!ontologyMode)
-          StatStrip(
-            tiles: [
-              StatTile(
-                label: 'Sources',
-                value: '${sources.length}',
-                caption: sources.isEmpty
-                    ? 'nothing synced yet'
-                    : '${sources.fold<int>(0, (s, r) => s + r.recordsLanded)} '
-                        'records landed',
-              ),
-              StatTile(
-                label: 'Mappings',
-                value: '${_mappings?.mappings.length ?? '—'}',
-                caption: 'declared contracts',
-              ),
-              StatTile(
-                label: 'Artifacts',
-                value: _n(_documentStats['documents']),
-                caption: '${_n(_documentStats['expiring'])} past retention',
-              ),
-              StatTile(
-                label: 'Conflicted',
-                value: _n(_graphStats['conflicted_objects']),
-                caption: 'sources disagree, both kept',
-              ),
-            ],
-          ),
-        Row(
-          children: [
-            for (final lens in _lenses) ...[
-              LensChip(
-                label: _label(lens),
-                selected: _lens == lens,
-                onTap: () => setState(() => _lens = lens),
-              ),
-              const SizedBox(width: 8),
-            ],
-          ],
-        ),
+        ...header,
         if (_loading && _collections == null && _sources == null)
           const CumulusLoading()
         else
@@ -293,11 +327,10 @@ class _DataPlaneViewState extends State<DataPlaneView> {
               mappings: _mappings?.mappings ?? const [],
             ),
             _Lens.mappings => _MappingsLens(registry: _mappings),
-            _Lens.entities => TBoxExplorer(
-              api: widget.api,
-              ontology: _ontology,
-              collections: _collections ?? const [],
-            ),
+            // Handled by the fill-height branch above, which is the only way
+            // its panes can scroll independently. Unreachable, and the switch
+            // must still be exhaustive.
+            _Lens.entities => const SizedBox.shrink(),
             _Lens.fragments => _InstancesLens(
               worlds: _worlds,
               selected: _abox,

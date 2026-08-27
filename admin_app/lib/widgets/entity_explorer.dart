@@ -1,9 +1,7 @@
 import 'package:flutter/material.dart';
 
-import '../models/asset.dart' show AskAnswer;
 import '../models/data_layer.dart' show DataCollection;
 import '../models/graph.dart';
-import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'ui_kit.dart';
 
@@ -18,11 +16,9 @@ import 'ui_kit.dart';
 /// opens an overview popup; from there you can make it the selection and
 /// keep walking the schema.
 ///
-/// The question box on top asks the graph (the planner's own tool calls
-/// render as the citation); it does not search instances — the ABox has its
-/// own screens.
+/// Two panes that fill the height and scroll themselves: the schema stays on
+/// screen while you read down a long link table.
 class TBoxExplorer extends StatefulWidget {
-  final ApiClient api;
   final Ontology? ontology;
 
   /// The Collection registry, used to tell business entities from
@@ -31,7 +27,6 @@ class TBoxExplorer extends StatefulWidget {
 
   const TBoxExplorer({
     super.key,
-    required this.api,
     required this.ontology,
     this.collections = const [],
   });
@@ -45,12 +40,6 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
   final TextEditingController _filterCtl = TextEditingController();
   String _filter = '';
   final Set<String> _activeTags = {};
-
-  final TextEditingController _askCtl = TextEditingController();
-  AskAnswer? _ask;
-  String _askedQuestion = '';
-  bool _asking = false;
-  String? _error;
 
   // -- derived ontology views -------------------------------------------------
 
@@ -97,159 +86,22 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
   @override
   void dispose() {
     _filterCtl.dispose();
-    _askCtl.dispose();
     super.dispose();
-  }
-
-  Future<void> _runAsk() async {
-    final q = _askCtl.text.trim();
-    if (q.isEmpty) return;
-    setState(() {
-      _asking = true;
-      _askedQuestion = q;
-      _ask = null;
-    });
-    try {
-      final answer = await widget.api.ask(q);
-      if (mounted) {
-        setState(() {
-          _ask = answer;
-          _asking = false;
-        });
-      }
-    } on ApiException catch (e) {
-      if (mounted) {
-        setState(() {
-          _error = e.message;
-          _asking = false;
-        });
-      }
-    }
   }
 
   // -- build --------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
-    return Column(
+    // No page scroll: each pane owns its own, so the rail does not slide away
+    // while you read the table beside it.
+    return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _askBar(),
-        if (_ask != null || _asking) _askPanel(),
-        if (_error != null)
-          Padding(
-            padding: const EdgeInsets.only(top: 10),
-            child: ErrorNotice(
-              message: _error!,
-              onRetry: () => setState(() => _error = null),
-            ),
-          ),
-        const SizedBox(height: 16),
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Expanded(flex: 1, child: _rail()),
-            const SizedBox(width: 16),
-            Expanded(flex: 2, child: _linkTable()),
-          ],
-        ),
+        Expanded(flex: 1, child: _rail()),
+        const SizedBox(width: 16),
+        Expanded(flex: 2, child: _linkTable()),
       ],
-    );
-  }
-
-  Widget _askBar() {
-    return Row(
-      children: [
-        Expanded(
-          child: TextField(
-            controller: _askCtl,
-            onSubmitted: (_) => _runAsk(),
-            decoration: InputDecoration(
-              isDense: true,
-              prefixIcon: const Icon(Icons.route_outlined, size: 18),
-              hintText:
-                  'Ask the graph a question — the planner\'s traversal is '
-                  'the citation',
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(CumulusRadius.control),
-                borderSide: const BorderSide(color: CumulusColors.border),
-              ),
-            ),
-          ),
-        ),
-        const SizedBox(width: 10),
-        FilledButton.icon(
-          onPressed: _asking ? null : _runAsk,
-          icon: const Icon(Icons.route_outlined, size: 16),
-          label: const Text('Ask the graph'),
-        ),
-      ],
-    );
-  }
-
-  Widget _askPanel() {
-    return Padding(
-      padding: const EdgeInsets.only(top: 10),
-      child: CumulusCard(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: SectionHeader(
-                    title: _askedQuestion,
-                    subtitle: _asking
-                        ? 'walking the graph…'
-                        : (_ask?.backend == 'vertex'
-                            ? 'answered by the planner — its actual tool '
-                                'calls are the citation'
-                            : 'answered from retrieval (no planner in this '
-                                'deployment)'),
-                  ),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.close, size: 16),
-                  onPressed: () => setState(() {
-                    _ask = null;
-                    _askedQuestion = '';
-                  }),
-                ),
-              ],
-            ),
-            if (_asking)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 18),
-                child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
-              )
-            else if (_ask != null) ...[
-              const SizedBox(height: 8),
-              Text(_ask!.answer, style: CumulusText.body),
-              if (_ask!.steps.isNotEmpty) ...[
-                const SizedBox(height: 14),
-                const Text('THE WALK IT TOOK', style: CumulusText.statCaption),
-                const SizedBox(height: 6),
-                for (final (i, step) in _ask!.steps.indexed)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 3),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('${i + 1}.', style: CumulusText.meta),
-                        const SizedBox(width: 8),
-                        Text(step.tool, style: CumulusText.mono),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(step.summary, style: CumulusText.meta),
-                        ),
-                      ],
-                    ),
-                  ),
-              ],
-            ],
-          ],
-        ),
-      ),
     );
   }
 
@@ -281,7 +133,7 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
     return CumulusCard(
       padding: EdgeInsets.zero,
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
@@ -325,24 +177,37 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
               ],
             ),
           ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 4, 16, 4),
-            child: Text('CORE ENTITIES', style: CumulusText.statCaption),
+          // The filter and its facets stay put; only the list scrolls.
+          Expanded(
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(16, 4, 16, 4),
+                    child:
+                        Text('CORE ENTITIES', style: CumulusText.statCaption),
+                  ),
+                  for (final t in core) _railRow(t),
+                  if (infra.isNotEmpty) ...[
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+                      child: Text('INFRASTRUCTURE',
+                          style: CumulusText.statCaption),
+                    ),
+                    for (final t in infra) _railRow(t),
+                  ],
+                  if (core.isEmpty && infra.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.all(16),
+                      child:
+                          Text('Nothing matches.', style: CumulusText.meta),
+                    ),
+                  const SizedBox(height: 8),
+                ],
+              ),
+            ),
           ),
-          for (final t in core) _railRow(t),
-          if (infra.isNotEmpty) ...[
-            const Padding(
-              padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
-              child: Text('INFRASTRUCTURE', style: CumulusText.statCaption),
-            ),
-            for (final t in infra) _railRow(t),
-          ],
-          if (core.isEmpty && infra.isEmpty)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: Text('Nothing matches.', style: CumulusText.meta),
-            ),
-          const SizedBox(height: 8),
         ],
       ),
     );
@@ -438,7 +303,8 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Header: the selected type's own declaration.
+          // Header: the selected type's own declaration. Fixed, so the entity
+          // you are reading about does not scroll off its own table.
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 18, 20, 14),
             child: Column(
@@ -476,6 +342,14 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
               ],
             ),
           ),
+          // A crisp edge, so content scrolling under the fixed header reads
+          // as scrolled rather than clipped.
+          const Divider(height: 1, thickness: 1, color: CumulusColors.border),
+          Expanded(
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
           // FIELDS — a fixed part of the view, not a popup. The schema of a
           // type is small and central; hiding it was wrong.
           _sectionStrip('FIELDS · queryable metadata'),
@@ -534,6 +408,10 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
                   style: CumulusText.meta),
             ),
           for (final r in rows) _tableRow(t, r),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );

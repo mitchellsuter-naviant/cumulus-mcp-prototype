@@ -1116,10 +1116,13 @@ cut by **origin** — who or what put each thing there:
 - **Library** — what people wrote: policies, standards, guidelines. The
   authority lens applies here and only here, because authority is a property
   of documents that argue.
-- **Ontology** — what we encoded: **Model · TBox**, **Instances · ABox**, the
-  Collection declarations, and the **Mappings** that bind sources in. The
-  generated exports carry a "regenerated from Python on every startup" banner
-  and refuse edits (409) rather than accepting one the next boot discards.
+- **Ontology** — what we encoded: **Entities & Links** (the TBox as a
+  navigable table — a core-entity rail on the left, every link touching the
+  selected type on the right, both panes scrolling themselves so the schema
+  stays on screen), the **Authored ABox** fragments, the Collection
+  declarations, and the **Mappings** that bind sources in. The generated
+  exports carry a "regenerated from Python on every startup" banner and
+  refuse edits (409) rather than accepting one the next boot discards.
 - **Learned** — what the system figured out through use: the exemplar shelf
   (with origin and revision pins), vendor payment profiles, and the eval
   datasets. The flywheel's output, gathered in one place instead of scattered

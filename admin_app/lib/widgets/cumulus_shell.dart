@@ -924,6 +924,43 @@ class _RailGlyph extends StatelessWidget {
 }
 
 /// Scrolling page body: one measured column, capped width, generous gutters.
+/// The horizontal geometry every page shares: one gutter, one max width.
+///
+/// [PageBody] bakes this into a scrolling column, which is right for a page
+/// that scrolls as a whole. Anything that must sit *outside* the scroll — a
+/// section title, a tab bar, a pane that scrolls internally — has to land on
+/// the same left edge as the body or the page looks broken, and it will not
+/// unless it is centred inside the same max width.
+class PageGutter extends StatelessWidget {
+  final Widget child;
+  final double maxWidth;
+  final EdgeInsetsGeometry padding;
+
+  const PageGutter({
+    super.key,
+    required this.child,
+    this.maxWidth = 1420,
+    this.padding = EdgeInsets.zero,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: padding,
+      child: Center(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxWidth: maxWidth),
+          // Fill the gutter rather than shrink to the child: a start-aligned
+          // column would otherwise be centred as a block, which puts the
+          // section title in the middle of the page instead of on the same
+          // left edge as the body below it.
+          child: SizedBox(width: double.infinity, child: child),
+        ),
+      ),
+    );
+  }
+}
+
 class PageBody extends StatelessWidget {
   final List<Widget> children;
   final double maxWidth;
