@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/data_layer.dart' show DataCollection;
 import '../models/graph.dart';
 import '../theme/cumulus_theme.dart';
+import 'tbox_graph.dart';
 import 'ui_kit.dart';
 
 /// The Entities & Links lens: the TBox, navigable as a table.
@@ -35,11 +36,18 @@ class TBoxExplorer extends StatefulWidget {
   State<TBoxExplorer> createState() => _TBoxExplorerState();
 }
 
+enum _View { table, graph }
+
 class _TBoxExplorerState extends State<TBoxExplorer> {
   String? _selected;
   final TextEditingController _filterCtl = TextEditingController();
   String _filter = '';
   final Set<String> _activeTags = {};
+
+  /// How the selected entity's links are shown. The table is exact and
+  /// scannable; the graph shows the shape at a glance. Neither replaces the
+  /// other, so it is a toggle rather than a choice made for the reader.
+  _View _view = _View.table;
 
   // -- derived ontology views -------------------------------------------------
 
@@ -112,12 +120,18 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
     // below the filter box narrow it. Selecting several tags means "all of
     // these"; a type carries many tags, so Employee answers to `people` and
     // to `expenses` without appearing twice.
+    // Alphabetical: declaration order is meaningful to the ontology and
+    // meaningless to someone looking for a name in a list.
+    int byLabel(OntologyObjectType a, OntologyObjectType b) =>
+        a.label.toLowerCase().compareTo(b.label.toLowerCase());
     final core = _types
         .where((t) => !t.isPart && !_isInfrastructure(t) && _matchesFilter(t))
-        .toList();
+        .toList()
+      ..sort(byLabel);
     final infra = _types
         .where((t) => !t.isPart && _isInfrastructure(t) && _matchesFilter(t))
-        .toList();
+        .toList()
+      ..sort(byLabel);
     // The facet vocabulary, with how many core types answer to each.
     final tagCounts = <String, int>{};
     for (final t in _types.where((t) => !t.isPart && !_isInfrastructure(t))) {
@@ -227,26 +241,19 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
         ),
         child: Row(
           children: [
+            // Just the name: the parts are visible the moment the entity is
+            // selected, and a second line per row bought clutter rather than
+            // information.
             Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    t.label,
-                    style: TextStyle(
-                      fontSize: 13.5,
-                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                      color: selected
-                          ? CumulusColors.accentInk
-                          : CumulusColors.ink,
-                    ),
-                  ),
-                  if (t.partTypes.isNotEmpty)
-                    Text(
-                      '▸ ${t.partTypes.join(" · ")}',
-                      style: CumulusText.statCaption,
-                    ),
-                ],
+              child: Text(
+                t.label,
+                style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                  color: selected
+                      ? CumulusColors.accentInk
+                      : CumulusColors.ink,
+                ),
               ),
             ),
             if (t.authoritative)
@@ -328,15 +335,29 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
                   ],
                 ),
                 const SizedBox(height: 6),
-                Wrap(
-                  spacing: 14,
-                  runSpacing: 4,
+                Row(
                   children: [
-                    if (t.collection.isNotEmpty)
-                      Text('collection ${t.collection}',
-                          style: CumulusText.meta),
-                    Text('· ${t.instances} in the graph',
-                        style: CumulusText.meta),
+                    Expanded(
+                      child: Wrap(
+                        spacing: 14,
+                        runSpacing: 4,
+                        children: [
+                          if (t.collection.isNotEmpty)
+                            Text('collection ${t.collection}',
+                                style: CumulusText.meta),
+                          Text('· ${t.instances} in the graph',
+                              style: CumulusText.meta),
+                        ],
+                      ),
+                    ),
+                    for (final v in _View.values) ...[
+                      LensChip(
+                        label: v == _View.table ? 'TABLE' : 'GRAPH',
+                        selected: _view == v,
+                        onTap: () => setState(() => _view = v),
+                      ),
+                      const SizedBox(width: 6),
+                    ],
                   ],
                 ),
               ],
@@ -345,6 +366,9 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
           // A crisp edge, so content scrolling under the fixed header reads
           // as scrolled rather than clipped.
           const Divider(height: 1, thickness: 1, color: CumulusColors.border),
+          if (_view == _View.graph)
+            Expanded(child: _graphBody(t, rows))
+          else
           Expanded(
             child: SingleChildScrollView(
               child: Column(
@@ -414,6 +438,67 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
           ),
         ],
       ),
+    );
+  }
+
+  /// The same rows the table shows, grouped by neighbour and handed to the
+  /// diagram — one source of truth for what links exist.
+  Widget _graphBody(OntologyObjectType t, List<_LinkRow> rows) {
+    final byType = <String, List<_LinkRow>>{};
+    for (final r in rows) {
+      byType.putIfAbsent(r.other, () => []).add(r);
+    }
+    final spokes = <GraphSpoke>[
+      for (final entry in byType.entries)
+        GraphSpoke(
+          type: entry.key,
+          label: _declared(entry.key)?.label ?? entry.key,
+          instances: _declared(entry.key)?.instances ?? 0,
+          isPart: _declared(entry.key)?.isPart ?? false,
+          edges: [
+            for (final r in entry.value)
+              SpokeEdge(
+                name: r.link.name,
+                outbound: r.outbound,
+                nature: r.link.nature,
+                cardinality: r.link.cardinality,
+              ),
+          ],
+        ),
+    ];
+    return Column(
+      children: [
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+            child: TBoxGraph(
+              focusLabel: t.label,
+              focusInstances: t.instances,
+              spokes: spokes,
+              // Walking a hop: a core entity becomes the focus, a part opens
+              // its declaration, since a part has no rail entry to land on.
+              onTapType: (name) {
+                final target = _declared(name);
+                if (target == null) return;
+                if (target.isPart) {
+                  _showOverview(name);
+                } else {
+                  setState(() => _selected = name);
+                }
+              },
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+          child: Text(
+            'Tap an entity to walk to it · a part opens its declaration · '
+            'thicker tinted lines are composition, dashed are identity '
+            'assertions',
+            style: CumulusText.statCaption,
+          ),
+        ),
+      ],
     );
   }
 
