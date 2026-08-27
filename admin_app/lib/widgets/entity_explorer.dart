@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 
 import '../models/asset.dart' show AskAnswer;
@@ -9,26 +7,21 @@ import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'ui_kit.dart';
 
-/// The Entities lens: independent entities on the left, one entity's world on
-/// the right, cut by link *nature*.
+/// The Entities & Links lens: the TBox, navigable as a table.
 ///
-/// The hierarchy does the scaling. Only independent entities (types nothing
-/// composes) appear in the left rail — parts fold into their owners, so a
-/// growing ontology grows the rail slowly. Selecting an entity fills the
-/// right two-thirds, where a floating pill switches between the three natures
-/// an edge can have:
+/// Deliberately schema-only — no instances. The left third lists the core
+/// entity types (independent ones; parts fold under their owners and
+/// infrastructure sits below the fold), with a filter box for when the
+/// ontology outgrows a screen. Selecting one fills the right two-thirds with
+/// a single table: every Link touching that type — the link's label, the
+/// related entity, its nature, its cardinality. Clicking a related entity
+/// opens an overview popup; from there you can make it the selection and
+/// keep walking the schema.
 ///
-/// - **Contents** — what it is made of (compositional edges: an invoice's
-///   lines, its retained match). Parts render with their substance, because
-///   they have no page of their own.
-/// - **Associations** — what it relates to (independent things: the vendor
-///   that issued it, the PO it bills). Clicking one moves the selection.
-/// - **Identity** — what other systems call it (identity edges, with the
-///   confidence and method a steward can audit).
-///
-/// Search accepts any handle a person holds; ending with `?` asks the graph
-/// and renders the planner's own walk.
-class EntityExplorer extends StatefulWidget {
+/// The question box on top asks the graph (the planner's own tool calls
+/// render as the citation); it does not search instances — the ABox has its
+/// own screens.
+class TBoxExplorer extends StatefulWidget {
   final ApiClient api;
   final Ontology? ontology;
 
@@ -36,7 +29,7 @@ class EntityExplorer extends StatefulWidget {
   /// infrastructure (a landing Collection's types group below the fold).
   final List<DataCollection> collections;
 
-  const EntityExplorer({
+  const TBoxExplorer({
     super.key,
     required this.api,
     required this.ontology,
@@ -44,40 +37,27 @@ class EntityExplorer extends StatefulWidget {
   });
 
   @override
-  State<EntityExplorer> createState() => _EntityExplorerState();
+  State<TBoxExplorer> createState() => _TBoxExplorerState();
 }
 
-enum _Nature { contents, associations, identity }
+class _TBoxExplorerState extends State<TBoxExplorer> {
+  String? _selected;
+  final TextEditingController _filterCtl = TextEditingController();
+  String _filter = '';
 
-class _EntityExplorerState extends State<EntityExplorer> {
-  /// Root instances by type name, for the left rail.
-  final Map<String, List<GraphObject>> _roots = {};
-  final Set<String> _expandedTypes = {};
-  bool _loadingRail = true;
-
-  GraphObjectDetail? _detail;
-  bool _loadingDetail = false;
-  _Nature _nature = _Nature.contents;
-  String? _expandedField;
-  bool _fieldsOpen = false;
-
-  final TextEditingController _searchCtl = TextEditingController();
-  Timer? _debounce;
-  List<EntityHit>? _hits;
-  bool _searching = false;
-
+  final TextEditingController _askCtl = TextEditingController();
   AskAnswer? _ask;
   String _askedQuestion = '';
   bool _asking = false;
-
   String? _error;
 
   // -- derived ontology views -------------------------------------------------
 
-  List<OntologyObjectType> get _rootTypes => [
-    for (final t in widget.ontology?.objects ?? const <OntologyObjectType>[])
-      if (!t.isPart) t,
-  ];
+  List<OntologyObjectType> get _types =>
+      widget.ontology?.objects ?? const <OntologyObjectType>[];
+
+  List<OntologyLinkType> get _links =>
+      widget.ontology?.links ?? const <OntologyLinkType>[];
 
   bool _isInfrastructure(OntologyObjectType t) {
     for (final c in widget.collections) {
@@ -86,160 +66,42 @@ class _EntityExplorerState extends State<EntityExplorer> {
     return false;
   }
 
-  String _natureOf(String linkType) {
-    for (final l in widget.ontology?.links ?? const <OntologyLinkType>[]) {
-      if (l.name == linkType) return l.nature;
-    }
-    return 'association';
-  }
-
   OntologyObjectType? _declared(String name) {
-    for (final t in widget.ontology?.objects ?? const <OntologyObjectType>[]) {
+    for (final t in _types) {
       if (t.name == name) return t;
     }
     return null;
   }
 
+  bool _matchesFilter(OntologyObjectType t) {
+    if (_filter.isEmpty) return true;
+    final q = _filter.toLowerCase();
+    return t.label.toLowerCase().contains(q) ||
+        t.name.toLowerCase().contains(q);
+  }
+
   @override
   void initState() {
     super.initState();
-    _loadRail();
+    // Land on the first core type with something declared against it.
+    final core = _types.where((t) => !t.isPart && !_isInfrastructure(t));
+    _selected = core.isNotEmpty ? core.first.name : null;
   }
 
   @override
   void dispose() {
-    _debounce?.cancel();
-    _searchCtl.dispose();
+    _filterCtl.dispose();
+    _askCtl.dispose();
     super.dispose();
   }
 
-  Future<void> _loadRail() async {
-    setState(() => _loadingRail = true);
-    Future<T?> attempt<T>(Future<T> call) =>
-        call.then<T?>((v) => v).catchError((_) => null);
-    final types = _rootTypes.where((t) => t.instances > 0).toList();
-    final results = await Future.wait([
-      for (final t in types) attempt(widget.api.listObjects(type: t.name, limit: 100)),
-    ]);
-    if (!mounted) return;
-    setState(() {
-      for (final (i, t) in types.indexed) {
-        final rows = results[i];
-        if (rows != null) _roots[t.name] = rows;
-      }
-      _loadingRail = false;
-    });
-    // Land on something with a story: the first business entity available.
-    if (_detail == null) {
-      for (final t in types) {
-        if (!_isInfrastructure(t) && (_roots[t.name]?.isNotEmpty ?? false)) {
-          if (t.name == 'Vendor' || t == types.last) {
-            _select(_roots[t.name]!.first.id);
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  Future<void> _select(String objectId) async {
-    setState(() {
-      _hits = null;
-      _loadingDetail = true;
-      _expandedField = null;
-      _fieldsOpen = false;
-      _error = null;
-    });
-    try {
-      final detail = await widget.api.getObject(objectId);
-      if (!mounted) return;
-      setState(() {
-        _detail = detail;
-        _loadingDetail = false;
-        // Default to the nature that has something to show, in story order.
-        final grouped = _grouped(detail);
-        _nature = grouped[_Nature.contents]!.isNotEmpty
-            ? _Nature.contents
-            : _Nature.associations;
-      });
-    } on ApiException catch (e) {
-      if (mounted) {
-        setState(() {
-          _error = e.message;
-          _loadingDetail = false;
-        });
-      }
-    }
-  }
-
-  /// Edges of the selected entity, cut by nature and grouped by link type.
-  Map<_Nature, List<_EdgeGroup>> _grouped(GraphObjectDetail detail) {
-    final byNature = {
-      _Nature.contents: <String, _EdgeGroup>{},
-      _Nature.associations: <String, _EdgeGroup>{},
-      _Nature.identity: <String, _EdgeGroup>{},
-    };
-    for (final e in detail.neighbors.where((e) => e.live)) {
-      final nature = switch (_natureOf(e.type)) {
-        'composition' => _Nature.contents,
-        'identity' => _Nature.identity,
-        _ => _Nature.associations,
-      };
-      // Contents are what this entity is made of — its own parts, not the
-      // owner seen from a part's side. The owner surfaces as a breadcrumb.
-      if (nature == _Nature.contents && e.direction == 'in') continue;
-      byNature[nature]!
-          .putIfAbsent('${e.type}:${e.direction}',
-              () => _EdgeGroup(e.type, e.direction))
-          .edges
-          .add(e);
-    }
-    return {
-      for (final entry in byNature.entries)
-        entry.key: entry.value.values.toList()
-          ..sort((a, b) => b.edges.length.compareTo(a.edges.length)),
-    };
-  }
-
-  GraphEdge? _ownerEdge(GraphObjectDetail detail) {
-    for (final e in detail.neighbors.where((e) => e.live)) {
-      if (e.direction == 'in' && _natureOf(e.type) == 'composition') return e;
-    }
-    return null;
-  }
-
-  // -- search and ask -----------------------------------------------------------
-
-  void _onQueryChanged(String q) {
-    _debounce?.cancel();
-    if (q.trim().length < 2) {
-      setState(() => _hits = null);
-      return;
-    }
-    _debounce = Timer(const Duration(milliseconds: 250), () async {
-      setState(() => _searching = true);
-      try {
-        final hits = await widget.api.searchEntities(q.trim());
-        if (mounted) {
-          setState(() {
-            _hits = hits;
-            _searching = false;
-          });
-        }
-      } on ApiException {
-        if (mounted) setState(() => _searching = false);
-      }
-    });
-  }
-
   Future<void> _runAsk() async {
-    final q = _searchCtl.text.trim();
+    final q = _askCtl.text.trim();
     if (q.isEmpty) return;
     setState(() {
       _asking = true;
       _askedQuestion = q;
       _ask = null;
-      _hits = null;
     });
     try {
       final answer = await widget.api.ask(q);
@@ -259,23 +121,14 @@ class _EntityExplorerState extends State<EntityExplorer> {
     }
   }
 
-  static String? _idFromRef(String ref) {
-    if (!ref.startsWith('graph:')) return null;
-    final slash = ref.indexOf('/');
-    if (slash < 0) return null;
-    final at = ref.indexOf('@', slash);
-    return at < 0 ? ref.substring(slash + 1) : ref.substring(slash + 1, at);
-  }
-
-  // -- build ---------------------------------------------------------------------
+  // -- build --------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _searchBar(),
-        if (_hits != null) _searchResults(),
+        _askBar(),
         if (_ask != null || _asking) _askPanel(),
         if (_error != null)
           Padding(
@@ -291,39 +144,26 @@ class _EntityExplorerState extends State<EntityExplorer> {
           children: [
             Expanded(flex: 1, child: _rail()),
             const SizedBox(width: 16),
-            Expanded(flex: 2, child: _entityPanel()),
+            Expanded(flex: 2, child: _linkTable()),
           ],
         ),
       ],
     );
   }
 
-  Widget _searchBar() {
+  Widget _askBar() {
     return Row(
       children: [
         Expanded(
           child: TextField(
-            controller: _searchCtl,
-            onChanged: _onQueryChanged,
-            onSubmitted: (_) {
-              if (_searchCtl.text.trim().endsWith('?')) _runAsk();
-            },
+            controller: _askCtl,
+            onSubmitted: (_) => _runAsk(),
             decoration: InputDecoration(
               isDense: true,
-              prefixIcon: const Icon(Icons.search, size: 18),
-              suffixIcon: _searching
-                  ? const Padding(
-                      padding: EdgeInsets.all(12),
-                      child: SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                    )
-                  : null,
+              prefixIcon: const Icon(Icons.route_outlined, size: 18),
               hintText:
-                  'Find an entity by name, natural key, or an external '
-                  "system's id — or end with ? to ask the graph",
+                  'Ask the graph a question — the planner\'s traversal is '
+                  'the citation',
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(CumulusRadius.control),
                 borderSide: const BorderSide(color: CumulusColors.border),
@@ -338,46 +178,6 @@ class _EntityExplorerState extends State<EntityExplorer> {
           label: const Text('Ask the graph'),
         ),
       ],
-    );
-  }
-
-  Widget _searchResults() {
-    final hits = _hits!;
-    return Padding(
-      padding: const EdgeInsets.only(top: 10),
-      child: CumulusCard(
-        padding: EdgeInsets.zero,
-        child: hits.isEmpty
-            ? const Padding(
-                padding: EdgeInsets.all(18),
-                child: Text('Nothing matches.', style: CumulusText.meta),
-              )
-            : Column(
-                children: [
-                  for (final hit in hits.take(10))
-                    CumulusListRow(
-                      onTap: () => _select(hit.entity.id),
-                      leading: _TypeDot(type: hit.entity.type),
-                      title: Row(
-                        children: [
-                          Flexible(child: Text(hit.entity.label)),
-                          const SizedBox(width: 8),
-                          StatusBadge(hit.entity.type, dense: true),
-                          const SizedBox(width: 6),
-                          StatusBadge('matched ${hit.match}', dense: true),
-                        ],
-                      ),
-                      subtitle: Text(
-                        hit.via.isEmpty
-                            ? hit.entity.naturalKey
-                            : '${hit.entity.naturalKey} · found via '
-                                'identity link from ${hit.via}',
-                        style: CumulusText.meta,
-                      ),
-                    ),
-                ],
-              ),
-      ),
     );
   }
 
@@ -436,11 +236,6 @@ class _EntityExplorerState extends State<EntityExplorer> {
                         Expanded(
                           child: Text(step.summary, style: CumulusText.meta),
                         ),
-                        if (_idFromRef(step.ref) != null)
-                          RowAction(
-                            label: 'Open',
-                            onTap: () => _select(_idFromRef(step.ref)!),
-                          ),
                       ],
                     ),
                   ),
@@ -452,95 +247,71 @@ class _EntityExplorerState extends State<EntityExplorer> {
     );
   }
 
-  // -- the left rail: independent entities only -----------------------------------
+  // -- left rail: core entity types ----------------------------------------------
 
   Widget _rail() {
-    if (_loadingRail) return const CumulusCard(child: CumulusLoading());
-    final business = _rootTypes.where((t) => !_isInfrastructure(t)).toList();
-    final infra = _rootTypes.where(_isInfrastructure).toList();
+    final core = _types
+        .where((t) => !t.isPart && !_isInfrastructure(t) && _matchesFilter(t))
+        .toList();
+    final infra = _types
+        .where((t) => !t.isPart && _isInfrastructure(t) && _matchesFilter(t))
+        .toList();
     return CumulusCard(
-      padding: const EdgeInsets.fromLTRB(6, 12, 6, 12),
+      padding: EdgeInsets.zero,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Padding(
-            padding: EdgeInsets.only(left: 14, bottom: 4),
-            child: Text('ENTITIES', style: CumulusText.statCaption),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+            child: TextField(
+              controller: _filterCtl,
+              onChanged: (v) => setState(() => _filter = v.trim()),
+              decoration: InputDecoration(
+                isDense: true,
+                prefixIcon: const Icon(Icons.filter_list, size: 16),
+                hintText: 'Filter entities…',
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(CumulusRadius.control),
+                  borderSide: const BorderSide(color: CumulusColors.border),
+                ),
+              ),
+            ),
           ),
-          for (final t in business) ..._typeSection(t),
-          if (infra.any((t) => (_roots[t.name] ?? const []).isNotEmpty)) ...[
-            const SizedBox(height: 14),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 4, 16, 4),
+            child: Text('CORE ENTITIES', style: CumulusText.statCaption),
+          ),
+          for (final t in core) _railRow(t),
+          if (infra.isNotEmpty) ...[
+            const SizedBox(height: 10),
             const Padding(
-              padding: EdgeInsets.only(left: 14, bottom: 4),
+              padding: EdgeInsets.fromLTRB(16, 4, 16, 4),
               child: Text('INFRASTRUCTURE', style: CumulusText.statCaption),
             ),
-            for (final t in infra) ..._typeSection(t, cap: 4),
+            for (final t in infra) _railRow(t),
           ],
+          if (core.isEmpty && infra.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text('Nothing matches.', style: CumulusText.meta),
+            ),
+          const SizedBox(height: 8),
         ],
       ),
     );
   }
 
-  List<Widget> _typeSection(OntologyObjectType t, {int cap = 8}) {
-    final rows = _roots[t.name] ?? const <GraphObject>[];
-    if (rows.isEmpty) return const [];
-    final expanded = _expandedTypes.contains(t.name);
-    final shown = expanded ? rows : rows.take(cap).toList();
-    final parts = t.partTypes;
-    return [
-      Padding(
-        padding: const EdgeInsets.fromLTRB(14, 12, 14, 4),
-        child: Row(
-          children: [
-            Text(
-              t.label.toUpperCase(),
-              style: CumulusText.statCaption.copyWith(
-                color: CumulusColors.ink,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(width: 6),
-            Text('${rows.length}', style: CumulusText.statCaption),
-            if (parts.isNotEmpty) ...[
-              const SizedBox(width: 6),
-              Tooltip(
-                message:
-                    'composes ${parts.join(", ")} — parts fold under their '
-                    'owner instead of cluttering this list',
-                child: Text('▸ ${parts.join(" · ")}',
-                    style: CumulusText.statCaption),
-              ),
-            ],
-          ],
-        ),
-      ),
-      for (final row in shown) _railEntityRow(row),
-      if (rows.length > cap)
-        Padding(
-          padding: const EdgeInsets.only(left: 14, top: 2),
-          child: RowAction(
-            label: expanded ? 'Show fewer' : 'All ${rows.length} →',
-            onTap: () => setState(() {
-              expanded
-                  ? _expandedTypes.remove(t.name)
-                  : _expandedTypes.add(t.name);
-            }),
-          ),
-        ),
-    ];
-  }
-
-  Widget _railEntityRow(GraphObject row) {
-    final selected = _detail?.object.id == row.id;
+  Widget _railRow(OntologyObjectType t) {
+    final selected = _selected == t.name;
     return InkWell(
-      onTap: () => _select(row.id),
-      borderRadius: BorderRadius.circular(8),
+      onTap: () => setState(() => _selected = t.name),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-        margin: const EdgeInsets.symmetric(horizontal: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         decoration: BoxDecoration(
           color: selected ? CumulusColors.accentSoft : Colors.transparent,
-          borderRadius: BorderRadius.circular(8),
+          border: const Border(
+            bottom: BorderSide(color: CumulusColors.border, width: 0.5),
+          ),
         ),
         child: Row(
           children: [
@@ -549,499 +320,386 @@ class _EntityExplorerState extends State<EntityExplorer> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    row.label,
-                    overflow: TextOverflow.ellipsis,
+                    t.label,
                     style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                      fontSize: 13.5,
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
                       color: selected
                           ? CumulusColors.accentInk
                           : CumulusColors.ink,
                     ),
                   ),
-                  if (row.naturalKey != row.label)
+                  if (t.partTypes.isNotEmpty)
                     Text(
-                      row.naturalKey,
-                      overflow: TextOverflow.ellipsis,
-                      style: CumulusText.mono.copyWith(
-                        fontSize: 10.5,
-                        color: CumulusColors.inkMuted,
-                      ),
+                      '▸ ${t.partTypes.join(" · ")}',
+                      style: CumulusText.statCaption,
                     ),
                 ],
               ),
             ),
-            if (row.conflictFields.isNotEmpty)
+            if (t.authoritative)
               const Padding(
-                padding: EdgeInsets.only(left: 6),
-                child: Icon(Icons.warning_amber_rounded,
-                    size: 13, color: CumulusColors.warn),
+                padding: EdgeInsets.only(right: 8),
+                child: Tooltip(
+                  message: 'Cumulus is the system of record for this type',
+                  child: Icon(Icons.verified_outlined,
+                      size: 14, color: CumulusColors.success),
+                ),
               ),
+            Text('${t.instances}', style: CumulusText.statCaption),
           ],
         ),
       ),
     );
   }
 
-  // -- the entity panel --------------------------------------------------------
+  // -- the link table --------------------------------------------------------------
 
-  Widget _entityPanel() {
-    if (_loadingDetail) return const CumulusCard(child: CumulusLoading());
-    final detail = _detail;
-    if (detail == null) {
+  /// Every Link touching the selected type, one row each — the schema as a
+  /// table you read rather than a diagram you decode.
+  Widget _linkTable() {
+    final t = _declared(_selected ?? '');
+    if (t == null) {
       return const CumulusCard(
         child: CumulusEmptyState(
           icon: Icons.hub_outlined,
           title: 'Pick an entity',
-          message:
-              'Select one on the left, search above, or end a question '
-              'with ? to ask the graph.',
+          message: 'Select a core entity on the left to see its links.',
         ),
       );
     }
-    final grouped = _grouped(detail);
-    final owner = _ownerEdge(detail);
-    final counts = {
-      for (final n in _Nature.values)
-        n: grouped[n]!.fold<int>(0, (s, g) => s + g.edges.length),
-    };
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _header(detail, owner),
-        const SizedBox(height: 12),
-        // The floating nature pill: one question at a time — what is it made
-        // of, what does it relate to, what do other systems call it.
-        Center(
-          child: Container(
-            padding: const EdgeInsets.all(4),
-            decoration: BoxDecoration(
-              color: CumulusColors.surface,
-              borderRadius: BorderRadius.circular(CumulusRadius.pill),
-              border: Border.all(color: CumulusColors.border),
-              boxShadow: CumulusShadows.card,
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                for (final n in _Nature.values)
-                  _naturePill(n, counts[n] ?? 0),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-        switch (_nature) {
-          _Nature.contents => _contentsBody(grouped[_Nature.contents]!),
-          _Nature.associations =>
-            _associationsBody(grouped[_Nature.associations]!),
-          _Nature.identity => _identityBody(grouped[_Nature.identity]!),
-        },
-      ],
-    );
-  }
+    final rows = <_LinkRow>[
+      for (final l in _links)
+        if (l.fromType == t.name)
+          _LinkRow(link: l, outbound: true, other: l.toType),
+      for (final l in _links)
+        if (l.toType == t.name && l.fromType != t.name)
+          _LinkRow(link: l, outbound: false, other: l.fromType),
+    ]..sort((a, b) {
+        // Contents first, then associations, identity last — story order.
+        int weight(_LinkRow r) => switch (r.link.nature) {
+          'composition' => 0,
+          'identity' => 2,
+          _ => 1,
+        };
+        final w = weight(a).compareTo(weight(b));
+        return w != 0 ? w : a.link.name.compareTo(b.link.name);
+      });
 
-  Widget _naturePill(_Nature n, int count) {
-    final selected = _nature == n;
-    final label = switch (n) {
-      _Nature.contents => 'CONTENTS',
-      _Nature.associations => 'ASSOCIATIONS',
-      _Nature.identity => 'IDENTITY',
-    };
-    return InkWell(
-      onTap: () => setState(() => _nature = n),
-      borderRadius: BorderRadius.circular(CumulusRadius.pill),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        decoration: BoxDecoration(
-          color: selected ? CumulusColors.ink : Colors.transparent,
-          borderRadius: BorderRadius.circular(CumulusRadius.pill),
-        ),
-        child: Text(
-          '$label · $count',
-          style: TextStyle(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 0.4,
-            color: selected ? Colors.white : CumulusColors.inkSecondary,
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _header(GraphObjectDetail detail, GraphEdge? owner) {
-    final entity = detail.object;
-    final preview = entity.props.entries.take(4).toList();
     return CumulusCard(
+      padding: EdgeInsets.zero,
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (owner != null)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Row(
-                children: [
-                  const Icon(Icons.subdirectory_arrow_right,
-                      size: 14, color: CumulusColors.inkMuted),
-                  const SizedBox(width: 6),
-                  Text('part of ', style: CumulusText.meta),
-                  RowAction(
-                    label: '${owner.other.type} · ${owner.other.label}',
-                    onTap: () => _select(owner.other.id),
-                  ),
-                ],
-              ),
-            ),
-          Row(
-            children: [
-              Expanded(
-                child: SectionHeader(
-                  title: entity.label,
-                  subtitle: entity.naturalKey,
-                ),
-              ),
-              StatusBadge(entity.type, dense: true),
-              const SizedBox(width: 6),
-              StatusBadge(
-                entity.status,
-                tone: entity.status == 'active'
-                    ? CumulusTone.success
-                    : CumulusTone.warn,
-                dense: true,
-              ),
-              const SizedBox(width: 6),
-              MetaPill(entity.ref),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Wrap(
-            spacing: 14,
-            runSpacing: 6,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              for (final e in preview)
-                Text.rich(TextSpan(children: [
-                  TextSpan(
-                      text: '${e.key} ',
-                      style: CumulusText.mono.copyWith(fontSize: 11.5)),
-                  TextSpan(text: '${e.value}', style: CumulusText.meta),
-                ])),
-              RowAction(
-                label: _fieldsOpen
-                    ? 'Hide fields'
-                    : 'All ${entity.props.length} fields & claims',
-                onTap: () => setState(() => _fieldsOpen = !_fieldsOpen),
-              ),
-            ],
-          ),
-          if (_fieldsOpen) ...[
-            const SizedBox(height: 10),
-            const Divider(height: 1, color: CumulusColors.border),
-            for (final e in detail.object.props.entries)
-              _fieldRow(detail, e.key, e.value),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _fieldRow(GraphObjectDetail detail, String field, Object? value) {
-    final conflicted = detail.conflicts.containsKey(field);
-    final expanded = _expandedField == field;
-    final claims = detail.claims.where((c) => c.field == field).toList()
-      ..sort((a, b) => b.atIso.compareTo(a.atIso));
-    return Column(
-      children: [
-        InkWell(
-          onTap: () =>
-              setState(() => _expandedField = expanded ? null : field),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            child: Row(
-              children: [
-                SizedBox(
-                  width: 190,
-                  child: Text(field,
-                      style: CumulusText.mono.copyWith(fontSize: 12)),
-                ),
-                Expanded(child: Text('$value', style: CumulusText.body)),
-                if (conflicted)
-                  const StatusBadge('sources disagree',
-                      tone: CumulusTone.warn, dense: true),
-                const SizedBox(width: 8),
-                Icon(expanded ? Icons.expand_less : Icons.expand_more,
-                    size: 15, color: CumulusColors.inkMuted),
-              ],
-            ),
-          ),
-        ),
-        if (expanded)
-          Container(
-            width: double.infinity,
-            decoration: BoxDecoration(
-              color: CumulusColors.surfaceMuted.withValues(alpha: 0.5),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            padding: const EdgeInsets.fromLTRB(14, 8, 14, 10),
+          // Header: the selected type's own declaration.
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 18, 20, 14),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                for (final claim in claims)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 3),
-                    child: Wrap(
-                      spacing: 10,
-                      runSpacing: 4,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      children: [
-                        Icon(
-                          '${claim.value}' == '$value'
-                              ? Icons.check_circle_outline
-                              : Icons.remove_circle_outline,
-                          size: 14,
-                          color: '${claim.value}' == '$value'
-                              ? CumulusColors.success
-                              : CumulusColors.inkMuted,
-                        ),
-                        Text('${claim.value}',
-                            style: CumulusText.body.copyWith(
-                              fontWeight: '${claim.value}' == '$value'
-                                  ? FontWeight.w600
-                                  : FontWeight.w400,
-                            )),
-                        Text('said by ${claim.source}',
-                            style: CumulusText.meta),
-                        if (claim.runId.isNotEmpty)
-                          Text('· in ${claim.runId}/${claim.stepId}',
-                              style: CumulusText.mono
-                                  .copyWith(fontSize: 11)),
-                        if (claim.atIso.isNotEmpty)
-                          Text('· ${claim.atIso.split("T").first}',
-                              style: CumulusText.meta),
-                      ],
+                Row(
+                  children: [
+                    Expanded(
+                      child: SectionHeader(
+                        title: t.label,
+                        subtitle: t.summary,
+                      ),
                     ),
-                  ),
-                if (claims.isEmpty)
-                  const Text('No claims recorded for this field.',
-                      style: CumulusText.meta),
+                    if (t.authoritative)
+                      const StatusBadge('authoritative',
+                          tone: CumulusTone.success, dense: true),
+                    const SizedBox(width: 10),
+                    RowAction(
+                      label: 'Overview',
+                      onTap: () => _showOverview(t.name),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 14,
+                  runSpacing: 4,
+                  children: [
+                    Text('natural key: ${t.naturalKey}',
+                        style: CumulusText.meta),
+                    Text('· ${t.fields.length} declared field(s)',
+                        style: CumulusText.meta),
+                    if (t.collection.isNotEmpty)
+                      Text('· collection ${t.collection}',
+                          style: CumulusText.meta),
+                    Text('· ${t.instances} in the graph',
+                        style: CumulusText.meta),
+                  ],
+                ),
               ],
             ),
           ),
-      ],
-    );
-  }
-
-  // -- nature bodies ----------------------------------------------------------
-
-  /// Contents: the entity's parts, shown with their substance. A part has no
-  /// page of its own — this is where it lives.
-  Widget _contentsBody(List<_EdgeGroup> groups) {
-    if (groups.isEmpty) {
-      return const CumulusCard(
-        child: CumulusEmptyState(
-          icon: Icons.inventory_2_outlined,
-          title: 'Nothing composed',
-          message:
-              'This entity has no parts — its substance is its fields.',
-        ),
-      );
-    }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      spacing: 12,
-      children: [
-        for (final g in groups)
-          ListCard(
-            title:
-                '${g.edges.length} × ${g.edges.first.other.type}',
-            subtitle:
-                'via ${g.label} — parts are identified through this owner '
-                'and die with it',
-            children: [
-              for (final e in g.edges) _partRow(e.other),
-            ],
+          // Column headers.
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 9),
+            decoration: const BoxDecoration(
+              color: CumulusColors.surfaceMuted,
+              border: Border(
+                top: BorderSide(color: CumulusColors.border),
+                bottom: BorderSide(color: CumulusColors.border),
+              ),
+            ),
+            child: const Row(
+              children: [
+                SizedBox(
+                    width: 190,
+                    child: Text('LINK', style: CumulusText.statCaption)),
+                SizedBox(
+                    width: 180,
+                    child: Text('RELATED ENTITY',
+                        style: CumulusText.statCaption)),
+                SizedBox(
+                    width: 110,
+                    child:
+                        Text('NATURE', style: CumulusText.statCaption)),
+                SizedBox(
+                    width: 110,
+                    child: Text('CARDINALITY',
+                        style: CumulusText.statCaption)),
+                Expanded(
+                    child: Text('ABOUT', style: CumulusText.statCaption)),
+              ],
+            ),
           ),
-      ],
+          if (rows.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(20),
+              child: Text('No links declared for this type.',
+                  style: CumulusText.meta),
+            ),
+          for (final r in rows) _tableRow(t, r),
+        ],
+      ),
     );
   }
 
-  Widget _partRow(GraphObject part) {
-    final declaredFields = [
-      for (final f in _declared(part.type)?.fields ??
-          const <Map<String, dynamic>>[])
-        '${f['name']}',
-    ];
-    final shown = declaredFields
-        .where((f) => part.props[f] != null)
-        .take(5)
-        .toList();
-    return CumulusListRow(
-      leading: _TypeDot(type: part.type),
-      title: Row(
-        children: [
-          Flexible(child: Text(part.label)),
-          if (part.conflictFields.isNotEmpty) ...[
-            const SizedBox(width: 8),
-            StatusBadge('⚠ ${part.conflictFields.join(", ")}',
-                tone: CumulusTone.warn, dense: true),
-          ],
-        ],
-      ),
-      subtitle: Wrap(
-        spacing: 12,
-        runSpacing: 4,
-        children: [
-          for (final f in shown)
-            Text('$f ${part.props[f]}', style: CumulusText.meta),
-          if (shown.isEmpty)
-            Text(part.naturalKey, style: CumulusText.mono),
-        ],
-      ),
-      trailing: [
-        Text('rev ${part.revision}', style: CumulusText.statCaption),
-      ],
-      onTap: () => _select(part.id),
-    );
-  }
-
-  /// Associations: the independent things this entity relates to. Clicking
-  /// one moves the selection — this is how you walk.
-  Widget _associationsBody(List<_EdgeGroup> groups) {
-    if (groups.isEmpty) {
-      return const CumulusCard(
-        child: CumulusEmptyState(
-          icon: Icons.link_off,
-          title: 'No associations',
-          message: 'This entity is not related to anything independent yet.',
+  Widget _tableRow(OntologyObjectType selected, _LinkRow r) {
+    final other = _declared(r.other);
+    final natureTone = switch (r.link.nature) {
+      'composition' => CumulusTone.violet,
+      'identity' => CumulusTone.teal,
+      _ => CumulusTone.neutral,
+    };
+    final natureLabel = switch (r.link.nature) {
+      'composition' => 'part',
+      'identity' => 'identity',
+      _ => 'association',
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 11),
+      decoration: const BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: CumulusColors.border, width: 0.5),
         ),
-      );
-    }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      spacing: 12,
-      children: [
-        for (final g in groups)
-          ListCard(
-            title: g.direction == 'out'
-                ? '${g.label} → ${g.edges.length} '
-                    '${g.edges.first.other.type}${g.edges.length == 1 ? '' : 's'}'
-                : '${g.edges.length} '
-                    '${g.edges.first.other.type}${g.edges.length == 1 ? '' : 's'} '
-                    '→ ${g.label}',
-            subtitle: _linkSummary(g.label),
-            children: [
-              for (final e in g.edges)
-                CumulusListRow(
-                  leading: _TypeDot(type: e.other.type),
-                  title: Text(e.other.label),
-                  subtitle: Text(e.other.naturalKey, style: CumulusText.mono),
-                  trailing: [
-                    if (e.props.isNotEmpty)
-                      Text(
-                        e.props.entries
-                            .take(2)
-                            .map((p) => '${p.key} ${p.value}')
-                            .join(' · '),
-                        style: CumulusText.statCaption,
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 190,
+            child: Row(
+              children: [
+                Icon(
+                  r.outbound ? Icons.arrow_forward : Icons.arrow_back,
+                  size: 13,
+                  color: CumulusColors.inkMuted,
+                ),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(r.link.name,
+                      style: CumulusText.mono.copyWith(fontSize: 12)),
+                ),
+              ],
+            ),
+          ),
+          SizedBox(
+            width: 180,
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: InkWell(
+                onTap: () => _showOverview(r.other),
+                borderRadius: BorderRadius.circular(6),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  child: Text(
+                    other?.label ?? r.other,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: CumulusColors.accentInk,
+                      decoration: TextDecoration.underline,
+                      decorationColor: CumulusColors.accentSoft,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 110,
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: StatusBadge(natureLabel, tone: natureTone, dense: true),
+            ),
+          ),
+          SizedBox(
+            width: 110,
+            child: Text(r.link.cardinality,
+                style: CumulusText.mono.copyWith(fontSize: 11)),
+          ),
+          Expanded(
+            child: Text(r.link.summary, style: CumulusText.meta),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // -- the overview popup -----------------------------------------------------------
+
+  void _showOverview(String typeName) {
+    final t = _declared(typeName);
+    if (t == null) return;
+    showDialog<void>(
+      context: context,
+      builder: (context) => Dialog(
+        backgroundColor: CumulusColors.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(CumulusRadius.card),
+        ),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 620, maxHeight: 640),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: SectionHeader(
+                        title: t.label,
+                        subtitle: t.summary,
+                      ),
+                    ),
+                    if (t.isPart)
+                      StatusBadge('part of ${t.ownerType}',
+                          tone: CumulusTone.violet, dense: true)
+                    else if (t.authoritative)
+                      const StatusBadge('authoritative',
+                          tone: CumulusTone.success, dense: true),
+                    IconButton(
+                      icon: const Icon(Icons.close, size: 16),
+                      onPressed: () => Navigator.of(context).pop(),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 14,
+                  runSpacing: 4,
+                  children: [
+                    Text('natural key: ${t.naturalKey}',
+                        style: CumulusText.meta),
+                    if (t.collection.isNotEmpty)
+                      Text('· collection ${t.collection}',
+                          style: CumulusText.meta),
+                    Text('· ${t.instances} in the graph',
+                        style: CumulusText.meta),
+                    if (t.partTypes.isNotEmpty)
+                      Text('· composes ${t.partTypes.join(", ")}',
+                          style: CumulusText.meta),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                const Text('DECLARED FIELDS', style: CumulusText.statCaption),
+                const SizedBox(height: 6),
+                Flexible(
+                  child: SingleChildScrollView(
+                    child: Column(
+                      children: [
+                        for (final f in t.fields)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                SizedBox(
+                                  width: 170,
+                                  child: Text('${f['name']}',
+                                      style: CumulusText.mono
+                                          .copyWith(fontSize: 12)),
+                                ),
+                                SizedBox(
+                                  width: 70,
+                                  child: Text('${f['kind']}',
+                                      style: CumulusText.meta),
+                                ),
+                                Expanded(
+                                  child: Text('${f['note'] ?? ''}',
+                                      style: CumulusText.meta),
+                                ),
+                              ],
+                            ),
+                          ),
+                        if (t.fields.isEmpty)
+                          const Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text('No fields declared.',
+                                style: CumulusText.meta),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    // A part has no rail entry — it lives inside its owner —
+                    // so exploration continues from the owner instead.
+                    if (t.isPart)
+                      OutlinedButton(
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                          setState(() => _selected = t.ownerType);
+                        },
+                        child: Text('Explore its owner (${t.ownerType})'),
+                      )
+                    else
+                      FilledButton(
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                          setState(() => _selected = t.name);
+                        },
+                        child: const Text('Explore this entity'),
                       ),
                   ],
-                  onTap: () => _select(e.other.id),
                 ),
-            ],
+              ],
+            ),
           ),
-      ],
-    );
-  }
-
-  /// Identity: what other systems call this entity — each row auditable.
-  Widget _identityBody(List<_EdgeGroup> groups) {
-    if (groups.isEmpty) {
-      return const CumulusCard(
-        child: CumulusEmptyState(
-          icon: Icons.fingerprint,
-          title: 'No identity assertions',
-          message:
-              'No external system\'s record has been resolved to this '
-              'entity. Identity links appear when a sync feed lands a row '
-              'that matches.',
-        ),
-      );
-    }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      spacing: 12,
-      children: [
-        for (final g in groups)
-          ListCard(
-            title: 'Known to other systems as',
-            subtitle:
-                'each row is an auditable assertion: the confidence and '
-                'method that produced it, reversible by a steward',
-            children: [
-              for (final e in g.edges)
-                CumulusListRow(
-                  leading: const Icon(Icons.fingerprint,
-                      size: 16, color: CumulusColors.inkMuted),
-                  title: Text(e.other.label, style: CumulusText.mono),
-                  subtitle: Wrap(
-                    spacing: 12,
-                    runSpacing: 4,
-                    children: [
-                      Text('method ${e.method}', style: CumulusText.meta),
-                      Text('confidence ${e.confidence.toStringAsFixed(2)}',
-                          style: CumulusText.meta),
-                      for (final p in e.props.entries.take(2))
-                        Text('· ${p.key} ${p.value}', style: CumulusText.meta),
-                    ],
-                  ),
-                  onTap: () => _select(e.other.id),
-                ),
-            ],
-          ),
-      ],
-    );
-  }
-
-  String _linkSummary(String linkType) {
-    for (final l in widget.ontology?.links ?? const <OntologyLinkType>[]) {
-      if (l.name == linkType) return l.summary;
-    }
-    return '';
-  }
-}
-
-class _EdgeGroup {
-  final String label;
-  final String direction;
-  final List<GraphEdge> edges = [];
-
-  _EdgeGroup(this.label, this.direction);
-}
-
-class _TypeDot extends StatelessWidget {
-  final String type;
-
-  const _TypeDot({required this.type});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 30,
-      height: 30,
-      alignment: Alignment.center,
-      decoration: BoxDecoration(
-        color: CumulusColors.accentSoft,
-        borderRadius: BorderRadius.circular(9),
-      ),
-      child: Text(
-        type.isEmpty ? '?' : type[0],
-        style: const TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w700,
-          color: CumulusColors.accentInk,
         ),
       ),
     );
   }
+}
+
+class _LinkRow {
+  final OntologyLinkType link;
+  final bool outbound;
+  final String other;
+
+  const _LinkRow({
+    required this.link,
+    required this.outbound,
+    required this.other,
+  });
 }

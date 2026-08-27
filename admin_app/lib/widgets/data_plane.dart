@@ -241,9 +241,13 @@ class _DataPlaneViewState extends State<DataPlaneView> {
                   StatTile(
                     label: 'Conformance',
                     value: _invariants.objectsChecked > 0
-                        ? '${_invariants.violations.length}'
+                        ? (_invariants.violations.isEmpty
+                            ? 'clean'
+                            : '${_invariants.violations.length}')
                         : '—',
-                    caption: 'invariant violations',
+                    caption: _invariants.violations.isEmpty
+                        ? 'graph conforms · bad writes refused'
+                        : 'invariant violation(s) — a bug, not a warning',
                   ),
                   StatTile(
                     label: 'Collections',
@@ -312,19 +316,10 @@ class _DataPlaneViewState extends State<DataPlaneView> {
               mappings: _mappings?.mappings ?? const [],
             ),
             _Lens.mappings => _MappingsLens(registry: _mappings),
-            _Lens.entities => Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // The universal test tier stays in view: a violation is a
-                // bug, and the explorer should not look healthy over one.
-                _ConformanceBanner(invariants: _invariants),
-                const SizedBox(height: 16),
-                EntityExplorer(
-                  api: widget.api,
-                  ontology: _ontology,
-                  collections: _collections ?? const [],
-                ),
-              ],
+            _Lens.entities => TBoxExplorer(
+              api: widget.api,
+              ontology: _ontology,
+              collections: _collections ?? const [],
             ),
             _Lens.fragments => _InstancesLens(
               worlds: _worlds,
@@ -897,115 +892,6 @@ class _DocumentsLens extends StatelessWidget {
             ],
           ),
       ],
-    );
-  }
-}
-
-/// TBox conformance, stated plainly.
-///
-/// This is the tier of testing that needs no per-case labels: the invariants
-/// hold for every object and edge, so a structural bug — a second vendor
-/// minted for one company, a line with no parent, an edge pointing at the
-/// wrong type — is caught without anyone having written an assertion about it.
-/// Green here is a claim worth making; a violation is a bug, not a warning.
-class _ConformanceBanner extends StatelessWidget {
-  final InvariantReport invariants;
-
-  const _ConformanceBanner({required this.invariants});
-
-  @override
-  Widget build(BuildContext context) {
-    final ok = invariants.ok;
-    final tone = ok ? CumulusTone.success : CumulusTone.danger;
-    return CumulusCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                width: 32,
-                height: 32,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: tone.background,
-                  borderRadius: BorderRadius.circular(9),
-                ),
-                child: Icon(
-                  ok ? Icons.verified_outlined : Icons.report_gmailerrorred,
-                  size: 17,
-                  color: tone.foreground,
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      ok
-                          ? 'The graph conforms to its ontology'
-                          : '${invariants.violations.length} violation(s) of '
-                              'the declared ontology',
-                      style: const TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: CumulusColors.ink,
-                      ),
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      '${invariants.objectsChecked} object(s) and '
-                      '${invariants.linksChecked} live link(s) checked · '
-                      '${invariants.strictWrites ? "writes that would violate it are refused" : "validation is reporting only on this deployment"}',
-                      style: CumulusText.meta,
-                    ),
-                  ],
-                ),
-              ),
-              StatusBadge(
-                ok ? 'conforming' : 'violated',
-                tone: tone,
-                uppercase: true,
-              ),
-            ],
-          ),
-          if (!ok) ...[
-            const SizedBox(height: 14),
-            for (final violation in invariants.violations.take(12))
-              Padding(
-                padding: const EdgeInsets.only(bottom: 5),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SizedBox(
-                      width: 168,
-                      child: StatusBadge(
-                        violation.kind,
-                        tone: CumulusTone.danger,
-                        dense: true,
-                      ),
-                    ),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(violation.subject, style: CumulusText.mono),
-                          Text(violation.detail, style: CumulusText.meta),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            if (invariants.violations.length > 12)
-              Text(
-                '… and ${invariants.violations.length - 12} more',
-                style: CumulusText.meta,
-              ),
-          ],
-        ],
-      ),
     );
   }
 }
