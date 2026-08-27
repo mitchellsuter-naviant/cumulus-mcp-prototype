@@ -459,3 +459,91 @@ class ExpenseRollup {
         .toList(),
   );
 }
+
+/// One entity-search result. `match` names which handle the query caught;
+/// `via` is set when the hit was reached through an identity Link — typing an
+/// ERP id finds the canonical entity it means here.
+class EntityHit {
+  final GraphObject entity;
+  final String match;
+  final String via;
+
+  const EntityHit({required this.entity, required this.match, required this.via});
+
+  factory EntityHit.fromJson(Map<String, dynamic> json) => EntityHit(
+    entity: GraphObject.fromJson(
+      (json['entity'] as Map<String, dynamic>?) ?? const {},
+    ),
+    match: json['match'] as String? ?? '',
+    via: json['via'] as String? ?? '',
+  );
+}
+
+class LinkEndpoint {
+  final String id;
+  final String type;
+  final String label;
+  final String ref;
+
+  const LinkEndpoint({
+    required this.id,
+    required this.type,
+    required this.label,
+    required this.ref,
+  });
+
+  factory LinkEndpoint.fromJson(Map<String, dynamic> json) => LinkEndpoint(
+    id: json['id'] as String? ?? '',
+    type: json['type'] as String? ?? '',
+    label: json['label'] as String? ?? '',
+    ref: json['ref'] as String? ?? '',
+  );
+}
+
+/// One Link as an auditable row: both endpoints, the identity metadata, and
+/// the run/step that wrote it.
+class LinkRow {
+  final String id;
+  final String type;
+  final LinkEndpoint fromEntity;
+  final LinkEndpoint toEntity;
+  final double confidence;
+  final String method;
+  final Map<String, dynamic> props;
+  final bool live;
+  final String reversalReason;
+  final String runId;
+  final String stepId;
+
+  const LinkRow({
+    required this.id,
+    required this.type,
+    required this.fromEntity,
+    required this.toEntity,
+    required this.confidence,
+    required this.method,
+    required this.props,
+    required this.live,
+    required this.reversalReason,
+    required this.runId,
+    required this.stepId,
+  });
+
+  factory LinkRow.fromJson(Map<String, dynamic> json) => LinkRow(
+    id: json['id'] as String? ?? '',
+    type: json['type'] as String? ?? '',
+    fromEntity: LinkEndpoint.fromJson(
+      (json['from_entity'] as Map<String, dynamic>?) ?? const {},
+    ),
+    toEntity: LinkEndpoint.fromJson(
+      (json['to_entity'] as Map<String, dynamic>?) ?? const {},
+    ),
+    confidence: (json['confidence'] as num? ?? 1).toDouble(),
+    method: json['method'] as String? ?? '',
+    props: (json['props'] as Map<String, dynamic>?) ?? const {},
+    live: json['live'] as bool? ?? true,
+    reversalReason: json['reversal_reason'] as String? ?? '',
+    runId: json['run_id'] as String? ?? '',
+    stepId: json['step_id'] as String? ?? '',
+  );
+}

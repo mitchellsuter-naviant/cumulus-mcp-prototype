@@ -7,8 +7,8 @@ import '../models/world.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'cumulus_shell.dart';
+import 'entity_explorer.dart';
 import 'instance_map.dart';
-import 'schema_map.dart';
 import 'ui_kit.dart';
 
 /// The Data plane of the Knowledge layer: what the map holds, and where it
@@ -71,15 +71,15 @@ class DataPlaneView extends StatefulWidget {
   State<DataPlaneView> createState() => _DataPlaneViewState();
 }
 
-enum _Lens { model, instances, collections, mappings, sources, documents }
+enum _Lens { entities, fragments, collections, mappings, sources, documents }
 
 class _DataPlaneViewState extends State<DataPlaneView> {
   late _Lens _lens = _lenses.first;
 
   List<_Lens> get _lenses => switch (widget.mode) {
     DataPlaneMode.ontology => const [
-      _Lens.model,
-      _Lens.instances,
+      _Lens.entities,
+      _Lens.fragments,
       _Lens.collections,
       _Lens.mappings,
     ],
@@ -96,11 +96,6 @@ class _DataPlaneViewState extends State<DataPlaneView> {
   Map<String, dynamic> _documentStats = const {};
   String? _error;
   bool _loading = true;
-
-  /// The object type being browsed under the Model lens.
-  String? _objectType;
-  List<GraphObject>? _objects;
-  GraphObjectDetail? _selected;
 
   /// The Instances lens: which ABox is showing, and what it holds.
   List<AuthoredWorld> _worlds = const [];
@@ -197,29 +192,6 @@ class _DataPlaneViewState extends State<DataPlaneView> {
           _loadingAbox = false;
         });
       }
-    }
-  }
-
-  Future<void> _browse(String type) async {
-    setState(() {
-      _objectType = type;
-      _objects = null;
-      _selected = null;
-    });
-    try {
-      final objects = await widget.api.listObjects(type: type, limit: 200);
-      if (mounted) setState(() => _objects = objects);
-    } on ApiException catch (e) {
-      if (mounted) setState(() => _error = e.message);
-    }
-  }
-
-  Future<void> _inspect(String objectId) async {
-    try {
-      final detail = await widget.api.getObject(objectId);
-      if (mounted) setState(() => _selected = detail);
-    } on ApiException catch (e) {
-      if (mounted) setState(() => _error = e.message);
     }
   }
 
@@ -340,22 +312,17 @@ class _DataPlaneViewState extends State<DataPlaneView> {
               mappings: _mappings?.mappings ?? const [],
             ),
             _Lens.mappings => _MappingsLens(registry: _mappings),
-            _Lens.model => _ModelLens(
-              ontology: _ontology,
-              invariants: _invariants,
-              type: _objectType,
-              objects: _objects,
-              selected: _selected,
-              onBrowse: _browse,
-              onInspect: _inspect,
-              onClear: () => setState(() {
-                _objectType = null;
-                _objects = null;
-                _selected = null;
-              }),
-              onCloseDetail: () => setState(() => _selected = null),
+            _Lens.entities => Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // The universal test tier stays in view: a violation is a
+                // bug, and the explorer should not look healthy over one.
+                _ConformanceBanner(invariants: _invariants),
+                const SizedBox(height: 16),
+                EntityExplorer(api: widget.api, ontology: _ontology),
+              ],
             ),
-            _Lens.instances => _InstancesLens(
+            _Lens.fragments => _InstancesLens(
               worlds: _worlds,
               selected: _abox,
               type: _aboxType,
@@ -392,8 +359,8 @@ class _DataPlaneViewState extends State<DataPlaneView> {
   }
 
   static String _label(_Lens lens) => switch (lens) {
-    _Lens.model => 'MODEL · TBOX',
-    _Lens.instances => 'INSTANCES · ABOX',
+    _Lens.entities => 'ENTITIES & LINKS',
+    _Lens.fragments => 'AUTHORED ABOX',
     _Lens.collections => 'COLLECTIONS',
     _Lens.mappings => 'MAPPINGS',
     _Lens.sources => 'FEEDS',
@@ -831,521 +798,6 @@ IconData _iconForSyncKind(String kind) => switch (kind) {
 };
 
 // ---------------------------------------------------------------------------
-// Entities
-// ---------------------------------------------------------------------------
-
-class _ModelLens extends StatelessWidget {
-  final Ontology? ontology;
-  final InvariantReport invariants;
-  final String? type;
-  final List<GraphObject>? objects;
-  final GraphObjectDetail? selected;
-  final void Function(String type) onBrowse;
-  final void Function(String objectId) onInspect;
-  final VoidCallback onClear;
-  final VoidCallback onCloseDetail;
-
-  const _ModelLens({
-    required this.ontology,
-    required this.invariants,
-    required this.type,
-    required this.objects,
-    required this.selected,
-    required this.onBrowse,
-    required this.onInspect,
-    required this.onClear,
-    required this.onCloseDetail,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final ontology = this.ontology;
-    if (ontology == null) {
-      return CumulusCard(
-        child: CumulusEmptyState(
-          icon: Icons.hub_outlined,
-          title: 'No ontology',
-          message: 'The entity layer did not answer.',
-        ),
-      );
-    }
-    if (selected != null) {
-      return _ObjectDetailCard(detail: selected!, onClose: onCloseDetail);
-    }
-    if (type != null) {
-      return _ObjectListCard(
-        type: type!,
-        objects: objects,
-        onInspect: onInspect,
-        onClear: onClear,
-      );
-    }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      spacing: 16,
-      children: [
-        _ConformanceBanner(invariants: invariants),
-        CumulusCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SectionHeader(
-                title: 'The model',
-                subtitle:
-                    'object types and the typed edges between them, with what '
-                    'is actually in the graph · dashed edges are identity '
-                    'assertions, which a steward can withdraw',
-                trailing: MetaPill('knowledge:${ontology.assetId}'),
-              ),
-              const SizedBox(height: 16),
-              SchemaMap(ontology: ontology, onBrowse: onBrowse),
-            ],
-          ),
-        ),
-        CumulusCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SectionHeader(
-                title: 'Claim precedence',
-                subtitle:
-                    'when two systems assert the same field, both claims are '
-                    'kept and this order decides which resolves',
-              ),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  for (var i = 0; i < ontology.precedence.length; i++) ...[
-                    StatusBadge(
-                      '${i + 1}. ${ontology.precedence[i]}',
-                      tone: i == 0 ? CumulusTone.violet : CumulusTone.neutral,
-                    ),
-                    if (i < ontology.precedence.length - 1)
-                      const Icon(Icons.chevron_right, size: 16,
-                          color: CumulusColors.inkMuted),
-                  ],
-                ],
-              ),
-              const SizedBox(height: 10),
-              Text(
-                'Changing this order re-resolves history rather than rewriting '
-                'it — the losing claims are still on the record.',
-                style: CumulusText.meta,
-              ),
-            ],
-          ),
-        ),
-        ListCard(
-          title: 'Object types',
-          subtitle:
-              'as declared, with what is actually in the graph beside it',
-          children: [
-            for (final objectType in ontology.objects)
-              _ObjectTypeRow(type: objectType, onBrowse: onBrowse),
-          ],
-        ),
-        ListCard(
-          title: 'Link types',
-          subtitle: 'typed, directional, and — for identity — reversible',
-          children: [
-            for (final link in ontology.links) _LinkTypeRow(link: link),
-          ],
-        ),
-      ],
-    );
-  }
-}
-
-class _ObjectTypeRow extends StatelessWidget {
-  final OntologyObjectType type;
-  final void Function(String type) onBrowse;
-
-  const _ObjectTypeRow({required this.type, required this.onBrowse});
-
-  @override
-  Widget build(BuildContext context) {
-    final empty = type.instances == 0;
-    return CumulusListRow(
-      onTap: empty ? null : () => onBrowse(type.name),
-      leading: Monogram(
-        type.name.substring(0, 1),
-        tone: empty ? CumulusTone.neutral : CumulusTone.accent,
-      ),
-      title: Row(
-        children: [
-          Flexible(child: Text(type.label)),
-          const SizedBox(width: 10),
-          StatusBadge(type.name, dense: true),
-          if (type.authoritative) ...[
-            const SizedBox(width: 6),
-            const StatusBadge('authoritative', tone: CumulusTone.violet,
-                dense: true),
-          ],
-        ],
-      ),
-      subtitle: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(type.summary),
-          const SizedBox(height: 6),
-          Text(
-            'natural key: ${type.naturalKey} · collection '
-            '${type.collection} · ${type.fields.length} declared field(s)',
-            style: CumulusText.meta,
-          ),
-        ],
-      ),
-      trailing: [
-        SizedBox(
-          width: 92,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Text(
-                '${type.instances}',
-                style: TextStyle(
-                  fontSize: 17,
-                  fontWeight: FontWeight.w600,
-                  color: empty ? CumulusColors.inkMuted : CumulusColors.ink,
-                ),
-              ),
-              Text(
-                empty ? 'declared only' : 'in the graph',
-                style: CumulusText.statCaption,
-                textAlign: TextAlign.end,
-              ),
-            ],
-          ),
-        ),
-        SizedBox(
-          width: 110,
-          child: empty
-              ? null
-              : Align(
-                  alignment: Alignment.centerRight,
-                  child: RowAction(
-                    label: 'Browse',
-                    icon: Icons.chevron_right,
-                    onTap: () => onBrowse(type.name),
-                  ),
-                ),
-        ),
-      ],
-    );
-  }
-}
-
-class _LinkTypeRow extends StatelessWidget {
-  final OntologyLinkType link;
-
-  const _LinkTypeRow({required this.link});
-
-  @override
-  Widget build(BuildContext context) {
-    return CumulusListRow(
-      leading: Icon(
-        link.identity ? Icons.link : Icons.arrow_forward,
-        size: 18,
-        color: link.identity ? CumulusColors.accent : CumulusColors.inkMuted,
-      ),
-      title: Row(
-        children: [
-          Flexible(
-            child: Text(
-              '${link.fromType} → ${link.toType}',
-              style: CumulusText.rowTitle,
-            ),
-          ),
-          const SizedBox(width: 10),
-          StatusBadge(link.name, dense: true),
-          const SizedBox(width: 6),
-          Tooltip(
-            message: link.enforced
-                ? 'Enforced on write: a second edge would be refused.'
-                : 'Declared unconstrained on purpose — a second edge here is '
-                    'legitimate, not a bug.',
-            child: StatusBadge(
-              link.cardinality,
-              tone: link.enforced ? CumulusTone.accent : CumulusTone.neutral,
-              dense: true,
-            ),
-          ),
-          if (link.identity) ...[
-            const SizedBox(width: 6),
-            const Tooltip(
-              message:
-                  'Carries a confidence and a method, and can be withdrawn '
-                  'without erasing that it was asserted.',
-              child: StatusBadge('identity', tone: CumulusTone.accent,
-                  dense: true),
-            ),
-          ],
-        ],
-      ),
-      subtitle: Text(link.summary),
-      trailing: [
-        SizedBox(
-          width: 80,
-          child: Text(
-            '${link.instances}',
-            textAlign: TextAlign.end,
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w600,
-              color: link.instances == 0
-                  ? CumulusColors.inkMuted
-                  : CumulusColors.ink,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _ObjectListCard extends StatelessWidget {
-  final String type;
-  final List<GraphObject>? objects;
-  final void Function(String objectId) onInspect;
-  final VoidCallback onClear;
-
-  const _ObjectListCard({
-    required this.type,
-    required this.objects,
-    required this.onInspect,
-    required this.onClear,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final rows = objects;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      spacing: 12,
-      children: [
-        Align(
-          alignment: Alignment.centerLeft,
-          child: BackLink(label: '← All object types', onTap: onClear),
-        ),
-        if (rows == null)
-          const CumulusLoading()
-        else
-          ListCard(
-            title: type,
-            subtitle: '${rows.length} object(s) · click one for its claims',
-            children: [
-              for (final object in rows)
-                CumulusListRow(
-                  onTap: () => onInspect(object.id),
-                  leading: Monogram(
-                    object.label.isEmpty ? '?' : object.label.substring(0, 1),
-                    tone: object.conflictFields.isEmpty
-                        ? CumulusTone.neutral
-                        : CumulusTone.warn,
-                  ),
-                  title: Row(
-                    children: [
-                      Flexible(child: Text(object.label)),
-                      const SizedBox(width: 10),
-                      StatusBadge(
-                        object.props['status']?.toString() ?? object.status,
-                        tone: object.status == 'active'
-                            ? CumulusTone.success
-                            : CumulusTone.neutral,
-                        dense: true,
-                      ),
-                      if (object.conflictFields.isNotEmpty) ...[
-                        const SizedBox(width: 6),
-                        StatusBadge(
-                          '${object.conflictFields.length} conflict(s)',
-                          tone: CumulusTone.warn,
-                          dense: true,
-                        ),
-                      ],
-                    ],
-                  ),
-                  subtitle: Text(
-                    object.props.entries
-                        .take(4)
-                        .map((e) => '${e.key}: ${e.value}')
-                        .join(' · '),
-                  ),
-                  trailing: [
-                    SizedBox(
-                      width: 150,
-                      child: Text(
-                        object.ref,
-                        textAlign: TextAlign.end,
-                        style: CumulusText.mono,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
-                ),
-            ],
-          ),
-      ],
-    );
-  }
-}
-
-class _ObjectDetailCard extends StatelessWidget {
-  final GraphObjectDetail detail;
-  final VoidCallback onClose;
-
-  const _ObjectDetailCard({required this.detail, required this.onClose});
-
-  @override
-  Widget build(BuildContext context) {
-    final object = detail.object;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      spacing: 12,
-      children: [
-        Align(
-          alignment: Alignment.centerLeft,
-          child: BackLink(label: '← Back to the list', onTap: onClose),
-        ),
-        CumulusCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SectionHeader(
-                title: object.label,
-                subtitle:
-                    '${object.type} · ${object.claimCount} claim(s) · revision '
-                    '${object.revision}',
-                trailing: MetaPill(object.ref),
-              ),
-              const SizedBox(height: 14),
-              _KeyValueGrid(
-                entries: object.props.entries
-                    .map((e) => (e.key, '${e.value}'))
-                    .toList(),
-              ),
-            ],
-          ),
-        ),
-        if (detail.conflicts.isNotEmpty)
-          ListCard(
-            title: 'Retained conflicts',
-            subtitle:
-                'two sources assert different values; precedence decides which '
-                'resolves and both stay on the record',
-            children: [
-              for (final entry in detail.conflicts.entries)
-                CumulusListRow(
-                  leading: const Icon(Icons.call_split, size: 18,
-                      color: CumulusColors.warn),
-                  title: Text(entry.key),
-                  subtitle: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      for (final claim in entry.value)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Row(
-                            children: [
-                              StatusBadge(
-                                claim.authority,
-                                tone: claim.authority == 'human'
-                                    ? CumulusTone.violet
-                                    : CumulusTone.neutral,
-                                dense: true,
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Text(
-                                  '${claim.value}  ·  ${claim.source}',
-                                  style: CumulusText.meta,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-            ],
-          ),
-        _FieldHistoryCard(detail: detail),
-        if (detail.neighbors.isNotEmpty)
-          ListCard(
-            title: 'Edges',
-            subtitle: 'typed, directional, and reversible where they assert '
-                'identity',
-            children: [
-              for (final edge in detail.neighbors)
-                CumulusListRow(
-                  leading: Icon(
-                    edge.direction == 'out'
-                        ? Icons.arrow_forward
-                        : Icons.arrow_back,
-                    size: 18,
-                    color: edge.live
-                        ? CumulusColors.inkSecondary
-                        : CumulusColors.inkMuted,
-                  ),
-                  title: Row(
-                    children: [
-                      Flexible(child: Text(edge.other.label)),
-                      const SizedBox(width: 10),
-                      StatusBadge(edge.type, dense: true),
-                      const SizedBox(width: 6),
-                      StatusBadge(edge.other.type, dense: true),
-                      if (!edge.live) ...[
-                        const SizedBox(width: 6),
-                        const StatusBadge('withdrawn',
-                            tone: CumulusTone.danger, dense: true),
-                      ],
-                    ],
-                  ),
-                  subtitle: Text(
-                    '${edge.method} · confidence '
-                    '${edge.confidence.toStringAsFixed(2)}'
-                    '${edge.props.isEmpty ? '' : ' · ${edge.props}'}',
-                  ),
-                ),
-            ],
-          ),
-      ],
-    );
-  }
-}
-
-class _KeyValueGrid extends StatelessWidget {
-  final List<(String, String)> entries;
-
-  const _KeyValueGrid({required this.entries});
-
-  @override
-  Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 28,
-      runSpacing: 12,
-      children: [
-        for (final (key, value) in entries)
-          ConstrainedBox(
-            constraints: const BoxConstraints(minWidth: 150, maxWidth: 320),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(key.toUpperCase(), style: CumulusText.statLabel),
-                const SizedBox(height: 3),
-                Text(value, style: CumulusText.body),
-              ],
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Documents
 // ---------------------------------------------------------------------------
 
@@ -1550,141 +1002,6 @@ class _ConformanceBanner extends StatelessWidget {
           ],
         ],
       ),
-    );
-  }
-}
-
-/// Every field of one object, with the claims behind it.
-///
-/// The view that makes retained claims feel like a feature rather than a
-/// storage detail: for each field, who asserted what, which assertion resolves,
-/// and — where the run recorded it — the step that wrote it. "Why does this say
-/// NET30" is answered by looking, not by reasoning about precedence.
-class _FieldHistoryCard extends StatelessWidget {
-  final GraphObjectDetail detail;
-
-  const _FieldHistoryCard({required this.detail});
-
-  /// Whether this claim is the one that resolved. Compared against the object's
-  /// resolved value rather than recomputed, so the card cannot disagree with
-  /// the server about precedence.
-  bool _resolves(GraphClaim claim) {
-    final resolved = detail.object.props[claim.field];
-    if (resolved == null) return false;
-    return '$resolved' == '${claim.value}';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final byField = <String, List<GraphClaim>>{};
-    for (final claim in detail.claims) {
-      byField.putIfAbsent(claim.field, () => []).add(claim);
-    }
-    for (final claims in byField.values) {
-      claims.sort((a, b) => b.atIso.compareTo(a.atIso));
-    }
-    final fields = byField.keys.toList()..sort();
-
-    return ListCard(
-      title: 'Fields and the claims behind them',
-      subtitle:
-          '${detail.claims.length} assertion(s) across ${fields.length} '
-          'field(s) · a losing claim is kept, not overwritten',
-      children: [
-        for (final field in fields)
-          CumulusListRow(
-            leading: Container(
-              width: 8,
-              height: 8,
-              margin: const EdgeInsets.only(top: 6),
-              decoration: BoxDecoration(
-                color: byField[field]!.length > 1
-                    ? CumulusTone.warn.foreground
-                    : CumulusColors.borderStrong,
-                shape: BoxShape.circle,
-              ),
-            ),
-            title: Row(
-              children: [
-                Flexible(child: Text(field)),
-                const SizedBox(width: 10),
-                Text(
-                  '${detail.object.props[field] ?? "—"}',
-                  style: CumulusText.body.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                if (byField[field]!.length > 1) ...[
-                  const SizedBox(width: 8),
-                  StatusBadge(
-                    '${byField[field]!.length} claims',
-                    tone: CumulusTone.warn,
-                    dense: true,
-                  ),
-                ],
-              ],
-            ),
-            subtitle: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                for (final claim in byField[field]!)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 4),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        SizedBox(
-                          width: 18,
-                          child: _resolves(claim)
-                              ? Icon(
-                                  Icons.check,
-                                  size: 13,
-                                  color: CumulusTone.success.foreground,
-                                )
-                              : const SizedBox.shrink(),
-                        ),
-                        SizedBox(
-                          width: 96,
-                          child: StatusBadge(
-                            claim.authority,
-                            tone: claim.authority == 'human'
-                                ? CumulusTone.violet
-                                : CumulusTone.neutral,
-                            dense: true,
-                          ),
-                        ),
-                        Expanded(
-                          child: Text(
-                            '${claim.value}',
-                            style: CumulusText.meta.copyWith(
-                              color: _resolves(claim)
-                                  ? CumulusColors.ink
-                                  : CumulusColors.inkMuted,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(
-                            [
-                              claim.source,
-                              if (claim.confidence < 1)
-                                'confidence ${claim.confidence.toStringAsFixed(2)}',
-                              if (claim.stepId.isNotEmpty)
-                                'wrote at ${claim.stepId}',
-                              _ago(claim.atIso),
-                            ].join('  ·  '),
-                            style: CumulusText.mono,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-              ],
-            ),
-          ),
-      ],
     );
   }
 }

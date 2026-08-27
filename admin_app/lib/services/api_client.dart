@@ -878,6 +878,35 @@ class ApiClient {
     );
   }
 
+  Future<List<EntityHit>> searchEntities(String q, {int limit = 20}) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/graph/search', {'q': q, 'limit': '$limit'}),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => EntityHit.fromJson(j as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<List<LinkRow>> listLinks({String? type, int limit = 200}) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/graph/links', {
+          if (type != null) 'type': type,
+          'limit': '$limit',
+        }),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => LinkRow.fromJson(j as Map<String, dynamic>))
+        .toList();
+  }
+
   Future<List<GraphObject>> listObjects({
     String? type,
     String q = '',

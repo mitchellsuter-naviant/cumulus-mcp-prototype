@@ -585,3 +585,74 @@ def test_two_sources_disagreeing_is_still_a_conflict(graph):
     )
     assert set(record.conflicts()) == {"payment_terms"}
     assert record.props["payment_terms"] == "NET30"
+
+
+# ---- entity search and the link table ---------------------------------------
+
+
+@pytest.fixture()
+def seeded(client, world):
+    """The demo world: vendors landed by the sync feeds, POs, invoices."""
+    from app.payables import seed_payables_if_empty
+
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    return client
+
+
+def test_search_finds_an_entity_by_label(seeded):
+    hits = seeded.get("/api/v1/graph/search", params={"q": "acme"}).json()
+    assert hits
+    top = hits[0]
+    assert top["entity"]["type"] == "Vendor"
+    assert "Acme" in top["entity"]["label"]
+
+
+def test_an_external_id_resolves_to_the_canonical_entity(seeded):
+    """Typing an ERP id must find the Vendor it means here, not just the
+    landing record — the identity Link made searchable is MDM's payoff."""
+    hits = seeded.get("/api/v1/graph/search", params={"q": "V-10041"}).json()
+    types = {h["entity"]["type"]: h for h in hits}
+    assert "SourceRecord" in types
+    assert "Vendor" in types
+    vendor_hit = types["Vendor"]
+    assert vendor_hit["match"] == "external id"
+    assert "V-10041" in vendor_hit["via"]
+
+
+def test_search_never_duplicates_an_entity(seeded):
+    hits = seeded.get("/api/v1/graph/search", params={"q": "a"}).json()
+    ids = [h["entity"]["id"] for h in hits]
+    assert len(ids) == len(set(ids))
+
+
+def test_links_table_makes_identity_links_auditable(seeded):
+    rows = seeded.get(
+        "/api/v1/graph/links", params={"type": "identified_as"}
+    ).json()
+    assert rows
+    for row in rows:
+        assert row["type"] == "identified_as"
+        # Declared Vendor -> SourceRecord: the canonical entity owns its ids.
+        assert row["from_entity"]["type"] == "Vendor"
+        assert row["to_entity"]["type"] == "SourceRecord"
+        # The identity metadata is the point of the table.
+        assert 0 < row["confidence"] <= 1
+        assert row["method"]
+        assert row["live"] is True
+
+
+def test_ask_trace_steps_carry_walkable_refs(seeded):
+    """The Walk screen replays the planner's steps; a step that landed on an
+    entity must say which one, as a ref — not as prose to parse."""
+    body = seeded.get(
+        "/api/v1/ask", params={"q": "How much has Acme Industrial invoiced?"}
+    ).json()
+    graph_steps = [
+        s for s in body.get("steps", [])
+        if s["tool"] in ("resolve_entity", "describe_entity", "aggregate_edges")
+    ]
+    if not graph_steps:  # the planner may degrade to retrieval with no model
+        import pytest
+
+        pytest.skip("planner did not run graph tools in this environment")
+    assert any(s.get("ref", "").startswith("graph:") for s in graph_steps)

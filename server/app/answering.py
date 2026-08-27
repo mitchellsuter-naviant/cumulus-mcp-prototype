@@ -116,8 +116,12 @@ class Toolbox:
 
     # -- helpers ----------------------------------------------------------
 
-    def _record(self, tool: str, arguments: dict, summary: str) -> None:
-        self.steps.append(AskStep(tool=tool, arguments=arguments, summary=summary))
+    def _record(
+        self, tool: str, arguments: dict, summary: str, ref: str = ""
+    ) -> None:
+        self.steps.append(
+            AskStep(tool=tool, arguments=arguments, summary=summary, ref=ref)
+        )
 
     def _asset_row(self, asset) -> dict:
         self.touched[asset.id] = asset.title
@@ -382,6 +386,7 @@ class Toolbox:
             f"{len(candidates)} candidate {type}(s)"
             + (f", best {candidates[0].label} at {candidates[0].score:.2f}"
                if candidates else ""),
+            ref=f"graph:{type}/{candidates[0].object_id}" if candidates else "",
         )
         thresholds = ResolutionThresholds()
         return {
@@ -425,6 +430,7 @@ class Toolbox:
             "describe_entity", {"object_id": object_id},
             f"{record.type} {record.label}: {len(record.props)} field(s), "
             f"{sum(edges.values())} edge(s)",
+            ref=record.ref(),
         )
         return {
             "id": record.id,
@@ -520,6 +526,7 @@ class Toolbox:
              "since_days": since_days},
             f"{len(rows)} record(s) at the end of {path}"
             + (f", {sum_field} totalling {total}" if total is not None else ""),
+            ref=root.ref(),
         )
         return {
             "root": {"id": root.id, "type": root.type, "label": root.label},

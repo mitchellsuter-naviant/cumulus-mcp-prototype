@@ -260,16 +260,22 @@ class AskStep {
   final Map<String, dynamic> arguments;
   final String summary;
 
+  /// The graph ref the step landed on, when it landed on one — what lets the
+  /// explorer replay the planner's walk instead of parsing prose.
+  final String ref;
+
   AskStep({
     required this.tool,
     required this.arguments,
     required this.summary,
+    this.ref = '',
   });
 
   factory AskStep.fromJson(Map<String, dynamic> json) => AskStep(
     tool: json['tool'] as String,
     arguments: (json['arguments'] as Map<String, dynamic>? ?? {}),
     summary: json['summary'] as String? ?? '',
+    ref: json['ref'] as String? ?? '',
   );
 }
 

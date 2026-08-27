@@ -1622,6 +1622,48 @@ const graphGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
+      path: '/api/v1/graph/search',
+      summary:
+          'Find entities by any handle a person holds: label, natural key, '
+          'id — or an external system\'s id.',
+      auth: ApiAuth.reader,
+      notes:
+          'When the match is a SourceRecord, the canonical entity it is '
+          '`identified_as` is surfaced too, with `via` naming the row that '
+          'carried the id — typing "V-10041" finds the Vendor it means here. '
+          'That is the MDM mapping made searchable.',
+      params: [
+        ApiParam('q', 'string', where: 'query', required: true),
+        ApiParam('limit', 'int', where: 'query', defaultValue: '20'),
+      ],
+      responseExample: '''[{
+  "entity": {"id": "vendor_2f39…", "type": "Vendor",
+             "label": "Acme Industrial Inc.", "…": "…"},
+  "match": "external id",
+  "via": "erp-vendors:V-10041"
+}]''',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/graph/links',
+      summary:
+          'Links as rows — the edge table for one Link type, with identity '
+          'metadata per pair.',
+      auth: ApiAuth.reader,
+      notes:
+          'Where an identity Link becomes auditable: confidence, method, '
+          'liveness, reversal reason, and the run/step that wrote it — per '
+          'pair, instead of a dashed line on a diagram.',
+      params: [
+        ApiParam('type', 'string', where: 'query',
+            description: '`identified_as`, `issued`, …'),
+        ApiParam('include_reversed', 'bool', where: 'query',
+            defaultValue: 'false'),
+        ApiParam('limit', 'int', where: 'query', defaultValue: '200'),
+      ],
+    ),
+    Endpoint(
+      method: 'GET',
       path: '/api/v1/graph/objects',
       summary: 'Browse objects of one type.',
       auth: ApiAuth.reader,

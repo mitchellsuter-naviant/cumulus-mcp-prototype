@@ -65,6 +65,41 @@ class ObjectDetail(BaseModel):
     neighbors: list[NeighborEdge]
 
 
+class EntityHit(BaseModel):
+    """One search result. `match` says which handle the query caught —
+    label, natural key, id — and `via` is set when the hit was reached
+    through an identity Link: typing an ERP id finds the canonical entity,
+    which is the MDM mapping made searchable."""
+
+    entity: ObjectSummary
+    match: str
+    via: str = ""
+
+
+class LinkEndpoint(BaseModel):
+    id: str
+    type: str
+    label: str
+    ref: str
+
+
+class LinkRow(BaseModel):
+    """One Link as an auditable row: both endpoints, the identity metadata
+    (confidence, method), liveness, and the run/step that wrote it."""
+
+    id: str
+    type: str
+    from_entity: LinkEndpoint
+    to_entity: LinkEndpoint
+    confidence: float
+    method: str
+    props: dict
+    live: bool
+    reversal_reason: str = ""
+    run_id: str = ""
+    step_id: str = ""
+
+
 class OntologyObjectType(BaseModel):
     name: str
     label: str
@@ -247,6 +282,118 @@ def instances(
     from .worlds import project_live
 
     return project_live(deps.get_graph_service(), type, limit)
+
+
+@router.get("/search", response_model=list[EntityHit])
+def search_entities(
+    q: str = Query(min_length=1, max_length=120),
+    limit: int = Query(default=20, ge=1, le=50),
+    principal: Principal = Depends(get_principal),
+) -> list[EntityHit]:
+    """Find entities by any handle a person actually holds.
+
+    Matches labels, natural keys and ids — and when the match is a
+    SourceRecord, the canonical entity it `identified_as` is surfaced too,
+    so an external system's id resolves to the thing it means here.
+    """
+    require_reader(principal)
+    graph = deps.get_graph_service()
+    raw = q.strip().lower()
+    needle = normalize_key(q)
+
+    def rank(record: ObjectRecord) -> tuple[int, str] | None:
+        label = normalize_key(record.label)
+        key = record.natural_key.lower()
+        if raw == record.id.lower() or needle == label or raw == key:
+            return (0, "exact")
+        # The thing *named* what you typed beats the things merely keyed
+        # under it: "acme" is the Vendor before it is any of its invoices.
+        if needle and label.startswith(needle):
+            return (1, "label")
+        if key.startswith(raw):
+            return (2, "natural key")
+        if needle and needle in label:
+            return (3, "label")
+        if raw in key:
+            return (4, "natural key")
+        if raw in record.id.lower():
+            return (5, "id")
+        return None
+
+    scored: list[tuple[int, ObjectRecord, str]] = []
+    for record in graph.find(None):
+        hit = rank(record)
+        if hit is not None:
+            scored.append((hit[0], record, hit[1]))
+    scored.sort(
+        key=lambda t: (t[0], len(t[1].label or t[1].natural_key),
+                       t[1].type, t[1].label.lower())
+    )
+
+    out: list[EntityHit] = []
+    seen: set[str] = set()
+    for _, record, match in scored[: limit * 2]:
+        if record.id not in seen:
+            seen.add(record.id)
+            out.append(EntityHit(entity=_summary(record), match=match))
+        # A matched source row also surfaces what it identifies: the person
+        # typing "V-10041" wants the Vendor, not the landing record.
+        if record.type == "SourceRecord":
+            for link, other in graph.neighbors(record.id, "identified_as", "in"):
+                if other.id not in seen:
+                    seen.add(other.id)
+                    out.append(EntityHit(
+                        entity=_summary(other),
+                        match="external id",
+                        via=record.natural_key,
+                    ))
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+@router.get("/links", response_model=list[LinkRow])
+def list_links(
+    type: str | None = Query(default=None),
+    include_reversed: bool = Query(default=False),
+    limit: int = Query(default=200, ge=1, le=500),
+    principal: Principal = Depends(get_principal),
+) -> list[LinkRow]:
+    """Links as rows — the edge table for one Link type.
+
+    This is where an identity Link becomes auditable: confidence, method,
+    liveness and the run that wrote it, per pair, instead of a dashed line
+    on a diagram.
+    """
+    require_reader(principal)
+    graph = deps.get_graph_service()
+    rows: list[LinkRow] = []
+    for link in graph.store.links():
+        if type is not None and link.type != type:
+            continue
+        if not include_reversed and not link.live:
+            continue
+        source = graph.store.get_object(link.from_id)
+        target = graph.store.get_object(link.to_id)
+        if source is None or target is None:
+            continue
+
+        def endpoint(record: ObjectRecord) -> LinkEndpoint:
+            return LinkEndpoint(
+                id=record.id, type=record.type,
+                label=record.label or record.natural_key, ref=record.ref(),
+            )
+
+        rows.append(LinkRow(
+            id=link.id, type=link.type,
+            from_entity=endpoint(source), to_entity=endpoint(target),
+            confidence=link.confidence, method=link.method, props=link.props,
+            live=link.live, reversal_reason=link.reversal_reason,
+            run_id=link.run_id, step_id=link.step_id,
+        ))
+        if len(rows) >= limit:
+            break
+    return rows
 
 
 @router.get("/objects", response_model=list[ObjectSummary])

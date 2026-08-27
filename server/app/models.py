@@ -254,6 +254,9 @@ class AskStep(BaseModel):
     tool: str
     arguments: dict = Field(default_factory=dict)
     summary: str = ""
+    # The graph ref the step landed on, when it landed on one — what lets a
+    # console replay the planner's walk hop by hop instead of parsing prose.
+    ref: str = ""
 
 
 class AskRequest(BaseModel):
