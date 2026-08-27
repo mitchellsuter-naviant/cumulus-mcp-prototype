@@ -15,11 +15,17 @@ class SpokeEdge {
   final String nature;
   final String cardinality;
 
+  /// Whether the focused entity can hold *many* of the neighbour across this
+  /// link — read from the cardinality in the focus's own direction, since
+  /// `one-to-many` means "many" from the source and "one" from the target.
+  final bool many;
+
   const SpokeEdge({
     required this.name,
     required this.outbound,
     required this.nature,
     required this.cardinality,
+    required this.many,
   });
 }
 
@@ -43,6 +49,10 @@ class GraphSpoke {
     required this.isPart,
     required this.edges,
   });
+
+  /// Drawn as a stack of cards rather than one: the shape says "a list of
+  /// these" without a label, which is what cardinality means to a reader.
+  bool get many => edges.any((e) => e.many);
 }
 
 /// The TBox as a hub and spokes: the focused entity in the middle, every
@@ -73,6 +83,25 @@ class TBoxGraph extends StatelessWidget {
   static const _nodeW = 176.0;
   static const _nodeH = 46.0;
   static const _focusH = 50.0;
+
+  /// How far the stacked cards extend past a node, so labels clear them.
+  static const _stackOut = 10.0;
+
+  /// Where a ray from [a] towards [b] leaves a's box, plus a margin. Shared
+  /// by the lines and the labels: the label sits on the segment this defines,
+  /// which is what keeps a long link name from sliding under a card.
+  static Offset edgeOf(Offset a, Offset b, Size box, {double margin = 6}) {
+    final dx = b.dx - a.dx;
+    final dy = b.dy - a.dy;
+    if (dx == 0 && dy == 0) return a;
+    final halfW = box.width / 2 + margin;
+    final halfH = box.height / 2 + margin;
+    final scale = math.min(
+      dx == 0 ? double.infinity : halfW / dx.abs(),
+      dy == 0 ? double.infinity : halfH / dy.abs(),
+    );
+    return Offset(a.dx + dx * scale, a.dy + dy * scale);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -116,7 +145,8 @@ class TBoxGraph extends StatelessWidget {
             ),
             for (final (i, spoke) in spokes.indexed) ...[
               _halo(positions[i]),
-              _label(center, positions[i], spoke, i),
+              if (spoke.many) ..._ghosts(positions[i]),
+              _label(center, positions[i], spoke),
               _node(positions[i], spoke),
             ],
             _focus(center),
@@ -263,18 +293,49 @@ class TBoxGraph extends StatelessWidget {
     );
   }
 
-  /// The link name, on the line. Staggered along adjacent spokes so two
-  /// chips never land on top of each other.
-  Widget _label(Offset center, Offset at, GraphSpoke spoke, int index) {
-    final t = index.isEven ? 0.56 : 0.44;
-    final point = Offset(
-      center.dx + (at.dx - center.dx) * t,
-      center.dy + (at.dy - center.dy) * t,
+  /// Two offset outlines behind the node, so "many of these" is legible as a
+  /// shape. A stack of cards is what a list looks like; a legend is not.
+  List<Widget> _ghosts(Offset at) {
+    return [
+      for (final step in const [_stackOut, _stackOut / 2])
+        Positioned(
+          left: at.dx - _nodeW / 2 + step,
+          top: at.dy - _nodeH / 2 + step,
+          child: IgnorePointer(
+            child: Container(
+              width: _nodeW,
+              height: _nodeH,
+              decoration: BoxDecoration(
+                color: CumulusColors.surface,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: CumulusColors.border,
+                  width: step == _stackOut ? 0.8 : 1,
+                ),
+              ),
+            ),
+          ),
+        ),
+    ];
+  }
+
+  /// The link name, centred on the *visible* part of its line — the segment
+  /// between the two boxes. Anchoring it at a fixed fraction of the spoke put
+  /// long names under a card, which is the one thing a labelled edge must
+  /// never do.
+  Widget _label(Offset center, Offset at, GraphSpoke spoke) {
+    final from = edgeOf(center, at, const Size(_nodeW + 16, _focusH));
+    final to = edgeOf(
+      at,
+      center,
+      const Size(_nodeW, _nodeH),
+      margin: spoke.many ? 6 + _stackOut : 6,
     );
+    final point = Offset((from.dx + to.dx) / 2, (from.dy + to.dy) / 2);
     return Positioned(
-      left: point.dx - 90,
+      left: point.dx - 110,
       top: point.dy - 30,
-      width: 180,
+      width: 220,
       height: 60,
       child: IgnorePointer(
         child: Center(
@@ -345,8 +406,13 @@ class _SpokePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     for (final (i, spoke) in spokes.indexed) {
       final target = positions[i];
-      final from = _edgeOf(center, target, focusSize);
-      final to = _edgeOf(target, center, nodeSize);
+      final from = TBoxGraph.edgeOf(center, target, focusSize);
+      final to = TBoxGraph.edgeOf(
+        target,
+        center,
+        nodeSize,
+        margin: spoke.many ? 6 + TBoxGraph._stackOut : 6,
+      );
       final nature = spoke.edges.first.nature;
       final paint = Paint()
         ..style = PaintingStyle.stroke
@@ -370,20 +436,6 @@ class _SpokePainter extends CustomPainter {
         _arrow(canvas, to, from, paint.color);
       }
     }
-  }
-
-  /// Where a line from [a] to [b] leaves a's box.
-  Offset _edgeOf(Offset a, Offset b, Size box) {
-    final dx = b.dx - a.dx;
-    final dy = b.dy - a.dy;
-    if (dx == 0 && dy == 0) return a;
-    final halfW = box.width / 2 + 6;
-    final halfH = box.height / 2 + 6;
-    final scale = math.min(
-      dx == 0 ? double.infinity : halfW / dx.abs(),
-      dy == 0 ? double.infinity : halfH / dy.abs(),
-    );
-    return Offset(a.dx + dx * scale, a.dy + dy * scale);
   }
 
   void _arrow(Canvas canvas, Offset from, Offset to, Color color) {

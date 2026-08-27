@@ -441,6 +441,22 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
     );
   }
 
+  /// Can the focused entity hold *many* of the neighbour across this link?
+  ///
+  /// Cardinality is declared from source to target, so it has to be read in
+  /// the focus's own direction: `one-to-many` constrains the target to one
+  /// source, which means many from the source's side and exactly one from the
+  /// target's. An invoice has many lines; a line has one invoice; both facts
+  /// come out of the same declaration.
+  static bool _manyFromFocus(String cardinality, bool outbound) {
+    return switch (cardinality) {
+      'one-to-many' => outbound,
+      'many-to-one' => !outbound,
+      'one-to-one' => false,
+      _ => true, // many-to-many
+    };
+  }
+
   /// The same rows the table shows, grouped by neighbour and handed to the
   /// diagram — one source of truth for what links exist.
   Widget _graphBody(OntologyObjectType t, List<_LinkRow> rows) {
@@ -462,6 +478,7 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
                 outbound: r.outbound,
                 nature: r.link.nature,
                 cardinality: r.link.cardinality,
+                many: _manyFromFocus(r.link.cardinality, r.outbound),
               ),
           ],
         ),
@@ -492,9 +509,10 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
         Padding(
           padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
           child: Text(
-            'Tap an entity to walk to it · a part opens its declaration · '
-            'thicker tinted lines are composition, dashed are identity '
-            'assertions',
+            'Tap an entity to walk to it · a stack of cards means many of '
+            'them, one card means exactly one · thicker tinted lines are '
+            'composition, dashed are identity assertions · a part opens its '
+            'declaration',
             style: CumulusText.statCaption,
           ),
         ),
