@@ -270,6 +270,7 @@ class TBoxViolation(BaseModel):
         "wrong-endpoint-type",
         "cardinality",
         "orphan",
+        "weak-key",
         "dangling-link",
     ]
     subject: str
@@ -590,8 +591,9 @@ class GraphService:
         objects = {o.id: o for o in self.store.objects()}
         for record in objects.values():
             violations.extend(self._validate_claims(record.type, record.claims))
-        # Children of a declared parent edge must have one.
+        # Children of a compositional edge must have one.
         parented: dict[str, set[str]] = {}
+        owner_of_part: dict[str, str] = {}
         for link in self.store.links():
             declared = self.ontology.link_type(link.type)
             if declared is None:
@@ -606,24 +608,39 @@ class GraphService:
             violations.extend(self._validate_link(
                 link.type, from_record, to_record, link.from_id, link.to_id,
             ))
-            if declared.cardinality in ("one-to-many", "one-to-one"):
+            if declared.composes:
                 parented.setdefault(declared.to_type, set()).add(link.to_id)
+                owner_of_part[link.to_id] = link.from_id
+        # Composition is what the old `has_*` naming convention was groping
+        # for: a part must have exactly one live owner (the cardinality check
+        # above catches seconds; this catches zero), and its natural key must
+        # embed its owner's — ER's weak-entity rule, enforced rather than
+        # merely followed.
         for record in objects.values():
-            expected_parents = [
-                linked for linked in self.ontology.links
-                if linked.to_type == record.type
-                and linked.cardinality in ("one-to-many", "one-to-one")
-                and linked.name.startswith("has_")
-            ]
-            if expected_parents and record.status != "superseded":
-                if record.id not in parented.get(record.type, set()):
-                    violations.append(TBoxViolation(
-                        kind="orphan", subject=record.ref(),
-                        detail=(
-                            f"{record.type} with no "
-                            f"{expected_parents[0].name} parent"
-                        ),
-                    ))
+            owning = self.ontology.owning_link(record.type)
+            if owning is None or record.status == "superseded":
+                continue
+            if record.id not in parented.get(record.type, set()):
+                violations.append(TBoxViolation(
+                    kind="orphan", subject=record.ref(),
+                    detail=f"{record.type} with no {owning.name} owner",
+                ))
+                continue
+            owner = objects.get(owner_of_part.get(record.id, ""))
+            if (
+                owner is not None
+                and record.natural_key
+                and owner.natural_key not in record.natural_key
+                and owner.id not in record.natural_key
+            ):
+                violations.append(TBoxViolation(
+                    kind="weak-key", subject=record.ref(),
+                    detail=(
+                        f"{record.type} key '{record.natural_key}' does not "
+                        f"embed its {owner.type}'s key — a part is "
+                        "identified through its owner"
+                    ),
+                ))
         # A cardinality violation is reported once per offending edge above, so
         # collapse the duplicates the pairwise check produces.
         seen: set[tuple[str, str, str]] = set()

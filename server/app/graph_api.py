@@ -109,10 +109,15 @@ class OntologyObjectType(BaseModel):
     collection: str
     fields: list[dict]
     instances: int = 0
+    # Derived from compositional links, never declared: a subordinate type is
+    # identified through its owner and folds under it in every view.
+    owner_type: str = ""
+    part_types: list[str] = Field(default_factory=list)
 
 
 class OntologyLinkType(BaseModel):
     name: str
+    nature: str = "association"  # association | composition | identity
     from_type: str
     to_type: str
     cardinality: str
@@ -249,12 +254,15 @@ def ontology(principal: Principal = Depends(get_principal)) -> OntologyView:
                     for f in o.fields
                 ],
                 instances=by_type.get(o.name, 0),
+                owner_type=ONTOLOGY.owner_of(o.name) or "",
+                part_types=ONTOLOGY.parts_of(o.name),
             )
             for o in ONTOLOGY.objects
         ],
         links=[
             OntologyLinkType(
-                name=linked.name, from_type=linked.from_type,
+                name=linked.name, nature=linked.nature,
+                from_type=linked.from_type,
                 to_type=linked.to_type, cardinality=linked.cardinality,
                 summary=linked.summary, identity=linked.identity,
                 instances=by_link.get(linked.name, 0),
@@ -320,19 +328,29 @@ def search_entities(
             return (5, "id")
         return None
 
-    scored: list[tuple[int, ObjectRecord, str]] = []
+    from .ontology import ONTOLOGY as _ontology
+
+    subordinate = {
+        o.name for o in _ontology.objects if _ontology.owner_of(o.name)
+    }
+    scored: list[tuple[int, int, ObjectRecord, str]] = []
     for record in graph.find(None):
         hit = rank(record)
         if hit is not None:
-            scored.append((hit[0], record, hit[1]))
+            # A part defers to independent entities on principle: searching
+            # "acme" should find the Vendor and the Invoices before any of
+            # their lines.
+            scored.append(
+                (1 if record.type in subordinate else 0, hit[0], record, hit[1])
+            )
     scored.sort(
-        key=lambda t: (t[0], len(t[1].label or t[1].natural_key),
-                       t[1].type, t[1].label.lower())
+        key=lambda t: (t[0], t[1], len(t[2].label or t[2].natural_key),
+                       t[2].type, t[2].label.lower())
     )
 
     out: list[EntityHit] = []
     seen: set[str] = set()
-    for _, record, match in scored[: limit * 2]:
+    for _, _, record, match in scored[: limit * 2]:
         if record.id not in seen:
             seen.add(record.id)
             out.append(EntityHit(entity=_summary(record), match=match))

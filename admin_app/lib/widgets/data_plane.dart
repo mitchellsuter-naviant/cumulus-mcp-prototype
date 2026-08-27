@@ -319,7 +319,11 @@ class _DataPlaneViewState extends State<DataPlaneView> {
                 // bug, and the explorer should not look healthy over one.
                 _ConformanceBanner(invariants: _invariants),
                 const SizedBox(height: 16),
-                EntityExplorer(api: widget.api, ontology: _ontology),
+                EntityExplorer(
+                  api: widget.api,
+                  ontology: _ontology,
+                  collections: _collections ?? const [],
+                ),
               ],
             ),
             _Lens.fragments => _InstancesLens(

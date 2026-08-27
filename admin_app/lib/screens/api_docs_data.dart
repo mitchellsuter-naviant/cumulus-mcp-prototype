@@ -1608,9 +1608,12 @@ const graphGroup = EndpointGroup(
       auth: ApiAuth.reader,
       notes:
           'Declaration and reality in one payload — a declared type with zero '
-          'instances is a promise nothing has kept yet. Generated from '
-          '`server/app/ontology.py`, which is also exported to the corpus as '
-          'the `enterprise-ontology` document.',
+          'instances is a promise nothing has kept yet. Links carry a '
+          '`nature` (association | composition | identity); each type carries '
+          'its derived place in the hierarchy (`owner_type`, `part_types`) — '
+          'a part is identified through its owner and folds under it. '
+          'Generated from `server/app/ontology.py`, which is also exported '
+          'to the corpus as the `enterprise-ontology` document.',
     ),
     Endpoint(
       method: 'GET',

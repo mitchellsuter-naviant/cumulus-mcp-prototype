@@ -656,3 +656,105 @@ def test_ask_trace_steps_carry_walkable_refs(seeded):
 
         pytest.skip("planner did not run graph tools in this environment")
     assert any(s.get("ref", "").startswith("graph:") for s in graph_steps)
+
+
+# ---- composition: the derived hierarchy --------------------------------------
+
+
+def test_part_ness_is_derived_never_declared():
+    from app.ontology import ONTOLOGY
+
+    assert ONTOLOGY.owner_of("InvoiceLine") == "Invoice"
+    # The non-obvious case the key test decides: a retained computation is
+    # still a dependent thing.
+    assert ONTOLOGY.owner_of("MatchSet") == "Invoice"
+    # "Belongs to" is not "is part of": a request has its own key and
+    # lifecycle, so `submitted` stays an association.
+    assert ONTOLOGY.owner_of("ExpenseRequest") is None
+    assert set(ONTOLOGY.parts_of("Invoice")) == {"InvoiceLine", "MatchSet"}
+    assert [o.name for o in ONTOLOGY.roots()] == [
+        "Employee", "ExpenseRequest", "Document", "Vendor",
+        "SourceRecord", "Invoice", "PurchaseOrder", "ReceivingReport",
+    ]
+
+
+def test_the_declared_ontology_conforms():
+    from app.ontology import validate_ontology
+
+    assert validate_ontology() == []
+
+
+def test_composition_rules_are_refused_at_declaration():
+    from app.ontology import LinkType, ObjectType, Ontology, validate_ontology
+
+    objects = (
+        ObjectType(name="A", label="A", summary="", natural_key="k"),
+        ObjectType(name="B", label="B", summary="", natural_key="k"),
+        ObjectType(name="C", label="C", summary="", natural_key="k"),
+    )
+    # A part with two possible owners by cardinality.
+    bad_cardinality = Ontology(objects=objects, links=(
+        LinkType("owns", "A", "B", "many-to-many", "", nature="composition"),
+    ), precedence=("human",))
+    assert any("two owners" in p for p in validate_ontology(bad_cardinality))
+
+    # Two compositional links targeting one type: two owners.
+    two_owners = Ontology(objects=objects, links=(
+        LinkType("owns_a", "A", "C", "one-to-many", "", nature="composition"),
+        LinkType("owns_b", "B", "C", "one-to-many", "", nature="composition"),
+    ), precedence=("human",))
+    assert any("exactly one" in p for p in validate_ontology(two_owners))
+
+    # An ownership cycle.
+    cycle = Ontology(objects=objects, links=(
+        LinkType("owns_b", "A", "B", "one-to-many", "", nature="composition"),
+        LinkType("owns_a", "B", "A", "one-to-many", "", nature="composition"),
+    ), precedence=("human",))
+    assert any("forest" in p for p in validate_ontology(cycle))
+
+
+def test_an_orphan_part_is_an_invariant_violation(graph):
+    graph.upsert(
+        "InvoiceLine", "acme-industrial:INV-1#1",
+        [Claim(field="amount_usd", value=10.0, source="flow:test")],
+    )
+    kinds = {v.kind for v in graph.check_invariants()}
+    assert "orphan" in kinds
+
+
+def test_a_part_key_must_embed_its_owner_key(graph):
+    invoice = graph.upsert(
+        "Invoice", "acme-industrial:INV-9",
+        [Claim(field="total_usd", value=10.0, source="flow:test")],
+    )
+    line = graph.upsert(
+        "InvoiceLine", "free-floating-key#1",
+        [Claim(field="amount_usd", value=10.0, source="flow:test")],
+    )
+    graph.link("has_invoice_line", invoice.id, line.id)
+    kinds = {v.kind for v in graph.check_invariants()}
+    assert "weak-key" in kinds
+
+
+def test_search_ranks_independent_entities_above_their_parts(seeded):
+    hits = seeded.get(
+        "/api/v1/graph/search", params={"q": "acme", "limit": 30}
+    ).json()
+    from app.ontology import ONTOLOGY
+
+    subordinate = {o.name for o in ONTOLOGY.objects if ONTOLOGY.owner_of(o.name)}
+    kinds = [h["entity"]["type"] in subordinate for h in hits]
+    # Once the first part appears, no independent entity follows it.
+    if True in kinds:
+        assert all(kinds[kinds.index(True):])
+
+
+def test_ontology_api_exposes_the_hierarchy(seeded):
+    body = seeded.get("/api/v1/graph/ontology").json()
+    by_name = {o["name"]: o for o in body["objects"]}
+    assert by_name["InvoiceLine"]["owner_type"] == "Invoice"
+    assert set(by_name["Invoice"]["part_types"]) == {"InvoiceLine", "MatchSet"}
+    natures = {l["name"]: l["nature"] for l in body["links"]}
+    assert natures["has_invoice_line"] == "composition"
+    assert natures["identified_as"] == "identity"
+    assert natures["issued"] == "association"

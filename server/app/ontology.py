@@ -76,9 +76,28 @@ class LinkType:
     to_type: str
     cardinality: str  # one-to-one | one-to-many | many-to-one | many-to-many
     summary: str
-    # True when the edge is an identity assertion — the kind that carries a
-    # confidence and can be reversed by a steward.
-    identity: bool = False
+    # What kind of edge this is. One discriminating field rather than a pile
+    # of booleans, because the three are mutually exclusive by meaning:
+    #
+    # - `association` — two independent things related ("issued",
+    #   "ordered_from"). The default, as in UML; there is deliberately no
+    #   soft "aggregation" middle tier (Fowler's "modeling placebo").
+    # - `composition` — the target is a *part* of the source: identified
+    #   through it (ER's weak entity — key = owner key + discriminator),
+    #   cannot exist without it, dies with it. Part-ness of a *type* is
+    #   derived from this, never declared, so it cannot drift.
+    # - `identity` — an assertion that an external record and a canonical
+    #   entity are the same real-world thing; carries confidence and can be
+    #   reversed by a steward.
+    nature: str = "association"  # association | composition | identity
+
+    @property
+    def identity(self) -> bool:
+        return self.nature == "identity"
+
+    @property
+    def composes(self) -> bool:
+        return self.nature == "composition"
 
 
 @dataclass(frozen=True)
@@ -95,6 +114,33 @@ class Ontology:
 
     def object_names(self) -> list[str]:
         return [o.name for o in self.objects]
+
+    # -- derived hierarchy --------------------------------------------------
+    #
+    # Part-ness is computed from compositional links, never declared on the
+    # type, so a type cannot claim to be a part of nothing.
+
+    def owner_of(self, type_name: str) -> str | None:
+        """The type that composes this one, if any."""
+        for link in self.links:
+            if link.composes and link.to_type == type_name:
+                return link.from_type
+        return None
+
+    def parts_of(self, type_name: str) -> list[str]:
+        return [
+            link.to_type for link in self.links
+            if link.composes and link.from_type == type_name
+        ]
+
+    def owning_link(self, type_name: str) -> "LinkType | None":
+        for link in self.links:
+            if link.composes and link.to_type == type_name:
+                return link
+        return None
+
+    def roots(self) -> list["ObjectType"]:
+        return [o for o in self.objects if self.owner_of(o.name) is None]
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +398,8 @@ LINK_TYPES: tuple[LinkType, ...] = (
     LinkType("submitted", "Employee", "ExpenseRequest", "one-to-many",
              "the employee who submitted the request"),
     LinkType("has_expense_line", "ExpenseRequest", "ExpenseLine", "one-to-many",
-             "the lines projected out of the request's documents"),
+             "the lines projected out of the request's documents",
+             nature="composition"),
     LinkType("evidenced_by", "ExpenseLine", "Document", "many-to-many",
              "the document (and region) a line was read from"),
     LinkType("decided_by", "ExpenseRequest", "Employee", "many-to-many",
@@ -361,26 +408,31 @@ LINK_TYPES: tuple[LinkType, ...] = (
     LinkType("identified_as", "Vendor", "SourceRecord", "one-to-many",
              "an external system's id for this vendor — reversible, and "
              "carrying the confidence and method that produced it",
-             identity=True),
+             nature="identity"),
     LinkType("issued", "Vendor", "Invoice", "one-to-many",
              "the vendor that issued the invoice"),
     LinkType("has_invoice_line", "Invoice", "InvoiceLine", "one-to-many",
-             "the invoice's billed lines"),
+             "the invoice's billed lines", nature="composition"),
     LinkType("evidenced_by_document", "Invoice", "Document", "many-to-many",
              "the invoice artifact the extraction read"),
     LinkType("ordered_from", "PurchaseOrder", "Vendor", "many-to-one",
              "the vendor a PO was raised against — one, and a second would be "
              "a resolution bug"),
     LinkType("has_po_line", "PurchaseOrder", "PurchaseOrderLine", "one-to-many",
-             "the PO's committed lines"),
+             "the PO's committed lines", nature="composition"),
     LinkType("receives_against", "ReceivingReport", "PurchaseOrder", "many-to-one",
              "the PO a receiving report books against"),
     LinkType("has_receiving_line", "ReceivingReport", "ReceivingReportLine",
-             "one-to-many", "the receiving report's lines"),
+             "one-to-many", "the receiving report's lines",
+             nature="composition"),
     LinkType("billed_against", "Invoice", "PurchaseOrder", "many-to-many",
              "the PO(s) an invoice bills against — many, on a consolidated bill"),
+    # A MatchSet is a *part* of its invoice — the key test decides the
+    # non-obvious case: its natural key embeds the invoice key, and it cannot
+    # exist without one. A retained computation is still a dependent thing.
     LinkType("matched_by", "Invoice", "MatchSet", "one-to-one",
-             "the retained three-way match for this invoice"),
+             "the retained three-way match for this invoice",
+             nature="composition"),
     LinkType("matches_invoice_line", "MatchSet", "InvoiceLine", "one-to-many",
              "one pairing in the match, with its variance in the link props"),
 )
@@ -392,6 +444,56 @@ LINK_TYPES: tuple[LinkType, ...] = (
 PRECEDENCE: tuple[str, ...] = ("human", "erp", "procurement", "flow", "model")
 
 ONTOLOGY = Ontology(objects=OBJECT_TYPES, links=LINK_TYPES, precedence=PRECEDENCE)
+
+
+def validate_ontology(ontology: Ontology = ONTOLOGY) -> list[str]:
+    """Structural conformance of the type system itself.
+
+    The composition rules are what keep the derived hierarchy honest: a part
+    has exactly one owner by type, ownership cannot form a cycle, and a
+    cardinality that would let a part have two owners is refused at
+    declaration time rather than discovered as a data bug.
+    """
+    problems: list[str] = []
+    names = {o.name for o in ontology.objects}
+    for link in ontology.links:
+        where = f"link `{link.name}`"
+        if link.from_type not in names:
+            problems.append(f"{where}: unknown from_type `{link.from_type}`")
+        if link.to_type not in names:
+            problems.append(f"{where}: unknown to_type `{link.to_type}`")
+        if link.nature not in ("association", "composition", "identity"):
+            problems.append(f"{where}: unknown nature `{link.nature}`")
+        if link.composes and link.cardinality not in ("one-to-many", "one-to-one"):
+            problems.append(
+                f"{where}: composition requires one-to-many or one-to-one — "
+                f"`{link.cardinality}` would let a part have two owners"
+            )
+    # At most one compositional link may target a type: single owner.
+    owners: dict[str, list[str]] = {}
+    for link in ontology.links:
+        if link.composes:
+            owners.setdefault(link.to_type, []).append(link.name)
+    for target, via in owners.items():
+        if len(via) > 1:
+            problems.append(
+                f"type `{target}` has {len(via)} owners ({', '.join(via)}); "
+                "a part has exactly one"
+            )
+    # Ownership must be a forest: walking owners always terminates at a root.
+    for obj in ontology.objects:
+        seen: set[str] = set()
+        current: str | None = obj.name
+        while current is not None:
+            if current in seen:
+                problems.append(
+                    f"composition cycle through `{obj.name}` — ownership "
+                    "must be a forest"
+                )
+                break
+            seen.add(current)
+            current = ontology.owner_of(current)
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +550,34 @@ def ontology_markdown(ontology: Ontology = ONTOLOGY) -> str:
         "A leaf no ref points at is unreachable by meaning, and should be "
         "treated as suspect.",
         "",
+        "## Hierarchy",
+        "",
+        "Links carry a *nature*: `association` (two independent things), "
+        "`composition` (the target is a **part** — identified through its "
+        "owner, cannot exist without it, dies with it), or `identity` (an "
+        "external record and a canonical entity are the same real-world "
+        "thing). Part-ness of a type is derived from compositional links, "
+        "never declared, and two invariants enforce it on every instance: a "
+        "part has exactly one live owner, and its natural key embeds its "
+        "owner's.",
+        "",
+        "The independent types, with their parts:",
+        "",
+    ]
+    for root in ontology.roots():
+        parts = ontology.parts_of(root.name)
+        lines.append(
+            f"- **{root.label}**"
+            + (f" ▸ {', '.join(parts)}" if parts else "")
+        )
+    lines += [
+        "",
+        "Governance: a new independent type must name its **competency "
+        "question** — the question it answers that no existing type can — "
+        "and its natural key. Types that fail that test enter as parts, "
+        "fields, or not at all; the hierarchy absorbs growth so the list of "
+        "independent concepts stays short.",
+        "",
         "## Object types",
         "",
     ]
@@ -462,6 +592,12 @@ def ontology_markdown(ontology: Ontology = ONTOLOGY) -> str:
         lines.append("")
         lines.append(obj.summary)
         lines.append("")
+        owner = ontology.owner_of(obj.name)
+        if owner is not None:
+            lines.append(
+                f"Part of `{owner}` (via "
+                f"`{ontology.owning_link(obj.name).name}`)."
+            )
         lines.append(f"Natural key: {obj.natural_key}.")
         if obj.fields:
             lines.append("")
@@ -471,10 +607,13 @@ def ontology_markdown(ontology: Ontology = ONTOLOGY) -> str:
         lines.append("")
     lines += ["## Link types", ""]
     for link in ontology.links:
-        identity = " · identity link (confidence, reversible)" if link.identity else ""
+        nature = {
+            "identity": " · identity (confidence, reversible)",
+            "composition": " · composition (the target is a part)",
+        }.get(link.nature, "")
         lines.append(
             f"- `{link.from_type} --{link.name}--> {link.to_type}` "
-            f"({link.cardinality}){identity}: {link.summary}"
+            f"({link.cardinality}){nature}: {link.summary}"
         )
     lines.append("")
     return "\n".join(lines)

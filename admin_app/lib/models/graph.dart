@@ -174,6 +174,11 @@ class OntologyObjectType {
   final List<Map<String, dynamic>> fields;
   final int instances;
 
+  /// Derived from compositional links, never declared: non-empty means this
+  /// type is a *part*, identified through its owner, and folds under it.
+  final String ownerType;
+  final List<String> partTypes;
+
   const OntologyObjectType({
     required this.name,
     required this.label,
@@ -183,7 +188,11 @@ class OntologyObjectType {
     required this.collection,
     required this.fields,
     required this.instances,
+    this.ownerType = '',
+    this.partTypes = const [],
   });
+
+  bool get isPart => ownerType.isNotEmpty;
 
   factory OntologyObjectType.fromJson(Map<String, dynamic> json) =>
       OntologyObjectType(
@@ -197,11 +206,18 @@ class OntologyObjectType {
             .map((e) => e as Map<String, dynamic>)
             .toList(),
         instances: json['instances'] as int? ?? 0,
+        ownerType: json['owner_type'] as String? ?? '',
+        partTypes: (json['part_types'] as List<dynamic>? ?? const [])
+            .map((e) => '$e')
+            .toList(),
       );
 }
 
 class OntologyLinkType {
   final String name;
+
+  /// association | composition | identity — one discriminating field.
+  final String nature;
   final String fromType;
   final String toType;
   final String cardinality;
@@ -220,6 +236,7 @@ class OntologyLinkType {
     required this.toType,
     required this.cardinality,
     required this.summary,
+    this.nature = 'association',
     required this.identity,
     required this.instances,
     required this.enforced,
@@ -232,6 +249,7 @@ class OntologyLinkType {
         toType: json['to_type'] as String? ?? '',
         cardinality: json['cardinality'] as String? ?? '',
         summary: json['summary'] as String? ?? '',
+        nature: json['nature'] as String? ?? 'association',
         identity: json['identity'] as bool? ?? false,
         instances: json['instances'] as int? ?? 0,
         enforced: json['enforced'] as bool? ?? false,
