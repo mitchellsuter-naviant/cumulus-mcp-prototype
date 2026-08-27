@@ -235,7 +235,6 @@ class _AssetsSectionState extends State<AssetsSection> {
     return PageBody(
       children: [
         _heading(),
-        _statStrip(),
         if (_error != null) ErrorNotice(message: _error!, onRetry: _refresh),
         if (_loading)
           const CumulusCard(child: CumulusLoading())
@@ -248,7 +247,8 @@ class _AssetsSectionState extends State<AssetsSection> {
   Widget _heading() {
     final published = _assets.where((a) => a.status == 'published').length;
     return PageHeading(
-      eyebrow: 'Knowledge layer · governed corpus',
+      // The section title above the tabs already says "Knowledge layer".
+      eyebrow: 'governed corpus · authored',
       title: 'Assets',
       pills: [
         MetaPill('${_assets.length} assets'),
@@ -270,88 +270,6 @@ class _AssetsSectionState extends State<AssetsSection> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _statStrip() {
-    int countWhere(bool Function(AssetSummary) test) =>
-        _assets.where(test).length;
-    final branches = _assets.map((a) => a.path.split('/').first).toSet().length;
-    final drafts = countWhere((a) => a.status == 'draft');
-    final deprecated = countWhere((a) => a.status == 'deprecated');
-    final governing = countWhere(
-      (a) => a.authorityLevel == 'policy' || a.authorityLevel == 'standard',
-    );
-    final freshest = _assets.isEmpty
-        ? null
-        : _assets
-              .map((a) => a.updatedAt)
-              .reduce((a, b) => a.isAfter(b) ? a : b);
-    // An asset with no row at all counts as unused: the store only holds
-    // documents that saw traffic, so absence is the signal.
-    final used = _assets.where((a) => !(_usage[a.id]?.unused ?? true)).length;
-    final ignored = _assets
-        .where((a) => _usage[a.id]?.ignored ?? false)
-        .length;
-    final undiscovered = _assets.length - used - ignored;
-    final reads = _usage.values.fold(0, (n, u) => n + u.reads);
-    final citations = _usage.values.fold(0, (n, u) => n + u.citations);
-
-    return StatStrip(
-      tiles: [
-        StatTile(
-          label: 'Total assets',
-          value: '${_assets.length}',
-          caption: '$branches taxonomy ${branches == 1 ? "branch" : "branches"}',
-        ),
-        StatTile(
-          label: 'Governing',
-          value: '$governing',
-          caption: 'policy + standard',
-          valueColor: CumulusColors.accent,
-        ),
-        StatTile(
-          label: 'Drafts',
-          value: '$drafts',
-          caption: drafts == 0 ? 'nothing pending' : 'awaiting publication',
-          valueColor: drafts == 0 ? null : CumulusColors.warn,
-        ),
-        StatTile(
-          label: 'Deprecated',
-          value: '$deprecated',
-          caption: 'still retrievable, not authoritative',
-          valueColor: deprecated == 0 ? null : CumulusColors.danger,
-        ),
-        StatTile(
-          label: 'Last change',
-          value: freshest == null ? '—' : agoLabel(freshest),
-          caption: 'across the corpus',
-        ),
-        StatTile(
-          label: 'Used (30d)',
-          value: '$used',
-          caption: used == 0
-              ? 'no reads or citations yet'
-              : '$reads read · $citations cited',
-          valueColor: used == 0 ? null : CumulusColors.success,
-        ),
-        StatTile(
-          label: 'Ignored',
-          value: _usage.isEmpty ? '—' : '$ignored',
-          caption: ignored == 0
-              ? 'nothing surfaces and gets passed over'
-              : 'found in search, never opened',
-          valueColor: ignored == 0 ? null : CumulusColors.warn,
-        ),
-        StatTile(
-          label: 'Undiscovered',
-          value: _usage.isEmpty ? '—' : '$undiscovered',
-          caption: undiscovered == 0
-              ? 'every document surfaces'
-              : 'search never returns these',
-          valueColor: undiscovered == 0 ? null : CumulusColors.danger,
-        ),
-      ],
     );
   }
 

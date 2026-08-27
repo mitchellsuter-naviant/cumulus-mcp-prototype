@@ -78,7 +78,8 @@ class _LearnedPlaneViewState extends State<LearnedPlaneView> {
       padding: const EdgeInsets.fromLTRB(28, 20, 28, 40),
       children: [
         PageHeading(
-          eyebrow: 'Knowledge layer · emergent',
+          // The section title above the tabs already says "Knowledge layer".
+          eyebrow: 'emergent · flywheel',
           title: 'Learned',
           subtitle:
               'What the system figured out through use: exemplars the '

@@ -3,11 +3,13 @@ import 'package:flutter/material.dart';
 import '../models/asset.dart';
 import '../services/api_client.dart';
 import '../services/auth_service.dart';
+import '../theme/cumulus_theme.dart';
 import '../widgets/command_palette.dart';
 import '../widgets/cumulus_shell.dart';
 import '../widgets/task_queue.dart';
 import 'api_docs_screen.dart';
 import '../widgets/data_plane.dart';
+import '../widgets/knowledge_overview.dart';
 import '../widgets/learned_plane.dart';
 import '../widgets/payables_view.dart';
 import '../widgets/reimbursements_view.dart';
@@ -26,6 +28,10 @@ const int _knowledgeIndex = 0;
 const int _flowsIndex = 1;
 const int _identitiesIndex = 2;
 const int _employeeHubIndex = 3;
+/// The Library's tab index inside the Knowledge layer section. Named because
+/// the palette navigates to it and a bare `1` would not survive a reorder.
+const int _libraryPlane = 1;
+
 const int _expenseWorkspaceIndex = 4;
 const int _payablesWorkspaceIndex = 5;
 
@@ -99,9 +105,9 @@ class _HomeShellState extends State<HomeShell> {
 
   int _index = 0;
 
-  /// Which plane of the Knowledge layer is showing: 0 = Library (the governed
-  /// corpus), 1 = Data (the dataset registry). Held here so opening an asset
-  /// from the palette can flip back to the Library.
+  /// Which plane of the Knowledge layer is showing — see the tab labels in
+  /// [_KnowledgeSection]. Held here so opening an asset from the palette can
+  /// flip back to the Library, wherever that tab sits.
   final ValueNotifier<int> _knowledgePlane = ValueNotifier(0);
 
   /// Sections fetch on first build, so a section that has never been opened
@@ -131,17 +137,17 @@ class _HomeShellState extends State<HomeShell> {
     switch (intent) {
       case OpenAssetIntent(:final assetId):
         _show(0);
-        _knowledgePlane.value = 0;
+        _knowledgePlane.value = _libraryPlane;
         _pageResults.value = null;
         _openAsset.value = assetId;
       case CreateAssetIntent():
         _show(0);
-        _knowledgePlane.value = 0;
+        _knowledgePlane.value = _libraryPlane;
         _pageResults.value = null;
         _openAsset.value = '';
       case ShowAllResultsIntent(:final query, :final filters):
         _show(0);
-        _knowledgePlane.value = 0;
+        _knowledgePlane.value = _libraryPlane;
         _openAsset.value = null;
         _pageResults.value = (query: query, filters: filters);
       case OpenSectionIntent(:final index):
@@ -202,8 +208,12 @@ class _HomeShellState extends State<HomeShell> {
   }
 }
 
-/// The Knowledge layer section: four planes under one heading, cut by
+/// The Knowledge layer section: an Overview plus four planes, cut by
 /// *origin* — who or what put each thing here.
+///
+/// **Overview** is the landing screen and the only place metrics live: the
+/// planes are about their subject, and reporting on the layer as a whole is
+/// a different job from browsing any one plane of it.
 ///
 /// **Library** is what people wrote: policies, standards, guidelines — the
 /// documents that argue and carry authority. **Ontology** is what we encoded:
@@ -246,10 +256,23 @@ class _KnowledgeSectionState extends State<_KnowledgeSection> {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // The section title sits above the tabs: the tabs are planes
+            // *of* the knowledge layer, and without the title each plane
+            // reads like a top-level destination of its own.
             Padding(
-              padding: const EdgeInsets.fromLTRB(28, 14, 28, 0),
+              padding: const EdgeInsets.fromLTRB(28, 18, 28, 12),
+              child: Text('Knowledge layer', style: CumulusText.pageTitle),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(28, 0, 28, 0),
               child: SegmentedTabs(
-                labels: const ['Library', 'Ontology', 'Learned', 'Sources'],
+                labels: const [
+                  'Overview',
+                  'Library',
+                  'Ontology',
+                  'Learned',
+                  'Sources',
+                ],
                 selectedIndex: selected,
                 onChanged: (i) => widget.plane.value = i,
               ),
@@ -258,6 +281,10 @@ class _KnowledgeSectionState extends State<_KnowledgeSection> {
               child: IndexedStack(
                 index: selected,
                 children: [
+                  KnowledgeOverview(
+                    api: widget.api,
+                    onOpenPlane: (i) => widget.plane.value = i,
+                  ),
                   widget.library,
                   DataPlaneView(
                     api: widget.api,
@@ -267,7 +294,7 @@ class _KnowledgeSectionState extends State<_KnowledgeSection> {
                     onOpenPayablesWorkspace: () =>
                         widget.onOpenWorkspace(_payablesWorkspaceIndex),
                     onOpenFlows: () => widget.onOpenWorkspace(_flowsIndex),
-                    onOpenLibrary: () => widget.plane.value = 0,
+                    onOpenLibrary: () => widget.plane.value = 1,
                   ),
                   LearnedPlaneView(
                     api: widget.api,
@@ -281,7 +308,7 @@ class _KnowledgeSectionState extends State<_KnowledgeSection> {
                     onOpenPayablesWorkspace: () =>
                         widget.onOpenWorkspace(_payablesWorkspaceIndex),
                     onOpenFlows: () => widget.onOpenWorkspace(_flowsIndex),
-                    onOpenLibrary: () => widget.plane.value = 0,
+                    onOpenLibrary: () => widget.plane.value = 1,
                   ),
                 ],
               ),

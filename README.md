@@ -1107,8 +1107,11 @@ rather than a plane of the map — and **Identities, access & keys**. The
 Employee Hub hangs off the account avatar and the Task Queue off the top bar,
 since both are asked for from every section rather than being one.
 
-The Knowledge layer itself has four planes, cut by **origin** — who or what
-put each thing there:
+The Knowledge layer itself opens on an **Overview** — the landing screen and
+the only place metrics live, because reporting on the layer as a whole is a
+different job from browsing any one plane of it. It carries two labelled
+strips (the corpus, and the model) plus a card per plane. Then four planes,
+cut by **origin** — who or what put each thing there:
 
 - **Library** — what people wrote: policies, standards, guidelines. The
   authority lens applies here and only here, because authority is a property
