@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/asset.dart' show AskAnswer;
+import '../models/data_layer.dart' show DataCollection;
 import '../models/graph.dart';
 import '../models/world.dart';
 import '../services/api_client.dart';
@@ -27,7 +28,16 @@ class ABoxExplorer extends StatefulWidget {
   final ApiClient api;
   final Ontology? ontology;
 
-  const ABoxExplorer({super.key, required this.api, required this.ontology});
+  /// The Collection registry, used to tell business entities from
+  /// infrastructure — the same split the Entities & Links rail makes.
+  final List<DataCollection> collections;
+
+  const ABoxExplorer({
+    super.key,
+    required this.api,
+    required this.ontology,
+    this.collections = const [],
+  });
 
   @override
   State<ABoxExplorer> createState() => _ABoxExplorerState();
@@ -44,9 +54,15 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
   bool _loadingWorld = true;
 
   String? _type;
-  String? _instanceId;
-  final TextEditingController _filterCtl = TextEditingController();
-  String _filter = '';
+
+  /// The drill-in trail: the last entry is what the pane shows; empty means
+  /// the pane shows the selected type's instance list. Back pops.
+  final List<String> _stack = [];
+  final TextEditingController _railFilterCtl = TextEditingController();
+  String _railFilter = '';
+  final Set<String> _activeTags = {};
+  final TextEditingController _listFilterCtl = TextEditingController();
+  String _listFilter = '';
   _View _view = _View.table;
   String? _expandedField;
 
@@ -73,6 +89,25 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
     return 'association';
   }
 
+  bool _isInfrastructure(OntologyObjectType t) {
+    for (final c in widget.collections) {
+      if (c.id == t.collection) return c.kind == 'landing';
+    }
+    return false;
+  }
+
+  bool _matchesRailFilter(OntologyObjectType t) {
+    if (_activeTags.isNotEmpty &&
+        !_activeTags.every((tag) => t.tags.contains(tag))) {
+      return false;
+    }
+    if (_railFilter.isEmpty) return true;
+    final q = _railFilter.toLowerCase();
+    return t.label.toLowerCase().contains(q) ||
+        t.name.toLowerCase().contains(q) ||
+        t.tags.any((tag) => tag.contains(q));
+  }
+
   List<OntologyObjectType> get _rootTypes {
     final types = [
       for (final t
@@ -92,7 +127,8 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
 
   @override
   void dispose() {
-    _filterCtl.dispose();
+    _railFilterCtl.dispose();
+    _listFilterCtl.dispose();
     _askCtl.dispose();
     super.dispose();
   }
@@ -112,7 +148,7 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
       _worldId = id;
       _loadingWorld = true;
       _error = null;
-      _instanceId = null;
+      _stack.clear();
       _ask = null;
       _askedQuestion = '';
     });
@@ -150,7 +186,7 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
   List<WorldObject> _instancesOf(String type) {
     final world = _world;
     if (world == null) return const [];
-    final q = _filter.toLowerCase();
+    final q = _listFilter.toLowerCase();
     return [
       for (final o in world.objects)
         if (o.type == type &&
@@ -211,8 +247,8 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
     }
   }
 
-  /// `graph:Vendor/vendor_ab12cd@rev3` → select that entity here, if this
-  /// world holds it.
+  /// `graph:Vendor/vendor_ab12cd@rev3` → drill into that entity here, if
+  /// this world holds it.
   void _openRef(String ref) {
     if (!ref.startsWith('graph:')) return;
     final slash = ref.indexOf('/');
@@ -225,14 +261,26 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
       _type = _declared(obj.type)?.isPart ?? false
           ? _declared(obj.type)!.ownerType
           : obj.type;
-      _instanceId = obj.id;
+      _stack
+        ..clear()
+        ..add(obj.id);
       _expandedField = null;
     });
   }
 
-  void _select(WorldObject obj) {
+  /// Drill in: everything clicked lands on the trail, so Back always means
+  /// "where I just was".
+  void _push(WorldObject obj) {
     setState(() {
-      _instanceId = obj.id;
+      // Re-clicking what is already on top should not grow the trail.
+      if (_stack.isEmpty || _stack.last != obj.id) _stack.add(obj.id);
+      _expandedField = null;
+    });
+  }
+
+  void _back() {
+    setState(() {
+      if (_stack.isNotEmpty) _stack.removeLast();
       _expandedField = null;
     });
   }
@@ -352,7 +400,7 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
     // instance's label substituted — the ontology's own admission test,
     // offered back as one-tap asks.
     final declared = _declared(_type ?? '');
-    final instance = _instanceId == null ? null : _object(_instanceId!);
+    final instance = _stack.isEmpty ? null : _object(_stack.last);
     final chips = <String>[
       for (final q in declared?.competencyQuestions ?? const <String>[])
         if (instance != null || !q.contains('{label}'))
@@ -479,12 +527,29 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
     );
   }
 
-  // -- rail: types, then instances -------------------------------------------------------
+  // -- rail: core entity types, exactly as the Entities & Links page ------------
 
   Widget _rail() {
     final world = _world;
     if (world == null) return const CumulusCard(child: CumulusLoading());
     final counts = world.byType;
+    final core = _rootTypes
+        .where((t) => !_isInfrastructure(t) && _matchesRailFilter(t))
+        .toList();
+    final infra = _rootTypes
+        .where((t) => _isInfrastructure(t) && _matchesRailFilter(t))
+        .toList();
+    final tagCounts = <String, int>{};
+    for (final t in _rootTypes.where((t) => !_isInfrastructure(t))) {
+      for (final tag in t.tags) {
+        tagCounts[tag] = (tagCounts[tag] ?? 0) + 1;
+      }
+    }
+    final tagOrder = tagCounts.keys.toList()
+      ..sort((a, b) {
+        final c = tagCounts[b]!.compareTo(tagCounts[a]!);
+        return c != 0 ? c : a.compareTo(b);
+      });
     return CumulusCard(
       padding: EdgeInsets.zero,
       child: Column(
@@ -493,12 +558,12 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
             child: TextField(
-              controller: _filterCtl,
-              onChanged: (v) => setState(() => _filter = v.trim()),
+              controller: _railFilterCtl,
+              onChanged: (v) => setState(() => _railFilter = v.trim()),
               decoration: InputDecoration(
                 isDense: true,
                 prefixIcon: const Icon(Icons.filter_list, size: 16),
-                hintText: 'Filter instances…',
+                hintText: 'Filter by name or tag…',
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(CumulusRadius.control),
                   borderSide: const BorderSide(color: CumulusColors.border),
@@ -506,47 +571,56 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
               ),
             ),
           ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final tag in tagOrder)
+                  InkWell(
+                    onTap: () => setState(() {
+                      _activeTags.contains(tag)
+                          ? _activeTags.remove(tag)
+                          : _activeTags.add(tag);
+                    }),
+                    borderRadius: BorderRadius.circular(CumulusRadius.pill),
+                    child: StatusBadge(
+                      '$tag · ${tagCounts[tag]}',
+                      tone: _activeTags.contains(tag)
+                          ? CumulusTone.accent
+                          : CumulusTone.neutral,
+                      dense: true,
+                    ),
+                  ),
+              ],
+            ),
+          ),
           Expanded(
             child: SingleChildScrollView(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  for (final t in _rootTypes)
-                    if ((counts[t.name] ?? 0) > 0) ...[
-                      InkWell(
-                        onTap: () => setState(() {
-                          _type = t.name;
-                          _instanceId = null;
-                        }),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 8),
-                          color: _type == t.name
-                              ? CumulusColors.surfaceMuted
-                              : Colors.transparent,
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  t.label.toUpperCase(),
-                                  style: CumulusText.statCaption.copyWith(
-                                    color: _type == t.name
-                                        ? CumulusColors.ink
-                                        : CumulusColors.inkMuted,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                              ),
-                              Text('${counts[t.name]}',
-                                  style: CumulusText.statCaption),
-                            ],
-                          ),
-                        ),
-                      ),
-                      if (_type == t.name)
-                        for (final o in _instancesOf(t.name))
-                          _railInstance(o),
-                    ],
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(16, 4, 16, 4),
+                    child:
+                        Text('CORE ENTITIES', style: CumulusText.statCaption),
+                  ),
+                  for (final t in core) _railRow(t, counts[t.name] ?? 0),
+                  if (infra.isNotEmpty) ...[
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+                      child: Text('INFRASTRUCTURE',
+                          style: CumulusText.statCaption),
+                    ),
+                    for (final t in infra) _railRow(t, counts[t.name] ?? 0),
+                  ],
+                  if (core.isEmpty && infra.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.all(16),
+                      child:
+                          Text('Nothing matches.', style: CumulusText.meta),
+                    ),
                   const SizedBox(height: 8),
                 ],
               ),
@@ -557,44 +631,46 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
     );
   }
 
-  Widget _railInstance(WorldObject o) {
-    final selected = _instanceId == o.id;
+  Widget _railRow(OntologyObjectType t, int count) {
+    final selected = _type == t.name;
     return InkWell(
-      onTap: () => _select(o),
+      onTap: () => setState(() {
+        _type = t.name;
+        _stack.clear();
+        _listFilter = '';
+        _listFilterCtl.clear();
+      }),
       child: Container(
-        padding: const EdgeInsets.fromLTRB(24, 7, 16, 7),
-        color: selected ? CumulusColors.accentSoft : Colors.transparent,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        decoration: BoxDecoration(
+          color: selected ? CumulusColors.accentSoft : Colors.transparent,
+          border: const Border(
+            bottom: BorderSide(color: CumulusColors.border, width: 0.5),
+          ),
+        ),
         child: Row(
           children: [
             Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    o.label,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight:
-                          selected ? FontWeight.w600 : FontWeight.w400,
-                      color: selected
-                          ? CumulusColors.accentInk
-                          : CumulusColors.ink,
-                    ),
-                  ),
-                  if (o.naturalKey != o.label)
-                    Text(
-                      o.naturalKey,
-                      overflow: TextOverflow.ellipsis,
-                      style: CumulusText.mono.copyWith(
-                          fontSize: 10.5, color: CumulusColors.inkMuted),
-                    ),
-                ],
+              child: Text(
+                t.label,
+                style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                  color:
+                      selected ? CumulusColors.accentInk : CumulusColors.ink,
+                ),
               ),
             ),
-            if (o.conflictFields.isNotEmpty)
-              const Icon(Icons.warning_amber_rounded,
-                  size: 13, color: CumulusColors.warn),
+            if (t.authoritative)
+              const Padding(
+                padding: EdgeInsets.only(right: 8),
+                child: Tooltip(
+                  message: 'Cumulus is the system of record for this type',
+                  child: Icon(Icons.verified_outlined,
+                      size: 14, color: CumulusColors.success),
+                ),
+              ),
+            Text('$count', style: CumulusText.statCaption),
           ],
         ),
       ),
@@ -603,20 +679,20 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
 
   // -- the instance pane -------------------------------------------------------------------
 
-  Widget _instancePane() {
-    final instance = _instanceId == null ? null : _object(_instanceId!);
-    if (instance == null) {
+  /// Level one of the pane: every instance of the selected type in this
+  /// world. Clicking a row drills in; Back returns here.
+  Widget _instanceList() {
+    final declared = _declared(_type ?? '');
+    if (declared == null) {
       return const CumulusCard(
         child: CumulusEmptyState(
           icon: Icons.hub_outlined,
-          title: 'Pick an instance',
-          message:
-              'Select an entity on the left — or ask a question above and '
-              'open a step of the walk.',
+          title: 'Pick a core entity',
+          message: 'Select a type on the left to list its instances.',
         ),
       );
     }
-    final edges = _edges(instance.id);
+    final instances = _instancesOf(declared.name);
     return CumulusCard(
       padding: EdgeInsets.zero,
       child: Column(
@@ -627,6 +703,115 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: SectionHeader(
+                        title: declared.label,
+                        subtitle: declared.summary,
+                      ),
+                    ),
+                    StatusBadge('${instances.length} in this world',
+                        dense: true),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _listFilterCtl,
+                  onChanged: (v) => setState(() => _listFilter = v.trim()),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    prefixIcon: const Icon(Icons.search, size: 16),
+                    hintText:
+                        'Filter ${declared.label.toLowerCase()}s by name or '
+                        'key…',
+                    border: OutlineInputBorder(
+                      borderRadius:
+                          BorderRadius.circular(CumulusRadius.control),
+                      borderSide:
+                          const BorderSide(color: CumulusColors.border),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1, thickness: 1, color: CumulusColors.border),
+          Expanded(
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (instances.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.all(20),
+                      child: Text('Nothing of this type in this world.',
+                          style: CumulusText.meta),
+                    ),
+                  for (final o in instances)
+                    CumulusListRow(
+                      onTap: () => _push(o),
+                      title: Row(
+                        children: [
+                          Flexible(child: Text(o.label)),
+                          if (o.conflictFields.isNotEmpty) ...[
+                            const SizedBox(width: 8),
+                            StatusBadge(
+                              '⚠ ${o.conflictFields.join(", ")}',
+                              tone: CumulusTone.warn,
+                              dense: true,
+                            ),
+                          ],
+                        ],
+                      ),
+                      subtitle: Wrap(
+                        spacing: 12,
+                        runSpacing: 4,
+                        children: [
+                          Text(o.naturalKey, style: CumulusText.mono),
+                          for (final e in o.props.entries.take(3))
+                            if (e.key != 'email' || o.naturalKey != '${e.value}')
+                              Text('· ${e.key} ${e.value}',
+                                  style: CumulusText.meta),
+                        ],
+                      ),
+                      trailing: [
+                        Text('${_edges(o.id).length} link(s)',
+                            style: CumulusText.statCaption),
+                      ],
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _instancePane() {
+    final instance = _stack.isEmpty ? null : _object(_stack.last);
+    if (instance == null) return _instanceList();
+    final edges = _edges(instance.id);
+    return CumulusCard(
+      padding: EdgeInsets.zero,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: BackLink(
+                    label: _stack.length > 1
+                        ? (_object(_stack[_stack.length - 2])?.label ?? 'Back')
+                        : 'All ${_declared(_type ?? '')?.label ?? _type}s',
+                    onTap: _back,
+                  ),
+                ),
                 Row(
                   children: [
                     Expanded(
@@ -819,7 +1004,7 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
           ),
           Expanded(
             child: InkWell(
-              onTap: () => _select(other),
+              onTap: () => _push(other),
               child: Text(
                 other.label,
                 style: const TextStyle(
@@ -895,7 +1080,7 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
       onTapType: (key) {
         final members = byKey[key] ?? const [];
         if (members.length == 1) {
-          _select(members.first.$2);
+          _push(members.first.$2);
         } else if (members.length > 1) {
           _pickFrom(members);
         }
@@ -955,7 +1140,7 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
                             ],
                             onTap: () {
                               Navigator.of(context).pop();
-                              _select(m.$2);
+                              _push(m.$2);
                             },
                           ),
                       ],

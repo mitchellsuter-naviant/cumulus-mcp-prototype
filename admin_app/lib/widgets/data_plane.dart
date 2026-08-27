@@ -265,7 +265,11 @@ class _DataPlaneViewState extends State<DataPlaneView> {
                           ontology: _ontology,
                           collections: _collections ?? const [],
                         )
-                      : ABoxExplorer(api: widget.api, ontology: _ontology),
+                      : ABoxExplorer(
+                          api: widget.api,
+                          ontology: _ontology,
+                          collections: _collections ?? const [],
+                        ),
             ),
           ),
         ],
@@ -309,7 +313,7 @@ class _DataPlaneViewState extends State<DataPlaneView> {
 
   static String _label(_Lens lens) => switch (lens) {
     _Lens.entities => 'ENTITIES & LINKS',
-    _Lens.fragments => 'INSTANCES · ABOX',
+    _Lens.fragments => 'INSTANCES',
     _Lens.collections => 'COLLECTIONS',
     _Lens.mappings => 'MAPPINGS',
     _Lens.sources => 'FEEDS',
