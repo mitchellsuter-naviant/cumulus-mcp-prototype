@@ -179,8 +179,8 @@ class OntologyObjectType {
   final String ownerType;
   final List<String> partTypes;
 
-  /// Effective navigation namespaces — a part inherits its owner's.
-  final List<String> domains;
+  /// Effective filter facets — a part inherits its owner's.
+  final List<String> tags;
 
   const OntologyObjectType({
     required this.name,
@@ -193,7 +193,7 @@ class OntologyObjectType {
     required this.instances,
     this.ownerType = '',
     this.partTypes = const [],
-    this.domains = const [],
+    this.tags = const [],
   });
 
   bool get isPart => ownerType.isNotEmpty;
@@ -214,7 +214,7 @@ class OntologyObjectType {
         partTypes: (json['part_types'] as List<dynamic>? ?? const [])
             .map((e) => '$e')
             .toList(),
-        domains: (json['domains'] as List<dynamic>? ?? const [])
+        tags: (json['tags'] as List<dynamic>? ?? const [])
             .map((e) => '$e')
             .toList(),
       );
@@ -263,37 +263,16 @@ class OntologyLinkType {
       );
 }
 
-class OntologyDomain {
-  final String id;
-  final String label;
-  final String summary;
-
-  const OntologyDomain({
-    required this.id,
-    required this.label,
-    required this.summary,
-  });
-
-  factory OntologyDomain.fromJson(Map<String, dynamic> json) =>
-      OntologyDomain(
-        id: json['id'] as String? ?? '',
-        label: json['label'] as String? ?? '',
-        summary: json['summary'] as String? ?? '',
-      );
-}
-
 class Ontology {
   final List<OntologyObjectType> objects;
   final List<OntologyLinkType> links;
   final List<String> precedence;
-  final List<OntologyDomain> domains;
   final String assetId;
 
   const Ontology({
     required this.objects,
     required this.links,
     required this.precedence,
-    this.domains = const [],
     required this.assetId,
   });
 
@@ -306,9 +285,6 @@ class Ontology {
         .toList(),
     precedence: (json['precedence'] as List<dynamic>? ?? const [])
         .map((e) => '$e')
-        .toList(),
-    domains: (json['domains'] as List<dynamic>? ?? const [])
-        .map((e) => OntologyDomain.fromJson(e as Map<String, dynamic>))
         .toList(),
     assetId: json['asset_id'] as String? ?? '',
   );

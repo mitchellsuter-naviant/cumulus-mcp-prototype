@@ -555,7 +555,10 @@ EXPENSE_SPEC = EvalSpec(
 
 _PAT = FixtureObject(
     type="Employee", key="pat@customer.example",
-    props={"email": "pat@customer.example", "team": "delivery"},
+    # Org membership is a member_of link, not a field — a fixture that
+    # claimed `team` here would be re-smuggling the string the ontology
+    # just retired.
+    props={"email": "pat@customer.example", "title": "Field Engineer"},
     label="pat@customer.example",
 )
 

@@ -673,8 +673,9 @@ def test_part_ness_is_derived_never_declared():
     assert ONTOLOGY.owner_of("ExpenseRequest") is None
     assert set(ONTOLOGY.parts_of("Invoice")) == {"InvoiceLine", "MatchSet"}
     assert [o.name for o in ONTOLOGY.roots()] == [
-        "Employee", "Team", "ExpenseRequest", "Document", "Vendor",
-        "SourceRecord", "Invoice", "PurchaseOrder", "ReceivingReport",
+        "Employee", "Team", "Capability", "ExpenseRequest", "Document",
+        "Vendor", "SourceRecord", "Invoice", "PurchaseOrder",
+        "ReceivingReport",
     ]
 
 
@@ -819,37 +820,59 @@ def test_same_key_still_lands_on_one_entity(graph):
 # ---- domains and ref fields ---------------------------------------------------
 
 
-def test_domains_are_declared_on_roots_and_inherited_by_parts():
+def test_tags_are_declared_on_roots_and_inherited_by_parts():
     from app.ontology import ONTOLOGY
 
-    assert ONTOLOGY.effective_domains("Employee") == ("people", "expenses")
-    # A part lives where its owner lives — it declares nothing itself.
-    assert ONTOLOGY.effective_domains("InvoiceLine") == ("payables",)
-    assert ONTOLOGY.object_type("InvoiceLine").domains == ()
+    assert ONTOLOGY.effective_tags("Employee") == (
+        "people", "expenses", "org-chart",
+    )
+    # A part is tagged as its owner is — it declares nothing itself.
+    assert ONTOLOGY.effective_tags("InvoiceLine") == ("payables",)
+    assert ONTOLOGY.object_type("InvoiceLine").tags == ()
     # Multi-membership: evidence serves both flows.
-    assert set(ONTOLOGY.effective_domains("Document")) == {"expenses", "payables"}
+    assert {"expenses", "payables"} <= set(ONTOLOGY.effective_tags("Document"))
 
 
-def test_domain_and_ref_rules_are_refused_at_declaration():
+def test_tag_and_ref_rules_are_refused_at_declaration():
     from app.ontology import (
         FieldSpec, LinkType, ObjectType, Ontology, validate_ontology,
     )
 
     objects = (
         ObjectType(name="A", label="A", summary="", natural_key="k",
-                   domains=("nowhere",),
+                   tags=("anything",),
                    fields=(FieldSpec("other", "ref:Ghost"),)),
-        # A part that tries to declare its own domain: drift refused.
+        # A part that tries to declare its own tags: drift refused.
         ObjectType(name="B", label="B", summary="", natural_key="k",
-                   domains=("people",)),
-        # A root that declares none: unfiled entities clutter every view.
+                   tags=("people",)),
+        # A root that declares none: unfindable by facet.
         ObjectType(name="C", label="C", summary="", natural_key="k"),
     )
     bad = Ontology(objects=objects, links=(
         LinkType("owns", "A", "B", "one-to-many", "", nature="composition"),
     ), precedence=("human",))
     problems = " ".join(validate_ontology(bad))
-    assert "unknown domain `nowhere`" in problems
     assert "refs unknown type `Ghost`" in problems
-    assert "part type `B` declares domains" in problems
-    assert "root type `C` declares no domain" in problems
+    assert "part type `B` declares tags" in problems
+    assert "root type `C` declares no tags" in problems
+
+
+def test_the_org_chart_is_a_traversal():
+    """The Human ontology's competency questions, as declared structure:
+    reports_to chains, teams that nest, and capabilities you can search."""
+    from app.ontology import ONTOLOGY
+
+    assert ONTOLOGY.link_type("reports_to").cardinality == "many-to-one"
+    assert ONTOLOGY.link_type("subteam_of").from_type == "Team"
+    assert ONTOLOGY.link_type("subteam_of").to_type == "Team"
+    assert ONTOLOGY.link_type("led_by").to_type == "Employee"
+    cap = ONTOLOGY.link_type("has_capability")
+    assert cap.cardinality == "many-to-many"
+    # Employee no longer smuggles the org chart through string fields.
+    employee = ONTOLOGY.object_type("Employee")
+    names = {f.name for f in employee.fields}
+    assert "manager_email" not in names and "team" not in names
+    # Capability is a real type with a description — what makes two people's
+    # skill the same capability instead of two strings.
+    capability = ONTOLOGY.object_type("Capability")
+    assert "description" in {f.name for f in capability.fields}

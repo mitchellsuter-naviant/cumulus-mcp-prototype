@@ -44,6 +44,7 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
   String? _selected;
   final TextEditingController _filterCtl = TextEditingController();
   String _filter = '';
+  final Set<String> _activeTags = {};
 
   final TextEditingController _askCtl = TextEditingController();
   AskAnswer? _ask;
@@ -74,10 +75,15 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
   }
 
   bool _matchesFilter(OntologyObjectType t) {
+    if (_activeTags.isNotEmpty &&
+        !_activeTags.every((tag) => t.tags.contains(tag))) {
+      return false;
+    }
     if (_filter.isEmpty) return true;
     final q = _filter.toLowerCase();
     return t.label.toLowerCase().contains(q) ||
-        t.name.toLowerCase().contains(q);
+        t.name.toLowerCase().contains(q) ||
+        t.tags.any((tag) => tag.contains(q));
   }
 
   @override
@@ -250,36 +256,42 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
   // -- left rail: core entity types ----------------------------------------------
 
   Widget _rail() {
-    // Domains are the buckets that keep this list legible as the ontology
-    // grows. A type may live in several — a view, not a container — so
-    // Employee appears under People and Expenses alike. Infrastructure
-    // (landing collections) stays below the fold regardless of domain.
-    final domains = widget.ontology?.domains ?? const <OntologyDomain>[];
+    // Tags are facets, not sections: the list stays flat, and the chips
+    // below the filter box narrow it. Selecting several tags means "all of
+    // these"; a type carries many tags, so Employee answers to `people` and
+    // to `expenses` without appearing twice.
+    final core = _types
+        .where((t) => !t.isPart && !_isInfrastructure(t) && _matchesFilter(t))
+        .toList();
     final infra = _types
         .where((t) => !t.isPart && _isInfrastructure(t) && _matchesFilter(t))
         .toList();
-    List<OntologyObjectType> inDomain(String id) => _types
-        .where((t) =>
-            !t.isPart &&
-            !_isInfrastructure(t) &&
-            t.domains.contains(id) &&
-            _matchesFilter(t))
-        .toList();
-    final anyCore = domains.any((d) => inDomain(d.id).isNotEmpty);
+    // The facet vocabulary, with how many core types answer to each.
+    final tagCounts = <String, int>{};
+    for (final t in _types.where((t) => !t.isPart && !_isInfrastructure(t))) {
+      for (final tag in t.tags) {
+        tagCounts[tag] = (tagCounts[tag] ?? 0) + 1;
+      }
+    }
+    final tagOrder = tagCounts.keys.toList()
+      ..sort((a, b) {
+        final c = tagCounts[b]!.compareTo(tagCounts[a]!);
+        return c != 0 ? c : a.compareTo(b);
+      });
     return CumulusCard(
       padding: EdgeInsets.zero,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
             child: TextField(
               controller: _filterCtl,
               onChanged: (v) => setState(() => _filter = v.trim()),
               decoration: InputDecoration(
                 isDense: true,
                 prefixIcon: const Icon(Icons.filter_list, size: 16),
-                hintText: 'Filter entities…',
+                hintText: 'Filter by name or tag…',
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(CumulusRadius.control),
                   borderSide: const BorderSide(color: CumulusColors.border),
@@ -287,19 +299,37 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
               ),
             ),
           ),
-          for (final d in domains)
-            if (inDomain(d.id).isNotEmpty) ...[
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
-                child: Tooltip(
-                  message: d.summary,
-                  waitDuration: const Duration(milliseconds: 350),
-                  child: Text(d.label.toUpperCase(),
-                      style: CumulusText.statCaption),
-                ),
-              ),
-              for (final t in inDomain(d.id)) _railRow(t),
-            ],
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final tag in tagOrder)
+                  InkWell(
+                    onTap: () => setState(() {
+                      _activeTags.contains(tag)
+                          ? _activeTags.remove(tag)
+                          : _activeTags.add(tag);
+                    }),
+                    borderRadius:
+                        BorderRadius.circular(CumulusRadius.pill),
+                    child: StatusBadge(
+                      '$tag · ${tagCounts[tag]}',
+                      tone: _activeTags.contains(tag)
+                          ? CumulusTone.accent
+                          : CumulusTone.neutral,
+                      dense: true,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 4, 16, 4),
+            child: Text('CORE ENTITIES', style: CumulusText.statCaption),
+          ),
+          for (final t in core) _railRow(t),
           if (infra.isNotEmpty) ...[
             const Padding(
               padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
@@ -307,7 +337,7 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
             ),
             for (final t in infra) _railRow(t),
           ],
-          if (!anyCore && infra.isEmpty)
+          if (core.isEmpty && infra.isEmpty)
             const Padding(
               padding: EdgeInsets.all(16),
               child: Text('Nothing matches.', style: CumulusText.meta),
@@ -422,8 +452,8 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
                         subtitle: t.summary,
                       ),
                     ),
-                    for (final d in t.domains) ...[
-                      StatusBadge(d, dense: true),
+                    for (final tag in t.tags) ...[
+                      StatusBadge(tag, dense: true),
                       const SizedBox(width: 6),
                     ],
                     if (t.authoritative)

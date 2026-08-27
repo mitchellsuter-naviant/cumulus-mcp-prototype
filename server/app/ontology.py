@@ -53,32 +53,6 @@ class FieldSpec:
 
 
 @dataclass(frozen=True)
-class Domain:
-    """A namespace for navigation — a view onto the ontology, not a container.
-
-    Domains exist so the list of core entities stays legible as the ontology
-    grows; a type may live in several, because "Employee" is a People fact
-    and an Expenses fact at once. They carry no semantics the graph enforces
-    — that is what `nature` and Collections are for — and agents tend the
-    assignments as types are added.
-    """
-
-    id: str
-    label: str
-    summary: str
-
-
-DOMAINS: tuple[Domain, ...] = (
-    Domain("people", "People",
-           "who works here and how they are organized"),
-    Domain("expenses", "Expenses",
-           "employee spend: requests, their lines, and the evidence"),
-    Domain("payables", "Payables",
-           "vendor commerce: invoices, orders, receipts, and the match"),
-)
-
-
-@dataclass(frozen=True)
 class ObjectType:
     name: str
     label: str
@@ -93,9 +67,11 @@ class ObjectType:
     authoritative: bool = False
     # The Collection whose retention and custody policy governs its rows.
     collection: str = ""
-    # Navigation namespaces. Multi-membership is deliberate; parts declare
-    # none and inherit their owner's (enforced by validate_ontology).
-    domains: tuple[str, ...] = ()
+    # Freeform facets for filtering, not structure: no registry, no
+    # sections, just strings a search box can match and chips can toggle.
+    # A type carries several; parts declare none and inherit their owner's
+    # (enforced by validate_ontology).
+    tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -188,15 +164,15 @@ class Ontology:
     def roots(self) -> list["ObjectType"]:
         return [o for o in self.objects if self.owner_of(o.name) is None]
 
-    def effective_domains(self, type_name: str) -> tuple[str, ...]:
-        """A part lives where its owner lives."""
+    def effective_tags(self, type_name: str) -> tuple[str, ...]:
+        """A part is tagged as its owner is."""
         obj = self.object_type(type_name)
         if obj is None:
             return ()
-        if obj.domains:
-            return obj.domains
+        if obj.tags:
+            return obj.tags
         owner = self.owner_of(type_name)
-        return self.effective_domains(owner) if owner else ()
+        return self.effective_tags(owner) if owner else ()
 
 
 # ---------------------------------------------------------------------------
@@ -217,14 +193,13 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         fields=(
             FieldSpec("email", "string"),
             FieldSpec("name", "string"),
-            FieldSpec("team", "ref:Team",
-                      "observation awaiting resolution to a member_of link"),
-            FieldSpec("manager_email", "ref:Employee",
-                      "observation awaiting resolution to a reports_to link"),
+            FieldSpec("title", "string", "job title — a label, not a role"),
+            FieldSpec("location", "string"),
+            FieldSpec("start_date", "date"),
         ),
         authoritative=True,
         collection="workforce",
-        domains=("people", "expenses"),
+        tags=("people", "expenses", "org-chart"),
     ),
     ObjectType(
         name="Team",
@@ -232,16 +207,40 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         summary=(
             "An organizational unit. Competency question: who is on which "
             "team, and what does a team's work cost — neither answerable by "
-            "a string field on Employee."
+            "a string field on Employee. Teams nest (subteam_of), so the org "
+            "chart is a traversal: members up through teams to the root."
         ),
         natural_key="team slug",
         fields=(
             FieldSpec("slug", "string"),
             FieldSpec("name", "string"),
+            FieldSpec("mission", "string", "one line on what the team is for"),
         ),
         authoritative=True,
         collection="workforce",
-        domains=("people",),
+        tags=("people", "org-chart"),
+    ),
+    ObjectType(
+        name="Capability",
+        label="Capability",
+        summary=(
+            "An encoded skill or competency. Competency question: who can do "
+            "X — unanswerable while skills live in resume prose. The "
+            "description is what makes two people's 'data engineering' the "
+            "same capability instead of two strings."
+        ),
+        natural_key="capability slug",
+        fields=(
+            FieldSpec("slug", "string"),
+            FieldSpec("name", "string"),
+            FieldSpec("description", "string",
+                      "what holding this capability actually means"),
+            FieldSpec("category", "string",
+                      "coarse grouping: engineering, finance, people, …"),
+        ),
+        authoritative=True,
+        collection="workforce",
+        tags=("people", "skills"),
     ),
     ObjectType(
         name="ExpenseRequest",
@@ -262,7 +261,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         authoritative=True,
         collection="expense-records",
-        domains=("expenses",),
+        tags=("expenses",),
     ),
     ObjectType(
         name="ExpenseLine",
@@ -304,7 +303,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("retention_until", "date", "stamped when the bytes landed"),
         ),
         collection="audit-documents",
-        domains=("expenses", "payables"),
+        tags=("expenses", "payables", "evidence"),
     ),
     ObjectType(
         name="Vendor",
@@ -328,7 +327,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         authoritative=True,
         collection="vendor-master",
-        domains=("payables",),
+        tags=("payables", "mdm"),
     ),
     ObjectType(
         name="SourceRecord",
@@ -349,7 +348,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("landed_at", "date"),
         ),
         collection="source-landing",
-        domains=("payables",),
+        tags=("payables", "landing", "mdm"),
     ),
     ObjectType(
         name="Invoice",
@@ -370,7 +369,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         authoritative=True,
         collection="ap-records",
-        domains=("payables",),
+        tags=("payables",),
     ),
     ObjectType(
         name="InvoiceLine",
@@ -404,7 +403,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("status", "enum", "open | closed | cancelled"),
         ),
         collection="ap-records",
-        domains=("payables",),
+        tags=("payables",),
     ),
     ObjectType(
         name="PurchaseOrderLine",
@@ -437,7 +436,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("status", "enum", "partial | complete"),
         ),
         collection="ap-records",
-        domains=("payables",),
+        tags=("payables",),
     ),
     ObjectType(
         name="ReceivingReportLine",
@@ -499,6 +498,15 @@ LINK_TYPES: tuple[LinkType, ...] = (
     LinkType("reports_to", "Employee", "Employee", "many-to-one",
              "the manager — what turns 'roll up a manager's spend' from "
              "unanswerable into a traversal"),
+    LinkType("subteam_of", "Team", "Team", "many-to-one",
+             "the parent team — nesting is what makes the org chart a tree "
+             "rather than a flat list"),
+    LinkType("led_by", "Team", "Employee", "many-to-one",
+             "the team's lead — distinct from reports_to, because the org "
+             "chart and the management chain are allowed to disagree"),
+    LinkType("has_capability", "Employee", "Capability", "many-to-many",
+             "an encoded skill — proficiency and how it was evidenced live "
+             "on the link, not on either endpoint"),
     LinkType("identified_as", "Vendor", "SourceRecord", "one-to-many",
              "an external system's id for this vendor — reversible, and "
              "carrying the confidence and method that produced it",
@@ -550,12 +558,8 @@ def validate_ontology(ontology: Ontology = ONTOLOGY) -> list[str]:
     """
     problems: list[str] = []
     names = {o.name for o in ontology.objects}
-    domain_ids = {d.id for d in DOMAINS}
     for obj in ontology.objects:
         where = f"type `{obj.name}`"
-        for d in obj.domains:
-            if d not in domain_ids:
-                problems.append(f"{where}: unknown domain `{d}`")
         for f in obj.fields:
             target = f.ref_target
             if target is not None and target not in names:
@@ -586,15 +590,15 @@ def validate_ontology(ontology: Ontology = ONTOLOGY) -> list[str]:
                 f"type `{target}` has {len(via)} owners ({', '.join(via)}); "
                 "a part has exactly one"
             )
-    # Domains are navigation for the *independent* types: every root
-    # declares at least one, and a part declares none — it lives where its
-    # owner lives, and letting it say otherwise would let the two drift.
+    # Tags are facets for filtering, deliberately unregistered — but an
+    # untagged root is unfindable by facet, and a part declaring its own
+    # tags would drift from its owner's.
     for obj in ontology.objects:
-        if ontology.owner_of(obj.name) is None and not obj.domains:
-            problems.append(f"root type `{obj.name}` declares no domain")
-        if ontology.owner_of(obj.name) is not None and obj.domains:
+        if ontology.owner_of(obj.name) is None and not obj.tags:
+            problems.append(f"root type `{obj.name}` declares no tags")
+        if ontology.owner_of(obj.name) is not None and obj.tags:
             problems.append(
-                f"part type `{obj.name}` declares domains — parts inherit "
+                f"part type `{obj.name}` declares tags — parts inherit "
                 "their owner's"
             )
     # Ownership must be a forest: walking owners always terminates at a root.
@@ -683,24 +687,16 @@ def ontology_markdown(ontology: Ontology = ONTOLOGY) -> str:
     ]
     for root in ontology.roots():
         parts = ontology.parts_of(root.name)
-        doms = "/".join(root.domains)
+        tags = " · ".join(root.tags)
         lines.append(
-            f"- **{root.label}** ({doms})"
+            f"- **{root.label}** ({tags})"
             + (f" ▸ {', '.join(parts)}" if parts else "")
         )
     lines += [
         "",
-        "## Domains",
-        "",
-        "Navigation namespaces — views onto the ontology, not containers. A "
-        "type may live in several; parts inherit their owner's.",
-        "",
+        "Types carry freeform *tags* — facets for filtering, deliberately "
+        "unregistered; parts inherit their owner's.",
     ]
-    for d in DOMAINS:
-        members = [
-            o.label for o in ontology.roots() if d.id in o.domains
-        ]
-        lines.append(f"- **{d.label}** — {d.summary}. ({', '.join(members)})")
     lines += [
         "",
         "Governance: a new independent type must name its **competency "
