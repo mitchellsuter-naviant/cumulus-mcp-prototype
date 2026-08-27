@@ -42,12 +42,17 @@ class GraphSpoke {
   final bool isPart;
   final List<SpokeEdge> edges;
 
+  /// Overrides the default "N in the graph" line when set — an instance
+  /// spoke wants its natural key or a count of grouped neighbours there.
+  final String subtitle;
+
   const GraphSpoke({
     required this.type,
     required this.label,
     required this.instances,
     required this.isPart,
     required this.edges,
+    this.subtitle = '',
   });
 
   /// Drawn as a stack of cards rather than one: the shape says "a list of
@@ -279,10 +284,13 @@ class TBoxGraph extends StatelessWidget {
                     ),
                   ),
                   Text(
-                    spoke.isPart
-                        ? 'part · ${spoke.instances} in the graph'
-                        : '${spoke.instances} in the graph',
+                    spoke.subtitle.isNotEmpty
+                        ? spoke.subtitle
+                        : spoke.isPart
+                            ? 'part · ${spoke.instances} in the graph'
+                            : '${spoke.instances} in the graph',
                     style: CumulusText.statCaption,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ],
               ),

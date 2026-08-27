@@ -72,6 +72,11 @@ class ObjectType:
     # A type carries several; parts declare none and inherit their owner's
     # (enforced by validate_ontology).
     tags: tuple[str, ...] = ()
+    # The questions this type exists to answer — the admission test, made
+    # data. `{label}` substitutes the selected instance's label, so the ABox
+    # explorer can offer them as one-tap asks. Declared on roots only; a part
+    # is asked about through its owner.
+    competency_questions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -200,6 +205,11 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         authoritative=True,
         collection="workforce",
         tags=("people", "expenses", "org-chart"),
+        competency_questions=(
+            "How much has {label} submitted in expenses in the last 6 months?",
+            "Who reports to {label}?",
+            "What capabilities does {label} hold?",
+        ),
     ),
     ObjectType(
         name="Team",
@@ -219,6 +229,10 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         authoritative=True,
         collection="workforce",
         tags=("people", "org-chart"),
+        competency_questions=(
+            "Who is on {label}?",
+            "Which teams roll up under {label}?",
+        ),
     ),
     ObjectType(
         name="Capability",
@@ -241,6 +255,9 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         authoritative=True,
         collection="workforce",
         tags=("people", "skills"),
+        competency_questions=(
+            "Who can do {label}, and at what proficiency?",
+        ),
     ),
     ObjectType(
         name="ExpenseRequest",
@@ -262,6 +279,9 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         authoritative=True,
         collection="expense-records",
         tags=("expenses",),
+        competency_questions=(
+            "What documents evidence {label}, and who decided it?",
+        ),
     ),
     ObjectType(
         name="ExpenseLine",
@@ -304,6 +324,9 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         collection="audit-documents",
         tags=("expenses", "payables", "evidence"),
+        competency_questions=(
+            "Which lines and invoices were read out of {label}?",
+        ),
     ),
     ObjectType(
         name="Vendor",
@@ -328,6 +351,10 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         authoritative=True,
         collection="vendor-master",
         tags=("payables", "mdm"),
+        competency_questions=(
+            "How much has {label} invoiced us, and is that usual for them?",
+            "Which systems have a record for {label}?",
+        ),
     ),
     ObjectType(
         name="SourceRecord",
@@ -349,6 +376,9 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         collection="source-landing",
         tags=("payables", "landing", "mdm"),
+        competency_questions=(
+            "Which canonical entity does {label} resolve to?",
+        ),
     ),
     ObjectType(
         name="Invoice",
@@ -370,6 +400,9 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         authoritative=True,
         collection="ap-records",
         tags=("payables",),
+        competency_questions=(
+            "Did {label} match its purchase order and receiving report?",
+        ),
     ),
     ObjectType(
         name="InvoiceLine",
@@ -404,6 +437,9 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         collection="ap-records",
         tags=("payables",),
+        competency_questions=(
+            "What was received and invoiced against {label}?",
+        ),
     ),
     ObjectType(
         name="PurchaseOrderLine",
@@ -437,6 +473,9 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         collection="ap-records",
         tags=("payables",),
+        competency_questions=(
+            "Which purchase order does {label} book goods in against?",
+        ),
     ),
     ObjectType(
         name="ReceivingReportLine",
@@ -606,6 +645,17 @@ def validate_ontology(ontology: Ontology = ONTOLOGY) -> list[str]:
                 f"part type `{obj.name}` declares tags — parts inherit "
                 "their owner's"
             )
+        # The admission test, enforced: a root that cannot name the question
+        # it answers has not earned its place in the rail.
+        if ontology.owner_of(obj.name) is None and not obj.competency_questions:
+            problems.append(
+                f"root type `{obj.name}` names no competency question"
+            )
+        if ontology.owner_of(obj.name) is not None and obj.competency_questions:
+            problems.append(
+                f"part type `{obj.name}` declares competency questions — a "
+                "part is asked about through its owner"
+            )
     # Ownership must be a forest: walking owners always terminates at a root.
     for obj in ontology.objects:
         seen: set[str] = set()
@@ -704,11 +754,12 @@ def ontology_markdown(ontology: Ontology = ONTOLOGY) -> str:
     ]
     lines += [
         "",
-        "Governance: a new independent type must name its **competency "
-        "question** — the question it answers that no existing type can — "
-        "and its natural key. Types that fail that test enter as parts, "
-        "fields, or not at all; the hierarchy absorbs growth so the list of "
-        "independent concepts stays short.",
+        "Governance: a new independent type must declare its **competency "
+        "questions** — what it answers that no existing type can — and its "
+        "natural key. This is enforced, not aspirational: the registry "
+        "refuses a root with no questions. Types that fail the test enter "
+        "as parts, fields, or not at all; the hierarchy absorbs growth so "
+        "the list of independent concepts stays short.",
         "",
         "## Object types",
         "",
@@ -731,6 +782,13 @@ def ontology_markdown(ontology: Ontology = ONTOLOGY) -> str:
                 f"`{ontology.owning_link(obj.name).name}`)."
             )
         lines.append(f"Natural key: {obj.natural_key}.")
+        if obj.competency_questions:
+            lines.append("")
+            lines.append(
+                "Competency questions — what this type exists to answer:"
+            )
+            for q in obj.competency_questions:
+                lines.append(f"- {q}")
         if obj.fields:
             lines.append("")
             for f in obj.fields:

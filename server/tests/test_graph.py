@@ -876,3 +876,32 @@ def test_the_org_chart_is_a_traversal():
     # skill the same capability instead of two strings.
     capability = ONTOLOGY.object_type("Capability")
     assert "description" in {f.name for f in capability.fields}
+
+
+def test_every_root_names_its_competency_questions():
+    """The admission test is enforced: a root with no questions is refused,
+    and a part declaring its own is drift — it is asked about via its owner."""
+    from app.ontology import ONTOLOGY, ObjectType, Ontology, validate_ontology
+
+    for root in ONTOLOGY.roots():
+        assert root.competency_questions, root.name
+
+    bad = Ontology(
+        objects=(
+            ObjectType(name="A", label="A", summary="", natural_key="k",
+                       tags=("x",)),
+        ),
+        links=(),
+        precedence=("human",),
+    )
+    assert any(
+        "names no competency question" in p for p in validate_ontology(bad)
+    )
+
+
+def test_ontology_api_carries_the_questions(seeded):
+    body = seeded.get("/api/v1/graph/ontology").json()
+    employee = next(o for o in body["objects"] if o["name"] == "Employee")
+    assert any("{label}" in q for q in employee["competency_questions"])
+    line = next(o for o in body["objects"] if o["name"] == "InvoiceLine")
+    assert line["competency_questions"] == []

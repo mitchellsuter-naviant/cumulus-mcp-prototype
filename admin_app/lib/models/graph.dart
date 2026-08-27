@@ -182,6 +182,10 @@ class OntologyObjectType {
   /// Effective filter facets — a part inherits its owner's.
   final List<String> tags;
 
+  /// The questions this type exists to answer; `{label}` substitutes the
+  /// selected instance's label.
+  final List<String> competencyQuestions;
+
   const OntologyObjectType({
     required this.name,
     required this.label,
@@ -194,6 +198,7 @@ class OntologyObjectType {
     this.ownerType = '',
     this.partTypes = const [],
     this.tags = const [],
+    this.competencyQuestions = const [],
   });
 
   bool get isPart => ownerType.isNotEmpty;
@@ -217,6 +222,10 @@ class OntologyObjectType {
         tags: (json['tags'] as List<dynamic>? ?? const [])
             .map((e) => '$e')
             .toList(),
+        competencyQuestions:
+            (json['competency_questions'] as List<dynamic>? ?? const [])
+                .map((e) => '$e')
+                .toList(),
       );
 }
 

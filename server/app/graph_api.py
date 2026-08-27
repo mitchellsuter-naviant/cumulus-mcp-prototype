@@ -115,6 +115,8 @@ class OntologyObjectType(BaseModel):
     part_types: list[str] = Field(default_factory=list)
     # Effective filter facets — a part inherits its owner's.
     tags: list[str] = Field(default_factory=list)
+    # `{label}` substitutes the selected instance's label.
+    competency_questions: list[str] = Field(default_factory=list)
 
 
 class OntologyLinkType(BaseModel):
@@ -259,6 +261,7 @@ def ontology(principal: Principal = Depends(get_principal)) -> OntologyView:
                 owner_type=ONTOLOGY.owner_of(o.name) or "",
                 part_types=ONTOLOGY.parts_of(o.name),
                 tags=list(ONTOLOGY.effective_tags(o.name)),
+                competency_questions=list(o.competency_questions),
             )
             for o in ONTOLOGY.objects
         ],
