@@ -250,12 +250,22 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
   // -- left rail: core entity types ----------------------------------------------
 
   Widget _rail() {
-    final core = _types
-        .where((t) => !t.isPart && !_isInfrastructure(t) && _matchesFilter(t))
-        .toList();
+    // Domains are the buckets that keep this list legible as the ontology
+    // grows. A type may live in several — a view, not a container — so
+    // Employee appears under People and Expenses alike. Infrastructure
+    // (landing collections) stays below the fold regardless of domain.
+    final domains = widget.ontology?.domains ?? const <OntologyDomain>[];
     final infra = _types
         .where((t) => !t.isPart && _isInfrastructure(t) && _matchesFilter(t))
         .toList();
+    List<OntologyObjectType> inDomain(String id) => _types
+        .where((t) =>
+            !t.isPart &&
+            !_isInfrastructure(t) &&
+            t.domains.contains(id) &&
+            _matchesFilter(t))
+        .toList();
+    final anyCore = domains.any((d) => inDomain(d.id).isNotEmpty);
     return CumulusCard(
       padding: EdgeInsets.zero,
       child: Column(
@@ -277,20 +287,27 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
               ),
             ),
           ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 4, 16, 4),
-            child: Text('CORE ENTITIES', style: CumulusText.statCaption),
-          ),
-          for (final t in core) _railRow(t),
+          for (final d in domains)
+            if (inDomain(d.id).isNotEmpty) ...[
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+                child: Tooltip(
+                  message: d.summary,
+                  waitDuration: const Duration(milliseconds: 350),
+                  child: Text(d.label.toUpperCase(),
+                      style: CumulusText.statCaption),
+                ),
+              ),
+              for (final t in inDomain(d.id)) _railRow(t),
+            ],
           if (infra.isNotEmpty) ...[
-            const SizedBox(height: 10),
             const Padding(
-              padding: EdgeInsets.fromLTRB(16, 4, 16, 4),
+              padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
               child: Text('INFRASTRUCTURE', style: CumulusText.statCaption),
             ),
             for (final t in infra) _railRow(t),
           ],
-          if (core.isEmpty && infra.isEmpty)
+          if (!anyCore && infra.isEmpty)
             const Padding(
               padding: EdgeInsets.all(16),
               child: Text('Nothing matches.', style: CumulusText.meta),
@@ -405,14 +422,13 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
                         subtitle: t.summary,
                       ),
                     ),
+                    for (final d in t.domains) ...[
+                      StatusBadge(d, dense: true),
+                      const SizedBox(width: 6),
+                    ],
                     if (t.authoritative)
                       const StatusBadge('authoritative',
                           tone: CumulusTone.success, dense: true),
-                    const SizedBox(width: 10),
-                    RowAction(
-                      label: 'Overview',
-                      onTap: () => _showOverview(t.name),
-                    ),
                   ],
                 ),
                 const SizedBox(height: 6),
@@ -420,12 +436,8 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
                   spacing: 14,
                   runSpacing: 4,
                   children: [
-                    Text('natural key: ${t.naturalKey}',
-                        style: CumulusText.meta),
-                    Text('· ${t.fields.length} declared field(s)',
-                        style: CumulusText.meta),
                     if (t.collection.isNotEmpty)
-                      Text('· collection ${t.collection}',
+                      Text('collection ${t.collection}',
                           style: CumulusText.meta),
                     Text('· ${t.instances} in the graph',
                         style: CumulusText.meta),
@@ -434,7 +446,26 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
               ],
             ),
           ),
-          // Column headers.
+          // FIELDS — a fixed part of the view, not a popup. The schema of a
+          // type is small and central; hiding it was wrong.
+          _sectionStrip('FIELDS · queryable metadata'),
+          _fieldTableRow(
+            leading: const Icon(Icons.key, size: 13,
+                color: CumulusColors.warn),
+            name: 'natural key',
+            kind: Text(t.naturalKey, style: CumulusText.meta),
+            note:
+                'how records find this entity — identity is a minted uid, so '
+                'the key can change without breaking references',
+          ),
+          for (final f in t.fields)
+            _fieldTableRow(
+              name: '${f['name']}',
+              kind: _kindCell('${f['kind']}'),
+              note: '${f['note'] ?? ''}',
+            ),
+          // LINKS — column headers.
+          _sectionStrip('LINKS · how this entity relates'),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 9),
             decoration: const BoxDecoration(
@@ -474,6 +505,77 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
             ),
           for (final r in rows) _tableRow(t, r),
         ],
+      ),
+    );
+  }
+
+  Widget _sectionStrip(String label) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 7),
+      decoration: const BoxDecoration(
+        color: CumulusColors.surfaceMuted,
+        border: Border(
+          top: BorderSide(color: CumulusColors.border),
+        ),
+      ),
+      child: Text(label,
+          style: CumulusText.statCaption.copyWith(
+            color: CumulusColors.ink,
+            fontWeight: FontWeight.w700,
+          )),
+    );
+  }
+
+  /// One field row. A `ref:` kind renders as a typed chip — an observation
+  /// awaiting promotion to a Link, clickable to preview the target type.
+  Widget _fieldTableRow({
+    required String name,
+    required Widget kind,
+    required String note,
+    Widget? leading,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+      decoration: const BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: CumulusColors.border, width: 0.5),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 190,
+            child: Row(
+              children: [
+                if (leading != null) ...[leading, const SizedBox(width: 6)],
+                Flexible(
+                  child: Text(name,
+                      style: CumulusText.mono.copyWith(fontSize: 12)),
+                ),
+              ],
+            ),
+          ),
+          SizedBox(width: 180, child: kind),
+          Expanded(child: Text(note, style: CumulusText.meta)),
+        ],
+      ),
+    );
+  }
+
+  Widget _kindCell(String kind) {
+    if (!kind.startsWith('ref:')) {
+      return Text(kind, style: CumulusText.meta);
+    }
+    final target = kind.substring(4);
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: InkWell(
+        onTap: () => _showOverview(target),
+        borderRadius: BorderRadius.circular(CumulusRadius.pill),
+        child: StatusBadge('ref → $target',
+            tone: CumulusTone.violet, dense: true),
       ),
     );
   }
@@ -638,9 +740,8 @@ class _TBoxExplorerState extends State<TBoxExplorer> {
                                           .copyWith(fontSize: 12)),
                                 ),
                                 SizedBox(
-                                  width: 70,
-                                  child: Text('${f['kind']}',
-                                      style: CumulusText.meta),
+                                  width: 110,
+                                  child: _kindCell('${f['kind']}'),
                                 ),
                                 Expanded(
                                   child: Text('${f['note'] ?? ''}',

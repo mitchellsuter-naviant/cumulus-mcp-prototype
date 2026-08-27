@@ -387,7 +387,12 @@ class GraphSnapshot(BaseModel):
 
     def get(self, object_type: str, natural_key: str) -> ObjectRecord | None:
         wanted = object_id(object_type, natural_key)
-        return next((o for o in self.objects if o.id == wanted), None)
+        # Ids are minted; the deterministic hash is a key *alias*, so a
+        # snapshot lookup goes through the alias list like the live get().
+        return next(
+            (o for o in self.objects if wanted in o.key_aliases or o.id == wanted),
+            None,
+        )
 
     def by_id(self, oid: str) -> ObjectRecord | None:
         return next((o for o in self.objects if o.id == oid), None)

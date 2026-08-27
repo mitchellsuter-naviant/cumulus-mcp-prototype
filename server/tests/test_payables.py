@@ -172,7 +172,10 @@ def test_the_invoice_path_resolves_against_the_master(world):
         hint="vendor=acme-industrial nopo invoice=ACME-9 lines=PPE-GLV:1 total=80.00",
     )
     assert record.vendor_resolution == "linked"
-    assert record.vendor_id == object_id("Vendor", "Acme Industrial Inc.")
+    # Ids are minted; the deterministic hash is an alias the graph resolves.
+    assert record.vendor_id == world.graph.get(
+        object_id("Vendor", "Acme Industrial Inc.")
+    ).id
     assert record.vendor_method in ("normalized-name", "fuzzy-name", "tax-id")
 
 
@@ -408,7 +411,9 @@ def test_an_outlier_is_measured_against_this_vendor(world):
                  "lines=STL-0250:2,FAS-M12:3",
         )
     world.anomaly.rebuild()
-    profile = world.anomaly.profile_for(object_id("Vendor", "Acme Industrial Inc."))
+    profile = world.anomaly.profile_for(
+        world.graph.get(object_id("Vendor", "Acme Industrial Inc.")).id
+    )
     assert profile.invoices == 3 and profile.median_usd > 0
 
     big = world.payables.submit(
@@ -450,7 +455,9 @@ def test_profiles_are_derived_and_rebuildable(world):
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-E lines=STL-0250:2,FAS-M12:3",
     )
     world.anomaly.rebuild()
-    before = world.anomaly.profile_for(object_id("Vendor", "Acme Industrial Inc."))
+    before = world.anomaly.profile_for(
+        world.graph.get(object_id("Vendor", "Acme Industrial Inc.")).id
+    )
     world.anomaly.store._items.clear()  # nothing here is a source of truth
     assert world.anomaly.profile_for(before.vendor_id) is None
     world.anomaly.rebuild()

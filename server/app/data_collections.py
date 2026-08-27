@@ -115,7 +115,7 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         ),
         role="data", kind="entities", origin="flow-written",
         container="graph_objects", authoritative=True, retention="indefinite",
-        object_types=("Employee",),
+        object_types=("Employee", "Team"),
         # Honest state: Employee objects are minted by the reimbursement flow
         # when someone first submits. An HRIS feed (which would flip origin to
         # `synced` and custody to `reference`) is designed, not built.

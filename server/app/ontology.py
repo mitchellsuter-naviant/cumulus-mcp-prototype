@@ -31,9 +31,51 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class FieldSpec:
+    """One declared field.
+
+    `kind` is a plain scalar kind (string | number | money | date | enum) —
+    or `ref:<Type>`, a field that *carries identifiers of another type*: a
+    soft reference, rendered as a typed chip and queryable, but deliberately
+    not a Link. The doctrine's rule stands — if two things relate, the
+    relation is a Link — so a ref field is an **observation awaiting
+    promotion**: the flow landed an identifier it has not resolved yet, the
+    way a landed row carries `vendor_name` before resolution. The moment a
+    competency question needs to traverse it, it must become a Link.
+    """
+
     name: str
-    kind: str  # string | number | money | date | enum | ref
+    kind: str
     note: str = ""
+
+    @property
+    def ref_target(self) -> str | None:
+        return self.kind[4:] if self.kind.startswith("ref:") else None
+
+
+@dataclass(frozen=True)
+class Domain:
+    """A namespace for navigation — a view onto the ontology, not a container.
+
+    Domains exist so the list of core entities stays legible as the ontology
+    grows; a type may live in several, because "Employee" is a People fact
+    and an Expenses fact at once. They carry no semantics the graph enforces
+    — that is what `nature` and Collections are for — and agents tend the
+    assignments as types are added.
+    """
+
+    id: str
+    label: str
+    summary: str
+
+
+DOMAINS: tuple[Domain, ...] = (
+    Domain("people", "People",
+           "who works here and how they are organized"),
+    Domain("expenses", "Expenses",
+           "employee spend: requests, their lines, and the evidence"),
+    Domain("payables", "Payables",
+           "vendor commerce: invoices, orders, receipts, and the match"),
+)
 
 
 @dataclass(frozen=True)
@@ -41,8 +83,9 @@ class ObjectType:
     name: str
     label: str
     summary: str
-    # How the natural key is formed. Object ids are derived from it, so the
-    # same real-world thing seen twice mints one object rather than two.
+    # How the natural key is formed. Keys *find* entities — the same
+    # real-world thing seen twice resolves to one object — but identity is a
+    # minted uid, so a key can change without breaking a single reference.
     natural_key: str
     fields: tuple[FieldSpec, ...] = ()
     # True when Cumulus is the system of record for this type: its id is the
@@ -50,6 +93,9 @@ class ObjectType:
     authoritative: bool = False
     # The Collection whose retention and custody policy governs its rows.
     collection: str = ""
+    # Navigation namespaces. Multi-membership is deliberate; parts declare
+    # none and inherit their owner's (enforced by validate_ontology).
+    domains: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -142,6 +188,16 @@ class Ontology:
     def roots(self) -> list["ObjectType"]:
         return [o for o in self.objects if self.owner_of(o.name) is None]
 
+    def effective_domains(self, type_name: str) -> tuple[str, ...]:
+        """A part lives where its owner lives."""
+        obj = self.object_type(type_name)
+        if obj is None:
+            return ()
+        if obj.domains:
+            return obj.domains
+        owner = self.owner_of(type_name)
+        return self.effective_domains(owner) if owner else ()
+
 
 # ---------------------------------------------------------------------------
 # The declaration
@@ -155,15 +211,37 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             "A person employed by the enterprise. The root of the expense "
             "graph: every expense request hangs off one."
         ),
-        natural_key="work email",
+        # A key, not an identity: ids are minted, and an email change is a
+        # rekey that leaves every reference intact.
+        natural_key="work email (re-keyable; identity is a minted uid)",
         fields=(
             FieldSpec("email", "string"),
             FieldSpec("name", "string"),
-            FieldSpec("team", "string"),
-            FieldSpec("manager_email", "string"),
+            FieldSpec("team", "ref:Team",
+                      "observation awaiting resolution to a member_of link"),
+            FieldSpec("manager_email", "ref:Employee",
+                      "observation awaiting resolution to a reports_to link"),
         ),
         authoritative=True,
         collection="workforce",
+        domains=("people", "expenses"),
+    ),
+    ObjectType(
+        name="Team",
+        label="Team",
+        summary=(
+            "An organizational unit. Competency question: who is on which "
+            "team, and what does a team's work cost — neither answerable by "
+            "a string field on Employee."
+        ),
+        natural_key="team slug",
+        fields=(
+            FieldSpec("slug", "string"),
+            FieldSpec("name", "string"),
+        ),
+        authoritative=True,
+        collection="workforce",
+        domains=("people",),
     ),
     ObjectType(
         name="ExpenseRequest",
@@ -184,6 +262,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         authoritative=True,
         collection="expense-records",
+        domains=("expenses",),
     ),
     ObjectType(
         name="ExpenseLine",
@@ -225,6 +304,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("retention_until", "date", "stamped when the bytes landed"),
         ),
         collection="audit-documents",
+        domains=("expenses", "payables"),
     ),
     ObjectType(
         name="Vendor",
@@ -248,6 +328,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         authoritative=True,
         collection="vendor-master",
+        domains=("payables",),
     ),
     ObjectType(
         name="SourceRecord",
@@ -268,6 +349,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("landed_at", "date"),
         ),
         collection="source-landing",
+        domains=("payables",),
     ),
     ObjectType(
         name="Invoice",
@@ -288,6 +370,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         authoritative=True,
         collection="ap-records",
+        domains=("payables",),
     ),
     ObjectType(
         name="InvoiceLine",
@@ -321,6 +404,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("status", "enum", "open | closed | cancelled"),
         ),
         collection="ap-records",
+        domains=("payables",),
     ),
     ObjectType(
         name="PurchaseOrderLine",
@@ -353,6 +437,7 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("status", "enum", "partial | complete"),
         ),
         collection="ap-records",
+        domains=("payables",),
     ),
     ObjectType(
         name="ReceivingReportLine",
@@ -405,6 +490,15 @@ LINK_TYPES: tuple[LinkType, ...] = (
     LinkType("decided_by", "ExpenseRequest", "Employee", "many-to-many",
              "the person whose Task decision resolved the request — plural, "
              "because a request reviewed twice can be decided by two people"),
+    # Declared ahead of their writer: an HRIS/teams sync flow is the named
+    # trigger. Until it exists these read "0 in the graph — a promise nothing
+    # has kept yet", and the ref: fields on Employee carry the observations.
+    LinkType("member_of", "Employee", "Team", "many-to-one",
+             "the team an employee belongs to — one at a time here; matrix "
+             "orgs would relax this deliberately"),
+    LinkType("reports_to", "Employee", "Employee", "many-to-one",
+             "the manager — what turns 'roll up a manager's spend' from "
+             "unanswerable into a traversal"),
     LinkType("identified_as", "Vendor", "SourceRecord", "one-to-many",
              "an external system's id for this vendor — reversible, and "
              "carrying the confidence and method that produced it",
@@ -456,6 +550,18 @@ def validate_ontology(ontology: Ontology = ONTOLOGY) -> list[str]:
     """
     problems: list[str] = []
     names = {o.name for o in ontology.objects}
+    domain_ids = {d.id for d in DOMAINS}
+    for obj in ontology.objects:
+        where = f"type `{obj.name}`"
+        for d in obj.domains:
+            if d not in domain_ids:
+                problems.append(f"{where}: unknown domain `{d}`")
+        for f in obj.fields:
+            target = f.ref_target
+            if target is not None and target not in names:
+                problems.append(
+                    f"{where}: field `{f.name}` refs unknown type `{target}`"
+                )
     for link in ontology.links:
         where = f"link `{link.name}`"
         if link.from_type not in names:
@@ -479,6 +585,17 @@ def validate_ontology(ontology: Ontology = ONTOLOGY) -> list[str]:
             problems.append(
                 f"type `{target}` has {len(via)} owners ({', '.join(via)}); "
                 "a part has exactly one"
+            )
+    # Domains are navigation for the *independent* types: every root
+    # declares at least one, and a part declares none — it lives where its
+    # owner lives, and letting it say otherwise would let the two drift.
+    for obj in ontology.objects:
+        if ontology.owner_of(obj.name) is None and not obj.domains:
+            problems.append(f"root type `{obj.name}` declares no domain")
+        if ontology.owner_of(obj.name) is not None and obj.domains:
+            problems.append(
+                f"part type `{obj.name}` declares domains — parts inherit "
+                "their owner's"
             )
     # Ownership must be a forest: walking owners always terminates at a root.
     for obj in ontology.objects:
@@ -566,10 +683,24 @@ def ontology_markdown(ontology: Ontology = ONTOLOGY) -> str:
     ]
     for root in ontology.roots():
         parts = ontology.parts_of(root.name)
+        doms = "/".join(root.domains)
         lines.append(
-            f"- **{root.label}**"
+            f"- **{root.label}** ({doms})"
             + (f" ▸ {', '.join(parts)}" if parts else "")
         )
+    lines += [
+        "",
+        "## Domains",
+        "",
+        "Navigation namespaces — views onto the ontology, not containers. A "
+        "type may live in several; parts inherit their owner's.",
+        "",
+    ]
+    for d in DOMAINS:
+        members = [
+            o.label for o in ontology.roots() if d.id in o.domains
+        ]
+        lines.append(f"- **{d.label}** — {d.summary}. ({', '.join(members)})")
     lines += [
         "",
         "Governance: a new independent type must name its **competency "
@@ -603,7 +734,10 @@ def ontology_markdown(ontology: Ontology = ONTOLOGY) -> str:
             lines.append("")
             for f in obj.fields:
                 note = f" — {f.note}" if f.note else ""
-                lines.append(f"- `{f.name}` ({f.kind}){note}")
+                kind = (
+                    f"ref → {f.ref_target}" if f.ref_target else f.kind
+                )
+                lines.append(f"- `{f.name}` ({kind}){note}")
         lines.append("")
     lines += ["## Link types", ""]
     for link in ontology.links:

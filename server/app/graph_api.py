@@ -26,7 +26,7 @@ from . import deps
 from .auth import Principal, get_principal, require_reader
 from .graph import Claim, ObjectRecord, TBoxViolation, normalize_key, object_id
 from .models import utcnow
-from .ontology import ONTOLOGY
+from .ontology import DOMAINS, ONTOLOGY
 
 log = logging.getLogger("cumulus.graph.api")
 
@@ -113,6 +113,8 @@ class OntologyObjectType(BaseModel):
     # identified through its owner and folds under it in every view.
     owner_type: str = ""
     part_types: list[str] = Field(default_factory=list)
+    # Effective navigation namespaces — a part inherits its owner's.
+    domains: list[str] = Field(default_factory=list)
 
 
 class OntologyLinkType(BaseModel):
@@ -130,10 +132,17 @@ class OntologyLinkType(BaseModel):
     enforced: bool = False
 
 
+class DomainView(BaseModel):
+    id: str
+    label: str
+    summary: str
+
+
 class OntologyView(BaseModel):
     objects: list[OntologyObjectType]
     links: list[OntologyLinkType]
     precedence: list[str]
+    domains: list[DomainView] = Field(default_factory=list)
     asset_id: str
 
 
@@ -256,6 +265,7 @@ def ontology(principal: Principal = Depends(get_principal)) -> OntologyView:
                 instances=by_type.get(o.name, 0),
                 owner_type=ONTOLOGY.owner_of(o.name) or "",
                 part_types=ONTOLOGY.parts_of(o.name),
+                domains=list(ONTOLOGY.effective_domains(o.name)),
             )
             for o in ONTOLOGY.objects
         ],
@@ -271,6 +281,10 @@ def ontology(principal: Principal = Depends(get_principal)) -> OntologyView:
             for linked in ONTOLOGY.links
         ],
         precedence=list(ONTOLOGY.precedence),
+        domains=[
+            DomainView(id=d.id, label=d.label, summary=d.summary)
+            for d in DOMAINS
+        ],
         asset_id="enterprise-ontology",
     )
 

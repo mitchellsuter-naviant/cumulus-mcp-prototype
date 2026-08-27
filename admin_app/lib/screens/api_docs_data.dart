@@ -1610,10 +1610,14 @@ const graphGroup = EndpointGroup(
           'Declaration and reality in one payload — a declared type with zero '
           'instances is a promise nothing has kept yet. Links carry a '
           '`nature` (association | composition | identity); each type carries '
-          'its derived place in the hierarchy (`owner_type`, `part_types`) — '
-          'a part is identified through its owner and folds under it. '
-          'Generated from `server/app/ontology.py`, which is also exported '
-          'to the corpus as the `enterprise-ontology` document.',
+          'its derived place in the hierarchy (`owner_type`, `part_types`) '
+          'and its navigation `domains` (a part inherits its owner\'s; a '
+          'type may live in several). Fields may be `ref:<Type>` — an '
+          'observation awaiting promotion to a Link. Object ids are minted; '
+          'the deterministic (type, key) hash is a lookup alias, so a key '
+          'change (an employee\'s email) re-keys without breaking one '
+          'reference. Generated from `server/app/ontology.py`, which is also '
+          'exported to the corpus as the `enterprise-ontology` document.',
     ),
     Endpoint(
       method: 'GET',

@@ -151,7 +151,7 @@ def run_spec(
 
     Every case gets its own in-memory world with the corpus copied in, so a run
     cannot touch the live graph — which matters more than it sounds, because
-    object ids derive from natural keys and eval invoices would otherwise land
+    natural keys resolve to entities and eval invoices would otherwise land
     in the anomaly baseline that real invoices are judged against.
     """
     require_role(principal, "admin")

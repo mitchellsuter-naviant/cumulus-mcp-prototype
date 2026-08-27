@@ -36,6 +36,7 @@ good at. When traversals stop being bounded, this is the seam to reconsider.
 from __future__ import annotations
 
 import hashlib
+import secrets
 import json
 import logging
 import re
@@ -91,6 +92,9 @@ class ObjectRecord(BaseModel):
     id: str
     type: str
     natural_key: str = ""
+    # Every (type, key) alias that has ever pointed at this object, newest
+    # first. Identity survives a key change; old addresses keep resolving.
+    key_aliases: list[str] = Field(default_factory=list)
     label: str = ""
     props: dict[str, Any] = Field(default_factory=dict)
     claims: list[Claim] = Field(default_factory=list)
@@ -192,15 +196,25 @@ def normalize_key(value: str) -> str:
 
 
 def object_id(object_type: str, natural_key: str) -> str:
-    """Deterministic id from type + natural key.
+    """The deterministic **alias** for a (type, natural key) pair.
 
-    Deterministic on purpose, twice over: the same entity seen from two systems
-    lands on one id without a lookup, and a replayed Flow step re-mints rather
-    than duplicates.
+    This used to be the object's id, which quietly made the natural key the
+    identity — change an employee's email and everything referencing them
+    broke. Now identity is a minted, opaque uid (`mint_object_id`) and this
+    hash is a *lookup alias*: the same entity seen from two systems, or a
+    replayed step, still lands on one object without a scan, and `get()`
+    resolves aliases transparently. A key is how records find an entity,
+    never what it is — re-keying appends a new alias and the old one keeps
+    resolving.
     """
     normalized = normalize_key(natural_key)
     digest = hashlib.sha256(f"{object_type}:{normalized}".encode()).hexdigest()[:12]
     return f"{object_type.lower()}_{digest}"
+
+
+def mint_object_id(object_type: str) -> str:
+    """A fresh opaque identity. Random on purpose: stable under re-keying."""
+    return f"{object_type.lower()}_{secrets.token_hex(6)}"
 
 
 def link_id(link_type: str, from_id: str, to_id: str) -> str:
@@ -303,6 +317,7 @@ _NUMERIC_KINDS = {"number", "money"}
 class GraphStore(Protocol):
     def objects(self) -> list[ObjectRecord]: ...
     def get_object(self, object_id: str) -> ObjectRecord | None: ...
+    def get_by_alias(self, alias: str) -> ObjectRecord | None: ...
     def put_object(self, record: ObjectRecord) -> ObjectRecord: ...
     def links(self) -> list[LinkRecord]: ...
     def get_link(self, link_id: str) -> LinkRecord | None: ...
@@ -321,6 +336,7 @@ class InMemoryGraphStore:
         self._lock = threading.Lock()
         self._objects: dict[str, ObjectRecord] = {}
         self._links: dict[str, LinkRecord] = {}
+        self._aliases: dict[str, str] = {}
 
     def objects(self) -> list[ObjectRecord]:
         with self._lock:
@@ -333,7 +349,14 @@ class InMemoryGraphStore:
     def put_object(self, record: ObjectRecord) -> ObjectRecord:
         with self._lock:
             self._objects[record.id] = record
+            for alias in record.key_aliases:
+                self._aliases[alias] = record.id
             return record
+
+    def get_by_alias(self, alias: str) -> ObjectRecord | None:
+        with self._lock:
+            oid = self._aliases.get(alias)
+            return self._objects.get(oid) if oid else None
 
     def links(self) -> list[LinkRecord]:
         with self._lock:
@@ -393,6 +416,20 @@ class FirestoreGraphStore:
             return ObjectRecord.model_validate(snap.to_dict())
         except Exception:
             log.exception("Unparseable object", extra={"objectId": object_id})
+            return None
+
+    def get_by_alias(self, alias: str) -> ObjectRecord | None:
+        docs = list(
+            self._objects.where("key_aliases", "array_contains", alias)
+            .limit(1)
+            .stream()
+        )
+        if not docs:
+            return None
+        try:
+            return ObjectRecord.model_validate(docs[0].to_dict())
+        except Exception:
+            log.exception("Unparseable object", extra={"docId": docs[0].id})
             return None
 
     def put_object(self, record: ObjectRecord) -> ObjectRecord:
@@ -673,13 +710,16 @@ class GraphService:
         re-delivered sync record both harmless.
         """
         self._enforce(self._validate_claims(object_type, claims))
-        oid = object_id(object_type, natural_key)
-        record = self.store.get_object(oid)
+        alias = object_id(object_type, natural_key)
+        record = self.store.get_by_alias(alias)
         if record is None:
+            # Identity is minted, not derived: the key finds the record, the
+            # uid *is* the record, and a later key change breaks nothing.
             record = ObjectRecord(
-                id=oid,
+                id=mint_object_id(object_type),
                 type=object_type,
                 natural_key=natural_key,
+                key_aliases=[alias],
                 label=label or natural_key,
                 status=status,
                 provenance=provenance,
@@ -715,10 +755,54 @@ class GraphService:
         return record
 
     def get(self, object_id_: str, *, follow: bool = True) -> ObjectRecord | None:
-        record = self.store.get_object(object_id_)
+        """Resolve a uid or a key alias — callers never need to know which."""
+        record = self.store.get_object(object_id_) or self.store.get_by_alias(
+            object_id_
+        )
         if record and follow and record.superseded_by:
             return self.store.get_object(record.superseded_by) or record
         return record
+
+    def rekey(
+        self, object_ref: str, new_natural_key: str, *, by: str, note: str = ""
+    ) -> ObjectRecord:
+        """Change an entity's natural key without changing what it is.
+
+        The point of minted identity. The new key becomes the primary alias,
+        the old ones keep resolving (a run journal that recorded the old
+        address still dereferences), and the change lands as a claim so the
+        history says who re-keyed it and why.
+        """
+        record = self.get(object_ref, follow=False)
+        if record is None:
+            raise TBoxError([TBoxViolation(
+                kind="unknown-object-type", subject=object_ref,
+                detail="cannot rekey an object that does not exist",
+            )])
+        alias = object_id(record.type, new_natural_key)
+        holder = self.store.get_by_alias(alias)
+        if holder is not None and holder.id != record.id:
+            raise TBoxError([TBoxViolation(
+                kind="cardinality", subject=record.ref(),
+                detail=(
+                    f"key '{new_natural_key}' already resolves to "
+                    f"{holder.ref()} — merge is a supersede, not a rekey"
+                ),
+            )])
+        old_key = record.natural_key
+        if record.label == record.natural_key:
+            record.label = new_natural_key
+        record.natural_key = new_natural_key
+        record.key_aliases = [alias] + [
+            a for a in record.key_aliases if a != alias
+        ]
+        record.claims.append(Claim(
+            field="natural_key", value=new_natural_key, source=by,
+            note=note or f"re-keyed from '{old_key}'",
+        ))
+        record.revision += 1
+        record.updated_at_iso = utcnow().isoformat()
+        return self.store.put_object(record)
 
     def find(
         self,
@@ -948,7 +1032,9 @@ class GraphWriter:
         claims: list[Claim],
         **kwargs: Any,
     ) -> ObjectRecord:
-        existed = self._graph.store.get_object(object_id(object_type, natural_key))
+        existed = self._graph.get(
+            object_id(object_type, natural_key), follow=False
+        )
         stamped = [
             claim.model_copy(update={"run_id": self.run_id, "step_id": self.step_id})
             if not claim.run_id else claim

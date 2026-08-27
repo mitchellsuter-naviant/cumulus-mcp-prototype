@@ -645,6 +645,14 @@ them wearing one name.
 4. **Mappings** — the declared seams between sources and the graph: which
    columns bind to which types via which keys, under which match policy and
    precedence, at which freshness ([server/app/mappings.py](server/app/mappings.py)).
+**Identity is minted; keys are aliases.** An object's uid is random and
+stable; the deterministic hash of (type, natural key) is a *lookup alias*
+that `get()` resolves transparently. Re-keying (an employee's email changes)
+appends a new alias, keeps the old ones resolving, and lands as a claim with
+an author — identity survives, journals that recorded the old address still
+dereference, and a key collision on rekey is refused ("merge is a supersede,
+not a rekey").
+
 5. **Refs** — the universal address grammar (`graph:`, `knowledge:`,
    `document:`, `link:`, run/step/task ids). Provenance is refs stamped on
    claims, read-sets and journals; the graph is the only place refs join.
@@ -907,9 +915,9 @@ the doctrine's Draft-Object status-gating, and would let a held invoice be
 visible as an entity; it is not built, and it would need the anomaly profile to
 filter drafts.)
 
-**Isolation, and why separate collections was the call.** Object ids derive
-from natural keys, so an eval fixture named "Acme Industrial Inc." *is* the
-production vendor id. An unisolated run would append `model:` claims to a real
+**Isolation, and why separate collections was the call.** Natural keys
+resolve to entities, so an eval fixture named "Acme Industrial Inc." would
+resolve to the production vendor. An unisolated run would append `model:` claims to a real
 vendor and — the one that actually matters — feed eval invoices into the
 `vendor_payment_profile` that real invoices are judged against, changing flow
 behaviour rather than a number on a screen. So every case runs in its own

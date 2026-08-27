@@ -1089,7 +1089,7 @@ class ReimbursementService:
         decided_by: str,
         writer: GraphWriter | None = None,
     ) -> dict:
-        """Write the entities. Idempotent: ids derive from natural keys.
+        """Write the entities. Idempotent: natural keys resolve to one uid.
 
         This is the step that makes "how much has this employee submitted in
         six months" answerable — not by scanning a table, but by walking one

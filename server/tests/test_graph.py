@@ -673,7 +673,7 @@ def test_part_ness_is_derived_never_declared():
     assert ONTOLOGY.owner_of("ExpenseRequest") is None
     assert set(ONTOLOGY.parts_of("Invoice")) == {"InvoiceLine", "MatchSet"}
     assert [o.name for o in ONTOLOGY.roots()] == [
-        "Employee", "ExpenseRequest", "Document", "Vendor",
+        "Employee", "Team", "ExpenseRequest", "Document", "Vendor",
         "SourceRecord", "Invoice", "PurchaseOrder", "ReceivingReport",
     ]
 
@@ -758,3 +758,98 @@ def test_ontology_api_exposes_the_hierarchy(seeded):
     assert natures["has_invoice_line"] == "composition"
     assert natures["identified_as"] == "identity"
     assert natures["issued"] == "association"
+
+
+# ---- minted identity: keys find entities, they are not entities --------------
+
+
+def test_identity_survives_a_key_change(graph):
+    """The email-changes case. Ids are minted, keys are aliases: re-keying an
+    employee changes how records find them, not what anything references."""
+    kim = graph.upsert(
+        "Employee", "kim@customer.example",
+        [Claim(field="name", value="Kim Reyes", source="flow:test")],
+    )
+    request = graph.upsert(
+        "ExpenseRequest", "run_x",
+        [Claim(field="requested_usd", value=10.0, source="flow:test")],
+    )
+    graph.link("submitted", kim.id, request.id)
+
+    rekeyed = graph.rekey(
+        kim.id, "kim.reyes@customer.example", by="human:hr-admin",
+    )
+    assert rekeyed.id == kim.id  # identity unchanged
+    # Both addresses resolve to the same entity — a journal that recorded the
+    # old alias still dereferences.
+    assert graph.get(object_id("Employee", "kim@customer.example")).id == kim.id
+    assert (
+        graph.get(object_id("Employee", "kim.reyes@customer.example")).id == kim.id
+    )
+    # The link never noticed.
+    neighbors = graph.neighbors(kim.id, "submitted", "out")
+    assert [o.id for _, o in neighbors] == [request.id]
+    # And the change is a claim with an author, not a silent mutation.
+    assert any(
+        c.field == "natural_key" and c.source == "human:hr-admin"
+        for c in rekeyed.claims
+    )
+
+
+def test_rekeying_onto_another_entity_is_refused(graph):
+    graph.upsert("Employee", "kim@customer.example",
+                 [Claim(field="name", value="Kim", source="flow:test")])
+    dana = graph.upsert("Employee", "dana@customer.example",
+                        [Claim(field="name", value="Dana", source="flow:test")])
+    from app.graph import TBoxError
+
+    with pytest.raises(TBoxError, match="supersede, not a rekey"):
+        graph.rekey(dana.id, "kim@customer.example", by="human:hr-admin")
+
+
+def test_same_key_still_lands_on_one_entity(graph):
+    """Minting must not cost idempotency: two sightings of one key, one uid."""
+    a = graph.upsert("Vendor", "Acme Industrial Inc.",
+                     [Claim(field="status", value="active", source="erp:x")])
+    b = graph.upsert("Vendor", "ACME INDUSTRIAL, INCORPORATED",
+                     [Claim(field="status", value="active", source="erp:y")])
+    assert a.id == b.id  # normalization still collapses spellings
+
+
+# ---- domains and ref fields ---------------------------------------------------
+
+
+def test_domains_are_declared_on_roots_and_inherited_by_parts():
+    from app.ontology import ONTOLOGY
+
+    assert ONTOLOGY.effective_domains("Employee") == ("people", "expenses")
+    # A part lives where its owner lives — it declares nothing itself.
+    assert ONTOLOGY.effective_domains("InvoiceLine") == ("payables",)
+    assert ONTOLOGY.object_type("InvoiceLine").domains == ()
+    # Multi-membership: evidence serves both flows.
+    assert set(ONTOLOGY.effective_domains("Document")) == {"expenses", "payables"}
+
+
+def test_domain_and_ref_rules_are_refused_at_declaration():
+    from app.ontology import (
+        FieldSpec, LinkType, ObjectType, Ontology, validate_ontology,
+    )
+
+    objects = (
+        ObjectType(name="A", label="A", summary="", natural_key="k",
+                   domains=("nowhere",),
+                   fields=(FieldSpec("other", "ref:Ghost"),)),
+        # A part that tries to declare its own domain: drift refused.
+        ObjectType(name="B", label="B", summary="", natural_key="k",
+                   domains=("people",)),
+        # A root that declares none: unfiled entities clutter every view.
+        ObjectType(name="C", label="C", summary="", natural_key="k"),
+    )
+    bad = Ontology(objects=objects, links=(
+        LinkType("owns", "A", "B", "one-to-many", "", nature="composition"),
+    ), precedence=("human",))
+    problems = " ".join(validate_ontology(bad))
+    assert "unknown domain `nowhere`" in problems
+    assert "refs unknown type `Ghost`" in problems
+    assert "part type `B` declares domains" in problems
+    assert "root type `C` declares no domain" in problems
