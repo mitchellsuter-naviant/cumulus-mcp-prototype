@@ -543,7 +543,12 @@ LINK_TYPES: tuple[LinkType, ...] = (
 # among systems, the ERP is the book of record for commercial terms, and a
 # Flow's own inference ranks last because it is a guess until something
 # confirms it.
-PRECEDENCE: tuple[str, ...] = ("human", "erp", "procurement", "flow", "model")
+# `hris` sits with `erp`: each is the system of record for its own subject
+# (people, commerce), and precedence is declared over authorities rather than
+# per field, so the two never actually compete.
+PRECEDENCE: tuple[str, ...] = (
+    "human", "erp", "hris", "procurement", "flow", "model",
+)
 
 ONTOLOGY = Ontology(objects=OBJECT_TYPES, links=LINK_TYPES, precedence=PRECEDENCE)
 

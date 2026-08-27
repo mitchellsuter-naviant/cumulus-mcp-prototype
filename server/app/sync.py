@@ -54,9 +54,13 @@ log = logging.getLogger("cumulus.sync")
 VENDOR_FLOW_ID = "vendor-sync"
 PO_FLOW_ID = "purchase-order-sync"
 RECEIVING_FLOW_ID = "receiving-sync"
+WORKFORCE_FLOW_ID = "workforce-sync"
 STEWARD_QUEUE = "vendor-stewardship"
+PEOPLE_QUEUE = "people-ops"
 
-SyncKind = Literal["vendors", "purchase-orders", "receiving-reports"]
+SyncKind = Literal[
+    "vendors", "purchase-orders", "receiving-reports", "workforce",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +115,37 @@ class ReceivingRecord(BaseModel):
     lines: list[ReceivingLineRecord] = Field(default_factory=list)
 
 
+class TeamRecord(BaseModel):
+    """One organizational unit as the HRIS holds it."""
+
+    external_id: str
+    slug: str
+    name: str
+    mission: str = ""
+    # Bind columns: identifiers of other entities, resolved on the way in.
+    parent_slug: str = ""
+    lead_email: str = ""
+
+
+class EmployeeRecord(BaseModel):
+    """One person as the HRIS holds them.
+
+    `email` is the natural key and `manager_email`/`team_slug` are bind
+    columns — identifiers of other entities carried in the row. Nothing here
+    needs a steward to adjudicate a match, which is exactly why the HRIS
+    mapping binds rather than reifies: an exact key needs no landing record.
+    """
+
+    external_id: str
+    email: str
+    name: str = ""
+    title: str = ""
+    location: str = ""
+    start_date: str = ""
+    manager_email: str = ""
+    team_slug: str = ""
+
+
 class SyncRequest(BaseModel):
     """One delivery from one source system.
 
@@ -125,6 +160,10 @@ class SyncRequest(BaseModel):
     vendors: list[VendorRecord] = Field(default_factory=list)
     purchase_orders: list[PurchaseOrderRecord] = Field(default_factory=list)
     receiving_reports: list[ReceivingRecord] = Field(default_factory=list)
+    # Teams and employees travel together: the org chart cannot be wired
+    # until both ends of every edge exist, so one delivery is one run.
+    teams: list[TeamRecord] = Field(default_factory=list)
+    employees: list[EmployeeRecord] = Field(default_factory=list)
 
 
 class SourceStatus(BaseModel):
@@ -173,6 +212,7 @@ class SyncService:
             engine.register(VENDOR_FLOW_ID, self._vendor_body)
             engine.register(PO_FLOW_ID, self._po_body)
             engine.register(RECEIVING_FLOW_ID, self._receiving_body)
+            engine.register(WORKFORCE_FLOW_ID, self._workforce_body)
 
     # -- entry point --------------------------------------------------------
 
@@ -186,14 +226,23 @@ class SyncService:
             (PO_FLOW_ID, "purchase_orders", request.purchase_orders),
             (RECEIVING_FLOW_ID, "receiving_reports", request.receiving_reports),
         ]
+        if request.teams or request.employees:
+            plan.append((WORKFORCE_FLOW_ID, "workforce", []))
         for flow_id, field, records in plan:
-            if not records:
+            if flow_id != WORKFORCE_FLOW_ID and not records:
                 continue
             inputs = {
                 "source": request.source,
                 "watermark": request.watermark,
                 "records": [r.model_dump() for r in records],
             }
+            if flow_id == WORKFORCE_FLOW_ID:
+                inputs = {
+                    "source": request.source,
+                    "watermark": request.watermark,
+                    "teams": [t.model_dump() for t in request.teams],
+                    "employees": [e.model_dump() for e in request.employees],
+                }
             run_id = None
             if request.idempotency_key:
                 # A retried delivery re-enters the same run, which replays its
@@ -617,6 +666,197 @@ class SyncService:
             **landed, **applied,
         }
 
+    # -- workforce ----------------------------------------------------------
+
+    def _workforce_body(self, ctx: RunContext, inputs: dict) -> dict:
+        """Land the org chart. A bind mapping, so nothing is reified.
+
+        The HRIS row's key is an exact identifier — a work email, a team slug
+        — so there is nothing for a steward to adjudicate and no landing
+        record to keep. Claims go straight onto the entity carrying `hris:` as
+        their authority, and the bind columns (`manager_email`, `team_slug`,
+        `parent_slug`, `lead_email`) resolve to links in one pass once both
+        ends exist. Batch feed: unresolved references escalate once, as an
+        aggregate, never per row.
+        """
+        source = inputs["source"]
+        teams = [TeamRecord.model_validate(t) for t in inputs.get("teams", [])]
+        employees = [
+            EmployeeRecord.model_validate(e) for e in inputs.get("employees", [])
+        ]
+        ctx.event(
+            "t1", "SourceDelivered",
+            f"{len(teams)} team(s) and {len(employees)} employee(s) from "
+            f"`{source}`",
+            kind="trigger",
+        )
+
+        team_writer = self.graph.writer(ctx.record.id, "a1")
+        team_out = ctx.step(
+            "a1", "apply-teams", "action",
+            fn=lambda: self._apply_teams(source, teams, ctx.record.id, team_writer),
+            writes=lambda _out: team_writer.refs,
+            summary=lambda out: f"{out['teams']} team(s) written",
+        )
+        people_writer = self.graph.writer(ctx.record.id, "a2")
+        people_out = ctx.step(
+            "a2", "apply-employees", "action",
+            fn=lambda: self._apply_employees(
+                source, employees, ctx.record.id, people_writer
+            ),
+            writes=lambda _out: people_writer.refs,
+            summary=lambda out: f"{out['employees']} employee(s) written",
+        )
+        chart_writer = self.graph.writer(ctx.record.id, "a3")
+        chart_out = ctx.step(
+            "a3", "wire-org-chart", "action",
+            fn=lambda: self._wire_org_chart(
+                teams, employees, chart_writer
+            ),
+            writes=lambda _out: chart_writer.refs,
+            summary=lambda out: (
+                f"{out['member_of']} membership(s), {out['reports_to']} "
+                f"reporting line(s), {out['subteam_of']} nesting(s), "
+                f"{out['led_by']} lead(s)"
+                + (
+                    f" · {out['unresolved']} reference(s) unresolved"
+                    if out["unresolved"]
+                    else ""
+                )
+            ),
+        )
+        if chart_out["unresolved"]:
+            # One Task for the delivery, not one per row: a batch feed that
+            # suspended on every dangling manager email would never finish.
+            ctx.event(
+                "e2", "WorkforceReferencesUnresolved",
+                f"{chart_out['unresolved']} reference(s) named nobody in the "
+                "graph",
+            )
+        ctx.event(
+            "e1", "WorkforceSynced",
+            f"{len(teams)} team(s), {len(employees)} employee(s)",
+        )
+        return {
+            "source": source, "watermark": inputs.get("watermark", ""),
+            "kind": "workforce",
+            "records": len(teams) + len(employees),
+            "landed": len(teams) + len(employees),
+            **team_out, **people_out, **chart_out,
+        }
+
+    def _apply_teams(
+        self,
+        source: str,
+        records: list[TeamRecord],
+        run_id: str,
+        writer: GraphWriter | None = None,
+    ) -> dict:
+        graph = writer if writer is not None else self.graph
+        claim_source = f"{_authority(source)}:{source}"
+        for record in records:
+            graph.upsert(
+                "Team", record.slug,
+                [
+                    Claim(field="slug", value=record.slug, source=claim_source),
+                    Claim(field="name", value=record.name, source=claim_source),
+                    Claim(field="mission", value=record.mission,
+                          source=claim_source),
+                ],
+                label=record.name or record.slug,
+                provenance=f"synced by {run_id}",
+            )
+        return {"teams": len(records)}
+
+    def _apply_employees(
+        self,
+        source: str,
+        records: list[EmployeeRecord],
+        run_id: str,
+        writer: GraphWriter | None = None,
+    ) -> dict:
+        graph = writer if writer is not None else self.graph
+        claim_source = f"{_authority(source)}:{source}"
+        for record in records:
+            graph.upsert(
+                "Employee", record.email,
+                [
+                    Claim(field="email", value=record.email, source=claim_source),
+                    Claim(field="name", value=record.name, source=claim_source),
+                    Claim(field="title", value=record.title, source=claim_source),
+                    Claim(field="location", value=record.location,
+                          source=claim_source),
+                    Claim(field="start_date", value=record.start_date,
+                          source=claim_source),
+                ],
+                label=record.name or record.email,
+                provenance=f"synced by {run_id}",
+            )
+        return {"employees": len(records)}
+
+    def _wire_org_chart(
+        self,
+        teams: list[TeamRecord],
+        employees: list[EmployeeRecord],
+        writer: GraphWriter | None = None,
+    ) -> dict:
+        graph = writer if writer is not None else self.graph
+        counts = {
+            "member_of": 0, "reports_to": 0, "subteam_of": 0, "led_by": 0,
+            "unresolved": 0,
+        }
+
+        def employee(email: str):
+            return self.graph.get(object_id("Employee", email)) if email else None
+
+        def team(slug: str):
+            return self.graph.get(object_id("Team", slug)) if slug else None
+
+        for record in employees:
+            person = employee(record.email)
+            if person is None:
+                counts["unresolved"] += 1
+                continue
+            if record.team_slug:
+                unit = team(record.team_slug)
+                if unit is None:
+                    counts["unresolved"] += 1
+                else:
+                    graph.link("member_of", person.id, unit.id,
+                               method="declared", provenance="hris team_slug")
+                    counts["member_of"] += 1
+            if record.manager_email:
+                manager = employee(record.manager_email)
+                if manager is None:
+                    counts["unresolved"] += 1
+                else:
+                    graph.link("reports_to", person.id, manager.id,
+                               method="declared",
+                               provenance="hris manager_email")
+                    counts["reports_to"] += 1
+        for record in teams:
+            unit = team(record.slug)
+            if unit is None:
+                counts["unresolved"] += 1
+                continue
+            if record.parent_slug:
+                parent = team(record.parent_slug)
+                if parent is None:
+                    counts["unresolved"] += 1
+                else:
+                    graph.link("subteam_of", unit.id, parent.id,
+                               method="declared", provenance="hris parent_slug")
+                    counts["subteam_of"] += 1
+            if record.lead_email:
+                lead = employee(record.lead_email)
+                if lead is None:
+                    counts["unresolved"] += 1
+                else:
+                    graph.link("led_by", unit.id, lead.id,
+                               method="declared", provenance="hris lead_email")
+                    counts["led_by"] += 1
+        return counts
+
     def _apply_receipts(
         self,
         source: str,
@@ -828,6 +1068,7 @@ class SyncService:
             VENDOR_FLOW_ID: "vendors",
             PO_FLOW_ID: "purchase-orders",
             RECEIVING_FLOW_ID: "receiving-reports",
+            WORKFORCE_FLOW_ID: "workforce",
         }
         for flow_id, kind in flows.items():
             for run in sorted(
@@ -858,7 +1099,7 @@ class SyncService:
         return sorted(by_key.values(), key=lambda s: (s.source, s.kind))
 
 
-def _authority(source: str) -> str:
+def _authority(source: str) -> str:  # noqa: D401
     """Map a source name onto a precedence bucket from the ontology.
 
     Precedence is declared over authorities (`erp`, `procurement`, …), not over
@@ -872,6 +1113,8 @@ def _authority(source: str) -> str:
         return "procurement"
     if "wms" in lowered or "receiv" in lowered:
         return "procurement"
+    if "hris" in lowered or "workday" in lowered or "bamboo" in lowered:
+        return "hris"
     return "flow"
 
 

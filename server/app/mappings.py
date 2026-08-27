@@ -23,10 +23,10 @@ The one decision a Mapping adds beyond binding is **materialization**:
   objects.
 
 Same concept, two strategies, chosen by whether the row itself needs identity,
-provenance, or human judgment. Every feed running today reifies; ``bind`` is
-declared because the *registry* must be able to say it, not because a bind
-feed exists yet — the validation refuses a bind mapping that names a
-``lands_as`` type, so the distinction cannot blur silently.
+provenance, or human judgment. The commerce feeds reify because a vendor name
+is fuzzy and a steward rules on the match; the HRIS feed binds because a work
+email is exact and nobody adjudicates it. The validation refuses a bind
+mapping that names a ``lands_as`` type, so the distinction cannot blur.
 """
 
 from __future__ import annotations
@@ -182,6 +182,43 @@ MAPPINGS: tuple[Mapping, ...] = (
         notes=(
             "A batch feed: unresolved vendors escalate as one aggregate Task "
             "per delivery, never per row."
+        ),
+    ),
+    Mapping(
+        id="hris-workday",
+        source="hris-workday",
+        system="HRIS (Workday)",
+        summary=(
+            "The firm's people and teams. The first **bind** contract in the "
+            "registry: an HRIS row is keyed by work email and names its "
+            "manager and team by their own keys, so there is nothing for a "
+            "steward to adjudicate and no landing record worth keeping — the "
+            "columns bind straight to entities and the org chart falls out."
+        ),
+        transport="push",
+        payload="EmployeeRecord + TeamRecord",
+        strategy="bind",
+        resolves_to=("Employee", "Team"),
+        identity=(
+            IdentityBinding(column="email", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="manager_email", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="team_slug", object_type="Team",
+                            key="team slug"),
+            IdentityBinding(column="parent_slug", object_type="Team",
+                            key="team slug"),
+            IdentityBinding(column="lead_email", object_type="Employee",
+                            key="work email"),
+        ),
+        precedence_source="hris",
+        freshness="on push",
+        collection="workforce",
+        escalation="windowed aggregate",
+        notes=(
+            "Capabilities are deliberately not in this feed: a skill is "
+            "asserted by people, not observed by a system, so the catalogue "
+            "and its assignments carry `human:people-ops` authority instead."
         ),
     ),
     Mapping(

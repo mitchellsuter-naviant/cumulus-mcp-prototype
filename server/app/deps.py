@@ -22,6 +22,7 @@ from .teams import TeamService, build_team_directory
 from .usage import AssetUsageStore, build_asset_usage_store
 from .users import UserDirectory, build_user_directory
 from .flows import FlowService, build_flow_service, seed_flows_if_empty
+from .workforce import seed_workforce_if_empty
 from .tasks import TaskService, build_task_service, seed_tasks_if_empty
 from .reimbursements import (
     ReimbursementService,
@@ -398,6 +399,9 @@ def get_payable_service() -> PayableService:
                 # and the receiving reports the invoices match against, so it
                 # has to exist before the AP seed runs.
                 seed_payables_if_empty(service, sync=sync)
+                # The org chart rides the same sync service, and the expense
+                # seed has already minted the employees it attaches to.
+                seed_workforce_if_empty(sync, get_graph_service())
                 _payable_service = service
     return _payable_service
 

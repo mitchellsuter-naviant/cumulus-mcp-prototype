@@ -113,13 +113,14 @@ COLLECTIONS: tuple[DataCollection, ...] = (
             "Employees as canonical entities — the root of the expense graph. "
             "Cumulus mints the id; an HRIS feed would attach its own."
         ),
-        role="data", kind="entities", origin="flow-written",
+        role="data", kind="entities", origin="synced",
         container="graph_objects", authoritative=True, retention="indefinite",
-        object_types=("Employee", "Team"),
-        # Honest state: Employee objects are minted by the reimbursement flow
-        # when someone first submits. An HRIS feed (which would flip origin to
-        # `synced` and custody to `reference`) is designed, not built.
-        written_by=("expense-reimbursement",), read_by=("expense-reimbursement",),
+        object_types=("Employee", "Team", "Capability"),
+        # Two writers on purpose: the HRIS feed syncs people and teams, and
+        # people-ops asserts the capability catalogue — a skill is not a
+        # system's observation.
+        written_by=("workforce-sync", "human:people-ops"),
+        read_by=("expense-reimbursement", "hr-agent"),
     ),
     DataCollection(
         id="vendor-master",
