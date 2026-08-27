@@ -114,7 +114,12 @@ def test_behaviour_is_derived_from_shape_not_a_type(client):
 
     # And the audit trail follows the derived signal, not a type: a per-case
     # flow ledgers decisions and gateway commits, never claim resolutions.
-    entries = client.get("/api/v1/flows/expense-reimbursement/audit").json()
+    # Enough history that one busy morning of automatic commits cannot crowd
+    # every human decision out of the window — the assertion is about which
+    # kinds the ledger carries, not about the newest page.
+    entries = client.get(
+        "/api/v1/flows/expense-reimbursement/audit?limit=200"
+    ).json()
     kinds = {e["kind"] for e in entries}
     assert "decision" in kinds and "action" in kinds
     assert "resolution" not in kinds

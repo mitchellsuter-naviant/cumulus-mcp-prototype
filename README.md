@@ -606,6 +606,79 @@ decision is a real, attributed write — the stand-in for the curation-ledger
 entry the doctrine requires. Nothing actually resumes yet; each task's
 `resumes` field says what would happen once a real engine lands.
 
+## The data & knowledge layer, rationalized
+
+Why any of this exists is argued once, in [THESIS.md](THESIS.md); what the
+primitives are is ruled in [DOCTRINE.md](DOCTRINE.md). This section is the
+working model that everything below implements: **five concepts, two axes**.
+Nothing in the system falls outside the five; several things started as two of
+them wearing one name.
+
+```
+                        ┌─────────────────────────────┐
+                        │   THE GRAPH  (TBox + ABox)  │  ← the only place meaning joins
+                        │   types · individuals ·     │
+                        │   links · retained claims   │
+                        └──────┬──────────┬───────────┘
+              refs out         │          │        refs out
+        ┌──────────────────────┘          └──────────────────┐
+        ▼                                                    ▼
+  ┌───────────┐   MAPPINGS (declared seams)           ┌───────────┐
+  │  STORES   │ ◄──── column↔type+key bindings ────── │ EXTERNAL  │
+  │ documents │       natural keys · precedence       │ SYSTEMS   │
+  │ corpus    │       freshness · match policy        │ ERP · IoT │
+  │ tables    │                                       │ historian │
+  └───────────┘                                       └───────────┘
+        ▲
+        │  COLLECTIONS (governance declarations over sets)
+        │  role · kind · origin · custody · retention · authoritative
+```
+
+1. **The Graph** — TBox + ABox. The index and meaning layer of everything
+   else. If two things relate, the relation is a Link; there is no second
+   relating mechanism. Everything else is a leaf the graph points at.
+2. **Stores** — where bytes and rows live, internal or external, chosen by
+   access shape. No meaning and no governance of their own.
+3. **Collections** — declared sets carrying governance (retention, custody,
+   authoritativeness). A Collection can govern content in a store, a subgraph,
+   or both.
+4. **Mappings** — the declared seams between sources and the graph: which
+   columns bind to which types via which keys, under which match policy and
+   precedence, at which freshness ([server/app/mappings.py](server/app/mappings.py)).
+5. **Refs** — the universal address grammar (`graph:`, `knowledge:`,
+   `document:`, `link:`, run/step/task ids). Provenance is refs stamped on
+   claims, read-sets and journals; the graph is the only place refs join.
+
+Two **axes** classify rather than contain — they drive navigation, never
+storage: **Role** (data: delete it and history is lost / knowledge: delete it
+and the agents get dumber) and **Origin** (authored / flywheel / derived /
+synced / flow-written). "Encoded vs. emergent" is Origin: encoded is authored
+documents plus the declarations (ontology, Mappings, Collections); emergent is
+synced claims, derived profiles, and flywheel exemplars.
+
+**Replication is safe exactly when the replica knows where it came from.**
+Three modes are legitimate: *copy custody* (bytes landed with lineage and
+hash), *reference custody* (a pointer plus freshness policy; the store stays
+external), and *claim replication* (a field value copied into the graph **as a
+claim naming its source**, re-resolvable under precedence because the loser is
+kept — the MDM case). The forbidden fourth is a bare copy with no lineage.
+
+**Reify vs. bind.** When a source row enters the system, its Mapping picks one
+of two materialization strategies:
+
+| | **Reify rows** (SourceRecord + identity Link) | **Column-bind** (Dataset + lazy resolution) |
+|---|---|---|
+| Volume | low (vendor lists, POs) | high (telemetry, GL transactions) |
+| Human adjudicates a row? | yes — a steward rules on a match | no — aggregates only |
+| Row is a Link endpoint? | yes (`identified_as` needs it) | no |
+| Escalation | per-row Task possible | windowed, aggregate Task only |
+
+Vendors reify; meter readings bind. A reading's meaning is a column binding
+("`asset_id` contains Machine identifiers, keyed by asset tag") resolved
+lazily at query or rollup time — never eagerly per row. What the readings
+*teach* the entity lands as derived claims with a recipe, the
+`vendor_payment_profile` pattern.
+
 ## The map: entities, runs, collections
 
 Three pieces of machinery the two live flows sit on. They were added together
@@ -1020,13 +1093,35 @@ flutter run -d chrome --dart-define=API_BASE_URL=http://localhost:8080
 Inside the dev container there is no display, so use the web-server device and
 your host browser instead — see [.devcontainer/README.md](.devcontainer/README.md).
 
-The left rail has four stops: **Knowledge layer** (Library, the governed
-corpus, and Data — five lenses: Collections, Sources, **Model · TBox**,
-**Instances · ABox**, and Documents), **Flows**, **Workspaces** — a dropdown, because a workspace is a
-business view onto rows a flow wrote rather than a plane of the map — and
-**Identities, access & keys**. The Employee Hub hangs off the account avatar
-and the Task Queue off the top bar, since both are asked for from every
-section rather than being one.
+The left rail has four stops: **Knowledge layer**, **Flows**, **Workspaces** —
+a dropdown, because a workspace is a business view onto rows a flow wrote
+rather than a plane of the map — and **Identities, access & keys**. The
+Employee Hub hangs off the account avatar and the Task Queue off the top bar,
+since both are asked for from every section rather than being one.
+
+The Knowledge layer itself has four planes, cut by **origin** — who or what
+put each thing there:
+
+- **Library** — what people wrote: policies, standards, guidelines. The
+  authority lens applies here and only here, because authority is a property
+  of documents that argue.
+- **Ontology** — what we encoded: **Model · TBox**, **Instances · ABox**, the
+  Collection declarations, and the **Mappings** that bind sources in. The
+  generated exports carry a "regenerated from Python on every startup" banner
+  and refuse edits (409) rather than accepting one the next boot discards.
+- **Learned** — what the system figured out through use: the exemplar shelf
+  (with origin and revision pins), vendor payment profiles, and the eval
+  datasets. The flywheel's output, gathered in one place instead of scattered
+  across three.
+- **Sources** — what arrives from outside: each feed shown against its
+  declared contract (strategy, bindings, escalation shape), and the artifact
+  store.
+
+An exemplar is no longer filed as a `how-to` next to the Expense Approval
+Policy: assets carry `kind` (document / exemplar / schema-export / prompt /
+config) and `origin` (authored / flywheel / derived), `authority_level` is
+None for anything that isn't a document, and search takes a `kind` filter so
+governed-context retrieval and exemplar lookup cannot cross.
 
 The two graph lenses are deliberately separate screens rather than one
 diagram with a toggle, because they answer different questions. **Model · TBox**

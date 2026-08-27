@@ -28,6 +28,7 @@ from .models import (
     Asset,
     AssetCreate,
     AssetFilter,
+    AssetKind,
     AssetSummary,
     AssetUpdate,
     AskAnswer,
@@ -86,11 +87,14 @@ def _require_can_write(principal: Principal, owner: str | None) -> None:
 def list_assets(
     prefix: str | None = None,
     status: str | None = None,
+    kind: AssetKind | None = None,
     principal: Principal = Depends(get_principal),
 ) -> list[AssetSummary]:
     require_reader(principal)
     return [
-        a.summary() for a in get_service().list_assets(prefix=prefix, status=status)
+        a.summary()
+        for a in get_service().list_assets(prefix=prefix, status=status)
+        if kind is None or a.kind == kind
     ]
 
 
@@ -207,6 +211,16 @@ def update_asset(
         current = service.get(asset_id)
     except AssetNotFoundError:
         raise HTTPException(status_code=404, detail=f"Asset not found: {asset_id}")
+    if current.kind == "schema-export":
+        # Regenerated from Python on every startup — an edit here would be
+        # silently overwritten, which is worse than a refusal with the fix.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"'{asset_id}' is generated from code and republished on every "
+                "startup; edit the declaration in server/app/ instead."
+            ),
+        )
     # Both ends of a move are gated: you must be able to write the asset where
     # it is, and to write it where it is going.
     _require_can_write(principal, current.owner)
@@ -235,7 +249,16 @@ def update_asset(
 def delete_asset(asset_id: str, principal: Principal = Depends(get_principal)) -> None:
     service = get_service()
     try:
-        _require_can_write(principal, service.get(asset_id).owner)
+        current = service.get(asset_id)
+        if current.kind == "schema-export":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"'{asset_id}' is generated from code; deleting it here "
+                    "only lasts until the next startup republishes it."
+                ),
+            )
+        _require_can_write(principal, current.owner)
         service.delete(asset_id)
     except AssetNotFoundError:
         raise HTTPException(status_code=404, detail=f"Asset not found: {asset_id}")
@@ -299,6 +322,13 @@ def search(
         default=None, description="Restrict to assets owned by this team slug."
     ),
     authority_level: AuthorityLevel | None = Query(default=None),
+    kind: AssetKind | None = Query(
+        default=None,
+        description=(
+            "Restrict by asset kind, so governed-context retrieval and "
+            "exemplar lookup cannot cross."
+        ),
+    ),
     status: Status | None = Query(default=None),
     tag: str | None = Query(default=None),
     path_prefix: str | None = Query(
@@ -324,6 +354,7 @@ def search(
     filters = AssetFilter(
         owner=owner,
         authority_level=authority_level,
+        kind=kind,
         status=status,
         tag=tag,
         path_prefix=path_prefix,
@@ -353,6 +384,7 @@ def search_facets(
     include_drafts: bool = False,
     owner: str | None = Query(default=None),
     authority_level: AuthorityLevel | None = Query(default=None),
+    kind: AssetKind | None = Query(default=None),
     status: Status | None = Query(default=None),
     tag: str | None = Query(default=None),
     path_prefix: str | None = Query(default=None),
@@ -367,6 +399,7 @@ def search_facets(
     filters = AssetFilter(
         owner=owner,
         authority_level=authority_level,
+        kind=kind,
         status=status,
         tag=tag,
         path_prefix=path_prefix,

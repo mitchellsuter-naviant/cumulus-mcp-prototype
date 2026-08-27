@@ -14,6 +14,7 @@ import '../models/flow.dart';
 import '../models/data_layer.dart';
 import '../models/eval.dart';
 import '../models/graph.dart';
+import '../models/mapping.dart';
 import '../models/payable.dart';
 import '../models/reimbursement.dart';
 import '../models/run.dart';
@@ -85,12 +86,14 @@ class ApiClient {
   Future<List<AssetSummary>> listAssets({
     String? prefix,
     String? status,
+    String? kind,
   }) async {
     final resp = await _send(
       _http.get(
         _uri('/api/v1/assets', {
           if (prefix != null && prefix.isNotEmpty) 'prefix': prefix,
           if (status != null && status.isNotEmpty) 'status': status,
+          if (kind != null && kind.isNotEmpty) 'kind': kind,
         }),
         headers: await _headers(),
       ),
@@ -958,6 +961,16 @@ class ApiClient {
     return (jsonDecode(resp.body) as List<dynamic>)
         .map((j) => SourceStatus.fromJson(j as Map<String, dynamic>))
         .toList();
+  }
+
+  Future<MappingRegistry> listMappings() async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/mappings'), headers: await _headers()),
+    );
+    _check(resp);
+    return MappingRegistry.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
   }
 
   Future<List<StoredDocument>> listDocuments({String? kind, String? runId}) async {

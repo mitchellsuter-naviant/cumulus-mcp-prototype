@@ -3,11 +3,17 @@ class AssetSummary {
   final String path;
   final String title;
   final String contentType;
+
+  /// Empty when the asset is not a document: an exemplar or a schema export
+  /// carries no authority — its [kind] is the signal instead.
   final String authorityLevel;
+  final String kind; // document | exemplar | schema-export | prompt | config
+  final String origin; // authored | flywheel | derived | synced | flow-written
   final String scope;
   final String owner;
   final List<String> tags;
   final String status;
+  final int revision;
   final DateTime updatedAt;
 
   AssetSummary({
@@ -16,10 +22,13 @@ class AssetSummary {
     required this.title,
     required this.contentType,
     required this.authorityLevel,
+    this.kind = 'document',
+    this.origin = 'authored',
     required this.scope,
     required this.owner,
     required this.tags,
     required this.status,
+    this.revision = 1,
     required this.updatedAt,
   });
 
@@ -28,11 +37,14 @@ class AssetSummary {
     path: json['path'] as String,
     title: json['title'] as String,
     contentType: json['content_type'] as String,
-    authorityLevel: json['authority_level'] as String,
+    authorityLevel: json['authority_level'] as String? ?? '',
+    kind: json['kind'] as String? ?? 'document',
+    origin: json['origin'] as String? ?? 'authored',
     scope: json['scope'] as String? ?? 'org',
     owner: json['owner'] as String? ?? '',
     tags: (json['tags'] as List<dynamic>? ?? []).cast<String>(),
     status: json['status'] as String,
+    revision: json['revision'] as int? ?? 1,
     updatedAt: DateTime.parse(json['updated_at'] as String),
   );
 }
@@ -43,7 +55,9 @@ class Asset {
   String title;
   String content;
   String contentType;
-  String authorityLevel;
+  String authorityLevel; // empty when kind != document
+  String kind;
+  String origin;
   String scope;
   String owner;
   List<String> tags;
@@ -60,6 +74,8 @@ class Asset {
     required this.content,
     this.contentType = 'text/markdown',
     this.authorityLevel = 'note',
+    this.kind = 'document',
+    this.origin = 'authored',
     this.scope = 'org',
     this.owner = '',
     this.tags = const [],
@@ -76,7 +92,9 @@ class Asset {
     title: json['title'] as String,
     content: json['content'] as String,
     contentType: json['content_type'] as String,
-    authorityLevel: json['authority_level'] as String,
+    authorityLevel: json['authority_level'] as String? ?? '',
+    kind: json['kind'] as String? ?? 'document',
+    origin: json['origin'] as String? ?? 'authored',
     scope: json['scope'] as String? ?? 'org',
     owner: json['owner'] as String? ?? '',
     tags: (json['tags'] as List<dynamic>? ?? []).cast<String>(),
@@ -93,7 +111,9 @@ class Asset {
     'title': title,
     'content': content,
     'content_type': contentType,
-    'authority_level': authorityLevel,
+    'authority_level': authorityLevel.isEmpty ? null : authorityLevel,
+    'kind': kind,
+    'origin': origin,
     'scope': scope,
     'owner': owner,
     'tags': tags,

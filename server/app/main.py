@@ -13,6 +13,7 @@ from . import (
     data_api,
     evals_api,
     graph_api,
+    mappings_api,
     identities_api,
     rest_api,
     runs_api,
@@ -187,6 +188,7 @@ app.include_router(reimbursements_api.router)
 app.include_router(payables_api.router)
 app.include_router(employee_api.router)
 app.include_router(graph_api.router)
+app.include_router(mappings_api.router)
 app.include_router(runs_api.router)
 app.include_router(data_api.router)
 app.include_router(evals_api.router)

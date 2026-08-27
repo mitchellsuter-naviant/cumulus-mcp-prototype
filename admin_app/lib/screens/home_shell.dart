@@ -8,6 +8,7 @@ import '../widgets/cumulus_shell.dart';
 import '../widgets/task_queue.dart';
 import 'api_docs_screen.dart';
 import '../widgets/data_plane.dart';
+import '../widgets/learned_plane.dart';
 import '../widgets/payables_view.dart';
 import '../widgets/reimbursements_view.dart';
 import '../widgets/ui_kit.dart';
@@ -201,20 +202,21 @@ class _HomeShellState extends State<HomeShell> {
   }
 }
 
-/// The Knowledge layer section: two planes under one heading.
+/// The Knowledge layer section: four planes under one heading, cut by
+/// *origin* — who or what put each thing here.
 ///
-/// **Library** is the governed corpus (documents people author); **Data** is
-/// the dataset registry — every container of content the map owns, what Role
-/// it carries, where its rows come from, and which Flow reads or writes it.
-/// The split mirrors the Dataset Role dial in the doctrine — delete knowledge
-/// and the agents get dumber; delete data and history is lost — and gives the
-/// section room to grow an Entities and an Ontology plane without another
-/// rework.
+/// **Library** is what people wrote: policies, standards, guidelines — the
+/// documents that argue and carry authority. **Ontology** is what we encoded:
+/// the TBox, the ABox, the Collection declarations, and the Mappings that
+/// bind sources in. **Learned** is what the system figured out through use:
+/// flywheel exemplars, derived profiles, eval datasets — the compounding
+/// record of judgment. **Sources** is what arrives from outside: the feeds
+/// against their contracts, and the artifact store.
 ///
-/// The two business tables that used to sit in Data behind dataset chips are
-/// now Workspaces on the rail. Data still names them, but as datasets — the
-/// row count, the Flow that writes them, the Role they carry — and hands off
-/// to the Workspace for the work itself.
+/// The old Library/Data split put a flywheel exemplar next to the Expense
+/// Approval Policy as if they were the same kind of thing. They are governed
+/// alike — versioned, audited, revision-pinned — but they answer different
+/// questions, and origin is the axis that separates them.
 class _KnowledgeSection extends StatefulWidget {
   final ApiClient api;
   final ValueNotifier<int> plane;
@@ -247,7 +249,7 @@ class _KnowledgeSectionState extends State<_KnowledgeSection> {
             Padding(
               padding: const EdgeInsets.fromLTRB(28, 14, 28, 0),
               child: SegmentedTabs(
-                labels: const ['Library', 'Data'],
+                labels: const ['Library', 'Ontology', 'Learned', 'Sources'],
                 selectedIndex: selected,
                 onChanged: (i) => widget.plane.value = i,
               ),
@@ -259,6 +261,21 @@ class _KnowledgeSectionState extends State<_KnowledgeSection> {
                   widget.library,
                   DataPlaneView(
                     api: widget.api,
+                    mode: DataPlaneMode.ontology,
+                    onOpenExpenseWorkspace: () =>
+                        widget.onOpenWorkspace(_expenseWorkspaceIndex),
+                    onOpenPayablesWorkspace: () =>
+                        widget.onOpenWorkspace(_payablesWorkspaceIndex),
+                    onOpenFlows: () => widget.onOpenWorkspace(_flowsIndex),
+                    onOpenLibrary: () => widget.plane.value = 0,
+                  ),
+                  LearnedPlaneView(
+                    api: widget.api,
+                    onOpenFlows: () => widget.onOpenWorkspace(_flowsIndex),
+                  ),
+                  DataPlaneView(
+                    api: widget.api,
+                    mode: DataPlaneMode.sources,
                     onOpenExpenseWorkspace: () =>
                         widget.onOpenWorkspace(_expenseWorkspaceIndex),
                     onOpenPayablesWorkspace: () =>

@@ -428,6 +428,26 @@ def ontology_markdown(ontology: Ontology = ONTOLOGY) -> str:
         "Changing this order re-resolves history rather than rewriting it — "
         "the claims are still there.",
         "",
+        "## How things are addressed (the ref grammar)",
+        "",
+        "Everything addressable carries a ref, and the graph is the only "
+        "place refs join. Provenance is refs stamped on claims, read-sets and "
+        "journals; these are the schemes:",
+        "",
+        "- `graph:{Type}/{id}@rev{n}` — an object, pinned to the revision "
+        "that was read. Resolved by `GET /api/v1/graph/objects/{id}`.",
+        "- `link:{type}/{id}` — a typed edge, including identity links.",
+        "- `knowledge:{id}@rev{n}` — a corpus asset at the revision a "
+        "decision actually read. Resolved by `GET /api/v1/refs/{ref}`.",
+        "- `document:{id}` — a stored artifact (bytes plus extraction "
+        "regions). Resolved by `GET /api/v1/documents/{id}`.",
+        "- `run_{...}` / step ids — the act that wrote a claim (`run_id` + "
+        "`step_id` on the claim). Resolved by `GET /api/v1/runs/{id}`.",
+        "- `task_{...}` — the unit of human judgment that released a gate.",
+        "",
+        "A leaf no ref points at is unreachable by meaning, and should be "
+        "treated as suspect.",
+        "",
         "## Object types",
         "",
     ]
@@ -466,7 +486,7 @@ def ontology_asset_fields() -> dict:
         "id": ONTOLOGY_ASSET_ID,
         "path": "platform/ontology/enterprise",
         "title": "Enterprise ontology",
-        "authority_level": "standard",
+        "kind": "schema-export",
         "scope": "org",
         "owner": "platform-eng",
         "tags": ["ontology", "governed-knowledge", "graph"],

@@ -943,7 +943,10 @@ def _run_summary(defn: FlowDefinition, day: date, idx: int, runs_that_day: int) 
     rid = _run_id(defn, day, idx)
     rng = _h(f"{rid}:shape")
     p = defn.profile
-    raised = rng.random() < p.task_rate
+    # The first run of each day always raises: with a pure Bernoulli draw an
+    # unlucky date-hash can produce a stretch where every recent run took the
+    # automatic path, and the audit ledger then claims nobody ever decides.
+    raised = idx == 0 or rng.random() < p.task_rate
     escalated = not raised and rng.random() < p.escalate_rate
     now = utcnow()
     # Spread the day's runs across working hours, newest last.

@@ -12,6 +12,10 @@ from app.service import parse_seed_file
 def client(_client):
     deps._service = KnowledgeService(InMemoryRepository())
     seed_if_empty(deps._service, settings.seed_dir)
+    # Startup does this too: the generated exports are part of the corpus.
+    from app.platform_assets import publish_generated_assets
+
+    publish_generated_assets(deps._service)
     deps._user_directory = InMemoryUserDirectory()
     return _client
 
@@ -19,11 +23,17 @@ def client(_client):
 def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    assert resp.json()["assets"] == 11
+    # 11 seed documents + 4 generated schema-exports (ontology, collections,
+    # mappings, eval specs) — the fixture publishes them like startup does.
+    assert resp.json()["assets"] == 15
 
 
 def test_list_and_prefix_filter(client):
-    assert len(client.get("/api/v1/assets").json()) == 11
+    assert len(client.get("/api/v1/assets").json()) == 15
+    # The kind filter carves the Library out of the corpus: documents only.
+    docs = client.get("/api/v1/assets", params={"kind": "document"}).json()
+    assert len(docs) == 9
+    assert all(a["kind"] == "document" for a in docs)
     finance = client.get("/api/v1/assets", params={"prefix": "finance"}).json()
     assert {a["id"] for a in finance} == {
         "expense-approval-policy",
@@ -372,3 +382,46 @@ def test_revision_bumps_on_update_and_resolver_dereferences(client):
         client.get("/api/v1/refs/knowledge:nope@rev1").status_code
         == 404
     )
+
+
+# ---- the two dials: kind and origin -----------------------------------------
+
+
+def test_an_exemplar_carries_no_authority_level(client):
+    """Authority answers "which document wins an argument"; an exemplar is a
+    one-shot template and is not in that conversation. The old encoding
+    (`authority_level: how-to`) was a category error the model now refuses."""
+    asset = client.get("/api/v1/assets/vendor-exemplar-acme-industrial").json()
+    assert asset["kind"] == "exemplar"
+    assert asset["origin"] == "flywheel"
+    assert asset["authority_level"] is None
+
+
+def test_documents_default_the_dials(client):
+    asset = client.get("/api/v1/assets/expense-approval-policy").json()
+    assert asset["kind"] == "document"
+    assert asset["origin"] == "authored"
+    assert asset["authority_level"] == "policy"
+
+
+def test_generated_exports_refuse_edits(client):
+    """A schema-export is republished from Python on every startup; letting a
+    PUT succeed would accept an edit the next boot silently discards."""
+    for asset_id in ("enterprise-ontology", "source-mappings"):
+        asset = client.get(f"/api/v1/assets/{asset_id}").json()
+        assert asset["kind"] == "schema-export", asset_id
+        r = client.put(f"/api/v1/assets/{asset_id}", json={"content": "x"})
+        assert r.status_code == 409
+        assert "server/app" in r.json()["detail"]
+        assert client.delete(f"/api/v1/assets/{asset_id}").status_code == 409
+
+
+def test_search_can_scope_by_kind(client):
+    """Governed-context retrieval and exemplar lookup must not cross."""
+    hits = client.get("/api/v1/search", params={"q": "vendor", "kind": "exemplar"}).json()
+    assert hits and all(h["asset"]["kind"] == "exemplar" for h in hits)
+    hits = client.get("/api/v1/search", params={"q": "vendor", "kind": "document"}).json()
+    assert all(h["asset"]["kind"] == "document" for h in hits)
+    facets = client.get("/api/v1/search/facets", params={"q": ""}).json()
+    kinds = {f["value"] for f in facets["kind"]}
+    assert {"document", "exemplar", "schema-export"} <= kinds

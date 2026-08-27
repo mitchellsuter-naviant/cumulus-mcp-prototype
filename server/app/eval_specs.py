@@ -827,7 +827,7 @@ def specs_asset_fields() -> dict:
         "id": EVAL_SPEC_ASSET_ID,
         "path": "platform/evals/flow-specs",
         "title": "Flow eval specs",
-        "authority_level": "standard",
+        "kind": "schema-export",
         "scope": "org",
         "owner": "platform-eng",
         "tags": ["evals", "governed-knowledge", "testing"],

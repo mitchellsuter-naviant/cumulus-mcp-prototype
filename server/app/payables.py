@@ -1664,10 +1664,11 @@ class PayableService:
                 path=f"finance/exemplars/{slug}",
                 title=f"Vendor exemplar: {vendor_label or extraction.vendor_name}",
                 content=content,
-                authority_level="how-to",
+                kind="exemplar",
+                origin="flywheel",
                 scope="org",
                 owner="finance-ops",
-                tags=["exemplar", "ap", slug, "governed-knowledge"],
+                tags=["exemplar", "ap", slug],
                 status="published",
             ))
         else:

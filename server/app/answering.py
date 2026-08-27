@@ -955,6 +955,7 @@ class AnswerService:
                     title=asset.title,
                     path=asset.path,
                     authority_level=asset.authority_level,
+                    kind=asset.kind,
                     status=asset.status,
                     snippet=make_snippet(asset.content, question, width=200),
                 )
@@ -999,6 +1000,7 @@ class AnswerService:
                     title=hit.asset.title,
                     path=hit.asset.path,
                     authority_level=hit.asset.authority_level,
+                    kind=hit.asset.kind,
                     status=hit.asset.status,
                     snippet=hit.snippet,
                 )

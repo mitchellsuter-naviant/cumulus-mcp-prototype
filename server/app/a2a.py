@@ -82,8 +82,8 @@ def _answer(question: str) -> str:
     if not result.citations:
         return result.answer
     sources = "\n".join(
-        f"- kb://{c.asset_id} · {c.title} · {c.path} · authority: "
-        f"{c.authority_level}"
+        f"- kb://{c.asset_id} · {c.title} · {c.path} · "
+        + (f"authority: {c.authority_level}" if c.authority_level else f"kind: {c.kind}")
         + ("" if c.status == "published" else f" · status: {c.status}")
         for c in result.citations
     )

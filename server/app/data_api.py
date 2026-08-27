@@ -81,10 +81,6 @@ def _live_counts() -> dict[str, tuple[int, str]]:
     except Exception:  # noqa: BLE001
         log.exception("Could not count the graph")
     try:
-        counts["run-journals"] = (len(deps.get_run_engine().list()), "runs")
-    except Exception:  # noqa: BLE001
-        log.exception("Could not count runs")
-    try:
         counts["task-ledger"] = (
             len(deps.get_task_service().directory.list()), "tasks"
         )

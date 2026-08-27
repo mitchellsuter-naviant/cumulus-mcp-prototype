@@ -113,10 +113,13 @@ COLLECTIONS: tuple[DataCollection, ...] = (
             "Employees as canonical entities — the root of the expense graph. "
             "Cumulus mints the id; an HRIS feed would attach its own."
         ),
-        role="data", kind="entities", origin="synced",
+        role="data", kind="entities", origin="flow-written",
         container="graph_objects", authoritative=True, retention="indefinite",
         object_types=("Employee",),
-        written_by=("employee-sync",), read_by=("expense-reimbursement",),
+        # Honest state: Employee objects are minted by the reimbursement flow
+        # when someone first submits. An HRIS feed (which would flip origin to
+        # `synced` and custody to `reference`) is designed, not built.
+        written_by=("expense-reimbursement",), read_by=("expense-reimbursement",),
     ),
     DataCollection(
         id="vendor-master",
@@ -198,24 +201,21 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         object_types=("Document",),
         written_by=("expense-reimbursement", "accounts-payable"),
     ),
-    DataCollection(
-        id="run-journals",
-        name="Run journals",
-        summary=(
-            "Every Flow run, step by step, with the read-set each step used. "
-            "The record a suspended run resumes from and an auditor reads."
-        ),
-        role="data", kind="ledger", origin="flow-written",
-        container="flow_runs", authoritative=True, retention="P7Y",
-        written_by=("expense-reimbursement", "accounts-payable", "vendor-sync"),
-    ),
+    # Run journals are deliberately NOT a Collection. The doctrine is explicit
+    # that machinery/operational state — "flow run journals, the trigger
+    # index, queues" — is not a Dataset: journals are how the engine resumes a
+    # suspended run, owned by the execution layer and read through the runs
+    # API. What the customer keeps is the *decisions* (the task ledger below)
+    # and the graph writes each step made, both of which carry the run/step
+    # refs needed to reconstruct what happened. Declaring the journal here too
+    # made it look like map content, which contradicted the LOCKED clause.
     DataCollection(
         id="task-ledger",
         name="Task ledger",
         summary=(
-            "Units of human judgment and the decisions that closed them — the "
-            "curation ledger the doctrine requires every human decision to "
-            "land in."
+            "Units of human judgment and the decisions that closed them. This "
+            "IS the curation ledger — map content the customer keeps, unlike "
+            "the run journals (machinery state, deliberately not a Collection)."
         ),
         role="data", kind="ledger", origin="flow-written",
         container="tasks", authoritative=True, retention="P7Y",
@@ -351,7 +351,7 @@ def collections_asset_fields() -> dict:
         "id": COLLECTIONS_ASSET_ID,
         "path": "platform/governance/data-collections",
         "title": "Data collections",
-        "authority_level": "policy",
+        "kind": "schema-export",
         "scope": "org",
         "owner": "platform-eng",
         "tags": ["governance", "governed-knowledge", "retention", "collections"],

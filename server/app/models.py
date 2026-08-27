@@ -1,11 +1,21 @@
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 ContentType = Literal["text/markdown", "text/plain"]
 AuthorityLevel = Literal["policy", "standard", "guideline", "how-to", "note"]
 Status = Literal["draft", "published", "deprecated"]
+
+# The doctrine's two Dataset dials, on the corpus. `kind` is what shape of
+# thing this is; a `document` argues and carries authority, an `exemplar` is a
+# one-shot template the flywheel promoted, a `schema-export` is generated from
+# Python on every startup and editing it here is pointless by construction.
+AssetKind = Literal["document", "exemplar", "schema-export", "prompt", "config"]
+# Who put it here. Matches the Origin literal on Collections: `authored` is a
+# person (including code a person ratified), `flywheel` was promoted out of
+# runs, `derived` is regenerable from a recipe.
+AssetOrigin = Literal["authored", "flywheel", "derived", "synced", "flow-written"]
 
 # Precedence used when flagging conflicts: lower index = higher authority.
 AUTHORITY_ORDER: list[str] = ["policy", "standard", "guideline", "how-to", "note"]
@@ -25,7 +35,12 @@ class Asset(BaseModel):
     title: str
     content: str
     content_type: ContentType = "text/markdown"
-    authority_level: AuthorityLevel = "note"
+    # Authority is a property of documents that argue — how much force this
+    # carries when two documents disagree. An exemplar never argues with a
+    # policy, so for kind != document it is None rather than a polite lie.
+    authority_level: AuthorityLevel | None = "note"
+    kind: AssetKind = "document"
+    origin: AssetOrigin = "authored"
     scope: str = "org"
     owner: str = ""
     tags: list[str] = Field(default_factory=list)
@@ -43,6 +58,16 @@ class Asset(BaseModel):
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
+
+    @model_validator(mode="after")
+    def _authority_is_for_documents(self):
+        # An exemplar or a schema export never argues with a policy; carrying
+        # an authority level would be a category error, so it is dropped
+        # rather than defaulted.
+        if self.kind != "document":
+            object.__setattr__(self, "authority_level", None)
+        return self
+
     @field_validator("path")
     @classmethod
     def normalize_path(cls, v: str) -> str:
@@ -58,6 +83,8 @@ class Asset(BaseModel):
             title=self.title,
             content_type=self.content_type,
             authority_level=self.authority_level,
+            kind=self.kind,
+            origin=self.origin,
             scope=self.scope,
             owner=self.owner,
             tags=self.tags,
@@ -72,7 +99,9 @@ class AssetSummary(BaseModel):
     path: str
     title: str
     content_type: ContentType
-    authority_level: AuthorityLevel
+    authority_level: AuthorityLevel | None
+    kind: AssetKind = "document"
+    origin: AssetOrigin = "authored"
     scope: str
     owner: str
     tags: list[str]
@@ -87,7 +116,9 @@ class AssetCreate(BaseModel):
     title: str
     content: str
     content_type: ContentType = "text/markdown"
-    authority_level: AuthorityLevel = "note"
+    authority_level: AuthorityLevel | None = "note"
+    kind: AssetKind = "document"
+    origin: AssetOrigin = "authored"
     scope: str = "org"
     owner: str = ""
     tags: list[str] = Field(default_factory=list)
@@ -96,6 +127,12 @@ class AssetCreate(BaseModel):
     supersedes: str | None = None
     superseded_by: str | None = None
     status: Status = "draft"
+
+    @model_validator(mode="after")
+    def _authority_is_for_documents(self):
+        if self.kind != "document":
+            object.__setattr__(self, "authority_level", None)
+        return self
 
 
 class AssetUpdate(BaseModel):
@@ -154,13 +191,21 @@ class AssetFilter(BaseModel):
 
     owner: str | None = None
     authority_level: AuthorityLevel | None = None
+    kind: AssetKind | None = None
     status: Status | None = None
     tag: str | None = None
     path_prefix: str | None = None
 
     def is_empty(self) -> bool:
         return not any(
-            (self.owner, self.authority_level, self.status, self.tag, self.path_prefix)
+            (
+                self.owner,
+                self.authority_level,
+                self.kind,
+                self.status,
+                self.tag,
+                self.path_prefix,
+            )
         )
 
     def matches(self, asset: Asset) -> bool:
@@ -170,6 +215,8 @@ class AssetFilter(BaseModel):
             self.authority_level is not None
             and asset.authority_level != self.authority_level
         ):
+            return False
+        if self.kind is not None and asset.kind != self.kind:
             return False
         if self.status is not None and asset.status != self.status:
             return False
@@ -188,7 +235,10 @@ class Citation(BaseModel):
     asset_id: str
     title: str
     path: str
-    authority_level: AuthorityLevel
+    # None when the cited asset is not a document (an exemplar carries no
+    # authority — the kind is the signal there).
+    authority_level: AuthorityLevel | None
+    kind: AssetKind = "document"
     status: Status
     snippet: str = ""
 
@@ -248,6 +298,7 @@ class SearchFacets(BaseModel):
     total: int
     owner: list[FacetValue] = Field(default_factory=list)
     authority_level: list[FacetValue] = Field(default_factory=list)
+    kind: list[FacetValue] = Field(default_factory=list)
     status: list[FacetValue] = Field(default_factory=list)
     branch: list[FacetValue] = Field(default_factory=list)
 

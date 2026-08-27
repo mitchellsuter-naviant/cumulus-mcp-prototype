@@ -19,6 +19,7 @@ import logging
 from . import data_collections
 from .models import AssetCreate, AssetUpdate
 from .eval_specs import specs_asset_fields
+from .mappings import mappings_asset_fields
 from .ontology import ontology_asset_fields
 from .data_collections import collections_asset_fields
 
@@ -31,6 +32,7 @@ def publish_generated_assets(knowledge) -> list[str]:
     for fields in (
         ontology_asset_fields(),
         collections_asset_fields(),
+        mappings_asset_fields(),
         specs_asset_fields(),
     ):
         asset_id = fields["id"]

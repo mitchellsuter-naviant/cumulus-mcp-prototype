@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/data_layer.dart';
 import '../models/graph.dart';
+import '../models/mapping.dart';
 import '../models/world.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
@@ -38,8 +39,19 @@ import 'ui_kit.dart';
 ///
 /// Business views onto these rows are Workspaces. A row here hands off to one
 /// rather than embedding it.
+/// Which face of the layer this instance shows. The split is by *origin* —
+/// the doctrine's encoded-vs-synced axis — not by storage: one backend, two
+/// questions.
+///
+/// [ontology] is what we encoded: the TBox, the ABox, the Collection
+/// declarations governance hangs off, and the Mappings that bind sources in.
+/// [sources] is what arrives from outside: the feeds against their contracts,
+/// and the artifact store.
+enum DataPlaneMode { ontology, sources }
+
 class DataPlaneView extends StatefulWidget {
   final ApiClient api;
+  final DataPlaneMode mode;
   final VoidCallback onOpenExpenseWorkspace;
   final VoidCallback onOpenPayablesWorkspace;
   final VoidCallback onOpenFlows;
@@ -48,6 +60,7 @@ class DataPlaneView extends StatefulWidget {
   const DataPlaneView({
     super.key,
     required this.api,
+    required this.mode,
     required this.onOpenExpenseWorkspace,
     required this.onOpenPayablesWorkspace,
     required this.onOpenFlows,
@@ -58,12 +71,23 @@ class DataPlaneView extends StatefulWidget {
   State<DataPlaneView> createState() => _DataPlaneViewState();
 }
 
-enum _Lens { collections, sources, model, instances, documents }
+enum _Lens { model, instances, collections, mappings, sources, documents }
 
 class _DataPlaneViewState extends State<DataPlaneView> {
-  _Lens _lens = _Lens.collections;
+  late _Lens _lens = _lenses.first;
+
+  List<_Lens> get _lenses => switch (widget.mode) {
+    DataPlaneMode.ontology => const [
+      _Lens.model,
+      _Lens.instances,
+      _Lens.collections,
+      _Lens.mappings,
+    ],
+    DataPlaneMode.sources => const [_Lens.sources, _Lens.documents],
+  };
 
   List<DataCollection>? _collections;
+  MappingRegistry? _mappings;
   List<SourceStatus>? _sources;
   Ontology? _ontology;
   InvariantReport _invariants = InvariantReport.unknown;
@@ -101,29 +125,49 @@ class _DataPlaneViewState extends State<DataPlaneView> {
     // survey, so one missing lens must not blank the page.
     Future<T?> attempt<T>(Future<T> call) =>
         call.then<T?>((v) => v).catchError((_) => null);
+    // Each mode fetches only what its lenses read — the two instances sit in
+    // one IndexedStack, so an indiscriminate load would run everything twice.
+    if (widget.mode == DataPlaneMode.ontology) {
+      final results = await Future.wait([
+        attempt(widget.api.listCollections()),
+        attempt(widget.api.ontology()),
+        attempt(widget.api.graphStats()),
+        attempt(widget.api.graphInvariants()),
+        attempt(widget.api.listWorlds()),
+        attempt(widget.api.listMappings()),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _collections = results[0] as List<DataCollection>?;
+        _ontology = results[1] as Ontology?;
+        _graphStats = (results[2] as Map<String, dynamic>?) ?? const {};
+        _invariants =
+            (results[3] as InvariantReport?) ?? InvariantReport.unknown;
+        _worlds = (results[4] as List<AuthoredWorld>?) ?? const [];
+        _mappings = results[5] as MappingRegistry?;
+        _loading = false;
+        if (_collections == null && _ontology == null) {
+          _error = 'The data layer did not answer.';
+        }
+      });
+      return;
+    }
     final results = await Future.wait([
-      attempt(widget.api.listCollections()),
       attempt(widget.api.listSources()),
-      attempt(widget.api.ontology()),
-      attempt(widget.api.graphStats()),
       attempt(widget.api.listDocuments()),
       attempt(widget.api.documentStats()),
-      attempt(widget.api.graphInvariants()),
-      attempt(widget.api.listWorlds()),
+      attempt(widget.api.graphStats()),
+      attempt(widget.api.listMappings()),
     ]);
     if (!mounted) return;
     setState(() {
-      _collections = results[0] as List<DataCollection>?;
-      _sources = results[1] as List<SourceStatus>?;
-      _ontology = results[2] as Ontology?;
+      _sources = results[0] as List<SourceStatus>?;
+      _documents = results[1] as List<StoredDocument>?;
+      _documentStats = (results[2] as Map<String, dynamic>?) ?? const {};
       _graphStats = (results[3] as Map<String, dynamic>?) ?? const {};
-      _documents = results[4] as List<StoredDocument>?;
-      _documentStats = (results[5] as Map<String, dynamic>?) ?? const {};
-      _invariants =
-          (results[6] as InvariantReport?) ?? InvariantReport.unknown;
-      _worlds = (results[7] as List<AuthoredWorld>?) ?? const [];
+      _mappings = results[4] as MappingRegistry?;
       _loading = false;
-      if (_collections == null && _sources == null && _ontology == null) {
+      if (_sources == null && _documents == null) {
         _error = 'The data layer did not answer.';
       }
     });
@@ -186,16 +230,21 @@ class _DataPlaneViewState extends State<DataPlaneView> {
     final knowledge = collections.where((c) => c.isKnowledge).length;
     final data = collections.length - knowledge;
 
+    final ontologyMode = widget.mode == DataPlaneMode.ontology;
     return PageBody(
       padding: const EdgeInsets.fromLTRB(28, 20, 28, 40),
       children: [
         PageHeading(
-          eyebrow: 'Knowledge layer · data',
-          title: 'Data',
-          subtitle:
-              'Every Collection the map owns, the feeds that land into it, the '
-              'entities it resolves to, and the artifacts it keeps. Business '
-              'views onto these rows live in Workspaces.',
+          eyebrow: ontologyMode
+              ? 'Knowledge layer · encoded'
+              : 'Knowledge layer · synced',
+          title: ontologyMode ? 'Ontology' : 'Sources',
+          subtitle: ontologyMode
+              ? 'What we encoded: the schema (TBox), what exists against it '
+                  '(ABox), the Collection declarations governance hangs off, '
+                  'and the Mappings that bind external systems in.'
+              : 'What arrives from outside: each feed against its declared '
+                  'contract, and the artifacts the flows keep as evidence.',
           trailing: OutlinedButton.icon(
             onPressed: _loading ? null : _load,
             icon: const Icon(Icons.refresh, size: 16),
@@ -204,40 +253,68 @@ class _DataPlaneViewState extends State<DataPlaneView> {
         ),
         if (_error != null) ErrorNotice(message: _error!, onRetry: _load),
         StatStrip(
-          tiles: [
-            StatTile(
-              label: 'Collections',
-              value: '${collections.length}',
-              caption: '$knowledge knowledge · $data data',
-            ),
-            StatTile(
-              label: 'Objects',
-              value: _n(_graphStats['objects']),
-              caption: '${_n(_graphStats['links'])} typed links',
-            ),
-            StatTile(
-              label: 'Sources',
-              value: '${sources.length}',
-              caption: sources.isEmpty
-                  ? 'nothing synced yet'
-                  : '${sources.fold<int>(0, (s, r) => s + r.recordsLanded)} '
-                      'records landed',
-            ),
-            StatTile(
-              label: 'Artifacts',
-              value: _n(_documentStats['documents']),
-              caption: '${_n(_documentStats['expiring'])} past retention',
-            ),
-            StatTile(
-              label: 'Conflicted',
-              value: _n(_graphStats['conflicted_objects']),
-              caption: 'sources disagree, both kept',
-            ),
-          ],
+          tiles: ontologyMode
+              ? [
+                  StatTile(
+                    label: 'Object types',
+                    value: '${_ontology?.objects.length ?? '—'}',
+                    caption:
+                        '${_ontology?.links.length ?? '—'} link types',
+                  ),
+                  StatTile(
+                    label: 'Objects',
+                    value: _n(_graphStats['objects']),
+                    caption: '${_n(_graphStats['links'])} typed links',
+                  ),
+                  StatTile(
+                    label: 'Conformance',
+                    value: _invariants.objectsChecked > 0
+                        ? '${_invariants.violations.length}'
+                        : '—',
+                    caption: 'invariant violations',
+                  ),
+                  StatTile(
+                    label: 'Collections',
+                    value: '${collections.length}',
+                    caption: '$knowledge knowledge · $data data',
+                  ),
+                  StatTile(
+                    label: 'Mappings',
+                    value: '${_mappings?.mappings.length ?? '—'}',
+                    caption: (_mappings?.problems.isEmpty ?? true)
+                        ? 'all conform'
+                        : '${_mappings!.problems.length} problem(s)',
+                  ),
+                ]
+              : [
+                  StatTile(
+                    label: 'Sources',
+                    value: '${sources.length}',
+                    caption: sources.isEmpty
+                        ? 'nothing synced yet'
+                        : '${sources.fold<int>(0, (s, r) => s + r.recordsLanded)} '
+                            'records landed',
+                  ),
+                  StatTile(
+                    label: 'Mappings',
+                    value: '${_mappings?.mappings.length ?? '—'}',
+                    caption: 'declared contracts',
+                  ),
+                  StatTile(
+                    label: 'Artifacts',
+                    value: _n(_documentStats['documents']),
+                    caption: '${_n(_documentStats['expiring'])} past retention',
+                  ),
+                  StatTile(
+                    label: 'Conflicted',
+                    value: _n(_graphStats['conflicted_objects']),
+                    caption: 'sources disagree, both kept',
+                  ),
+                ],
         ),
         Row(
           children: [
-            for (final lens in _Lens.values) ...[
+            for (final lens in _lenses) ...[
               LensChip(
                 label: _label(lens),
                 selected: _lens == lens,
@@ -247,7 +324,7 @@ class _DataPlaneViewState extends State<DataPlaneView> {
             ],
           ],
         ),
-        if (_loading && _collections == null)
+        if (_loading && _collections == null && _sources == null)
           const CumulusLoading()
         else
           switch (_lens) {
@@ -258,7 +335,11 @@ class _DataPlaneViewState extends State<DataPlaneView> {
               onOpenExpense: widget.onOpenExpenseWorkspace,
               onOpenPayables: widget.onOpenPayablesWorkspace,
             ),
-            _Lens.sources => _SourcesLens(sources: sources),
+            _Lens.sources => _SourcesLens(
+              sources: sources,
+              mappings: _mappings?.mappings ?? const [],
+            ),
+            _Lens.mappings => _MappingsLens(registry: _mappings),
             _Lens.model => _ModelLens(
               ontology: _ontology,
               invariants: _invariants,
@@ -311,10 +392,11 @@ class _DataPlaneViewState extends State<DataPlaneView> {
   }
 
   static String _label(_Lens lens) => switch (lens) {
-    _Lens.collections => 'COLLECTIONS',
-    _Lens.sources => 'SOURCES',
     _Lens.model => 'MODEL · TBOX',
     _Lens.instances => 'INSTANCES · ABOX',
+    _Lens.collections => 'COLLECTIONS',
+    _Lens.mappings => 'MAPPINGS',
+    _Lens.sources => 'FEEDS',
     _Lens.documents => 'DOCUMENTS',
   };
 
@@ -545,7 +627,18 @@ IconData _iconForKind(String kind) => switch (kind) {
 class _SourcesLens extends StatelessWidget {
   final List<SourceStatus> sources;
 
-  const _SourcesLens({required this.sources});
+  /// Declared contracts, joined onto the rows below so a feed is always shown
+  /// against what it *promised*, not just what it delivered.
+  final List<SourceMapping> mappings;
+
+  const _SourcesLens({required this.sources, required this.mappings});
+
+  SourceMapping? _contract(SourceStatus source) {
+    for (final m in mappings) {
+      if (m.source == source.source) return m;
+    }
+    return null;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -571,7 +664,10 @@ class _SourcesLens extends StatelessWidget {
             subtitle:
                 'one row per source and kind, assembled from the sync runs — '
                 'not from a separate bookkeeping store',
-            children: [for (final source in sources) _SourceRow(source: source)],
+            children: [
+              for (final source in sources)
+                _SourceRow(source: source, mapping: _contract(source)),
+            ],
           ),
         CumulusCard(
           child: Column(
@@ -606,8 +702,9 @@ class _SourcesLens extends StatelessWidget {
 
 class _SourceRow extends StatelessWidget {
   final SourceStatus source;
+  final SourceMapping? mapping;
 
-  const _SourceRow({required this.source});
+  const _SourceRow({required this.source, this.mapping});
 
   @override
   Widget build(BuildContext context) {
@@ -668,6 +765,24 @@ class _SourceRow extends StatelessWidget {
                 Text('· ${source.lastRunId}', style: CumulusText.mono),
             ],
           ),
+          if (mapping != null) ...[
+            const SizedBox(height: 6),
+            // The contract line: what this feed binds to, per its Mapping.
+            Wrap(
+              spacing: 12,
+              runSpacing: 4,
+              children: [
+                Text('contract: ${mapping!.strategy}'
+                    '${mapping!.landsAs.isEmpty ? '' : ' → ${mapping!.landsAs}'}',
+                    style: CumulusText.meta),
+                for (final b in mapping!.identity)
+                  Text('· ${b.column} → ${b.objectType}',
+                      style: CumulusText.meta),
+                Text('· escalates ${mapping!.escalation}',
+                    style: CumulusText.meta),
+              ],
+            ),
+          ],
           if (source.lastError.isNotEmpty) ...[
             const SizedBox(height: 6),
             Text(
@@ -2132,6 +2247,160 @@ class _InstanceInventoryCard extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mappings — the declared seams
+// ---------------------------------------------------------------------------
+
+/// One card per feed contract, read from `server/app/mappings.py` via the
+/// registry endpoint. The point of the lens is that the whole contract is one
+/// artifact: binding, precedence, policy ref, custody, escalation — nowhere
+/// else to look.
+class _MappingsLens extends StatelessWidget {
+  final MappingRegistry? registry;
+
+  const _MappingsLens({required this.registry});
+
+  @override
+  Widget build(BuildContext context) {
+    final reg = registry;
+    if (reg == null) {
+      return const CumulusCard(
+        child: CumulusEmptyState(
+          icon: Icons.cable_outlined,
+          title: 'The mapping registry did not answer',
+          message: 'GET /api/v1/mappings returns the declared contracts.',
+        ),
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 16,
+      children: [
+        if (reg.problems.isNotEmpty)
+          CumulusCard(
+            borderColor: CumulusColors.danger,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SectionHeader(
+                  title: 'Registry does not conform',
+                  subtitle: 'a mapping names something that does not exist',
+                ),
+                const SizedBox(height: 8),
+                for (final p in reg.problems)
+                  Text('· $p', style: CumulusText.body),
+              ],
+            ),
+          ),
+        ListCard(
+          title: 'Declared contracts',
+          subtitle:
+              'one per feed — what arrives, what it binds to, and whether '
+              'rows are reified into the graph or column-bound and resolved '
+              'lazily. Declared in server/app/mappings.py, exported to the '
+              'corpus like the ontology.',
+          children: [for (final m in reg.mappings) _MappingRow(mapping: m)],
+        ),
+        CumulusCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SectionHeader(
+                title: 'Reify vs. bind',
+                subtitle: 'the one decision a Mapping adds beyond binding',
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'Reify a source row into the graph only when the row itself '
+                'needs identity, provenance, or human adjudication — a vendor '
+                'list, a purchase order. A high-volume feed (telemetry, GL '
+                'transactions) is column-bound instead: the mapping declares '
+                'that a column carries identifiers of a type, resolution '
+                'happens lazily at query or rollup time, and unresolvable '
+                'ids escalate on aggregates. A million readings must never '
+                'become a million objects. Every feed running today reifies; '
+                'the registry refuses a bind mapping that tries to name a '
+                'lands-as type, so the distinction cannot blur silently.',
+                style: CumulusText.body,
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _MappingRow extends StatelessWidget {
+  final SourceMapping mapping;
+
+  const _MappingRow({required this.mapping});
+
+  @override
+  Widget build(BuildContext context) {
+    final m = mapping;
+    return CumulusListRow(
+      leading: Container(
+        width: 34,
+        height: 34,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: CumulusTone.violet.background,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: const Icon(Icons.cable_outlined, size: 17,
+            color: CumulusColors.ink),
+      ),
+      title: Row(
+        children: [
+          Flexible(child: Text(m.id)),
+          const SizedBox(width: 10),
+          StatusBadge(m.strategy, dense: true, uppercase: true),
+          const SizedBox(width: 6),
+          StatusBadge(m.transport, dense: true),
+          if (m.custody == 'reference') ...[
+            const SizedBox(width: 6),
+            StatusBadge('reference custody',
+                tone: CumulusTone.warn, dense: true),
+          ],
+        ],
+      ),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(m.summary),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 12,
+            runSpacing: 4,
+            children: [
+              Text('${m.system} · payload ${m.payload}',
+                  style: CumulusText.meta),
+              if (m.landsAs.isNotEmpty)
+                Text('· lands as ${m.landsAs}', style: CumulusText.mono),
+              for (final b in m.identity)
+                Text('· ${b.column} → ${b.objectType} (by ${b.key})',
+                    style: CumulusText.meta),
+              if (m.precedenceSource.isNotEmpty)
+                Text('· claims write as ${m.precedenceSource}',
+                    style: CumulusText.meta),
+              if (m.matchPolicy.isNotEmpty)
+                Text('· policy ${m.matchPolicy}', style: CumulusText.mono),
+              if (m.collection.isNotEmpty)
+                Text('· governed by ${m.collection}', style: CumulusText.meta),
+              Text('· escalates ${m.escalation}', style: CumulusText.meta),
+            ],
+          ),
+          if (m.notes.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(m.notes, style: CumulusText.meta),
+          ],
+        ],
+      ),
     );
   }
 }

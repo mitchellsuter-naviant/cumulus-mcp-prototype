@@ -2,10 +2,11 @@
 id: vendor-exemplar-northwind-traders
 path: finance/exemplars/northwind-traders
 title: "Vendor exemplar: Northwind Traders"
-authority_level: how-to
+kind: exemplar
+origin: flywheel
 scope: org
 owner: finance-ops
-tags: exemplar, ap, northwind-traders, governed-knowledge
+tags: exemplar, ap, northwind-traders
 status: published
 ---
 # Vendor exemplar: Northwind Traders

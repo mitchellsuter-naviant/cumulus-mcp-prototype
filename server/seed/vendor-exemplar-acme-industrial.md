@@ -2,7 +2,8 @@
 id: vendor-exemplar-acme-industrial
 path: finance/exemplars/acme-industrial
 title: "Vendor exemplar: Acme Industrial"
-authority_level: how-to
+kind: exemplar
+origin: flywheel
 scope: org
 owner: finance-ops
 tags: exemplar, ap, acme-industrial

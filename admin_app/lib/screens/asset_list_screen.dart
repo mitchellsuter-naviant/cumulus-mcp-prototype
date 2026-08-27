@@ -149,7 +149,10 @@ class _AssetsSectionState extends State<AssetsSection> {
       _error = null;
     });
     try {
-      final assets = await _api.listAssets();
+      // The Library is documents people wrote. Exemplars live under
+      // Learned and schema-exports under Ontology — same corpus, different
+      // question, so the kind filter carves this screen's slice server-side.
+      final assets = await _api.listAssets(kind: 'document');
       if (!mounted) return;
       setState(() {
         _assets = assets;

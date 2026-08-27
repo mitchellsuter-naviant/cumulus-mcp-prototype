@@ -68,6 +68,13 @@ class _AssetEditorViewState extends State<AssetEditorView> {
 
   String _contentType = 'text/markdown';
   String _authorityLevel = 'note';
+  String _kind = 'document';
+  String _origin = 'authored';
+
+  /// Generated from Python and republished on every startup — the server
+  /// refuses edits (409), so the editor says so up front instead of letting
+  /// someone type into a page that cannot take it.
+  bool get _generated => _kind == 'schema-export';
   String _status = 'draft';
   String _scope = 'org';
 
@@ -214,7 +221,12 @@ class _AssetEditorViewState extends State<AssetEditorView> {
       _relatedController.text = asset.related.join(', ');
       setState(() {
         _contentType = asset.contentType;
-        _authorityLevel = asset.authorityLevel;
+        // Empty for non-documents (an exemplar carries no authority); the
+        // dropdown still needs a resolvable value.
+        _authorityLevel =
+            asset.authorityLevel.isEmpty ? 'note' : asset.authorityLevel;
+        _kind = asset.kind;
+        _origin = asset.origin;
         _status = asset.status;
         _scope = asset.scope;
         _owner = asset.owner;
@@ -250,6 +262,8 @@ class _AssetEditorViewState extends State<AssetEditorView> {
       content: _contentController.text,
       contentType: _contentType,
       authorityLevel: _authorityLevel,
+      kind: _kind,
+      origin: _origin,
       scope: _scope,
       owner: _owner,
       supersedes: _supersedes,
@@ -340,10 +354,15 @@ class _AssetEditorViewState extends State<AssetEditorView> {
                       : _titleController.text)
                 : 'New asset',
             pills: [
-              MetaPill(
-                _authorityChoices[_authorityLevel]!.split(' — ').first,
-                tone: toneForAuthority(_authorityLevel),
-              ),
+              if (_kind == 'document')
+                MetaPill(
+                  _authorityChoices[_authorityLevel]!.split(' — ').first,
+                  tone: toneForAuthority(_authorityLevel),
+                )
+              else
+                MetaPill(_kind, tone: CumulusTone.violet),
+              if (_origin != 'authored')
+                MetaPill('origin $_origin', tone: CumulusTone.teal),
               MetaPill(
                 _statusChoices[_status]!,
                 tone: toneForStatus(_status),
@@ -354,7 +373,7 @@ class _AssetEditorViewState extends State<AssetEditorView> {
               children: [
                 if (_isEdit) ...[
                   OutlinedButton.icon(
-                    onPressed: _saving ? null : _delete,
+                    onPressed: (_saving || _generated) ? null : _delete,
                     icon: const Icon(Icons.delete_outline, size: 16),
                     label: const Text('Delete'),
                     style: OutlinedButton.styleFrom(
@@ -365,7 +384,7 @@ class _AssetEditorViewState extends State<AssetEditorView> {
                   const SizedBox(width: 10),
                 ],
                 FilledButton.icon(
-                  onPressed: _saving ? null : _save,
+                  onPressed: (_saving || _generated) ? null : _save,
                   icon: _saving
                       ? const SizedBox(
                           width: 15,
@@ -381,6 +400,25 @@ class _AssetEditorViewState extends State<AssetEditorView> {
               ],
             ),
           ),
+          if (_generated)
+            const CumulusCard(
+              child: Row(
+                children: [
+                  Icon(Icons.sync_outlined, size: 18,
+                      color: CumulusColors.inkSecondary),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Generated from code and republished on every startup — '
+                      'the declaration in server/app/ is the source of truth, '
+                      'and the server refuses edits to this page. Read it '
+                      'here; change it in Python.',
+                      style: CumulusText.body,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           if (_error != null) ErrorNotice(message: _error!),
           SectionCard(
             title: 'Identity',

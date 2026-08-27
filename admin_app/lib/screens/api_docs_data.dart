@@ -134,6 +134,12 @@ const knowledgeGroup = EndpointGroup(
                 'path itself and everything beneath it.'),
         ApiParam('status', 'string', where: 'query',
             description: 'One of `draft`, `published`, `deprecated`.'),
+        ApiParam('kind', 'string', where: 'query',
+            description:
+                'One of `document`, `exemplar`, `schema-export`, `prompt`, '
+                '`config`. The Library is `kind=document`; the exemplar shelf '
+                'is `kind=exemplar`. Assets carry `origin` too — who put them '
+                'here: authored, flywheel, derived.'),
       ],
       responseExample: '[$_assetSummaryShape]',
     ),
@@ -289,6 +295,9 @@ const knowledgeGroup = EndpointGroup(
       errors: [
         ApiError(403, 'Requires admin role, or admin of the team that owns this asset'),
         ApiError(404, 'Asset not found: {asset_id}'),
+        ApiError(409,
+            'kind=schema-export: generated from code and republished on '
+            'every startup — edit the declaration in server/app/ instead'),
         ApiError(422, 'Validation error, e.g. an empty path'),
       ],
     ),
@@ -301,7 +310,12 @@ const knowledgeGroup = EndpointGroup(
       params: [
         ApiParam('asset_id', 'string', where: 'path', required: true),
       ],
-      errors: [ApiError(404, 'Asset not found: {asset_id}')],
+      errors: [
+        ApiError(404, 'Asset not found: {asset_id}'),
+        ApiError(409,
+            'kind=schema-export: deleting only lasts until the next startup '
+            'republishes it'),
+      ],
     ),
   ],
 );
@@ -336,6 +350,11 @@ const searchGroup = EndpointGroup(
             where: 'query',
             defaultValue: 'false',
             description: 'Drafts and deprecated assets are excluded by default.'),
+        ApiParam('kind', 'string',
+            where: 'query',
+            description:
+                'Restrict by asset kind, so governed-context retrieval and '
+                'exemplar lookup cannot cross.'),
         ApiParam('mode', 'string',
             where: 'query',
             defaultValue: 'hybrid',
@@ -1675,6 +1694,58 @@ const graphGroup = EndpointGroup(
 
 // ---- Collections, documents, sources ------------------------------------------
 
+// ---- Mappings ----------------------------------------------------------------
+
+const mappingsGroup = EndpointGroup(
+  title: 'Mappings',
+  blurb:
+      'The declared seams between external systems and the graph — the '
+      'doctrine\'s Mapping primitive, one contract per feed: what arrives, '
+      'what it binds to via which keys, under which match policy and '
+      'precedence, and whether rows are **reified** into the graph (so a '
+      'steward can adjudicate them) or **column-bound** and resolved lazily '
+      '(so a high-volume feed never mints objects per row). Declared in '
+      '`server/app/mappings.py` and exported to the corpus like the ontology; '
+      'read-only over HTTP for the same reason the graph is.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/mappings',
+      summary: 'Every declared contract, plus registry conformance.',
+      auth: ApiAuth.reader,
+      notes:
+          '`problems` lists structural failures — a mapping naming a type, '
+          'Collection or precedence source that does not exist. Empty means '
+          'the registry conforms, checked the same way the TBox invariant '
+          'sweep checks the graph.',
+      responseExample: '''{
+  "mappings": [{
+    "id": "erp-vendors",
+    "source": "erp-vendors",
+    "strategy": "reify",
+    "lands_as": "SourceRecord",
+    "resolves_to": ["Vendor"],
+    "identity": [{"column": "name", "object_type": "Vendor",
+                  "key": "normalized legal name"}],
+    "precedence_source": "erp",
+    "match_policy": "knowledge:entity-resolution-policy",
+    "custody": "copy",
+    "collection": "source-landing",
+    "escalation": "per-row task"
+  }],
+  "problems": []
+}''',
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/mappings/{mapping_id}',
+      summary: 'One contract.',
+      auth: ApiAuth.reader,
+      errors: [ApiError(404, 'No such mapping.')],
+    ),
+  ],
+);
+
 const dataGroup = EndpointGroup(
   title: 'Data governance',
   blurb:
@@ -2022,6 +2093,7 @@ const restGroups = <EndpointGroup>[
   runsGroup,
   graphGroup,
   worldsGroup,
+  mappingsGroup,
   evalsGroup,
   dataGroup,
   apiKeysGroup,

@@ -549,6 +549,7 @@ class KnowledgeService:
             total=len([a for a in candidates if active.matches(a)]),
             owner=counts("owner", lambda a: a.owner),
             authority_level=counts("authority_level", lambda a: a.authority_level),
+            kind=counts("kind", lambda a: a.kind),
             status=counts("status", lambda a: a.status),
             branch=counts("path_prefix", lambda a: a.path.split("/")[0]),
         )
@@ -707,7 +708,11 @@ def _sorted_hits(hits: list[SearchHit], sort: str) -> list[SearchHit]:
         return sorted(
             hits,
             key=lambda h: (
-                AUTHORITY_ORDER.index(h.asset.authority_level),
+                # None (an exemplar, a schema export) sorts after every
+                # document that actually carries authority.
+                AUTHORITY_ORDER.index(h.asset.authority_level)
+                if h.asset.authority_level in AUTHORITY_ORDER
+                else len(AUTHORITY_ORDER),
                 -h.score,
             ),
         )
