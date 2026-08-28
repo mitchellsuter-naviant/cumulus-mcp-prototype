@@ -149,9 +149,9 @@ class _AssetsSectionState extends State<AssetsSection> {
       _error = null;
     });
     try {
-      // The Library is documents people wrote. Exemplars live under
-      // Learned and schema-exports under Ontology — same corpus, different
-      // question, so the kind filter carves this screen's slice server-side.
+      // The Library is documents people wrote. Schema-exports live under
+      // Ontology — same corpus, different question, so the kind filter carves
+      // this screen's slice server-side.
       final assets = await _api.listAssets(kind: 'document');
       if (!mounted) return;
       setState(() {
@@ -252,8 +252,8 @@ class _AssetsSectionState extends State<AssetsSection> {
     return PlaneHeader(
       summary:
           'What people wrote: policies, standards, guidelines and notes — the '
-          'documents that argue and carry authority. Exemplars live under '
-          'Learned; generated exports under Ontology.',
+          'documents that argue and carry authority. Generated exports live '
+          'under Ontology.',
       pills: [
         MetaPill('${_assets.length} assets'),
         MetaPill('$published published', tone: CumulusTone.success),

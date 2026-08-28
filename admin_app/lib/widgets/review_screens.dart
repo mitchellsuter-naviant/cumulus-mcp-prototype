@@ -858,21 +858,17 @@ class _InvoiceReviewState extends State<_InvoiceReview> {
   @override
   Widget build(BuildContext context) {
     final invoice = _invoice;
-    final isCuration = widget.task.kind == 'curation';
     final total = _lines.fold<double>(0, (sum, line) => sum + line.amount);
     return _ReviewFrame(
       eyebrow: 'Invoice review · ${widget.task.queue}',
       title: widget.task.title,
-      subtitle: isCuration
-          ? 'Three extractors read this document independently. Verify the '
-              'adjudicated values — approving writes this vendor’s exemplar, '
-              'so the next invoice from them is one confident pass.'
-          : 'Correct what the extraction read, and the three-way match and the '
-              'anomaly screen run again over the corrected values.',
+      subtitle: 'Correct what the extraction read, and the three-way match '
+          'and the anomaly screen run again over the corrected values — a '
+          'correction re-runs the checks rather than overriding them.',
       footer: _DecisionBar(
         note: _note,
         dirty: _dirty,
-        correctLabel: isCuration ? 'Verify with corrections' : 'Apply and re-check',
+        correctLabel: 'Apply and re-check',
         onApprove: () => _decide('approved'),
         onReject: () => _decide('rejected'),
         onCorrect: () => _decide('corrected'),
@@ -900,15 +896,11 @@ class _InvoiceReviewState extends State<_InvoiceReview> {
                           '${invoice.vendorName} · ${invoice.vendorResolution}',
                           tone: CumulusTone.teal,
                         ),
-                        MetaPill(invoice.extractionPath,
-                            tone: CumulusTone.violet),
                         if (invoice.matchVerdict.isNotEmpty)
                           MetaPill('match: ${invoice.matchVerdict}',
                               tone: invoice.matchVerdict == 'matched'
                                   ? CumulusTone.success
                                   : CumulusTone.warn),
-                        if (invoice.exemplarRef.isNotEmpty)
-                          MetaPill(invoice.exemplarRef),
                         MetaPill(invoice.policyRef),
                       ],
                     ),
@@ -1067,21 +1059,6 @@ class _InvoiceReviewState extends State<_InvoiceReview> {
                               ),
                             ],
                           ),
-                        ),
-                    ],
-                    if (invoice.conflicts.isNotEmpty) ...[
-                      const SizedBox(height: 20),
-                      const FieldLabel(
-                        'Where the three extractors disagreed',
-                        hint: 'the adjudicator picked; you are the tiebreak',
-                      ),
-                      for (final conflict in invoice.conflicts)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 3),
-                          child: Text('· $conflict',
-                              style: CumulusText.body.copyWith(
-                                color: CumulusColors.warn,
-                              )),
                         ),
                     ],
                     if (invoice.anomalyBasis.isNotEmpty) ...[

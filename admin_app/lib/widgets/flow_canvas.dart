@@ -17,9 +17,10 @@ const double _padding = 44;
 CumulusTone stepTone(String type) => switch (type) {
   'trigger' => CumulusTone.teal,
   'modelcall' => CumulusTone.violet,
-  'rule' => CumulusTone.warn,
+  'rule' || 'check' => CumulusTone.warn,
   'task' => CumulusTone.accent,
   'action' => CumulusTone.success,
+  'resolve' || 'sync' => CumulusTone.teal,
   _ => CumulusTone.neutral,
 };
 

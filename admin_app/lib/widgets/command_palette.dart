@@ -378,7 +378,7 @@ class CommandCatalog extends ChangeNotifier {
     ),
     CatalogEntry(
       label: 'Accounts Payable',
-      detail: 'workspace — invoices, exemplars, posting',
+      detail: 'workspace — invoices, matching, posting',
       keywords: 'workspace ap accounts payable invoices vendors posting',
       icon: Icons.folder_outlined,
       intent: OpenSectionIntent(5),

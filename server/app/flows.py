@@ -48,9 +48,14 @@ FlowStatus = Literal["draft", "active", "paused", "deprecated"]
 # The step vocabulary of the declarative export. `transform` is authored
 # non-model logic (parse, reshape, entity-match) carried as a faithful
 # plain-language description — implementation stays machinery.
-StepType = Literal["trigger", "modelcall", "rule", "task", "action", "event", "transform"]
+# The declared vocabulary is the executed one: `StepKind` in runs.py is the
+# same list, so a step a run journals can always be found on the definition.
+StepType = Literal[
+    "trigger", "modelcall", "transform", "rule", "task", "action", "event",
+    "sync", "check", "resolve",
+]
 GoldenSource = Literal[
-    "correction-set", "exemplar", "human-authored", "promoted-from-run"
+    "correction-set", "human-authored", "promoted-from-run"
 ]
 # How a fact assertion is graded. `judge` is itself a governed ModelCall.
 FactOp = Literal["equals", "approx", "one_of", "judge"]
@@ -1990,7 +1995,6 @@ class FlowService:
     # being thoroughly labelled.
     _SOURCE_RATES = {
         "correction-set": 0.94,
-        "exemplar": 0.84,
         "human-authored": 0.90,
         "promoted-from-run": 0.92,
     }
@@ -2002,7 +2006,7 @@ class FlowService:
         "elevate": "approve", "standard": "escalate", "escalate": "standard",
         "accept": "review", "true": "false", "false": "true",
         "completed": "escalated", "matched": "mismatched",
-        "post": "review", "one-shot": "ensemble", "ensemble": "one-shot",
+        "post": "review", "variance": "matched", "unmatched": "matched",
         # A committed Action that should not have committed flips to "none";
         # "none" itself flips to the flow's own terminal commit, derived from
         # its steps in `_diverged` rather than hard-coded here.
@@ -2362,17 +2366,18 @@ def _seed_definitions() -> list[FlowDefinition]:
             id="accounts-payable",
             name="Accounts payable",
             description=(
-                "Classifies the vendor on an inbound invoice, extracts one-shot from "
-                "the vendor's exemplar in the knowledge layer — or, for an unknown "
-                "vendor, runs three independent extractions, adjudicates them, and "
-                "raises a Task to verify the new exemplar — then posts under the "
-                "governed auto-post limit. Three-way match and fraud screening are "
-                "declared placeholders until the PO and receiving feeds land."
+                "Reads an inbound invoice in one extraction pass, resolves the "
+                "printed vendor name against the vendor master, matches the "
+                "billed lines against the purchase order and the receiving "
+                "report already in the graph, screens the invoice against this "
+                "vendor's own payment history, and posts under the governed "
+                "auto-post limit — or routes it to a clerk, whose correction "
+                "re-runs the match rather than overriding it."
             ),
             team="finance-ops",
             status="active",
-            version=5,
-            tags=["ap", "invoices", "vision", "ensemble"],
+            version=6,
+            tags=["ap", "invoices", "vision", "three-way-match"],
             queues=["ap-clerk"],
             workspace="ap-workspace",
             roi_minutes_per_run=9,
@@ -2387,13 +2392,13 @@ def _seed_definitions() -> list[FlowDefinition]:
             ),
             contract=FlowContract(facts=[
                 ContractFact(path="invoice.vendor_id", type="ref", kind="extraction",
-                             description="canonical vendor the classifier resolves to"),
+                             description="canonical vendor the resolver settles on"),
                 ContractFact(path="invoice.invoice_number", type="string", kind="extraction"),
                 ContractFact(path="invoice.invoice_date", type="string", kind="extraction"),
                 ContractFact(path="invoice.po_number", type="string", kind="extraction"),
                 ContractFact(path="invoice.total_usd", type="money", kind="extraction"),
-                ContractFact(path="invoice.extraction_path", type="string", kind="verdict",
-                             description="one-shot from the exemplar, or ensemble for an unknown vendor"),
+                ContractFact(path="invoice.match_verdict", type="string", kind="verdict",
+                             description="matched, variance, unmatched or blocked"),
                 ContractFact(path="invoice.verdict", type="verdict", kind="verdict",
                              description="post automatically, or route to review"),
                 ContractFact(path="invoice.posted", type="bool", kind="commit"),
@@ -2401,58 +2406,53 @@ def _seed_definitions() -> list[FlowDefinition]:
             steps=[
                 FlowStep(id="t1", type="trigger", name="InvoiceReceived",
                          summary="one run per inbound invoice",
-                         config={"event": "InvoiceReceived"}, next=["m0"]),
-                FlowStep(id="m0", type="modelcall", name="classify-vendor",
-                         summary="names the vendor and resolves it to a canonical slug, with confidence",
-                         config={"model": "claude-haiku-4-5", "prompt": "vendor-classifier v4"},
-                         next=["x1"]),
-                FlowStep(id="x1", type="transform", name="load-exemplar",
-                         summary="looks up the vendor's one-shot exemplar in the knowledge layer — the flow gathers; rules never fetch",
-                         config={"source": "knowledge:vendor-exemplar-{vendor}"}, next=["r1"]),
-                FlowStep(id="r1", type="rule", name="exemplar-known",
-                         summary="does a verified exemplar exist for this vendor?",
-                         config={"rule_type": "match-condition"},
-                         next=["m1", "m2a"], branch_labels=["one-shot", "ensemble"]),
-                FlowStep(id="m1", type="modelcall", name="extract-one-shot",
-                         summary="extracts number, dates, PO and total using the vendor exemplar as the one-shot template",
-                         config={"model": "claude-sonnet-5", "prompt": "invoice-extraction-oneshot v7"},
+                         config={"event": "InvoiceReceived"}, next=["s1"]),
+                FlowStep(id="s1", type="action", name="store-document",
+                         summary="the invoice bytes land in the document store before anything reads them, so every later claim has an artifact to point at",
+                         config={"target": "documents", "gateway": "action-gateway"},
+                         next=["m1"]),
+                FlowStep(id="m1", type="modelcall", name="extract-invoice",
+                         summary="one pass over the document: the vendor as printed, the invoice number, dates, PO, totals and the billed lines — with a confidence",
+                         config={"model": "claude-sonnet-5", "prompt": "invoice-extraction v8"},
+                         next=["z1"]),
+                FlowStep(id="z1", type="resolve", name="resolve-vendor",
+                         summary="the printed name becomes a canonical Vendor id against the vendor master; an unknown one is minted `onboarding`, an ambiguous one stops the run",
+                         config={"entity": "Vendor", "source": "knowledge:entity-resolution-policy"},
+                         next=["x3", "k0"], branch_labels=["resolved", "ambiguous"]),
+                FlowStep(id="k0", type="task", name="confirm-vendor",
+                         summary="a clerk names the vendor from the scored candidates — nothing is asserted until they do, because posting against the wrong vendor is not recoverable",
+                         config={"queue": "ap-clerk"}, next=["a0"]),
+                FlowStep(id="a0", type="action", name="apply-vendor-decision",
+                         summary="guarded write of the vendor the clerk chose: an identity link, or a newly minted vendor",
+                         config={"target": "vendor-master", "gateway": "action-gateway"},
                          next=["x3"]),
-                FlowStep(id="m2a", type="modelcall", name="extract-a",
-                         summary="independent blind extraction — first of three, because no exemplar exists yet",
-                         config={"model": "claude-sonnet-5", "prompt": "invoice-extraction v7"},
-                         next=["m2b"]),
-                FlowStep(id="m2b", type="modelcall", name="extract-b",
-                         summary="independent blind extraction — different model, same document",
-                         config={"model": "gemini-2.5-flash", "prompt": "invoice-extraction v7"},
-                         next=["m2c"]),
-                FlowStep(id="m2c", type="modelcall", name="extract-c",
-                         summary="independent blind extraction — third opinion",
-                         config={"model": "claude-haiku-4-5", "prompt": "invoice-extraction v7"},
-                         next=["x2"]),
-                FlowStep(id="x2", type="transform", name="adjudicate",
-                         summary="merges the three candidates field-by-field: majority wins, near-equal amounts agree, and every disagreement is recorded as a conflict for the human",
-                         config={"language": "python"}, next=["k1"]),
-                FlowStep(id="k1", type="task", name="verify-exemplar",
-                         summary="a clerk verifies the adjudicated fields and the proposed exemplar; corrections seed the correction set — the vendor graduates from unknown to known",
-                         config={"queue": "ap-clerk"}, next=["a2"]),
-                FlowStep(id="a2", type="action", name="save-exemplar",
-                         summary="writes the verified exemplar into the knowledge layer — a governed knowledge write, ledgered like any other",
-                         config={"target": "knowledge-layer", "gateway": "action-gateway"}, next=["x3"]),
-                FlowStep(id="x3", type="transform", name="three-way-match",
-                         summary="placeholder — will match invoice ↔ purchase order ↔ receiving record when the PO and receiving feeds land",
-                         config={"status": "placeholder"}, next=["x4"]),
-                FlowStep(id="x4", type="transform", name="fraud-screen",
-                         summary="placeholder — will score bank-detail changes, duplicate invoices, and round-number anomalies",
-                         config={"status": "placeholder"}, next=["r2"]),
+                FlowStep(id="x3", type="transform", name="project-lines",
+                         summary="the extracted lines become facts against the contract's paths — the same vocabulary the golden sets assert on",
+                         config={"language": "python"}, next=["x4"]),
+                FlowStep(id="x4", type="transform", name="gather-po-and-receiving",
+                         summary="reads the purchase order and receiving lines out of the graph — the flow gathers; the matcher and the rule never fetch",
+                         config={"source": "graph:PurchaseOrder,ReceivingReport"},
+                         next=["c1"]),
+                FlowStep(id="c1", type="check", name="three-way-match",
+                         summary="pairs invoice ↔ PO ↔ receiving line by line within the governed tolerances, and writes the pairings as a MatchSet rather than discarding them",
+                         config={"source": "knowledge:invoice-posting-policy"},
+                         next=["c2"]),
+                FlowStep(id="c2", type="check", name="anomaly-screen",
+                         summary="scores the invoice against this vendor's own payment history — duplicates, amount outliers, round numbers — with thresholds read at run time",
+                         config={"source": "knowledge:invoice-posting-policy"},
+                         next=["x5"]),
+                FlowStep(id="x5", type="transform", name="read-posting-policy",
+                         summary="gathers the governed posting values (auto-post limit, confidence floor) for the rule",
+                         config={"source": "knowledge:invoice-posting-policy"}, next=["r2"]),
                 FlowStep(id="r2", type="rule", name="post-or-review",
-                         summary="under the governed auto-post limit, with a confident classification?",
+                         summary="under the governed auto-post limit, confidently extracted, matched, and nothing unusual?",
                          config={"rule_type": "threshold", "source": "knowledge:invoice-posting-policy"},
                          next=["a1", "k2"], branch_labels=["post", "review"]),
                 FlowStep(id="k2", type="task", name="review-invoice",
-                         summary="a clerk decides the flagged invoice with the extraction and policy findings attached",
+                         summary="a clerk decides the flagged invoice; a correction re-runs the match and the rule rather than overriding them",
                          config={"queue": "ap-clerk"}, next=["a1"]),
                 FlowStep(id="a1", type="action", name="post-to-ap",
-                         summary="guarded write of the posting into the AP ledger",
+                         summary="guarded write of the invoice, its lines and the match set into the graph and the AP ledger",
                          config={"target": "ap-ledger", "gateway": "action-gateway"}, next=["e1"]),
                 FlowStep(id="e1", type="event", name="InvoicePosted",
                          summary="emitted on commit", config={"event": "InvoicePosted"}),
@@ -2635,7 +2635,7 @@ _SEED_CASE_EXTRAS: dict[str, dict] = {
             ("invoice.invoice_date", "2026-08-02"),
             ("invoice.po_number", "PO-4471"),
             ("invoice.total_usd", "1840.00"),
-            ("invoice.extraction_path", "one-shot"),
+            ("invoice.match_verdict", "matched"),
             ("invoice.verdict", "post"),
         ),
         "trajectory": _traj(
@@ -2643,8 +2643,8 @@ _SEED_CASE_EXTRAS: dict[str, dict] = {
             ("action_committed", "post-to-ap"),
         ),
         "reads": _reads(
-            ("knowledge:vendor-exemplar-acme-industrial@rev1",
-             "vendor exemplar — one-shot template"),
+            ("knowledge:entity-resolution-policy@rev1",
+             "governed resolution thresholds"),
             ("knowledge:invoice-posting-policy@rev1", "governed posting policy"),
         ),
     },
@@ -2652,7 +2652,7 @@ _SEED_CASE_EXTRAS: dict[str, dict] = {
         "assertions": _facts(
             ("invoice.vendor_id", "vendor:acme-industrial"),
             ("invoice.total_usd", "6120.00"),
-            ("invoice.extraction_path", "one-shot"),
+            ("invoice.match_verdict", "matched"),
             ("invoice.verdict", "review"),
         ),
         "trajectory": _traj(
@@ -2660,35 +2660,35 @@ _SEED_CASE_EXTRAS: dict[str, dict] = {
             ("action_committed", "post-to-ap"),
         ),
         "reads": _reads(
-            ("knowledge:vendor-exemplar-acme-industrial@rev1",
-             "vendor exemplar — one-shot template"),
             ("knowledge:invoice-posting-policy@rev1", "governed posting policy"),
         ),
     },
     "ap-fixture-007": {
-        # First contact: no exemplar exists yet, so the pinned world holds the
-        # posting policy but deliberately no vendor exemplar.
+        # First contact: nothing in the vendor master resembles this name, so
+        # the resolver mints it rather than matching it.
         "assertions": _facts(
-            ("invoice.extraction_path", "ensemble"),
+            ("invoice.vendor_id", "vendor:meridian-supply"),
             ("invoice.verdict", "post"),
         ),
         "trajectory": _traj(
             ("task_raised", "true"),
-            ("waypoint", "exemplar verified by clerk and saved to the knowledge layer"),
+            ("waypoint", "vendor minted onboarding and vouched for at the posting gate"),
             ("action_committed", "post-to-ap"),
         ),
         "reads": _reads(
+            ("knowledge:entity-resolution-policy@rev1",
+             "governed resolution thresholds"),
             ("knowledge:invoice-posting-policy@rev1", "governed posting policy"),
         ),
     },
     "ap-fixture-010": {
         "assertions": _facts(
             ("invoice.invoice_date", "2026-07-30"),
-            ("invoice.extraction_path", "ensemble"),
+            ("invoice.match_verdict", "variance"),
         ),
         "trajectory": _traj(
             ("task_raised", "true"),
-            ("waypoint", "adjudicator picked the ISO date and recorded the conflict"),
+            ("waypoint", "clerk corrected the unit price and the match re-ran"),
         ),
         "reads": _reads(
             ("knowledge:invoice-posting-policy@rev1", "governed posting policy"),
@@ -2704,16 +2704,16 @@ def _seed_golden_cases(flow_id: str) -> list[GoldenCase]:
         "expense-reimbursement": [
             ("In-policy team lunch, clear receipt", "exp-fixture-001", "total $64.20 · approved automatically", "correction-set"),
             ("Hotel night above the city cap", "exp-fixture-004", "$612/night vs $290 cap · elevated", "correction-set"),
-            ("Blurry thermal-paper receipt", "exp-fixture-007", "low extraction confidence · elevated", "exemplar"),
+            ("Blurry thermal-paper receipt", "exp-fixture-007", "low extraction confidence · elevated", "promoted-from-run"),
             ("Mileage at the current governed rate", "exp-fixture-010", "auto-approved · rate read from policy", "correction-set"),
             ("Alcohol line item over cap", "exp-fixture-013", "elevated · policy §4.2 cited", "correction-set"),
             ("Missing receipt over $75", "exp-fixture-016", "elevated · receipt requested", "human-authored"),
         ],
         "accounts-payable": [
-            ("Known vendor · clean scan", "ap-fixture-001", "one-shot from exemplar · $1,840 posted", "correction-set"),
+            ("Known vendor · clean scan", "ap-fixture-001", "matched · $1,840 posted", "correction-set"),
             ("Known vendor · over the auto-post limit", "ap-fixture-004", "$6,120 · review path", "correction-set"),
-            ("Unknown vendor · first contact", "ap-fixture-007", "ensemble ×3 · exemplar verified by clerk", "exemplar"),
-            ("Ensemble date-format conflict", "ap-fixture-010", "adjudicator picks ISO · conflict recorded", "correction-set"),
+            ("Unknown vendor · first contact", "ap-fixture-007", "minted onboarding · clerk vouched", "promoted-from-run"),
+            ("Price variance corrected on review", "ap-fixture-010", "match re-ran after the correction", "correction-set"),
             ("Missing PO number", "ap-fixture-013", "review path · PO lookup suggested", "human-authored"),
             ("Duplicate of a posted invoice", "ap-fixture-016", "flagged · no Action committed", "human-authored"),
         ],
@@ -2825,42 +2825,149 @@ def _seed_version_history(defn: FlowDefinition) -> list[FlowVersion]:
     return versions
 
 
-def seed_flows_if_empty(service: FlowService) -> int:
-    """Register the demo fleet when the registry is empty. Idempotent."""
-    if service.list():
-        return 0
-    created = 0
-    for defn in _seed_definitions():
-        try:
-            service.create(
-                defn.model_copy(update={"versions": _seed_version_history(defn)})
+def _seeded_golden_set(flow_id: str) -> GoldenSet | None:
+    """The golden set as the repository declares it, or None if it has none."""
+    cases = _seed_golden_cases(flow_id)
+    if not cases:
+        return None
+    return GoldenSet(
+        flow_id=flow_id,
+        cases=cases,
+        version=1,
+        revisions=[
+            GoldenSetRevision(
+                version=1,
+                at=utcnow() - timedelta(hours=2),
+                by="cumulus eval push",
+                note="seeded from the repository export",
+                case_count=len(cases),
             )
-            cases = _seed_golden_cases(defn.id)
-            if cases:
-                service.golden_sets.put(
-                    GoldenSet(
-                        flow_id=defn.id,
-                        cases=cases,
-                        version=1,
-                        revisions=[
-                            GoldenSetRevision(
-                                version=1,
-                                at=utcnow() - timedelta(hours=2),
-                                by="cumulus eval push",
-                                note="seeded from the repository export",
-                                case_count=len(cases),
-                            )
-                        ],
-                        # FDEs author golden cases in code as well as in the
-                        # console; naming the file keeps the console honest
-                        # about not being the only source.
-                        synced_from=f"server/tests/golden/{defn.id}.json",
-                        synced_at=utcnow() - timedelta(hours=2),
-                    )
+        ],
+        # FDEs author golden cases in code as well as in the console; naming
+        # the file keeps the console honest about not being the only source.
+        synced_from=f"server/tests/golden/{flow_id}.json",
+        synced_at=utcnow() - timedelta(hours=2),
+    )
+
+
+def _untouched_by_humans(golden: GoldenSet) -> bool:
+    """Has anyone edited this golden set since it was pushed from the repo?
+
+    Cases are console-editable, and a human-authored case is exactly the kind
+    of work a re-sync must never discard. The tell is the set's own revision
+    log: a push writes version 1 and nothing else does.
+    """
+    return golden.version <= 1 and len(golden.revisions) <= 1
+
+
+def _upgraded(stored: FlowDefinition, latest: FlowDefinition) -> FlowDefinition:
+    """The code's definition, carrying the stored one's history beneath it.
+
+    The point of re-seeding by version is that the change is *legible*: the
+    revision the console was showing is archived rather than dropped, so the
+    version picker still opens it and `v5 → v6` diffs to the steps that
+    actually changed. Drafts at or below the new version go — they were
+    proposals against a map that no longer exists.
+    """
+    history = [
+        version.model_copy(update={"status": "archived"})
+        if version.status == "active" else version
+        for version in stored.version_history()
+        if not (version.status == "draft" and version.version <= latest.version)
+    ]
+    history = [v for v in history if v.version != latest.version]
+    history.append(
+        FlowVersion(
+            version=latest.version,
+            label=f"v{latest.version}",
+            status="active",
+            steps=[step.model_copy(deep=True) for step in latest.steps],
+            model_budget_usd_per_run=latest.model_budget_usd_per_run,
+            notes="Published from the repository definition.",
+            authored_by=latest.authored_by,
+            created_at=utcnow(),
+        )
+    )
+    return latest.model_copy(update={
+        "versions": history,
+        # The definition's own age is a fact about the deployment, not about
+        # this release.
+        "created_at": stored.created_at,
+        "updated_at": utcnow(),
+    })
+
+
+def seed_flows_if_empty(service: FlowService) -> int:
+    """Bring the registry in line with the definitions declared in code.
+
+    Registering the fleet is the easy half. The half that bit us: a stored
+    definition is the *only* source of a flow's steps — `FlowUpdate` cannot
+    carry them — so a seed that ran once meant a definition edited in code
+    could never reach an environment that already had it. A console would go
+    on drawing a canvas the engine had stopped running, which is precisely
+    the divergence the transparency bar exists to prevent.
+
+    So the version is the contract. A definition whose declared `version` is
+    higher than the stored one replaces it, archiving what was there into the
+    version history; equal or lower is left alone. That makes the bump the
+    explicit opt-in — nothing is overwritten because a summary was reworded —
+    and it keeps the map honest across a redeploy.
+
+    Golden sets are re-synced only while nobody has touched them, because a
+    human-authored case is work, not seed data.
+    """
+    created = updated = 0
+    for defn in _seed_definitions():
+        stored = service.get(defn.id)
+        if stored is None:
+            try:
+                service.create(
+                    defn.model_copy(update={"versions": _seed_version_history(defn)})
                 )
+            except FlowExistsError:  # raced with another worker; theirs wins
+                continue
+            golden = _seeded_golden_set(defn.id)
+            if golden is not None:
+                service.golden_sets.put(golden)
             created += 1
-        except FlowExistsError:
             continue
-    if created:
-        log.info("Seeded flow definitions", extra={"count": created})
+
+        if defn.version <= stored.version:
+            continue
+
+        service.update(_upgraded(stored, defn))
+        log.info(
+            "Flow definition upgraded from the repository",
+            extra={
+                "flowId": defn.id,
+                "from": stored.version,
+                "to": defn.version,
+            },
+        )
+        updated += 1
+
+        seeded = _seeded_golden_set(defn.id)
+        existing = service.golden_sets.get(defn.id)
+        if seeded is None or existing is None:
+            continue
+        if _untouched_by_humans(existing):
+            service.golden_sets.put(seeded)
+        else:
+            # Not a failure — a deployment whose evals someone has curated is
+            # the good outcome. Say so, because a stale case asserting a
+            # retired fact path fails loudly and the reason should be findable.
+            log.warning(
+                "Golden set edited in the console; left as it is",
+                extra={
+                    "flowId": defn.id,
+                    "cases": len(existing.cases),
+                    "goldenVersion": existing.version,
+                },
+            )
+
+    if created or updated:
+        log.info(
+            "Seeded flow definitions",
+            extra={"count": created, "upgraded": updated},
+        )
     return created

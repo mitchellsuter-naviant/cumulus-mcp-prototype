@@ -19,12 +19,12 @@ The accounts-payable flow reads this section as governed values. Edits here
 change what the flow does — no code changes, and every edit is logged.
 
 - Auto-post limit: $2,500.00 per invoice. At or under this limit, a
-  confidently classified invoice from a known vendor posts without review.
-- Minimum classification confidence: 0.75. Below this the invoice is
-  elevated to the ap-clerk queue regardless of amount.
-- First-time vendors are always reviewed: the three-model ensemble extracts
-  the document, an adjudicator merges the candidates, and a clerk verifies
-  the proposed exemplar before anything posts.
+  confidently extracted invoice from a resolved vendor posts without review.
+- Minimum extraction confidence: 0.75. Below this the invoice is elevated to
+  the ap-clerk queue regardless of amount.
+- A vendor the resolver could not settle is always reviewed: the run stops
+  before anything is asserted and a clerk names the vendor from the scored
+  candidates.
 
 ## Three-way match
 

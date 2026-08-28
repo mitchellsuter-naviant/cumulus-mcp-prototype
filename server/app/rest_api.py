@@ -326,7 +326,7 @@ def search(
         default=None,
         description=(
             "Restrict by asset kind, so governed-context retrieval and "
-            "exemplar lookup cannot cross."
+            "generated-export listing cannot cross."
         ),
     ),
     status: Status | None = Query(default=None),

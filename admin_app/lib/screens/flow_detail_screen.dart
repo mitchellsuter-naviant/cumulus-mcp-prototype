@@ -2498,6 +2498,19 @@ class _NodeConfiguration extends StatelessWidget {
               'event' =>
                 'An Event is the immutable fact that something happened; '
                     'other definitions bind to it through their own Triggers.',
+              'resolve' =>
+                'A Resolve step picks a winner among competing claims by a '
+                    'declarative Rule — automatic like an observation, '
+                    'audited like a decision, and it raises a Task when it '
+                    'cannot decide.',
+              'check' =>
+                'A Check is a pure evaluation over what the flow already '
+                    'gathered — a match, a screen — recorded as a result the '
+                    'run can point at, not a number computed and discarded.',
+              'sync' =>
+                'A Sync step lands what an external system reported. It is an '
+                    'observation: audited by per-revision lineage, bulk '
+                    'rather than per-row.',
               _ =>
                 'Authored non-model logic. Its meaning is exported in plain '
                     'language; the implementation stays machinery.',

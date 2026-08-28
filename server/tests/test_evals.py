@@ -193,17 +193,17 @@ def test_trajectory_is_scoped_to_the_checkpoint(service):
         id="probe", flow_id="accounts-payable",
         checkpoints=[
             Checkpoint(
-                id="early", after_step="z1",
-                trajectory=[TrajectoryRule(kind="step_absent", expected="m2")],
+                id="early", after_step="s1",
+                trajectory=[TrajectoryRule(kind="step_absent", expected="c1")],
             ),
             Checkpoint(
                 id="late", after_step="final",
-                trajectory=[TrajectoryRule(kind="step_ran", expected="m2")],
+                trajectory=[TrajectoryRule(kind="step_ran", expected="c1")],
             ),
         ],
     )
     case = EvalCase(
-        id="one-shot", spec_id="probe", name="known vendor",
+        id="known-vendor", spec_id="probe", name="known vendor",
         fixture=GraphFixture(deliveries=[{
             "source": "erp-vendors",
             "vendors": [{"external_id": "V-1", "name": "Acme Industrial Inc."}],
@@ -350,7 +350,7 @@ def test_an_eval_cannot_touch_the_live_world(world):
     before_objects = world.graph.stats()
     before_runs = len(world.engine.list())
     before_tasks = len(world.tasks.directory.list())
-    before_shelf = {a.id for a in world.knowledge.repo.all() if "exemplar" in a.tags}
+    before_corpus = {(a.id, a.revision) for a in world.knowledge.repo.all()}
 
     result = service.run(AP_SPEC.id)
     assert result.passed == len(result.cases)
@@ -358,10 +358,11 @@ def test_an_eval_cannot_touch_the_live_world(world):
     assert world.graph.stats() == before_objects
     assert len(world.engine.list()) == before_runs
     assert len(world.tasks.directory.list()) == before_tasks
-    # The AP flow writes an exemplar when a clerk verifies one; the eval's
-    # copy-on-write corpus is why that did not land on the real shelf.
-    after_shelf = {a.id for a in world.knowledge.repo.all() if "exemplar" in a.tags}
-    assert after_shelf == before_shelf
+    # The corpus is copied into each world, not shared, so a graded run can
+    # read and write governed knowledge without the live shelf moving under
+    # the console — neither a new asset nor a bumped revision.
+    after_corpus = {(a.id, a.revision) for a in world.knowledge.repo.all()}
+    assert after_corpus == before_corpus
 
 
 def test_each_case_gets_a_fresh_world(service):

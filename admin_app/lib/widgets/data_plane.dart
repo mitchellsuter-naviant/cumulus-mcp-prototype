@@ -344,7 +344,6 @@ class _CollectionsLens extends StatelessWidget {
 
   VoidCallback? _handoff(String id) => switch (id) {
     'knowledge-library' => onOpenLibrary,
-    'ap-vendor-exemplars' => onOpenLibrary,
     'flow-definitions' => onOpenFlows,
     'expense-records' => onOpenExpense,
     'ap-records' => onOpenPayables,
@@ -353,7 +352,7 @@ class _CollectionsLens extends StatelessWidget {
   };
 
   String? _handoffLabel(String id) => switch (id) {
-    'knowledge-library' || 'ap-vendor-exemplars' => 'Library',
+    'knowledge-library' => 'Library',
     'flow-definitions' => 'Flows',
     'expense-records' => 'Workspace',
     'ap-records' => 'Workspace',
@@ -528,7 +527,6 @@ class _CollectionRow extends StatelessWidget {
 
 IconData _iconForKind(String kind) => switch (kind) {
   'documents' => Icons.description_outlined,
-  'exemplar shelf' => Icons.auto_awesome_outlined,
   'definitions' => Icons.account_tree_outlined,
   'eval datasets' => Icons.science_outlined,
   'entities' => Icons.hub_outlined,

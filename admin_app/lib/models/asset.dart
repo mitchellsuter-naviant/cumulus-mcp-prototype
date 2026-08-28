@@ -4,10 +4,10 @@ class AssetSummary {
   final String title;
   final String contentType;
 
-  /// Empty when the asset is not a document: an exemplar or a schema export
+  /// Empty when the asset is not a document: a prompt or a schema export
   /// carries no authority — its [kind] is the signal instead.
   final String authorityLevel;
-  final String kind; // document | exemplar | schema-export | prompt | config
+  final String kind; // document | schema-export | prompt | config
   final String origin; // authored | flywheel | derived | synced | flow-written
   final String scope;
   final String owner;

@@ -35,8 +35,8 @@ from natural keys, so an eval fixture named "Acme Industrial Inc." *is* the
 production vendor id — running against the live graph would append claims to a
 real vendor and, worse, feed eval invoices into the anomaly baseline that real
 invoices are judged against. The corpus is copied in (frozen for the run,
-writable, so a flow that promotes an exemplar does not touch the real shelf)
-and the revisions read are recorded, so two results are only compared when they
+writable, so nothing a graded run writes touches the real shelf) and the
+revisions read are recorded, so two results are only compared when they
 measured the same knowledge.
 """
 
@@ -491,10 +491,10 @@ class EvalWorld(BaseModel):
 def build_world(source_knowledge=None, *, seed_dir: str | None = None) -> EvalWorld:
     """An isolated world, with the corpus copied in rather than shared.
 
-    Copied because the AP flow *writes* governed knowledge when a clerk
-    verifies an exemplar; pointing that at the live corpus would let an eval
-    promote a real exemplar. The revisions copied are recorded, so two results
-    are only compared when they read the same knowledge.
+    Copied rather than shared: a graded run reads governed knowledge and may
+    write it, and neither should reach the corpus the console is showing. The
+    revisions copied are recorded, so two results are only compared when they
+    read the same knowledge.
     """
     # Deferred: the flow modules import this one for their seed helpers.
     from .payables import (
@@ -894,8 +894,8 @@ class EvalService:
         prefix: list[str],
     ) -> list[AssertionResult]:
         results: list[AssertionResult] = []
-        # Scoped to the checkpoint, so "no ensemble before the vendor is
-        # resolved" means what it says.
+        # Scoped to the checkpoint, so "no second model call before the
+        # vendor is resolved" means what it says.
         in_scope = [s for s in run.steps if s.step_id in set(prefix)]
         step_ids = [s.step_id for s in in_scope]
         gates = [s for s in in_scope if s.kind == "task"]

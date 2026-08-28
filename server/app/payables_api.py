@@ -1,9 +1,8 @@
 """REST surface for the payables table and the live accounts-payable run.
 
 Submitting is the trigger of the accounts-payable flow: the invoice runs
-synchronously through classify → exemplar lookup → one-shot or ensemble
-extraction → placeholder match/fraud screens → the governed posting rule,
-and lands as a row. Submission is a human act (a person is entering a
+synchronously through one extraction pass → vendor resolution → the three-way
+match → the anomaly screen → the governed posting rule, and lands as a row. Submission is a human act (a person is entering a
 vendor's invoice), so minted API keys are refused; reads are any
 authenticated role — the table is a data-role dataset the whole console
 may see.

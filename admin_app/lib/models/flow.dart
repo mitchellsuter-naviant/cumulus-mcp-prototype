@@ -16,7 +16,8 @@ DateTime _date(dynamic v) =>
 
 class FlowStep {
   final String id;
-  final String type; // trigger | modelcall | rule | task | action | event | transform
+  final String type; // trigger | modelcall | transform | rule | task |
+  // action | event | sync | check | resolve
   final String name;
   final String summary;
   final Map<String, String> config;
@@ -979,7 +980,7 @@ class GoldenCase {
   final String name;
   final String inputRef;
   final String expected;
-  // correction-set | exemplar | human-authored | promoted-from-run
+  // correction-set | human-authored | promoted-from-run
   final String source;
   final String addedBy;
   final DateTime addedAt;

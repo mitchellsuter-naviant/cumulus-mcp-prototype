@@ -64,9 +64,6 @@ def _live_counts() -> dict[str, tuple[int, str]]:
     try:
         assets = deps.get_service().repo.all()
         counts["knowledge-library"] = (len(assets), "documents")
-        counts["ap-vendor-exemplars"] = (
-            sum(1 for a in assets if "exemplar" in a.tags), "vendors covered"
-        )
     except Exception:  # noqa: BLE001 — a registry view must not 500
         log.exception("Could not count the corpus")
     try:

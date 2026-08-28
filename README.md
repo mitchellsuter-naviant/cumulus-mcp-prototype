@@ -662,7 +662,7 @@ storage: **Role** (data: delete it and history is lost / knowledge: delete it
 and the agents get dumber) and **Origin** (authored / flywheel / derived /
 synced / flow-written). "Encoded vs. emergent" is Origin: encoded is authored
 documents plus the declarations (ontology, Mappings, Collections); emergent is
-synced claims, derived profiles, and flywheel exemplars.
+synced claims, derived profiles, and the correction sets runs accumulate.
 
 **Replication is safe exactly when the replica knows where it came from.**
 Three modes are legitimate: *copy custody* (bytes landed with lineage and
@@ -922,7 +922,7 @@ vendor and — the one that actually matters — feed eval invoices into the
 `vendor_payment_profile` that real invoices are judged against, changing flow
 behaviour rather than a number on a screen. So every case runs in its own
 in-memory world with the corpus copied in (frozen for the run and writable, so
-a flow that promotes an exemplar cannot promote a real one), and the revisions
+nothing a graded run writes touches the real shelf), and the revisions
 it read are recorded on the result — two pass rates are only comparable when
 they measured the same knowledge.
 
@@ -1000,38 +1000,30 @@ rows on first start; live submissions append.
 
 ## Accounts payable (the second live flow)
 
-`accounts-payable` resolves, extracts, matches, screens and posts. **A vendor is
-an entity, not a slug** — the previous version matched a slug against exemplar
-asset ids, which made the knowledge shelf the primary key and meant one company
-in two systems was two vendors.
+`accounts-payable` extracts, resolves, matches, screens and posts. **A vendor is
+an entity, not a slug** — the previous version matched a slug against per-vendor
+knowledge assets, which made the knowledge shelf the primary key and meant one
+company in two systems was two vendors.
 
-1. **read-vendor-candidates (ModelCall)** does one narrow job: strip every party
-   named on the page. Deciding which entity that text refers to is the
-   resolver's job against the vendor master, not the model's against its memory.
-2. **resolve-vendor (resolve)** fuzzy-matches the master. A confident match
-   links; an unknown name mints an `onboarding` vendor; an ambiguous one
-   **suspends the run** for a clerk, because posting against the wrong vendor is
-   not recoverable.
-3. **load-exemplar (transform)** looks for the exemplar keyed by the *canonical
-   vendor id*.
-3. **Known vendor → one-shot**: a single extraction pass using the exemplar
-   as the template — cheap, confident, boring in the right way.
-4. **Unknown vendor → ensemble**: three independent model extractions, an
-   **adjudicator** that merges them field-by-field (majority wins, amounts
-   within a cent agree, disagreements recorded as conflicts), then a
-   **verify-exemplar Task** to the `ap-clerk` queue. On approval, the flow
-   **writes the verified exemplar into the knowledge layer** — a real
-   governed knowledge write — so the vendor graduates from unknown to known
-   and the *next* invoice takes the one-shot path. This is the doctrine's
-   unknown-vendor flywheel, running.
-5. **three-way-match (check)** pairs each invoice line against the PO line that
+1. **extract-invoice (ModelCall)** — one pass over the document returns the
+   vendor as printed, the invoice number, dates, PO, totals and the billed
+   lines, with a confidence. One governed model call reads the page; there is
+   no separate classifier pass and no per-vendor template to keep in step with
+   it.
+2. **resolve-vendor (resolve)** fuzzy-matches the printed name against the
+   vendor master. A confident match links; an unknown name mints an
+   `onboarding` vendor; an ambiguous one **suspends the run** for a clerk,
+   because posting against the wrong vendor is not recoverable. The model
+   contributes text it read; the resolver decides identity, against the master
+   and the governed thresholds.
+3. **three-way-match (check)** pairs each invoice line against the PO line that
    ordered it and the receiving line that booked it in — both landed by their
    own sync Flows — and **retains the comparison as a `MatchSet` object** with
    the variance and the tolerance that judged it. Three misses are modelled
    distinctly because they mean different things: a goods line with no PO line
    is a variance, a freight line under the governed allowance is normal, and
    goods not booked in yet is a *sequencing* state (`blocked`), not an error.
-6. **anomaly-screen (check)** replaces the fraud placeholder. It scores the
+4. **anomaly-screen (check)** replaces the fraud placeholder. It scores the
    invoice against *this vendor's own history* from the derived
    `vendor_payment_profile` — amount outlier, first-time-large, suspected
    duplicate, out-of-cadence, round-number — because "unusual" only has a
@@ -1039,15 +1031,16 @@ in two systems was two vendors.
    that judge them are governed knowledge in the policy document.
 7. **post-or-review (Rule)** reads governed values from the
    `invoice-posting-policy` asset at run time (auto-post limit $2,500,
-   classification floor 0.75, match tolerances, anomaly thresholds). Under the
-   limit and clean, it posts; otherwise a review Task, and a clerk's correction
-   **re-runs the match** rather than overriding it.
+   extraction-confidence floor 0.75, match tolerances, anomaly thresholds).
+   Under the limit and clean, it posts; otherwise a review Task, and a clerk's
+   correction **re-runs the match** rather than overriding it.
 
-**The flywheel still closes, and now it is provable.** Verifying an ensemble
-writes the exemplar keyed by the canonical vendor id and graduates the vendor
-out of `onboarding`; the *next* invoice from that vendor takes the one-shot
-path. The seeded world demonstrates it end to end (`run_ap_seed04` ensemble →
-`run_ap_seed05` one-shot, same vendor).
+**A vendor still graduates through use.** One seen for the first time is minted
+`onboarding` and stays there until a person posts one of its invoices — that
+decision, and nothing automatic, is the confirmation it is real. The seeded
+world demonstrates it end to end (`run_ap_seed04` mints Meridian and a clerk
+vouches for it at the posting gate; `run_ap_seed05` links to the same object
+rather than minting a second one).
 
 The table lives in the **Accounts Payable** workspace, which also shows the
 vendor master — one row per canonical vendor carrying every source system's id
@@ -1057,7 +1050,7 @@ without a credential:
 | Hint | What it exercises |
 | --- | --- |
 | `vendor=acme-industrial` | a known vendor, resolved against the master |
-| `newvendor=meridian-supply` | an unknown vendor, stably named — run it twice to watch the flywheel close |
+| `newvendor=meridian-supply` | an unknown vendor, stably named — run it twice to watch the second invoice link rather than mint |
 | `po=PO-7741 lines=STL-0250:2,FAS-M12:3` | bills that PO exactly, so the three-way match really matches |
 | `pricebump` | a unit price 8% off the PO — price variance |
 | `overbill` | bills more than was received — quantity variance |
@@ -1117,25 +1110,25 @@ cut by **origin** — who or what put each thing there:
   authority lens applies here and only here, because authority is a property
   of documents that argue.
 - **Ontology** — what we encoded: **Entities & Links** (the TBox as a
+| `taxid` | prints a tax id — the resolver's strongest signal |
   navigable table — a core-entity rail on the left, every link touching the
   selected type on the right, both panes scrolling themselves so the schema
   stays on screen), the **Authored ABox** fragments, the Collection
   declarations, and the **Mappings** that bind sources in. The generated
   exports carry a "regenerated from Python on every startup" banner and
   refuse edits (409) rather than accepting one the next boot discards.
-- **Learned** — what the system figured out through use: the exemplar shelf
-  (with origin and revision pins), vendor payment profiles, and the eval
-  datasets. The flywheel's output, gathered in one place instead of scattered
-  across three.
+- **Learned** — what the system figured out through use: vendor payment
+  profiles and the eval datasets grown from real runs. What runs produced,
+  gathered in one place instead of scattered across three.
 - **Sources** — what arrives from outside: each feed shown against its
   declared contract (strategy, bindings, escalation shape), and the artifact
   store.
 
-An exemplar is no longer filed as a `how-to` next to the Expense Approval
-Policy: assets carry `kind` (document / exemplar / schema-export / prompt /
+A generated schema export is no longer filed as a `how-to` next to the Expense
+Approval Policy: assets carry `kind` (document / schema-export / prompt /
 config) and `origin` (authored / flywheel / derived), `authority_level` is
 None for anything that isn't a document, and search takes a `kind` filter so
-governed-context retrieval and exemplar lookup cannot cross.
+governed-context retrieval and generated-export listing cannot cross.
 
 The two graph lenses are deliberately separate screens rather than one
 diagram with a toggle, because they answer different questions. **Model · TBox**

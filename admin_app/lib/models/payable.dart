@@ -4,24 +4,6 @@ library;
 
 import 'reimbursement.dart' show JournalEvent;
 
-class InvoiceCandidate {
-  final String model;
-  final Map<String, String> fields;
-
-  const InvoiceCandidate({required this.model, required this.fields});
-
-  factory InvoiceCandidate.fromJson(Map<String, dynamic> json) {
-    final fields = <String, String>{};
-    json.forEach((k, v) {
-      if (k != 'model' && v != null) fields[k] = '$v';
-    });
-    return InvoiceCandidate(
-      model: json['model'] as String? ?? '',
-      fields: fields,
-    );
-  }
-}
-
 /// One billed line on an invoice.
 class InvoiceLine {
   final String sku;
@@ -142,7 +124,6 @@ class PayableInvoice {
   final String vendorId;
   final String vendorResolution; // linked | new | review
   final String vendorMethod;
-  final List<String> vendorCandidates;
   final double subtotalUsd;
   final double freightUsd;
   final double taxUsd;
@@ -160,16 +141,13 @@ class PayableInvoice {
   final String vendorSlug;
   final String vendorName;
   final double vendorConfidence;
-  final String exemplarRef;
-  final String extractionPath; // one-shot | ensemble
+  final String vendorTaxId;
   final String invoiceNumber;
   final String invoiceDate;
   final String dueDate;
   final String poNumber;
   final double totalUsd;
   final String lineSummary;
-  final List<InvoiceCandidate> candidates;
-  final List<String> conflicts;
   final String threeWayMatch;
   final String fraudScreen;
   final String state; // posted | pending | denied
@@ -188,7 +166,6 @@ class PayableInvoice {
     required this.vendorId,
     required this.vendorResolution,
     required this.vendorMethod,
-    required this.vendorCandidates,
     required this.subtotalUsd,
     required this.freightUsd,
     required this.taxUsd,
@@ -206,16 +183,13 @@ class PayableInvoice {
     required this.vendorSlug,
     required this.vendorName,
     required this.vendorConfidence,
-    required this.exemplarRef,
-    required this.extractionPath,
+    required this.vendorTaxId,
     required this.invoiceNumber,
     required this.invoiceDate,
     required this.dueDate,
     required this.poNumber,
     required this.totalUsd,
     required this.lineSummary,
-    required this.candidates,
-    required this.conflicts,
     required this.threeWayMatch,
     required this.fraudScreen,
     required this.state,
@@ -235,9 +209,6 @@ class PayableInvoice {
     vendorId: json['vendor_id'] as String? ?? '',
     vendorResolution: json['vendor_resolution'] as String? ?? '',
     vendorMethod: json['vendor_method'] as String? ?? '',
-    vendorCandidates: (json['vendor_candidates'] as List<dynamic>? ?? const [])
-        .map((e) => '$e')
-        .toList(),
     subtotalUsd: (json['subtotal_usd'] as num? ?? 0).toDouble(),
     freightUsd: (json['freight_usd'] as num? ?? 0).toDouble(),
     taxUsd: (json['tax_usd'] as num? ?? 0).toDouble(),
@@ -261,20 +232,13 @@ class PayableInvoice {
     vendorSlug: json['vendor_slug'] as String? ?? '',
     vendorName: json['vendor_name'] as String? ?? '',
     vendorConfidence: (json['vendor_confidence'] as num? ?? 0).toDouble(),
-    exemplarRef: json['exemplar_ref'] as String? ?? '',
-    extractionPath: json['extraction_path'] as String? ?? '',
+    vendorTaxId: json['vendor_tax_id'] as String? ?? '',
     invoiceNumber: json['invoice_number'] as String? ?? '',
     invoiceDate: json['invoice_date'] as String? ?? '',
     dueDate: json['due_date'] as String? ?? '',
     poNumber: json['po_number'] as String? ?? '',
     totalUsd: (json['total_usd'] as num? ?? 0).toDouble(),
     lineSummary: json['line_summary'] as String? ?? '',
-    candidates: (json['candidates'] as List<dynamic>? ?? const [])
-        .map((e) => InvoiceCandidate.fromJson(e as Map<String, dynamic>))
-        .toList(),
-    conflicts: (json['conflicts'] as List<dynamic>? ?? const [])
-        .map((e) => e as String)
-        .toList(),
     threeWayMatch: json['three_way_match'] as String? ?? '',
     fraudScreen: json['fraud_screen'] as String? ?? '',
     state: json['state'] as String? ?? 'pending',
@@ -296,8 +260,6 @@ class PayableStats {
   final int pending;
   final int denied;
   final double postedUsd;
-  final int oneShot;
-  final int ensemble;
   final int matched;
   final int matchVariance;
   final int matchBlocked;
@@ -309,8 +271,6 @@ class PayableStats {
     required this.pending,
     required this.denied,
     required this.postedUsd,
-    required this.oneShot,
-    required this.ensemble,
     required this.matched,
     required this.matchVariance,
     required this.matchBlocked,
@@ -323,8 +283,6 @@ class PayableStats {
     pending: json['pending'] as int? ?? 0,
     denied: json['denied'] as int? ?? 0,
     postedUsd: (json['posted_usd'] as num? ?? 0).toDouble(),
-    oneShot: json['one_shot'] as int? ?? 0,
-    ensemble: json['ensemble'] as int? ?? 0,
     matched: json['matched'] as int? ?? 0,
     matchVariance: json['match_variance'] as int? ?? 0,
     matchBlocked: json['match_blocked'] as int? ?? 0,

@@ -1,8 +1,8 @@
 """The entity layer: canonical Objects, typed Links, retained Claims.
 
-Why this exists. Before it, a vendor was a slug string used to look up
-`vendor-exemplar-{slug}` in the corpus — a knowledge shelf doing a primary
-key's job — and an expense was a flat row with no edge back to the person who
+Why this exists. Before it, a vendor was a slug string carried on a row — two
+spellings of the same company were two vendors, and merging them merged
+nothing — and an expense was a flat row with no edge back to the person who
 submitted it. Both of the questions the two flows need to answer ("how much
 has this employee submitted in six months", "does this invoice line match a PO
 line and a receiving line") are graph questions, so this is a graph.

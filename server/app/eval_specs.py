@@ -8,9 +8,10 @@ application code.
 Read the specs as **contracts**: what the accounts-payable flow promises about
 an Invoice, how tightly, and at which point in a run. The cases below are
 deliberately few and each exists to pin one behaviour that would otherwise
-regress silently — the vendor resolving before any extraction happens, the
-match re-running after a correction rather than being overridden, the flywheel
-turning a second invoice into a one-shot read.
+regress silently — one model call reading the document and the resolver (not
+the model) settling the entity, the match re-running after a correction rather
+than being overridden, and the same vendor seen twice resolving to one object
+rather than two.
 """
 
 from __future__ import annotations
@@ -95,9 +96,9 @@ AP_SPEC = EvalSpec(
     version=1,
     summary=(
         "What the accounts-payable flow is answerable for: naming the right "
-        "vendor before it extracts anything, reading the commercial content of "
-        "the document, retaining a three-way match, and posting only what the "
-        "governed policy allows. Fields the vendor controls rather than the "
+        "vendor it read off the document, reading the commercial content of "
+        "that document in a single pass, retaining a three-way match, and "
+        "posting only what the governed policy allows. Fields the vendor controls rather than the "
         "flow — due dates, currency — are ignored on purpose: grading them "
         "would be grading the wrong system."
     ),
@@ -107,9 +108,10 @@ AP_SPEC = EvalSpec(
             after_step="z1",
             label="after resolve-vendor",
             note=(
-                "An ordering promise, not just an outcome: the vendor is "
-                "settled before a single extraction runs, because extracting "
-                "against the wrong exemplar is worse than not extracting."
+                "A division-of-labour promise, not just an outcome: the model "
+                "contributes a name it read off a page and the *resolver* "
+                "decides which entity that is, against the master and the "
+                "governed thresholds. One model call gets to see the document."
             ),
             objects=[
                 ObjectRule(
@@ -135,15 +137,11 @@ AP_SPEC = EvalSpec(
             trajectory=[
                 TrajectoryRule(
                     kind="step_ran", expected="m1",
-                    note="the classifier reads candidate names off the page",
+                    note="one pass reads the document",
                 ),
                 TrajectoryRule(
                     kind="step_absent", expected="m2",
-                    note="no extraction before the vendor is known",
-                ),
-                TrajectoryRule(
-                    kind="step_absent", expected="m2a",
-                    note="…and no ensemble either",
+                    note="…and only one: no second reading of the same page",
                 ),
                 TrajectoryRule(kind="model_calls_at_most", expected="1"),
             ],
@@ -259,9 +257,9 @@ AP_CASES = [
         spec_id=AP_SPEC.id,
         name="Known vendor, bills its PO exactly, posts without a human",
         summary=(
-            "The happy path, and the one that regresses silently: an exemplar "
-            "exists, the lines match the order and the receipt, the total is "
-            "under the governed limit."
+            "The happy path, and the one that regresses silently: the vendor "
+            "is in the master, the lines match the order and the receipt, and "
+            "the total is under the governed limit."
         ),
         fixture=_ap_world(),
         trigger={
@@ -394,7 +392,7 @@ AP_CASES = [
     EvalCase(
         id="ap-unknown-vendor-onboards",
         spec_id=AP_SPEC.id,
-        name="An unknown vendor runs the ensemble and is minted onboarding",
+        name="An unknown vendor is minted onboarding, not matched",
         summary=(
             "The resolver's other branch. Nothing in the vendor master "
             "resembles this name, so it is minted rather than matched — and it "
@@ -429,14 +427,15 @@ AP_CASES = [
         ],
     ),
     EvalCase(
-        id="ap-flywheel-second-invoice-is-one-shot",
+        id="ap-second-invoice-links-not-mints",
         spec_id=AP_SPEC.id,
-        name="A verified exemplar turns the next invoice into one pass",
+        name="A vendor seen before is linked, not minted a second time",
         summary=(
-            "The flywheel, asserted rather than asserted-about. The clerk "
-            "verifies the ensemble, the exemplar is written, and this run — the "
-            "same vendor's second invoice — takes the one-shot path. `m2a` "
-            "absent is the whole assertion."
+            "The property that makes a vendor an entity. This vendor was "
+            "onboarded by an earlier invoice, so its second invoice must "
+            "resolve to the *same* object — `active`, not a fresh "
+            "`onboarding` duplicate — even though the name is only ever read "
+            "off a page."
         ),
         fixture=GraphFixture(
             deliveries=_ap_world().deliveries,
@@ -457,10 +456,16 @@ AP_CASES = [
                     "lines=PPE-GLV:1 total=112.00",
         },
         decisions=[
-            ScriptedDecision(verdict="approved", note="Fields verified."),
             ScriptedDecision(verdict="approved", note="No PO at this size."),
         ],
         expectations=[
+            CheckpointExpectation(
+                checkpoint="vendor-resolved",
+                objects=[ExpectedObject(
+                    type="Vendor", key="Meridian Supply Ltd.",
+                    fields={"status": "active", "slug": "meridian-supply"},
+                )],
+            ),
             CheckpointExpectation(
                 checkpoint="committed",
                 objects=[ExpectedObject(
@@ -470,7 +475,7 @@ AP_CASES = [
             ),
             CheckpointExpectation(
                 checkpoint="outcome",
-                trajectory={"terminal_status": "succeeded"},
+                trajectory={"terminal_status": "succeeded", "gate_count": "1"},
             ),
         ],
     ),

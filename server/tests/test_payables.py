@@ -2,12 +2,11 @@
 
 The doctrinal assertions:
 
-- a vendor is an *entity*: the first ModelCall reads names, the resolver decides
-  identity against the vendor master, and two systems' ids for one company
-  resolve to one Vendor;
-- extraction is one-shot against the vendor's exemplar when we have one and a
-  three-model adjudicated ensemble when we do not, and verifying the ensemble
-  writes the exemplar — so the vendor's *next* invoice is one-shot;
+- a vendor is an *entity*: one ModelCall reads the name printed on the page,
+  the resolver decides identity against the vendor master, and two systems'
+  ids for one company resolve to one Vendor;
+- extraction is a single pass, and a vendor seen a second time resolves to the
+  object the first invoice minted rather than to a duplicate;
 - the three-way match is retained as a MatchSet, and "no receiving report yet"
   is a state rather than a failure;
 - the anomaly screen is scored against the vendor's own history with governed
@@ -190,10 +189,12 @@ def test_an_unknown_vendor_is_minted_onboarding(world):
     assert vendor.props["status"] == "onboarding"
 
 
-# ---- extraction paths and the flywheel ------------------------------------
+# ---- one extraction pass, and the vendor's second invoice -----------------
 
 
-def test_known_vendor_takes_the_one_shot_path(world):
+def test_one_model_call_reads_the_document(world):
+    """The whole extraction is one governed ModelCall — no separate classifier
+    pass, no ensemble. The resolver, not a second model, settles the entity."""
     _vendors(world)
     _orders(world)
     _receipts(world)
@@ -201,64 +202,59 @@ def test_known_vendor_takes_the_one_shot_path(world):
         "ap@customer.example", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-2 lines=STL-0250:2,FAS-M12:3",
     )
-    assert record.extraction_path == "one-shot"
-    assert record.exemplar_ref.startswith("knowledge:vendor-exemplar-acme-industrial")
     assert record.state == "posted"
     run = world.engine.get(record.run_id)
-    assert {s.step_id for s in run.steps} >= {"m1", "z1", "x1", "r1", "m2", "c1", "c2"}
-    assert not any(s.step_id.startswith("m2a") for s in run.steps)
+    step_ids = {s.step_id for s in run.steps}
+    assert step_ids >= {"s1", "m1", "z1", "x3", "c1", "c2"}
+    assert [s.step_id for s in run.steps if s.kind == "modelcall"] == ["m1"]
 
 
-def test_unknown_vendor_runs_the_ensemble_and_verifying_writes_the_exemplar(world):
+def test_an_unknown_vendor_is_minted_onboarding_and_graduates_on_posting(world):
     _vendors(world)
     record = world.payables.submit(
         "ap@customer.example", filename="mer.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 total=190.00",
     )
-    assert record.extraction_path == "ensemble"
+    # No PO on the document, so the posting rule holds it for a clerk.
     assert record.state == "pending"
-    run = world.engine.get(record.run_id)
-    assert {"m2a", "m2b", "m2c", "x2"} <= {s.step_id for s in run.steps}
+    vendor = world.graph.get(record.vendor_id)
+    assert vendor.props["status"] == "onboarding"
     task = world.tasks.get(record.task_id)
-    assert task.kind == "curation" and task.queue == "ap-clerk"
+    assert task.kind == "decision" and task.queue == "ap-clerk"
 
     decided = world.tasks.decide(
-        task.id, "approved", "dana@customer.example", note="Fields verified.",
+        task.id, "approved", "dana@customer.example",
+        note="First invoice from this vendor, no PO expected at this size.",
     )
-    world.payables.resume_for_task(decided)
-    # The exemplar is a real governed-knowledge write, keyed by the vendor id.
-    shelf = [a for a in world.knowledge.repo.all() if "exemplar" in a.tags]
-    assert any("meridian" in a.id for a in shelf)
-    vendor = world.graph.get(record.vendor_id)
-    # A human vouched for it, so the vendor graduates out of onboarding.
-    assert vendor.props["status"] == "active"
+    resumed = world.payables.resume_for_task(decided)
+    assert resumed.state == "posted"
+    # A human vouched for it by posting, so the vendor graduates.
+    assert world.graph.get(record.vendor_id).props["status"] == "active"
 
 
-def test_the_next_invoice_from_a_verified_vendor_is_one_shot(world):
+def test_the_next_invoice_links_to_the_same_vendor(world):
     _vendors(world)
     first = world.payables.submit(
         "ap@customer.example", filename="mer1.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 total=190.00",
     )
-    decided = world.tasks.decide(first.task_id, "approved", "dana@customer.example")
-    world.payables.resume_for_task(decided)
-    # The posting gate for the no-PO invoice, then done with the first run.
-    run = world.engine.get(first.run_id)
-    if run.status == "suspended":
-        world.payables.resume_for_task(
-            world.tasks.decide(run.open_task_id, "approved", "dana@customer.example")
-        )
+    world.payables.resume_for_task(
+        world.tasks.decide(first.task_id, "approved", "dana@customer.example")
+    )
 
     second = world.payables.submit(
         "ap@customer.example", filename="mer2.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-2 lines=PPE-GLV:1 total=112.00",
     )
-    assert second.extraction_path == "one-shot"
     assert second.vendor_id == first.vendor_id
-    assert "meridian" in second.exemplar_ref
+    assert second.vendor_resolution == "linked"
+    meridian = [
+        v for v in world.graph.find("Vendor") if "meridian" in v.label.lower()
+    ]
+    assert len(meridian) == 1
 
 
-def test_a_rejected_verification_denies_and_writes_no_exemplar(world):
+def test_a_rejected_review_denies_and_commits_nothing(world):
     _vendors(world)
     record = world.payables.submit(
         "ap@customer.example", filename="mer.pdf",
@@ -270,9 +266,8 @@ def test_a_rejected_verification_denies_and_writes_no_exemplar(world):
     )
     resumed = world.payables.resume_for_task(decided)
     assert resumed.state == "denied"
-    assert not any(
-        "meridian" in a.id for a in world.knowledge.repo.all() if "exemplar" in a.tags
-    )
+    # The vendor never graduated: nobody vouched for it.
+    assert world.graph.get(record.vendor_id).props["status"] == "onboarding"
 
 
 # ---- the three-way match --------------------------------------------------
@@ -478,7 +473,7 @@ def test_seed_builds_a_matchable_world(world):
     assert len(rows) == seeded
     assert all(row.run_id for row in rows)
     stats = world.payables.stats()
-    assert stats.one_shot and stats.ensemble
+    assert stats.posted and stats.pending and stats.denied
     assert stats.matched  # the PO and receiving feeds landed, so matches happen
     assert stats.anomalies  # and the screen found something
     # Vendors, orders and receipts all arrived through their sync Flows.
@@ -508,7 +503,6 @@ def test_api_exposes_the_table_the_match_and_the_vendors(client, world):
     vendors = client.get("/api/v1/graph/vendors").json()
     acme = next(v for v in vendors if "Acme" in v["label"])
     assert len(acme["source_records"]) >= 2  # ERP and procurement
-    assert acme["has_exemplar"]
     assert acme["invoices"] >= 1
 
     sources = client.get("/api/v1/sources").json()

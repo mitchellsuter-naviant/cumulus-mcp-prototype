@@ -136,10 +136,10 @@ const knowledgeGroup = EndpointGroup(
             description: 'One of `draft`, `published`, `deprecated`.'),
         ApiParam('kind', 'string', where: 'query',
             description:
-                'One of `document`, `exemplar`, `schema-export`, `prompt`, '
-                '`config`. The Library is `kind=document`; the exemplar shelf '
-                'is `kind=exemplar`. Assets carry `origin` too — who put them '
-                'here: authored, flywheel, derived.'),
+                'One of `document`, `schema-export`, `prompt`, `config`. '
+                'The Library is `kind=document`; generated exports are '
+                '`kind=schema-export`. Assets carry `origin` too — who put '
+                'them here: authored, flywheel, derived.'),
       ],
       responseExample: '[$_assetSummaryShape]',
     ),
@@ -354,7 +354,7 @@ const searchGroup = EndpointGroup(
             where: 'query',
             description:
                 'Restrict by asset kind, so governed-context retrieval and '
-                'exemplar lookup cannot cross.'),
+                'generated-export listing cannot cross.'),
         ApiParam('mode', 'string',
             where: 'query',
             defaultValue: 'hybrid',
@@ -882,8 +882,8 @@ const flowsGroup = EndpointGroup(
         ApiParam('steps', 'list',
             description:
                 'Declarative steps: {id, type, name, summary, config, next, '
-                'branch_labels}. Types: trigger, modelcall, rule, task, '
-                'action, event, transform.'),
+                'branch_labels}. Types: trigger, modelcall, transform, rule, '
+                'task, action, event, sync, check, resolve.'),
         ApiParam('roi_minutes_per_run', 'number', defaultValue: '0'),
         ApiParam('model_budget_usd_per_run', 'number', defaultValue: '0.50'),
       ],
@@ -1095,7 +1095,7 @@ const flowsGroup = EndpointGroup(
             description: 'The pinned input document or fixture.'),
         ApiParam('source', 'string', defaultValue: 'human-authored',
             description:
-                '`correction-set`, `exemplar`, `human-authored`, or '
+                '`correction-set`, `human-authored`, or '
                 '`promoted-from-run`.'),
         ApiParam('run_id', 'string',
             description: 'The run being promoted, if any.'),
@@ -1254,11 +1254,11 @@ const reimbursementsGroup = EndpointGroup(
 const payablesGroup = EndpointGroup(
   title: 'Accounts payable',
   blurb:
-      'The accounts-payable flow\'s live run and its table. A known vendor is '
-      'a one-shot extraction against its exemplar in the knowledge layer; an '
-      'unknown vendor runs a three-model ensemble, an adjudicator merges the '
-      'candidates, and a clerk verifies the new exemplar before anything '
-      'posts. Three-way match and fraud screening are declared placeholders.',
+      'The accounts-payable flow\'s live run and its table. One extraction '
+      'pass reads the document; the resolver turns the printed vendor name '
+      'into a canonical Vendor id against the master; the billed lines are '
+      'matched against the purchase order and the receiving report, screened '
+      'against the vendor\'s own history, and posted under governed policy.',
   endpoints: [
     Endpoint(
       method: 'POST',
@@ -1269,9 +1269,9 @@ const payablesGroup = EndpointGroup(
       notes:
           'Locally the stub readers honor hints (`vendor=acme-industrial '
           'total=1840 invoice=ACME-INV-20881 po=PO-7741`); an unrecognized '
-          'vendor takes the ensemble path. The auto-post limit and '
-          'classification floor parse from the invoice-posting-policy asset '
-          'at run time.',
+          'vendor is minted `onboarding` by the resolver. The auto-post limit '
+          'and extraction-confidence floor parse from the '
+          'invoice-posting-policy asset at run time.',
       params: [
         ApiParam('image_base64', 'string'),
         ApiParam('filename', 'string'),
@@ -1704,8 +1704,8 @@ const graphGroup = EndpointGroup(
       auth: ApiAuth.reader,
       notes:
           'The column that matters is `source_records`. When a vendor was a '
-          'slug used to look up an exemplar asset, the same company in two '
-          'systems was two vendors and merging them merged nothing.',
+          'slug on a row, the same company in two systems was two vendors and '
+          'merging them merged nothing.',
       responseExample: '''[{
   "id": "vendor_5c1b0f9a3e21",
   "label": "Acme Industrial Inc.",
@@ -1718,7 +1718,6 @@ const graphGroup = EndpointGroup(
      "confidence": 1.0, "method": "exact", "live": true}
   ],
   "invoices": 3,
-  "has_exemplar": true,
   "conflict_fields": ["payment_terms"]
 }]''',
     ),

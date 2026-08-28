@@ -142,7 +142,7 @@ class OntologyView(BaseModel):
 
 
 class VendorView(BaseModel):
-    """A vendor as the AP workspace needs it: identity, sources, exemplar."""
+    """A vendor as the AP workspace needs it: identity, sources, activity."""
 
     id: str
     label: str
@@ -155,8 +155,6 @@ class VendorView(BaseModel):
     invoices: int = 0
     invoiced_usd: float = 0.0
     purchase_orders: int = 0
-    has_exemplar: bool = False
-    exemplar_ref: str = ""
     conflict_fields: list[str] = Field(default_factory=list)
     revision: int = 1
     ref: str = ""
@@ -476,7 +474,6 @@ def list_vendors(
     """
     require_reader(principal)
     graph = deps.get_graph_service()
-    knowledge = deps.get_service()
     out: list[VendorView] = []
     for vendor in graph.find("Vendor"):
         if vendor.status == "superseded":
@@ -497,13 +494,6 @@ def list_vendors(
         invoices = [o for _, o in graph.neighbors(vendor.id, "issued", "out")]
         orders = graph.neighbors(vendor.id, "ordered_from", "in")
         slug = str(vendor.props.get("slug") or normalize_key(vendor.label))
-        exemplar = next(
-            (
-                a for a in knowledge.repo.all()
-                if "exemplar" in a.tags and slug in a.id
-            ),
-            None,
-        )
         out.append(VendorView(
             id=vendor.id, label=vendor.label, slug=slug,
             status=str(vendor.props.get("status") or vendor.status),
@@ -516,10 +506,6 @@ def list_vendors(
                 sum(float(i.props.get("total_usd") or 0) for i in invoices), 2
             ),
             purchase_orders=len(orders),
-            has_exemplar=exemplar is not None,
-            exemplar_ref=(
-                f"knowledge:{exemplar.id}@rev{exemplar.revision}" if exemplar else ""
-            ),
             conflict_fields=sorted(vendor.conflicts().keys()),
             revision=vendor.revision, ref=vendor.ref(),
         ))

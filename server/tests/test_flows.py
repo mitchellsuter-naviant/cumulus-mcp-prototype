@@ -7,7 +7,7 @@ gates (admin writes, human-only management, no deleting active definitions)
 hold.
 
 The seeded fleet is two flows — expense-reimbursement (the workhorse most
-behavioural tests exercise) and accounts-payable (a branching, ensemble-shaped
+behavioural tests exercise) and accounts-payable (a branching, match-and-screen
 definition that keeps the fleet-level rollups honest). Shape-derived
 behaviours neither seed exhibits (windowed triggering, canonical-graph writes)
 are covered by synthetic definitions constructed inline, because the behaviour
@@ -21,6 +21,7 @@ import pytest
 
 import app.deps as deps
 from app.flows import (
+    FlowStep,
     InMemoryGoldenSetDirectory,
     InMemoryTestRunDirectory,
     InMemoryFlowDirectory,
@@ -135,36 +136,37 @@ def test_detail_carries_declarative_steps(client):
     assert client.get("/api/v1/flows/nope").status_code == 404
 
 
-def test_accounts_payable_export_declares_its_branches_and_placeholders(client):
-    """The Tier-2 export states the flow's real shape: the exemplar rule fans
-    out to a one-shot path and a three-model ensemble, and the steps that do
-    not exist yet say so instead of pretending."""
+def test_accounts_payable_export_declares_its_shape(client):
+    """The Tier-2 export states the flow's real shape: one governed extraction
+    pass, a resolve step that can branch to a human, and the retained
+    three-way match — no step in the map that the engine does not run."""
     from app.flows import is_windowed, writes_canonical
 
     detail = client.get("/api/v1/flows/accounts-payable").json()
     by_id = {s["id"]: s for s in detail["steps"]}
 
-    # The ensemble branch: known vendors extract one-shot from the exemplar,
-    # unknown vendors fan out to three independent extractions.
-    rule = by_id["r1"]
-    assert rule["type"] == "rule"
-    assert rule["next"] == ["m1", "m2a"]
-    assert rule["branch_labels"] == ["one-shot", "ensemble"]
-    ensemble = [by_id["m2a"], by_id["m2b"], by_id["m2c"]]
-    assert all(s["type"] == "modelcall" for s in ensemble)
-    # Three independent opinions means more than one model.
-    assert len({s["config"]["model"] for s in ensemble}) > 1
+    # One ModelCall reads the document. If a second ever appears here, the
+    # simplification has quietly been undone.
+    model_steps = [s for s in detail["steps"] if s["type"] == "modelcall"]
+    assert [s["id"] for s in model_steps] == ["m1"]
+    assert by_id["m1"]["name"] == "extract-invoice"
 
-    # Declared placeholders, not silent gaps: the transparency bar means the
-    # export admits what is not built yet.
-    placeholders = [
+    # The resolver is its own step kind and its own branch: it either settles
+    # the vendor or stops the run for a human, and nothing is asserted first.
+    resolve = by_id["z1"]
+    assert resolve["type"] == "resolve"
+    assert resolve["next"] == ["x3", "k0"]
+    assert resolve["branch_labels"] == ["resolved", "ambiguous"]
+    assert by_id["k0"]["type"] == "task" and by_id["k0"]["config"]["queue"] == "ap-clerk"
+
+    # The match and the screen are real checks now, not declared placeholders.
+    assert by_id["c1"]["type"] == "check" and by_id["c2"]["type"] == "check"
+    assert not [
         s for s in detail["steps"] if s["config"].get("status") == "placeholder"
     ]
-    assert {s["id"] for s in placeholders} == {"x3", "x4"}
-    assert all(s["type"] == "transform" and s["summary"] for s in placeholders)
 
-    # Shape-derived signals: woken per invoice, writes to the AP ledger and
-    # the knowledge layer — never the canonical graph, never on a window.
+    # Shape-derived signals: woken per invoice, writes to the AP ledger —
+    # never the canonical graph, never on a window.
     defn = deps._flow_service.require("accounts-payable")
     assert not is_windowed(defn)
     assert not writes_canonical(defn)
@@ -344,22 +346,24 @@ def test_accounts_payable_golden_set_is_seeded_and_synced(client, owner):
     # paths, a trajectory naming the terminal commit, and a pinned world.
     clean = by_ref["ap-fixture-001"]
     paths = {a["path"] for a in clean["assertions"]}
-    assert {"invoice.total_usd", "invoice.extraction_path", "invoice.verdict"} <= paths
+    assert {"invoice.total_usd", "invoice.match_verdict", "invoice.verdict"} <= paths
     assert all(a["path"].startswith("invoice.") for a in clean["assertions"])
     committed = next(
         t for t in clean["trajectory"] if t["kind"] == "action_committed"
     )
     assert committed["expected"] == "post-to-ap"
     refs = {r["ref"] for r in clean["read_set"]}
-    assert "knowledge:vendor-exemplar-acme-industrial@rev1" in refs
+    assert "knowledge:entity-resolution-policy@rev1" in refs
     assert "knowledge:invoice-posting-policy@rev1" in refs
-    # First contact: no exemplar exists yet, so none is pinned.
+    # First contact: the resolver mints rather than matches, and a human
+    # vouches for the vendor at the posting gate.
     first_contact = by_ref["ap-fixture-007"]
     assert {r["ref"] for r in first_contact["read_set"]} == {
-        "knowledge:invoice-posting-policy@rev1"
+        "knowledge:entity-resolution-policy@rev1",
+        "knowledge:invoice-posting-policy@rev1",
     }
     assert any(
-        a["path"] == "invoice.extraction_path" and a["expected"] == "ensemble"
+        a["path"] == "invoice.vendor_id" and a["expected"] == "vendor:meridian-supply"
         for a in first_contact["assertions"]
     )
 
@@ -421,6 +425,82 @@ def test_version_history_and_draft(client, owner):
     )
 
 
+def test_a_newer_definition_in_code_replaces_a_stored_one(client):
+    """The bug this closes: a definition's steps live only in the seed, and
+    the seed used to run once. An environment that already held a flow kept
+    serving its old canvas forever — the console drawing a map the engine had
+    stopped running. A higher declared version now republishes."""
+    from app.flows import seed_flows_if_empty
+
+    service = deps._flow_service
+    stored = service.require("accounts-payable")
+    # Wind the stored definition back to a plausible earlier revision.
+    service.update(stored.model_copy(update={
+        "version": stored.version - 1,
+        "steps": [
+            FlowStep(id="t1", type="trigger", name="InvoiceReceived",
+                     summary="one run per inbound invoice", next=["m0"]),
+            FlowStep(id="m0", type="modelcall", name="classify-vendor",
+                     summary="the retired classifier pass"),
+        ],
+        "versions": [],
+    }))
+    assert [s.id for s in service.require("accounts-payable").steps] == ["t1", "m0"]
+
+    seed_flows_if_empty(service)
+
+    upgraded = service.require("accounts-payable")
+    assert upgraded.version == stored.version
+    assert "m0" not in {s.id for s in upgraded.steps}
+    assert [s.id for s in upgraded.steps if s.type == "modelcall"] == ["m1"]
+    # The revision that was live is archived rather than dropped, so the
+    # version picker still opens it and the diff shows what changed.
+    history = {v.version: v.status for v in upgraded.version_history()}
+    assert history[stored.version] == "active"
+    assert history[stored.version - 1] == "archived"
+    old_version = upgraded.find_version(stored.version - 1)
+    assert {s.id for s in old_version.steps} == {"t1", "m0"}
+
+
+def test_an_equal_or_older_definition_leaves_the_stored_one_alone(client):
+    """The version bump is the opt-in. Re-running the seed against a registry
+    already at that version must not touch it — otherwise every restart would
+    quietly rewrite history and a console edit would vanish."""
+    from app.flows import seed_flows_if_empty
+
+    service = deps._flow_service
+    before = service.require("accounts-payable")
+    seed_flows_if_empty(service)
+    seed_flows_if_empty(service)
+    after = service.require("accounts-payable")
+    assert after.version == before.version
+    assert after.updated_at == before.updated_at
+    assert [v.version for v in after.version_history()] == [
+        v.version for v in before.version_history()
+    ]
+
+
+def test_an_upgrade_keeps_a_golden_set_a_human_has_edited(client, owner):
+    """A re-sync must not discard curation. An untouched set is republished
+    from code; one someone has added a case to is left exactly as it is."""
+    from app.flows import seed_flows_if_empty
+
+    service = deps._flow_service
+    created = client.post(
+        "/api/v1/flows/accounts-payable/golden-set",
+        json={"name": "A case a human wrote", "expected": "posts"},
+        headers=owner,
+    )
+    assert created.status_code == 201, created.text
+
+    stored = service.require("accounts-payable")
+    service.update(stored.model_copy(update={"version": stored.version - 1}))
+    seed_flows_if_empty(service)
+
+    golden = service.golden_set("accounts-payable")
+    assert any(c.name == "A case a human wrote" for c in golden.cases)
+
+
 def test_accounts_payable_history_has_no_open_draft(client, owner):
     """A draft is an open piece of work, not furniture every flow ships with:
     accounts-payable seeds two archived revisions and the active one, only."""
@@ -428,13 +508,13 @@ def test_accounts_payable_history_has_no_open_draft(client, owner):
         "/api/v1/flows/accounts-payable/versions", headers=owner
     ).json()
     assert [(v["version"], v["status"]) for v in versions] == [
-        (5, "active"), (4, "archived"), (3, "archived")
+        (6, "active"), (5, "archived"), (4, "archived")
     ]
     # Full snapshots here too — every revision carries the whole map.
     assert all(v["steps"] for v in versions)
 
     detail = client.get("/api/v1/flows/accounts-payable", headers=owner).json()
-    assert detail["active_version_label"] == "v5"
+    assert detail["active_version_label"] == "v6"
     assert detail["draft_version_label"] == ""
     assert detail["version_count"] == 3
 
@@ -529,12 +609,11 @@ def test_recommendations_carry_evidence_and_apply_to_a_draft(client, owner):
 
 
 def test_accounts_payable_recommendations_follow_its_own_telemetry(client, owner):
-    """Cards are derived per flow: accounts-payable earns a prompt cache on
-    the classifier, a one-rung downgrade on each claude-sonnet-5 extraction
-    (the haiku steps have no cheaper rung; gemini has no mapped path), and
-    the thin-coverage advisory (6 < 8). Spend per run sits under its $0.60
-    budget and the trigger is per-invoice, so neither the budget nor the
-    batching card fires."""
+    """Cards are derived per flow: accounts-payable has one ModelCall, so it
+    earns a prompt cache on it, a one-rung downgrade on it (claude-sonnet-5
+    has a cheaper rung), and the thin-coverage advisory (6 < 8). Spend per run
+    sits under its $0.60 budget and the trigger is per-invoice, so neither the
+    budget nor the batching card fires."""
     recs = client.get(
         "/api/v1/flows/accounts-payable/recommendations", headers=owner
     ).json()
@@ -542,12 +621,12 @@ def test_accounts_payable_recommendations_follow_its_own_telemetry(client, owner
         "model-downgrade", "prompt-cache", "coverage"
     }
     downgrades = [r for r in recs if r["kind"] == "model-downgrade"]
-    assert {r["step_id"] for r in downgrades} == {"m1", "m2a"}
+    assert {r["step_id"] for r in downgrades} == {"m1"}
     for card in downgrades:
         assert card["proposed_change"]["from"] == "claude-sonnet-5"
         assert card["proposed_change"]["to"] == "claude-haiku-4-5"
     cache = next(r for r in recs if r["kind"] == "prompt-cache")
-    assert cache["step_id"] == "m0"
+    assert cache["step_id"] == "m1"
     # Every card still carries its evidence, and money sorts the list.
     assert all(r["evidence"] for r in recs)
     savings = [r["estimated_monthly_savings_usd"] for r in recs]

@@ -379,25 +379,25 @@ def _seed_tasks() -> list[Task]:
                 target="graph",
                 summary="Link merchant \u2192 vendor:corner-bistro (reversible)",
             ),
-            resumes="future receipts from this merchant resolve one-shot",
+            resumes="future receipts from this merchant resolve without a Task",
             created_at_iso=_ago_iso(26),
         ),
         # ---- Governed knowledge: the flywheel's human half ----
         Task(
             id="task_cur_0210",
             kind="curation",
-            title="Promote correction set entries into the receipt exemplar",
+            title="Promote correction set entries into the receipt prompt",
             summary=(
                 "Five consistent human corrections on thermal-paper receipts. "
-                "The promotion Rule proposes updating the one-shot exemplar; "
-                "promotion into canonical knowledge is a curation decision, "
-                "never automatic."
+                "The promotion Rule proposes amending the extraction prompt so "
+                "the tip line stops being read as the total; promotion into "
+                "canonical knowledge is a curation decision, never automatic."
             ),
             queue="knowledge-curation",
             priority="normal",
             flow_id="expense-reimbursement",
             refs=[
-                "knowledge:receipt-exemplar@rev3",
+                "knowledge:receipt-extraction-prompt@rev3",
                 "knowledge:receipt-extraction-corrections@rev41",
             ],
             evidence=[
@@ -408,11 +408,11 @@ def _seed_tasks() -> list[Task]:
                 TaskEvidence(label="Blast radius", value="~90 receipts/month"),
             ],
             proposal=TaskProposal(
-                action="promote-exemplar",
+                action="amend-prompt",
                 target="knowledge-layer",
-                summary="Exemplar rev3 \u2192 rev4 with the tip-line template",
+                summary="Prompt rev3 \u2192 rev4 with the tip-line instruction",
             ),
-            resumes="exemplar revision published; change ledgered",
+            resumes="prompt revision published; change ledgered",
             created_at_iso=_ago_iso(50),
         ),
         Task(

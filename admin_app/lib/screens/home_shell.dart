@@ -61,7 +61,7 @@ const _destinations = <RailDestination>[
       ),
       RailChild(
         label: 'Accounts Payable',
-        detail: 'invoices, exemplars, posting',
+        detail: 'invoices, matching, posting',
         index: _payablesWorkspaceIndex,
       ),
     ],
@@ -219,14 +219,13 @@ class _HomeShellState extends State<HomeShell> {
 /// documents that argue and carry authority. **Ontology** is what we encoded:
 /// the TBox, the ABox, the Collection declarations, and the Mappings that
 /// bind sources in. **Learned** is what the system figured out through use:
-/// flywheel exemplars, derived profiles, eval datasets — the compounding
-/// record of judgment. **Sources** is what arrives from outside: the feeds
+/// derived profiles, eval datasets — the compounding record of judgment. **Sources** is what arrives from outside: the feeds
 /// against their contracts, and the artifact store.
 ///
-/// The old Library/Data split put a flywheel exemplar next to the Expense
-/// Approval Policy as if they were the same kind of thing. They are governed
-/// alike — versioned, audited, revision-pinned — but they answer different
-/// questions, and origin is the axis that separates them.
+/// The old Library/Data split put a derived vendor profile next to the
+/// Expense Approval Policy as if they were the same kind of thing. They are
+/// governed alike — versioned, audited, revision-pinned — but they answer
+/// different questions, and origin is the axis that separates them.
 class _KnowledgeSection extends StatefulWidget {
   final ApiClient api;
   final ValueNotifier<int> plane;

@@ -550,8 +550,8 @@ class ApiClient {
     return PayableStats.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  /// One live run of the accounts-payable flow: classify → exemplar one-shot
-  /// or three-model ensemble → placeholders → post or review.
+  /// One live run of the accounts-payable flow: extract → resolve the vendor
+  /// → three-way match → anomaly screen → post or review.
   Future<PayableInvoice> submitInvoice({
     String imageBase64 = '',
     String filename = '',

@@ -221,7 +221,7 @@ class _AssetEditorViewState extends State<AssetEditorView> {
       _relatedController.text = asset.related.join(', ');
       setState(() {
         _contentType = asset.contentType;
-        // Empty for non-documents (an exemplar carries no authority); the
+        // Empty for non-documents (a prompt carries no authority); the
         // dropdown still needs a resolvable value.
         _authorityLevel =
             asset.authorityLevel.isEmpty ? 'note' : asset.authorityLevel;

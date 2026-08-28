@@ -23,13 +23,13 @@ def client(_client):
 def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    # 11 seed documents + 4 generated schema-exports (ontology, collections,
+    # 9 seed documents + 4 generated schema-exports (ontology, collections,
     # mappings, eval specs) — the fixture publishes them like startup does.
-    assert resp.json()["assets"] == 15
+    assert resp.json()["assets"] == 13
 
 
 def test_list_and_prefix_filter(client):
-    assert len(client.get("/api/v1/assets").json()) == 15
+    assert len(client.get("/api/v1/assets").json()) == 13
     # The kind filter carves the Library out of the corpus: documents only.
     docs = client.get("/api/v1/assets", params={"kind": "document"}).json()
     assert len(docs) == 9
@@ -39,8 +39,6 @@ def test_list_and_prefix_filter(client):
         "expense-approval-policy",
         "travel-booking-guideline",
         "invoice-posting-policy",
-        "vendor-exemplar-acme-industrial",
-        "vendor-exemplar-northwind-traders",
     }
 
 
@@ -387,13 +385,13 @@ def test_revision_bumps_on_update_and_resolver_dereferences(client):
 # ---- the two dials: kind and origin -----------------------------------------
 
 
-def test_an_exemplar_carries_no_authority_level(client):
-    """Authority answers "which document wins an argument"; an exemplar is a
-    one-shot template and is not in that conversation. The old encoding
-    (`authority_level: how-to`) was a category error the model now refuses."""
-    asset = client.get("/api/v1/assets/vendor-exemplar-acme-industrial").json()
-    assert asset["kind"] == "exemplar"
-    assert asset["origin"] == "flywheel"
+def test_a_generated_export_carries_no_authority_level(client):
+    """Authority answers "which document wins an argument"; a generated schema
+    export is not in that conversation. Carrying an authority level would be a
+    category error, so the model drops it rather than defaulting it."""
+    asset = client.get("/api/v1/assets/enterprise-ontology").json()
+    assert asset["kind"] == "schema-export"
+    assert asset["origin"] == "authored"
     assert asset["authority_level"] is None
 
 
@@ -417,11 +415,13 @@ def test_generated_exports_refuse_edits(client):
 
 
 def test_search_can_scope_by_kind(client):
-    """Governed-context retrieval and exemplar lookup must not cross."""
-    hits = client.get("/api/v1/search", params={"q": "vendor", "kind": "exemplar"}).json()
-    assert hits and all(h["asset"]["kind"] == "exemplar" for h in hits)
+    """Governed-context retrieval and generated-export listing must not cross."""
+    hits = client.get(
+        "/api/v1/search", params={"q": "vendor", "kind": "schema-export"}
+    ).json()
+    assert hits and all(h["asset"]["kind"] == "schema-export" for h in hits)
     hits = client.get("/api/v1/search", params={"q": "vendor", "kind": "document"}).json()
     assert all(h["asset"]["kind"] == "document" for h in hits)
     facets = client.get("/api/v1/search/facets", params={"q": ""}).json()
     kinds = {f["value"] for f in facets["kind"]}
-    assert {"document", "exemplar", "schema-export"} <= kinds
+    assert {"document", "schema-export"} <= kinds

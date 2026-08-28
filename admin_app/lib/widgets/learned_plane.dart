@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 
-import '../models/asset.dart';
 import '../models/data_layer.dart';
 import '../models/eval.dart';
 import '../services/api_client.dart';
@@ -11,13 +10,12 @@ import 'ui_kit.dart';
 /// The Learned plane: what the system figured out, as opposed to what people
 /// wrote (Library) or what we declared (Ontology).
 ///
-/// The doctrine's flywheel names three knowledge assets — the exemplar, the
-/// model config, and the correction set — and this is where they surface,
-/// together with the derived statistics (vendor payment profiles) and the
-/// eval datasets built from promoted runs. Everything on this screen was
-/// produced by runs and ratified by people; every row says what produced it
-/// and which flow reads it, because provenance is the difference between
-/// learned knowledge and a config file.
+/// Two kinds of thing surface here: statistics derived from the graph (the
+/// vendor payment profiles the anomaly screen judges against) and the eval
+/// datasets grown from real runs. Everything on this screen was produced by
+/// runs and ratified by people; every row says what produced it and which
+/// flow reads it, because provenance is the difference between learned
+/// knowledge and a config file.
 class LearnedPlaneView extends StatefulWidget {
   final ApiClient api;
   final VoidCallback onOpenFlows;
@@ -33,7 +31,6 @@ class LearnedPlaneView extends StatefulWidget {
 }
 
 class _LearnedPlaneViewState extends State<LearnedPlaneView> {
-  List<AssetSummary>? _exemplars;
   List<VendorProfile>? _profiles;
   List<EvalSpecSummary>? _specs;
   String? _error;
@@ -53,17 +50,15 @@ class _LearnedPlaneViewState extends State<LearnedPlaneView> {
     Future<T?> attempt<T>(Future<T> call) =>
         call.then<T?>((v) => v).catchError((_) => null);
     final results = await Future.wait([
-      attempt(widget.api.listAssets(kind: 'exemplar')),
       attempt(widget.api.listVendorProfiles()),
       attempt(widget.api.listEvalSpecs()),
     ]);
     if (!mounted) return;
     setState(() {
-      _exemplars = results[0] as List<AssetSummary>?;
-      _profiles = results[1] as List<VendorProfile>?;
-      _specs = results[2] as List<EvalSpecSummary>?;
+      _profiles = results[0] as List<VendorProfile>?;
+      _specs = results[1] as List<EvalSpecSummary>?;
       _loading = false;
-      if (_exemplars == null && _profiles == null && _specs == null) {
+      if (_profiles == null && _specs == null) {
         _error = 'The knowledge layer did not answer.';
       }
     });
@@ -71,7 +66,6 @@ class _LearnedPlaneViewState extends State<LearnedPlaneView> {
 
   @override
   Widget build(BuildContext context) {
-    final exemplars = _exemplars ?? const <AssetSummary>[];
     final profiles = _profiles ?? const <VendorProfile>[];
     final specs = _specs ?? const <EvalSpecSummary>[];
     return PageBody(
@@ -79,10 +73,10 @@ class _LearnedPlaneViewState extends State<LearnedPlaneView> {
       children: [
         PlaneHeader(
           summary:
-              'What the system figured out through use: exemplars the '
-              'flywheel promoted, statistics derived from the graph, and the '
-              'eval datasets built from real runs. Corrections land as '
-              'structure — this is the compounding record of judgment.',
+              'What the system figured out through use: statistics derived '
+              'from the graph, and the eval datasets built from real runs. '
+              'Corrections land as structure — this is the compounding '
+              'record of judgment.',
           trailing: OutlinedButton.icon(
             onPressed: _loading ? null : _load,
             icon: const Icon(Icons.refresh, size: 16),
@@ -92,13 +86,6 @@ class _LearnedPlaneViewState extends State<LearnedPlaneView> {
         if (_error != null) ErrorNotice(message: _error!, onRetry: _load),
         StatStrip(
           tiles: [
-            StatTile(
-              label: 'Exemplars',
-              value: _loading && _exemplars == null
-                  ? '—'
-                  : '${exemplars.length}',
-              caption: 'one-shot templates, human-vouched',
-            ),
             StatTile(
               label: 'Vendor profiles',
               value:
@@ -114,29 +101,9 @@ class _LearnedPlaneViewState extends State<LearnedPlaneView> {
             ),
           ],
         ),
-        if (_loading && _exemplars == null)
+        if (_loading && _profiles == null)
           const CumulusLoading()
         else ...[
-          ListCard(
-            title: 'Exemplar shelf',
-            subtitle:
-                'a vendor graduates from unknown to known through use: the '
-                'ensemble reads its first invoice, a clerk verifies, and the '
-                'verified extraction is promoted here so the second invoice '
-                'is the one-shot path. Promotion is a governed decision — '
-                'never an inline side effect.',
-            children: [
-              if (exemplars.isEmpty)
-                const CumulusEmptyState(
-                  icon: Icons.auto_awesome_outlined,
-                  title: 'Nothing promoted yet',
-                  message:
-                      'The first verified extraction for a new vendor lands '
-                      'here from the accounts-payable flow.',
-                ),
-              for (final e in exemplars) _ExemplarRow(asset: e),
-            ],
-          ),
           ListCard(
             title: 'Vendor payment profiles',
             subtitle:
@@ -197,49 +164,6 @@ class _LearnedPlaneViewState extends State<LearnedPlaneView> {
           ),
         ],
       ],
-    );
-  }
-}
-
-class _ExemplarRow extends StatelessWidget {
-  final AssetSummary asset;
-
-  const _ExemplarRow({required this.asset});
-
-  @override
-  Widget build(BuildContext context) {
-    return CumulusListRow(
-      leading: Container(
-        width: 34,
-        height: 34,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: CumulusTone.accent.background,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: const Icon(Icons.auto_awesome_outlined, size: 17,
-            color: CumulusColors.ink),
-      ),
-      title: Row(
-        children: [
-          Flexible(child: Text(asset.title)),
-          const SizedBox(width: 10),
-          StatusBadge('origin ${asset.origin}', dense: true),
-          const SizedBox(width: 6),
-          StatusBadge('rev ${asset.revision}', dense: true),
-        ],
-      ),
-      subtitle: Wrap(
-        spacing: 12,
-        runSpacing: 4,
-        children: [
-          Text(asset.path, style: CumulusText.mono),
-          Text('· read by accounts-payable at resolve time',
-              style: CumulusText.meta),
-          Text('· pinned as knowledge:${asset.id}@rev${asset.revision}',
-              style: CumulusText.mono),
-        ],
-      ),
     );
   }
 }

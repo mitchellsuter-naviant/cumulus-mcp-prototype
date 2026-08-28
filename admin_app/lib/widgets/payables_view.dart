@@ -13,13 +13,12 @@ import 'ui_kit.dart';
 /// The Accounts Payable workspace: the AP invoices table, the
 /// accounts-payable flow's output.
 ///
-/// What makes this table interesting is the two extraction paths it records:
-/// a known vendor is a single one-shot pass against its exemplar in the
-/// knowledge layer; an unknown vendor is a three-model ensemble whose
-/// adjudicated fields — conflicts included — went through a human before the
-/// exemplar was written back. Expanding a row shows which path ran, the
-/// per-model candidates when there were three, and the placeholders the flow
-/// declares honestly (three-way match, fraud screen) until their feeds land.
+/// What makes this table interesting is what it records *around* the
+/// extraction: which canonical vendor the printed name resolved to and how,
+/// how the billed lines paired against the purchase order and the receiving
+/// report, and what the anomaly screen made of the invoice against that
+/// vendor's own history. Expanding a row shows all three, plus the governed
+/// values the posting rule read.
 class PayablesView extends StatefulWidget {
   final ApiClient api;
 
@@ -106,7 +105,7 @@ class _PayablesViewState extends State<PayablesView> {
         _message = switch (row.state) {
           'posted' =>
             'Posted — ${row.vendorName}, \$${row.totalUsd.toStringAsFixed(2)} '
-                '(${row.extractionPath}).',
+                '(${row.matchVerdict.isEmpty ? "no match" : row.matchVerdict}).',
           _ =>
             'Suspended for review — ${row.verdictReason}. '
                 'The task is in the ap-clerk queue.',
@@ -148,9 +147,9 @@ class _PayablesViewState extends State<PayablesView> {
             eyebrow: 'Workspace',
             title: 'Accounts Payable',
             subtitle:
-                'The accounts-payable flow writes this table: one-shot from a '
-                'vendor exemplar when one exists, a three-model ensemble plus '
-                'human verification when one does not.',
+                'The accounts-payable flow writes this table: one extraction '
+                'pass over the document, the vendor resolved against the '
+                'master, then matched, screened and posted under policy.',
             trailing: OutlinedButton.icon(
               onPressed: _load,
               icon: const Icon(Icons.refresh, size: 16),
@@ -166,10 +165,8 @@ class _PayablesViewState extends State<PayablesView> {
                   caption: '\$${stats.postedUsd.toStringAsFixed(2)} to the ledger'),
               StatTile(label: 'Pending', value: '${stats.pending}',
                   caption: 'suspended, waiting on a Task'),
-              StatTile(label: 'One-shot', value: '${stats.oneShot}',
-                  caption: 'known vendors, from exemplars'),
-              StatTile(label: 'Ensemble', value: '${stats.ensemble}',
-                  caption: 'unknown vendors, 3 models + human'),
+              StatTile(label: 'Denied', value: '${stats.denied}',
+                  caption: 'rejected on review'),
               StatTile(label: 'Matched', value: '${stats.matched}',
                   caption: '${stats.matchVariance} variance · '
                       '${stats.matchBlocked} not received yet'),
@@ -182,8 +179,8 @@ class _PayablesViewState extends State<PayablesView> {
             title: 'Submit an invoice',
             subtitle:
                 'runs the flow now — try note "vendor=acme-industrial total=1840 '
-                'invoice=ACME-INV-20881 po=PO-7741" for the one-shot path, or a '
-                'new vendor name for the ensemble',
+                'invoice=ACME-INV-20881 po=PO-7741" for a clean match, or '
+                '"newvendor=meridian-supply nopo" for an unknown vendor',
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -306,13 +303,23 @@ class _PayablesViewState extends State<PayablesView> {
                     ],
                   ),
                 ),
-                StatusBadge(
-                  r.extractionPath,
-                  tone: r.extractionPath == 'one-shot'
-                      ? CumulusTone.teal
-                      : CumulusTone.violet,
-                  dense: true,
-                ),
+                if (r.vendorResolution.isNotEmpty)
+                  Tooltip(
+                    message: 'the printed name resolved '
+                        '${r.vendorResolution} '
+                        '${r.vendorMethod.isEmpty ? '' : 'by ${r.vendorMethod} '}'
+                        'at ${r.vendorConfidence.toStringAsFixed(2)}',
+                    child: StatusBadge(
+                      r.vendorResolution,
+                      tone: switch (r.vendorResolution) {
+                        'linked' => CumulusTone.teal,
+                        'new' => CumulusTone.warn,
+                        'review' => CumulusTone.danger,
+                        _ => CumulusTone.neutral,
+                      },
+                      dense: true,
+                    ),
+                  ),
                 if (r.matchVerdict.isNotEmpty) ...[
                   const SizedBox(width: 6),
                   Tooltip(
@@ -387,7 +394,6 @@ class _PayablesViewState extends State<PayablesView> {
             spacing: 6,
             runSpacing: 6,
             children: [
-              if (r.exemplarRef.isNotEmpty) _monoChip(r.exemplarRef),
               if (r.policyRef.isNotEmpty) _monoChip(r.policyRef),
               _monoChip('limit \$${r.postLimitUsd.toStringAsFixed(2)}'),
               if (r.runId.isNotEmpty) _monoChip(r.runId),
@@ -400,7 +406,7 @@ class _PayablesViewState extends State<PayablesView> {
           const SizedBox(height: 12),
           const FieldLabel(
             'Vendor resolution',
-            hint: 'names off the page, then one canonical entity',
+            hint: 'a name off the page, then one canonical entity',
           ),
           Row(
             children: [
@@ -417,7 +423,8 @@ class _PayablesViewState extends State<PayablesView> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  '${r.vendorCandidates.isEmpty ? "no candidates read" : r.vendorCandidates.join(", ")}'
+                  '${r.vendorName.isEmpty ? "no vendor read" : r.vendorName}'
+                  '${r.vendorTaxId.isEmpty ? '' : ' · tax id ${r.vendorTaxId}'}'
                   '${r.vendorMethod.isEmpty ? '' : ' → ${r.vendorMethod} at ${r.vendorConfidence.toStringAsFixed(2)}'}',
                   style: CumulusText.meta,
                 ),
@@ -463,50 +470,6 @@ class _PayablesViewState extends State<PayablesView> {
                     ],
                   ),
                 ),
-          ],
-          if (r.candidates.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            const FieldLabel('Ensemble candidates'),
-            for (final c in r.candidates)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 4),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SizedBox(
-                      width: 150,
-                      child: Text(
-                        c.model,
-                        style: CumulusText.mono.copyWith(fontSize: 11),
-                      ),
-                    ),
-                    Expanded(
-                      child: Text(
-                        c.fields.entries
-                            .where((e) => e.value.isNotEmpty)
-                            .map((e) => '${e.key}=${e.value}')
-                            .join(' · '),
-                        style: CumulusText.body.copyWith(fontSize: 12),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-          ],
-          if (r.conflicts.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            const FieldLabel('Conflicts the adjudicator resolved'),
-            for (final c in r.conflicts)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 3),
-                child: Text(
-                  '• $c',
-                  style: CumulusText.body.copyWith(
-                    fontSize: 12.5,
-                    color: CumulusColors.warn,
-                  ),
-                ),
-              ),
           ],
           const SizedBox(height: 12),
           const FieldLabel('Run journal'),
@@ -673,8 +636,8 @@ class _PayablesViewState extends State<PayablesView> {
 ///
 /// The column that matters is `sources`: one canonical vendor carrying every
 /// external system's id for it. That is the thing that was impossible when a
-/// vendor was a slug used to look up an exemplar asset — the same company in
-/// two systems was two vendors, and merging them merged nothing.
+/// vendor was a slug on a row — the same company in two systems was two
+/// vendors, and merging them merged nothing.
 class _VendorMasterCard extends StatefulWidget {
   final List<VendorRecord> vendors;
 
@@ -690,7 +653,7 @@ class _VendorMasterCardState extends State<_VendorMasterCard> {
   @override
   Widget build(BuildContext context) {
     final vendors = widget.vendors;
-    final withExemplar = vendors.where((v) => v.hasExemplar).length;
+    final onboarding = vendors.where((v) => v.status == 'onboarding').length;
     final conflicted = vendors.where((v) => v.conflictFields.isNotEmpty).length;
     final multiSource =
         vendors.where((v) => v.sourceRecords.length > 1).length;
@@ -698,9 +661,9 @@ class _VendorMasterCardState extends State<_VendorMasterCard> {
     return ListCard(
       title: 'Vendor master',
       subtitle:
-          '${vendors.length} canonical vendor(s) · $withExemplar with an '
-          'exemplar (one-shot path) · $multiSource known to more than one '
-          'system · $conflicted with sources that disagree',
+          '${vendors.length} canonical vendor(s) · $onboarding still '
+          'onboarding · $multiSource known to more than one system · '
+          '$conflicted with sources that disagree',
       headerTrailing: vendors.length > 5
           ? TextButton(
               onPressed: () => setState(() => _expanded = !_expanded),
@@ -727,16 +690,6 @@ class _VendorMasterCardState extends State<_VendorMasterCard> {
                       : CumulusTone.warn,
                   dense: true,
                 ),
-                if (vendor.hasExemplar) ...[
-                  const SizedBox(width: 6),
-                  const Tooltip(
-                    message:
-                        'A verified one-shot template exists, so this vendor’s '
-                        'invoices take the single-pass path.',
-                    child: StatusBadge('exemplar', tone: CumulusTone.accent,
-                        dense: true),
-                  ),
-                ],
                 if (vendor.conflictFields.isNotEmpty) ...[
                   const SizedBox(width: 6),
                   Tooltip(

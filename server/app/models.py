@@ -8,10 +8,10 @@ AuthorityLevel = Literal["policy", "standard", "guideline", "how-to", "note"]
 Status = Literal["draft", "published", "deprecated"]
 
 # The doctrine's two Dataset dials, on the corpus. `kind` is what shape of
-# thing this is; a `document` argues and carries authority, an `exemplar` is a
-# one-shot template the flywheel promoted, a `schema-export` is generated from
-# Python on every startup and editing it here is pointless by construction.
-AssetKind = Literal["document", "exemplar", "schema-export", "prompt", "config"]
+# thing this is; a `document` argues and carries authority, a `prompt` or a
+# `config` is governed machinery, a `schema-export` is generated from Python on
+# every startup and editing it here is pointless by construction.
+AssetKind = Literal["document", "schema-export", "prompt", "config"]
 # Who put it here. Matches the Origin literal on Collections: `authored` is a
 # person (including code a person ratified), `flywheel` was promoted out of
 # runs, `derived` is regenerable from a recipe.
@@ -36,7 +36,7 @@ class Asset(BaseModel):
     content: str
     content_type: ContentType = "text/markdown"
     # Authority is a property of documents that argue — how much force this
-    # carries when two documents disagree. An exemplar never argues with a
+    # carries when two documents disagree. A prompt never argues with a
     # policy, so for kind != document it is None rather than a polite lie.
     authority_level: AuthorityLevel | None = "note"
     kind: AssetKind = "document"
@@ -61,9 +61,9 @@ class Asset(BaseModel):
 
     @model_validator(mode="after")
     def _authority_is_for_documents(self):
-        # An exemplar or a schema export never argues with a policy; carrying
-        # an authority level would be a category error, so it is dropped
-        # rather than defaulted.
+        # A prompt or a schema export never argues with a policy; carrying an
+        # authority level would be a category error, so it is dropped rather
+        # than defaulted.
         if self.kind != "document":
             object.__setattr__(self, "authority_level", None)
         return self
@@ -235,7 +235,7 @@ class Citation(BaseModel):
     asset_id: str
     title: str
     path: str
-    # None when the cited asset is not a document (an exemplar carries no
+    # None when the cited asset is not a document (a prompt carries no
     # authority — the kind is the signal there).
     authority_level: AuthorityLevel | None
     kind: AssetKind = "document"

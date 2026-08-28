@@ -5,9 +5,9 @@ two places on purpose:
 
 - **The vendor sync**, when an ERP row arrives and we have to decide whether it
   is a vendor we already know.
-- **The invoice path**, when a ModelCall has read some candidate vendor names
-  off a document and we need the canonical id before we can look for an
-  exemplar or a purchase order.
+- **The invoice path**, when the extraction has read a vendor name off a
+  document and we need the canonical id before we can look for a purchase
+  order or this vendor's payment history.
 
 One resolver, two callers, so the two can never disagree about what counts as a
 match — which is the failure mode that produces two vendors named Acme.

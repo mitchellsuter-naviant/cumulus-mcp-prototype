@@ -397,8 +397,6 @@ class VendorRecord {
   final int invoices;
   final double invoicedUsd;
   final int purchaseOrders;
-  final bool hasExemplar;
-  final String exemplarRef;
   final List<String> conflictFields;
   final int revision;
   final String ref;
@@ -415,8 +413,6 @@ class VendorRecord {
     required this.invoices,
     required this.invoicedUsd,
     required this.purchaseOrders,
-    required this.hasExemplar,
-    required this.exemplarRef,
     required this.conflictFields,
     required this.revision,
     required this.ref,
@@ -438,8 +434,6 @@ class VendorRecord {
     invoices: json['invoices'] as int? ?? 0,
     invoicedUsd: (json['invoiced_usd'] as num? ?? 0).toDouble(),
     purchaseOrders: json['purchase_orders'] as int? ?? 0,
-    hasExemplar: json['has_exemplar'] as bool? ?? false,
-    exemplarRef: json['exemplar_ref'] as String? ?? '',
     conflictFields: (json['conflict_fields'] as List<dynamic>? ?? const [])
         .map((e) => '$e')
         .toList(),

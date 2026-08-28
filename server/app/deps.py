@@ -307,8 +307,8 @@ def get_eval_service() -> EvalService:
     """Graph-shaped evals over the declared specs.
 
     Holds the live corpus only to *copy* it into each eval world: a case runs
-    against a frozen, writable copy so a flow that promotes an exemplar cannot
-    promote a real one.
+    against a frozen, writable copy, so nothing a graded run does can reach
+    the real shelf.
     """
     global _eval_service
     if _eval_service is None:

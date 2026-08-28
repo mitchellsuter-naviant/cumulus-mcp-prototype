@@ -75,19 +75,6 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         read_by=("expense-reimbursement", "accounts-payable", "hr-agent"),
     ),
     DataCollection(
-        id="ap-vendor-exemplars",
-        name="AP vendor exemplars",
-        summary=(
-            "One-shot extraction templates, one per vendor, keyed by the "
-            "canonical Vendor id. Promoted by a curation Task after a verified "
-            "ensemble run — the flywheel's output."
-        ),
-        role="knowledge", kind="exemplar shelf", origin="flywheel",
-        container="assets · tag:exemplar", authoritative=True,
-        retention="indefinite",
-        written_by=("accounts-payable",), read_by=("accounts-payable",),
-    ),
-    DataCollection(
         id="flow-definitions",
         name="Flow definitions",
         summary="Authored logic as declarative Tier-2 map assets.",
@@ -128,8 +115,8 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         summary=(
             "One concept of vendor, with every source system's id attached as "
             "a reversible identity Link. This is the master-data Collection: "
-            "the AP flow resolves invoices against it rather than against the "
-            "exemplar shelf."
+            "the AP flow resolves the name printed on an invoice against it, "
+            "so a vendor is an entity rather than a string on a row."
         ),
         role="data", kind="entities", origin="synced",
         container="graph_objects", authoritative=True, retention="indefinite",

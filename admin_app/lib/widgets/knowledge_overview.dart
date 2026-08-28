@@ -113,7 +113,7 @@ class _KnowledgeOverviewState extends State<KnowledgeOverview> {
         else ...[
           const _StripLabel(
             'The corpus',
-            'documents, exemplars and generated exports — and whether anyone '
+            'documents, prompts and generated exports — and whether anyone '
                 'reads them',
           ),
           StatStrip(tiles: _corpusTiles()),
@@ -136,7 +136,9 @@ class _KnowledgeOverviewState extends State<KnowledgeOverview> {
     int countWhere(bool Function(AssetSummary) test) =>
         assets.where(test).length;
     final documents = countWhere((a) => a.kind == 'document');
-    final exemplars = countWhere((a) => a.kind == 'exemplar');
+    final governed = countWhere(
+      (a) => a.kind == 'prompt' || a.kind == 'config',
+    );
     final generated = countWhere((a) => a.kind == 'schema-export');
     final drafts = countWhere((a) => a.status == 'draft');
     final deprecated = countWhere((a) => a.status == 'deprecated');
@@ -161,7 +163,7 @@ class _KnowledgeOverviewState extends State<KnowledgeOverview> {
       StatTile(
         label: 'Assets',
         value: '${assets.length}',
-        caption: '$documents authored · $exemplars learned · $generated '
+        caption: '$documents authored · $governed governed · $generated '
             'generated',
       ),
       StatTile(
@@ -273,7 +275,6 @@ class _KnowledgeOverviewState extends State<KnowledgeOverview> {
   Widget _planeCards() {
     final assets = _assets ?? const <AssetSummary>[];
     final sources = _sources ?? const <SourceStatus>[];
-    final exemplars = assets.where((a) => a.kind == 'exemplar').length;
     final landed = sources.fold<int>(0, (s, r) => s + r.recordsLanded);
     final stewardWaits = sources.fold<int>(0, (s, r) => s + r.awaitingSteward);
     final cards = <Widget>[
@@ -304,9 +305,9 @@ class _KnowledgeOverviewState extends State<KnowledgeOverview> {
         title: 'Learned',
         origin: 'flywheel',
         summary:
-            'Exemplars the flywheel promoted, derived profiles, and the eval '
-            'datasets built from real runs.',
-        detail: '$exemplars exemplars promoted',
+            'Statistics derived from the graph, and the eval datasets built '
+            'from real runs.',
+        detail: 'profiles and eval specs',
         onTap: () => widget.onOpenPlane(3),
       ),
       _PlaneCard(

@@ -656,8 +656,8 @@ def parse_seed_file(name: str, text: str) -> Asset:
             key, _, value = line.partition(":")
             key, value = key.strip(), value.strip()
             # A value containing a colon has to be quoted to survive the
-            # partition above ("Vendor exemplar: Acme Industrial"); strip the
-            # quoting so it does not end up in the stored title.
+            # partition above ("Expense policy: travel"); strip the quoting so
+            # it does not end up in the stored title.
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                 value = value[1:-1].strip()
             if key in _LIST_FIELDS:
@@ -708,8 +708,8 @@ def _sorted_hits(hits: list[SearchHit], sort: str) -> list[SearchHit]:
         return sorted(
             hits,
             key=lambda h: (
-                # None (an exemplar, a schema export) sorts after every
-                # document that actually carries authority.
+                # None (a prompt, a schema export) sorts after every document
+                # that actually carries authority.
                 AUTHORITY_ORDER.index(h.asset.authority_level)
                 if h.asset.authority_level in AUTHORITY_ORDER
                 else len(AUTHORITY_ORDER),

@@ -1,34 +1,35 @@
-"""The accounts-payable Flow: resolve, extract, match, screen, post.
+"""The accounts-payable Flow: extract, resolve, match, screen, post.
 
 What this flow proves, and the order it proves it in:
 
-1. **A vendor is an entity, not a slug.** The first ModelCall does one narrow
-   job — strip every candidate vendor name off the document — and the *resolver*
-   turns those into a canonical Vendor id by fuzzy-matching the vendor master.
-   The old code matched a slug against exemplar asset ids, which made the
-   knowledge shelf the primary key; a vendor that appeared in two systems, or
-   under two spellings, was two vendors. Now the exemplar shelf is keyed *by
-   the canonical id*, which is the right way round.
-2. **Extraction is data-model shaped.** One-shot against the vendor's exemplar
-   when we have one, a three-model ensemble with a code adjudicator when we do
-   not. Either way the output is invoice lines against the FlowContract's fact
-   paths — the same vocabulary the golden sets assert on and the graph stores.
-3. **The three-way match is retained.** Invoice lines are paired against the PO
+1. **One ModelCall reads the document.** A single extraction pass returns the
+   vendor as printed *and* the commercial content. There is no separate
+   classifier call and no exemplar shelf: an extra call to name the vendor and
+   a per-vendor template to extract against were two mechanisms doing what one
+   governed prompt does, and both had to be kept in step with each other.
+2. **A vendor is an entity, not a string.** The model reads a name off a page;
+   the *resolver* turns that into a canonical Vendor id by fuzzy-matching the
+   vendor master. Deciding which entity a piece of text refers to is the
+   resolver's job against the master, never the model's against its memory —
+   and when the resolver cannot decide, the run stops and asks.
+3. **Extraction is data-model shaped.** The output is invoice lines against the
+   FlowContract's fact paths — the same vocabulary the golden sets assert on
+   and the graph stores.
+4. **The three-way match is retained.** Invoice lines are paired against the PO
    lines and receiving lines already in the graph (landed by their own sync
    Flows), and the pairings are written as a `MatchSet` object rather than
    computed and discarded. `no receiving report yet` is a *state*, not a
    failure.
-4. **Anomaly screening replaces the fraud placeholder.** Scored against this
+5. **Anomaly screening replaces the fraud placeholder.** Scored against this
    vendor's own history from the derived `vendor_payment_profile`, with the
    thresholds read from the posting policy at run time.
-5. **The flywheel still turns.** Verifying an ensemble writes the exemplar back
-   into the corpus keyed by the vendor id, so the vendor's next invoice takes
-   the one-shot path.
+6. **A vendor graduates through use.** One seen for the first time is minted
+   `onboarding`; it becomes `active` when a human posts one of its invoices,
+   which is the confirmation that it is real.
 
-Steps: t1 trigger → s1 store-document → m1 read-vendor-candidates → z1
-resolve-vendor → x1 load-exemplar → r1 exemplar-known → (m2 one-shot | m2a/b/c
-ensemble + x2 adjudicate + k1 verify-exemplar) → x3 project-lines → x4
-gather-po-and-receiving → c1 three-way-match → c2 anomaly-screen → r2
+Steps: t1 trigger → s1 store-document → m1 extract-invoice → z1 resolve-vendor
+→ (k0 confirm-vendor) → x3 project-lines → x4 gather-po-and-receiving → c1
+three-way-match → c2 anomaly-screen → x5 read-posting-policy → r2
 post-or-review → k2 review-invoice → a1 post-invoice → e1 InvoicePosted.
 """
 
@@ -39,9 +40,7 @@ import hashlib
 import json
 import logging
 import re
-import statistics
 import threading
-from collections import Counter
 from datetime import date, timedelta
 from typing import Literal, Protocol
 
@@ -51,7 +50,7 @@ from .anomaly import AnomalyService, parse_anomaly_thresholds
 from .documents import DOCUMENT_COLLECTION, DocumentService, Region
 from .graph import Claim, GraphService, GraphWriter, object_id
 from .matching import MatchLine, MatchResult, match_invoice, parse_match_tolerances
-from .models import AssetCreate, AssetUpdate, utcnow
+from .models import utcnow
 from .reimbursements import JournalEvent, _event  # shared journal shape
 from .resolution import ResolutionOutcome, ResolutionThresholds
 from .resolution import read_resolution_thresholds, resolve
@@ -65,7 +64,6 @@ POLICY_ASSET_ID = "invoice-posting-policy"
 CLERK_QUEUE = "ap-clerk"
 
 PayableState = Literal["posted", "pending", "denied"]
-ExtractionPath = Literal["one-shot", "ensemble"]
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +102,9 @@ class InvoiceLineExtract(BaseModel):
 class InvoiceExtraction(BaseModel):
     vendor_name: str = ""
     vendor_slug: str = ""
+    # Printed on some invoices and not others; when it is there it is the
+    # strongest signal the resolver has, so the one extraction call reads it.
+    vendor_tax_id: str = ""
     invoice_number: str = ""
     invoice_date: str = ""
     due_date: str = ""
@@ -118,22 +119,6 @@ class InvoiceExtraction(BaseModel):
     model: str = ""
     lines: list[InvoiceLineExtract] = Field(default_factory=list)
     regions: list[Region] = Field(default_factory=list)
-
-
-class VendorCandidates(BaseModel):
-    """The first ModelCall's whole job: names, nothing else.
-
-    Narrow on purpose. Asking one call to both name the vendor and resolve it
-    is what produced vendor-as-a-slug; the model reads text off a page, and
-    deciding which entity that text refers to is the resolver's job against the
-    master, not the model's against its own memory.
-    """
-
-    names: list[str] = Field(default_factory=list)
-    tax_id: str = ""
-    remit_to: str = ""
-    confidence: float = 0.0
-    model: str = ""
 
 
 class PostingPolicy(BaseModel):
@@ -159,10 +144,7 @@ class InvoiceRecord(BaseModel):
     vendor_confidence: float = 0.0
     vendor_resolution: str = ""
     vendor_method: str = ""
-    vendor_candidates: list[str] = Field(default_factory=list)
-    # e.g. `knowledge:vendor-exemplar-…@rev1`; "" when none.
-    exemplar_ref: str = ""
-    extraction_path: ExtractionPath = "one-shot"
+    vendor_tax_id: str = ""
     invoice_number: str = ""
     invoice_date: str = ""
     due_date: str = ""
@@ -174,8 +156,6 @@ class InvoiceRecord(BaseModel):
     currency: str = "USD"
     line_summary: str = ""
     lines: list[InvoiceLineExtract] = Field(default_factory=list)
-    candidates: list[dict] = Field(default_factory=list)
-    conflicts: list[str] = Field(default_factory=list)
     # The retained three-way match, and the anomaly findings.
     match_verdict: str = ""
     match_summary: str = ""
@@ -204,8 +184,6 @@ class PayableStats(BaseModel):
     pending: int = 0
     denied: int = 0
     posted_usd: float = 0.0
-    one_shot: int = 0
-    ensemble: int = 0
     matched: int = 0
     match_variance: int = 0
     match_blocked: int = 0
@@ -218,17 +196,8 @@ class PayableStats(BaseModel):
 
 
 class InvoiceReader(Protocol):
-    def read_vendor_candidates(
-        self, image: bytes | None, filename: str, hint: str
-    ) -> VendorCandidates: ...
-
     def read(
-        self,
-        image: bytes | None,
-        filename: str,
-        hint: str,
-        persona: str,
-        exemplar: str | None,
+        self, image: bytes | None, filename: str, hint: str
     ) -> InvoiceExtraction: ...
 
 
@@ -257,69 +226,25 @@ class StubInvoiceReader:
     Steerable for demos, and the hints matter because they are how a local run
     exercises each branch:
 
-    - `vendor=acme-industrial` names a vendor; with an exemplar on the shelf the
-      one-shot path runs.
-    - `newvendor` (or an unrecognized `vendor=`) names one we do not know, so the
-      ensemble path runs and a clerk verifies the proposed exemplar.
-    - `po=PO-7741` bills against that purchase order, using SKUs from the shared
-      catalog so the three-way match is real.
+    - `vendor=acme-industrial` names a vendor in the master, so the resolver
+      links it.
+    - `newvendor` (or an unrecognized `vendor=`) names one we do not know, so
+      the resolver mints it `onboarding`.
+    - `po=PO-7741` bills against that purchase order, using SKUs from the
+      shared catalog so the three-way match is real.
     - `pricebump` raises a unit price 8% (price variance), `overbill` bills more
       than was received (quantity variance), `nopo` omits the PO entirely
       (unmatched), `blurry` drops confidence below the policy floor.
+    - `taxid` prints a tax id, which is the resolver's strongest signal.
     """
 
     name = "stub"
 
     # -- m1 ---------------------------------------------------------------
-    def read_vendor_candidates(
-        self, image: bytes | None, filename: str, hint: str
-    ) -> VendorCandidates:
-        text = f"{filename} {hint}".lower()
-        seed = hashlib.sha256(
-            (image or b"") + filename.encode() + hint.encode()
-        ).digest()
-        vendor_match = re.search(r"vendor[=\-_]([a-z0-9\-]+)", text)
-        new_match = re.search(r"newvendor[=\-_]([a-z0-9\-]+)", text)
-        if new_match:
-            primary = f"{_slug_to_name(new_match.group(1))} Ltd."
-            confidence = 0.88
-        elif vendor_match:
-            primary = _slug_to_name(vendor_match.group(1))
-            confidence = 0.94
-        elif "newvendor" in text:
-            primary = f"Meridian Supply {seed[:2].hex().upper()} Ltd."
-            confidence = 0.88
-        else:
-            primary = _AP_VENDORS[seed[3] % len(_AP_VENDORS)]
-            confidence = 0.91
-        # A real reader returns everything that looks like a party on the page:
-        # the biller, the remit-to, sometimes a parent company. The resolver is
-        # what decides which one is the vendor.
-        names = [primary]
-        if "remitto" in text or seed[4] % 3 == 0:
-            names.append(f"{primary.split()[0]} Holdings")
-        return VendorCandidates(
-            names=names,
-            tax_id=f"98-{int.from_bytes(seed[5:7], 'big') % 10000000:07d}"
-            if "taxid" in text else "",
-            remit_to=names[-1] if len(names) > 1 else primary,
-            confidence=0.55 if "blurry" in text else confidence,
-            model="stub-classifier",
-        )
-
-    # -- m2 / m2a-c -------------------------------------------------------
     def read(
-        self,
-        image: bytes | None,
-        filename: str,
-        hint: str,
-        persona: str = "oneshot",
-        exemplar: str | None = None,
+        self, image: bytes | None, filename: str, hint: str
     ) -> InvoiceExtraction:
         text = f"{filename} {hint}".lower()
-        seed = hashlib.sha256(
-            (image or b"") + filename.encode() + hint.encode() + persona.encode()
-        ).digest()
         base = hashlib.sha256(
             (image or b"") + filename.encode() + hint.encode()
         ).digest()
@@ -408,23 +333,16 @@ class StubInvoiceReader:
                 lines[-1].amount_usd = freight
             total = round(subtotal + freight, 2)
 
-        # Ensemble personas read the same document slightly differently — the
-        # point of an ensemble is that they disagree in recoverable ways.
         confidence = 0.55 if "blurry" in text else 0.93
         invoice_date_text = issued.isoformat()
         due = (issued + timedelta(days=30)).isoformat()
-        if persona == "b":
-            invoice_date_text = issued.strftime("%m/%d/%Y")
-            confidence = round(confidence - 0.06, 2)
-        elif persona == "c":
-            total = round(total + (0.02 if seed[0] % 2 else -0.03), 2)
-            confidence = round(confidence - 0.03, 2)
-            po_number = po_number if seed[1] % 4 else ""
-        elif persona == "oneshot" and exemplar:
-            confidence = 0.97
 
         return InvoiceExtraction(
-            vendor_name=vendor_name, vendor_slug=slug,
+            vendor_name=vendor_name, vendor_slug=_name_to_slug(vendor_name),
+            vendor_tax_id=(
+                f"98-{int.from_bytes(base[5:7], 'big') % 10000000:07d}"
+                if "taxid" in text else ""
+            ),
             invoice_number=invoice_number, invoice_date=invoice_date_text,
             due_date=due, po_number=po_number,
             subtotal_usd=subtotal, freight_usd=freight, tax_usd=0.0,
@@ -433,7 +351,7 @@ class StubInvoiceReader:
                 f"{line.quantity:g}× {line.sku}" for line in lines if line.kind == "goods"
             ),
             confidence=confidence,
-            model=f"stub-extractor-{persona}",
+            model="stub-extractor",
             lines=lines,
             regions=_invoice_regions(lines, total, invoice_number),
         )
@@ -461,10 +379,10 @@ def _invoice_regions(
 class VertexInvoiceReader:
     """Multimodal extraction on Vertex AI via google-genai.
 
-    Same client and credentials as the embedder and the answer backend. Two
-    prompts, because the two calls have genuinely different jobs: one reads the
-    parties off the page, the other reads the commercial content — with the
-    vendor's exemplar in front of it when one exists.
+    Same client and credentials as the embedder and the answer backend. One
+    prompt, one call: the vendor as printed plus the commercial content. The
+    prompt deliberately asks for the name *as printed* and forbids guessing an
+    identifier — naming the entity is the resolver's job, against the master.
     """
 
     name = "vertex"
@@ -502,56 +420,22 @@ class VertexInvoiceReader:
         )
         return json.loads(response.text or "{}")
 
-    def read_vendor_candidates(
-        self, image: bytes | None, filename: str, hint: str
-    ) -> VendorCandidates:
-        prompt = (
-            "List every party named on this invoice that could be the vendor "
-            "who issued it — the biller, the remit-to name, and any parent or "
-            "trading name. Do not guess an identifier and do not normalize the "
-            "names; return them as printed. Also return the vendor tax id if "
-            "one is printed, and your confidence 0-1 that the first name is "
-            "the issuing vendor. Respond with only a JSON object with keys "
-            "names (array of strings), tax_id, remit_to, confidence."
-            + (f" Context: {hint}" if hint else "")
-        )
-        data = self._generate(self._parts(image, filename, prompt), 0.0)
-        names = [str(n) for n in (data.get("names") or []) if str(n).strip()]
-        return VendorCandidates(
-            names=names,
-            tax_id=str(data.get("tax_id", "") or ""),
-            remit_to=str(data.get("remit_to", "") or ""),
-            confidence=float(data.get("confidence", 0) or 0),
-            model=self._model,
-        )
-
     def read(
-        self,
-        image: bytes | None,
-        filename: str,
-        hint: str,
-        persona: str = "oneshot",
-        exemplar: str | None = None,
+        self, image: bytes | None, filename: str, hint: str
     ) -> InvoiceExtraction:
-        role = (
-            "Extract using the vendor exemplar below as the template."
-            if exemplar else
-            "Extract independently; another extractor is reading the same "
-            "document and you must not assume its answer."
-        )
         prompt = (
-            f"{role} Extract from this invoice: vendor_name, invoice_number, "
+            "Extract from this invoice: vendor_name — the party that issued "
+            "it, as printed, not normalized and not guessed at from an "
+            "identifier — vendor_tax_id if one is printed, invoice_number, "
             "invoice_date (ISO 8601), due_date (ISO 8601), po_number, "
             "subtotal_usd, freight_usd, tax_usd, total_usd, currency, a short "
             "line_summary, your confidence 0-1, and lines: an array of the "
             "billed lines, each with sku, description, quantity, "
             "unit_price_usd, amount_usd and kind (goods, freight, tax or "
             "discount). Respond with only a JSON object with those keys."
-            + (f"\n\nVendor exemplar (one-shot template):\n{exemplar}" if exemplar else "")
             + (f"\n\nContext: {hint}" if hint else "")
         )
-        temperature = {"a": 0.0, "b": 0.2, "c": 0.4}.get(persona, 0.0)
-        data = self._generate(self._parts(image, filename, prompt), temperature)
+        data = self._generate(self._parts(image, filename, prompt), 0.0)
         lines = [
             InvoiceLineExtract(
                 sku=str(item.get("sku", "") or ""),
@@ -567,6 +451,7 @@ class VertexInvoiceReader:
         return InvoiceExtraction(
             vendor_name=vendor_name,
             vendor_slug=_name_to_slug(vendor_name),
+            vendor_tax_id=str(data.get("vendor_tax_id", "") or ""),
             invoice_number=str(data.get("invoice_number", "") or ""),
             invoice_date=str(data.get("invoice_date", "") or ""),
             due_date=str(data.get("due_date", "") or ""),
@@ -578,7 +463,7 @@ class VertexInvoiceReader:
             currency=str(data.get("currency", "USD") or "USD"),
             line_summary=str(data.get("line_summary", "") or ""),
             confidence=float(data.get("confidence", 0) or 0),
-            model=f"{self._model}:{persona}",
+            model=self._model,
             lines=lines,
         )
 
@@ -603,86 +488,16 @@ def parse_posting_policy(content: str) -> PostingPolicy:
     )
     if limit:
         values.limit_usd = float(limit.group(1).replace(",", ""))
+    # Both spellings, because the governed asset said "classification" while
+    # a separate classifier call existed and says "extraction" now — a policy
+    # already published in a deployment must keep parsing.
     confidence = re.search(
-        r"minimum classification confidence:?\s*(\d+(?:\.\d+)?)",
+        r"minimum (?:extraction|classification) confidence:?\s*(\d+(?:\.\d+)?)",
         content, re.IGNORECASE,
     )
     if confidence:
         values.min_confidence = float(confidence.group(1))
     return values
-
-
-# ---------------------------------------------------------------------------
-# Adjudication — field-by-field majority over the ensemble
-# ---------------------------------------------------------------------------
-
-_ADJUDICATED_TEXT_FIELDS = [
-    "invoice_number", "invoice_date", "due_date", "po_number", "line_summary",
-]
-
-
-def adjudicate(candidates: list[InvoiceExtraction]) -> tuple[dict, list[str]]:
-    """Field-by-field majority over the independent extractions.
-
-    Amounts within a cent agree; otherwise the median wins and a conflict is
-    recorded. Empty fields lose to non-empty ones. Lines are taken from the
-    candidate whose line count is the median and whose subtotal is closest to
-    the adjudicated total — merging line arrays across extractors produces
-    plausible nonsense, and a clerk reviewing an ensemble needs one coherent
-    reading to correct rather than a union of three.
-    """
-    conflicts: list[str] = []
-    adjudicated: dict = {}
-
-    for field in _ADJUDICATED_TEXT_FIELDS:
-        values = [getattr(c, field) for c in candidates]
-        shown = [v if v else "(empty)" for v in values]
-        non_empty = [v for v in values if v]
-        if not non_empty:
-            adjudicated[field] = ""
-            continue
-        top, votes = Counter(non_empty).most_common(1)[0]
-        if votes >= 2:
-            winner, note = top, f"majority {top}"
-        else:
-            winner, note = (
-                non_empty[0], f"no majority — extractor A's {non_empty[0]} retained"
-            )
-        if len(set(values)) > 1:
-            conflicts.append(f"{field}: {' vs '.join(shown)} — {note}")
-        adjudicated[field] = winner
-
-    totals = [round(c.total_usd, 2) for c in candidates]
-    total = round(statistics.median(totals), 2)
-    if max(totals) - min(totals) > 0.01 + 1e-9:
-        conflicts.append(
-            "total_usd: " + " vs ".join(f"${t:,.2f}" for t in totals)
-            + f" — median ${total:,.2f} wins"
-        )
-    adjudicated["total_usd"] = total
-    adjudicated["confidence"] = round(
-        statistics.median(c.confidence for c in candidates), 2
-    )
-
-    line_counts = [len(c.lines) for c in candidates]
-    if len(set(line_counts)) > 1:
-        conflicts.append(
-            "lines: " + " vs ".join(f"{n} line(s)" for n in line_counts)
-            + " — the closest coherent reading is kept whole"
-        )
-    target = statistics.median(line_counts)
-    chosen = min(
-        candidates,
-        key=lambda c: (abs(len(c.lines) - target), abs(c.total_usd - total)),
-    )
-    adjudicated["lines"] = [line.model_dump() for line in chosen.lines]
-    adjudicated["subtotal_usd"] = chosen.subtotal_usd
-    adjudicated["freight_usd"] = chosen.freight_usd
-    adjudicated["tax_usd"] = chosen.tax_usd
-    adjudicated["currency"] = chosen.currency
-    adjudicated["vendor_name"] = chosen.vendor_name
-    adjudicated["vendor_slug"] = chosen.vendor_slug
-    return adjudicated, conflicts
 
 
 # ---------------------------------------------------------------------------
@@ -746,17 +561,6 @@ class FirestorePayableDirectory:
         return record
 
 
-def _exemplar_asset_id(vendor_id: str, slug: str) -> str:
-    """Exemplars are keyed by the canonical vendor id, with the slug for humans.
-
-    The old scheme keyed them by slug alone, which quietly made the asset id
-    the vendor's identity: two spellings meant two exemplars, and merging the
-    vendors did not merge the shelves. The id is the key; the slug is a label.
-    """
-    suffix = vendor_id.split("_")[-1] if "_" in vendor_id else vendor_id
-    return f"vendor-exemplar-{slug or 'unknown'}-{suffix}"[:120]
-
-
 def _knowledge_ref(asset) -> str:
     return f"knowledge:{asset.id}@rev{getattr(asset, 'revision', 1)}"
 
@@ -806,10 +610,6 @@ class PayableService:
         stats = PayableStats()
         for r in self.directory.list():
             stats.total += 1
-            if r.extraction_path == "one-shot":
-                stats.one_shot += 1
-            else:
-                stats.ensemble += 1
             if r.match_verdict == "matched":
                 stats.matched += 1
             elif r.match_verdict in ("variance", "unmatched"):
@@ -904,30 +704,29 @@ class PayableService:
         )
         document_id = slot["document_id"]
 
-        # -- m1: names off the page, nothing more -------------------------
-        candidates = VendorCandidates.model_validate(ctx.step(
-            "m1", "read-vendor-candidates", "modelcall",
-            fn=lambda: self.reader.read_vendor_candidates(
-                image, filename, hint
-            ).model_dump(),
+        # -- m1: one call reads the whole document ------------------------
+        extraction = InvoiceExtraction.model_validate(ctx.step(
+            "m1", "extract-invoice", "modelcall",
+            fn=lambda: self._extract(image, filename, hint, document_id).model_dump(),
             summary=lambda out: (
-                f"{out['model']}: {len(out['names'])} candidate name(s) — "
-                + ", ".join(out["names"][:3])
-                + f" · confidence {out['confidence']:.2f}"
+                f"{out['model']}: {out['vendor_name'] or 'unnamed vendor'} · "
+                f"{out['invoice_number']} · ${out['total_usd']:,.2f} · "
+                f"{len(out['lines'])} line(s) · "
+                f"confidence {out['confidence']:.2f}"
             ),
             model=getattr(self.reader, "name", ""),
             refs=[f"document:{document_id}"],
             retries=1, escalate_queue=CLERK_QUEUE,
         ))
 
-        # -- z1: names become one canonical vendor ------------------------
+        # -- z1: the printed name becomes one canonical vendor ------------
         vendor_writer = (
             self.graph.writer(ctx.record.id, "z1") if self.graph else None
         )
         resolution_raw = ctx.step(
             "z1", "resolve-vendor", "resolve",
             fn=lambda: self._resolve_vendor(
-                candidates, ctx.record.id, vendor_writer
+                extraction, ctx.record.id, vendor_writer
             ),
             writes=lambda _out: (
                 vendor_writer.refs if vendor_writer is not None else []
@@ -947,7 +746,7 @@ class PayableService:
             decision = ctx.gate(
                 "k0", "confirm-vendor",
                 build_task=lambda: self._build_vendor_task(
-                    ctx.record, candidates, resolution_raw, submitted_by
+                    ctx.record, extraction, resolution_raw, submitted_by
                 ),
             )
             decision_writer = (
@@ -956,7 +755,7 @@ class PayableService:
             chosen = ctx.step(
                 "a0", "apply-vendor-decision", "action",
                 fn=lambda: self._apply_vendor_decision(
-                    candidates, resolution_raw, decision, ctx.record.id,
+                    extraction, resolution_raw, decision, ctx.record.id,
                     decision_writer,
                 ),
                 writes=lambda _out: (
@@ -968,124 +767,6 @@ class PayableService:
             )
             vendor_id = chosen["vendor_id"]
             vendor_label = chosen["label"]
-
-        # -- x1/r1: the governed knowledge read that changes the plan ------
-        exemplar = ctx.step(
-            "x1", "load-exemplar", "transform",
-            fn=lambda: self._load_exemplar(vendor_id, candidates),
-            summary=lambda out: (
-                f"{out['ref']} found — one-shot extraction available"
-                if out["found"] else
-                f"no exemplar for {vendor_label or 'this vendor'} — the "
-                "ensemble path will propose one"
-            ),
-        )
-        if exemplar["found"]:
-            ctx.note_refs(exemplar["ref"])
-        one_shot = bool(exemplar["found"])
-        ctx.step(
-            "r1", "exemplar-known", "rule",
-            fn=lambda: {"one_shot": one_shot},
-            summary=(
-                "one-shot: a verified template exists for this vendor"
-                if one_shot else
-                "ensemble: no template — three independent reads, adjudicated, "
-                "then verified by a clerk"
-            ),
-            refs=[exemplar["ref"]] if exemplar["found"] else [],
-        )
-
-        conflicts: list[str] = []
-        candidate_dumps: list[dict] = []
-        if one_shot:
-            extraction = InvoiceExtraction.model_validate(ctx.step(
-                "m2", "extract-oneshot", "modelcall",
-                fn=lambda: self._extract(
-                    image, filename, hint, "oneshot", exemplar["content"],
-                    document_id,
-                ).model_dump(),
-                summary=lambda out: (
-                    f"{out['model']}: {out['invoice_number']} · "
-                    f"${out['total_usd']:,.2f} · {len(out['lines'])} line(s) · "
-                    f"confidence {out['confidence']:.2f}"
-                ),
-                model=getattr(self.reader, "name", ""),
-                refs=[exemplar["ref"], f"document:{document_id}"],
-                retries=1, escalate_queue=CLERK_QUEUE,
-            ))
-            path: ExtractionPath = "one-shot"
-        else:
-            reads: list[InvoiceExtraction] = []
-            for persona, step_id in (("a", "m2a"), ("b", "m2b"), ("c", "m2c")):
-                reads.append(InvoiceExtraction.model_validate(ctx.step(
-                    step_id, f"extract-ensemble[{persona}]", "modelcall",
-                    fn=lambda p=persona: self._extract(
-                        image, filename, hint, p, None, document_id
-                    ).model_dump(),
-                    summary=lambda out: (
-                        f"{out['model']}: {out['invoice_number']} · "
-                        f"${out['total_usd']:,.2f} · {len(out['lines'])} line(s)"
-                    ),
-                    model=getattr(self.reader, "name", ""),
-                    refs=[f"document:{document_id}"],
-                    retries=1, escalate_queue=CLERK_QUEUE,
-                )))
-            adjudicated = ctx.step(
-                "x2", "adjudicate", "transform",
-                fn=lambda: _adjudicate_output(reads),
-                summary=lambda out: (
-                    f"merged 3 reads · {len(out['conflicts'])} conflict(s)"
-                    + (
-                        ": " + "; ".join(c.split(":")[0] for c in out["conflicts"])
-                        if out["conflicts"] else ""
-                    )
-                ),
-            )
-            conflicts = adjudicated["conflicts"]
-            candidate_dumps = adjudicated["candidates"]
-            extraction = InvoiceExtraction.model_validate(adjudicated["merged"])
-            path = "ensemble"
-
-            verification = ctx.gate(
-                "k1", "verify-exemplar",
-                build_task=lambda: self._build_verify_task(
-                    ctx.record, extraction, conflicts, vendor_label,
-                    resolution_raw, submitted_by,
-                ),
-            )
-            exemplar_writer = (
-                self.graph.writer(ctx.record.id, "a2") if self.graph else None
-            )
-            written = ctx.step(
-                "a2", "write-exemplar", "action",
-                fn=lambda: self._write_exemplar(
-                    vendor_id, vendor_label, extraction, verification,
-                    ctx.record.id, exemplar_writer,
-                ),
-                writes=lambda out: (
-                    ([out["ref"]] if out.get("written") else [])
-                    + (exemplar_writer.refs if exemplar_writer is not None else [])
-                ),
-                summary=lambda out: (
-                    f"exemplar {out['ref']} written to the shelf — this "
-                    "vendor's next invoice takes the one-shot path"
-                    if out["written"] else
-                    f"no exemplar written ({out['reason']})"
-                ),
-            )
-            if written["written"]:
-                ctx.note_refs(written["ref"])
-            if verification.verdict == "rejected":
-                return self._finish(
-                    ctx, submitted_by, submitted_at, filename, document_id,
-                    vendor_id, vendor_label, resolution_raw, candidates,
-                    exemplar, path, extraction, conflicts, candidate_dumps,
-                    match=None, screen=None, policy=self.read_policy(),
-                    state="denied",
-                    reason=verification.note or "rejected at exemplar verification",
-                    decided_by=verification.decided_by,
-                    decision_note=verification.note,
-                )
 
         # -- x3: the lines become facts -----------------------------------
         lines = ctx.step(
@@ -1230,8 +911,7 @@ class PayableService:
 
         return self._finish(
             ctx, submitted_by, submitted_at, filename, document_id, vendor_id,
-            vendor_label, resolution_raw, candidates, exemplar, path,
-            extraction, conflicts, candidate_dumps, match, screen, policy,
+            vendor_label, resolution_raw, extraction, match, screen, policy,
             state, reason, decided_by, decision_note,
         )
 
@@ -1253,55 +933,59 @@ class PayableService:
         image: bytes | None,
         filename: str,
         hint: str,
-        persona: str,
-        exemplar: str | None,
         document_id: str,
     ) -> InvoiceExtraction:
-        extraction = self.reader.read(image, filename, hint, persona, exemplar)
+        extraction = self.reader.read(image, filename, hint)
         if self.documents is not None and extraction.regions:
             self.documents.set_regions(document_id, extraction.regions)
         return extraction
 
     def _resolve_vendor(
         self,
-        candidates: VendorCandidates,
+        extraction: InvoiceExtraction,
         run_id: str,
         writer: GraphWriter | None = None,
     ) -> dict:
+        """The name the model read becomes a canonical Vendor id.
+
+        The model contributes text; the resolver decides identity, against the
+        vendor master and the governed thresholds. That division is the whole
+        reason a vendor is an entity here rather than a string on a row.
+        """
         thresholds = read_resolution_thresholds(self.knowledge)
+        name = extraction.vendor_name.strip()
         if self.graph is None:
             return {
-                "disposition": "new", "vendor_id": "", "label": candidates.names[0]
-                if candidates.names else "", "score": 0.0, "method": "none",
-                "reason": "no graph wired", "candidates": [],
-                "thresholds_ref": thresholds.source_ref,
+                "disposition": "new", "vendor_id": "", "label": name,
+                "score": 0.0, "method": "none", "reason": "no graph wired",
+                "candidates": [], "thresholds_ref": thresholds.source_ref,
             }
         outcome = resolve(
-            self.graph, "Vendor", candidates.names, thresholds,
-            tax_id=candidates.tax_id,
+            self.graph, "Vendor", [name] if name else [], thresholds,
+            tax_id=extraction.vendor_tax_id,
         )
         payload = outcome.model_dump()
         payload["vendor_id"] = outcome.object_id
-        if outcome.disposition == "new" and candidates.names:
+        if outcome.disposition == "new" and name:
             # Mint it now, `onboarding`, so the rest of the run has an id to
-            # hang facts off. The clerk's exemplar verification doubles as the
-            # confirmation that this vendor is real — which is exactly the
-            # unknown-vendor onboarding step the doctrine describes.
+            # hang facts off. It graduates to `active` when a human posts one
+            # of its invoices — the unknown-vendor onboarding step the
+            # doctrine describes.
+            source = f"model:{extraction.model}"
             vendor = (writer or self.graph).upsert(
-                "Vendor", candidates.names[0],
+                "Vendor", name,
                 [
-                    Claim(field="name", value=candidates.names[0],
-                          source=f"model:{candidates.model}",
-                          confidence=candidates.confidence),
-                    Claim(field="slug", value=_name_to_slug(candidates.names[0]),
+                    Claim(field="name", value=name, source=source,
+                          confidence=extraction.confidence),
+                    Claim(field="slug", value=_name_to_slug(name),
                           source=f"flow:{FLOW_ID}"),
                     Claim(field="status", value="onboarding",
                           source=f"flow:{FLOW_ID}"),
                 ]
-                + ([Claim(field="tax_id", value=candidates.tax_id,
-                          source=f"model:{candidates.model}")]
-                   if candidates.tax_id else []),
-                label=candidates.names[0],
+                + ([Claim(field="tax_id", value=extraction.vendor_tax_id,
+                          source=source)]
+                   if extraction.vendor_tax_id else []),
+                label=name,
                 provenance=f"first seen on an invoice, run {run_id}",
             )
             payload["vendor_id"] = vendor.id
@@ -1313,7 +997,7 @@ class PayableService:
 
     def _apply_vendor_decision(
         self,
-        candidates: VendorCandidates,
+        extraction: InvoiceExtraction,
         resolution_raw: dict,
         decision,
         run_id: str,
@@ -1331,7 +1015,7 @@ class PayableService:
                 graph.upsert(
                     "Vendor", vendor.natural_key,
                     [Claim(
-                        field="aliases", value=candidates.names,
+                        field="aliases", value=[extraction.vendor_name],
                         source=f"human:{decision.decided_by}",
                     )],
                     label=vendor.label,
@@ -1340,7 +1024,7 @@ class PayableService:
                     "action": "linked", "vendor_id": vendor.id,
                     "label": vendor.label, "decided_by": decision.decided_by,
                 }
-        name = candidates.names[0] if candidates.names else "Unknown vendor"
+        name = extraction.vendor_name.strip() or "Unknown vendor"
         if self.graph is None:
             return {
                 "action": "unresolved", "vendor_id": "", "label": name,
@@ -1360,30 +1044,6 @@ class PayableService:
         return {
             "action": "minted", "vendor_id": vendor.id, "label": vendor.label,
             "decided_by": decision.decided_by,
-        }
-
-    def _load_exemplar(self, vendor_id: str, candidates: VendorCandidates) -> dict:
-        """Look for this vendor's one-shot template, keyed by canonical id."""
-        if not vendor_id:
-            return {"found": False, "ref": "", "content": "", "asset_id": ""}
-        vendor = self.graph.get(vendor_id) if self.graph else None
-        slug = str((vendor.props.get("slug") if vendor else "") or "")
-        if not slug and vendor is not None:
-            slug = _name_to_slug(vendor.label)
-        asset_id = _exemplar_asset_id(vendor_id, slug)
-        asset = self.knowledge.repo.get(asset_id)
-        if asset is None:
-            # Fall back to the pre-canonical naming so exemplars written before
-            # vendors had ids are still found. One lookup, and it keeps the
-            # seeded Acme exemplar working.
-            legacy = self.knowledge.repo.get(f"vendor-exemplar-{slug}")
-            asset = legacy
-            asset_id = legacy.id if legacy else asset_id
-        if asset is None:
-            return {"found": False, "ref": "", "content": "", "asset_id": asset_id}
-        return {
-            "found": True, "ref": _knowledge_ref(asset),
-            "content": asset.content, "asset_id": asset.id,
         }
 
     def _gather_match_context(self, vendor_id: str, po_number: str) -> dict:
@@ -1471,17 +1131,18 @@ class PayableService:
     def _build_vendor_task(
         self,
         record: RunRecord,
-        candidates: VendorCandidates,
+        extraction: InvoiceExtraction,
         resolution_raw: dict,
         submitted_by: str,
     ) -> Task:
         ranked = resolution_raw.get("candidates") or []
+        printed = extraction.vendor_name or "no clear party"
         return Task(
             id=f"task_{record.id}_k0",
             kind="match_review",
-            title=f"Which vendor issued this invoice? {candidates.names[0] if candidates.names else '—'}",
+            title=f"Which vendor issued this invoice? {printed}",
             summary=(
-                f"The document names {', '.join(candidates.names) or 'no clear party'}. "
+                f"The document is billed by {printed}. "
                 f"{resolution_raw.get('reason', '')}. Nothing has been asserted: "
                 "approve to accept the top candidate, correct with the id of "
                 "the right vendor, or reject to onboard this as a new one."
@@ -1495,9 +1156,12 @@ class PayableService:
             + [f"graph:Vendor/{c['object_id']}" for c in ranked[:3]],
             evidence=[
                 TaskEvidence(label="Submitted by", value=submitted_by),
-                TaskEvidence(label="Names on the document",
-                             value=", ".join(candidates.names) or "—"),
-                TaskEvidence(label="Tax id", value=candidates.tax_id or "—"),
+                TaskEvidence(label="Printed on the document", value=printed),
+                TaskEvidence(label="Tax id", value=extraction.vendor_tax_id or "—"),
+                TaskEvidence(label="Invoice number",
+                             value=extraction.invoice_number or "—"),
+                TaskEvidence(label="Total",
+                             value=f"${extraction.total_usd:,.2f}"),
             ] + [
                 TaskEvidence(
                     label=f"Candidate {i + 1} ({c['score']:.2f})",
@@ -1512,56 +1176,8 @@ class PayableService:
                     if ranked else "Onboard a new vendor"
                 ),
             ),
-            resumes="this run resumes at k0 and extracts against the chosen vendor",
-            created_at_iso=utcnow().isoformat(),
-        )
-
-    def _build_verify_task(
-        self,
-        record: RunRecord,
-        extraction: InvoiceExtraction,
-        conflicts: list[str],
-        vendor_label: str,
-        resolution_raw: dict,
-        submitted_by: str,
-    ) -> Task:
-        return Task(
-            id=f"task_{record.id}_k1",
-            kind="curation",
-            title=f"Verify extraction and exemplar: {vendor_label or extraction.vendor_name}",
-            summary=(
-                "No exemplar existed for this vendor, so three extractors read "
-                "the document independently and an adjudicator merged them "
-                f"({len(conflicts)} disagreement(s)). Approving verifies the "
-                "adjudicated fields and writes the vendor's exemplar into the "
-                "knowledge layer, so the next invoice from them is a single "
-                "confident pass. This is also the confirmation that "
-                f"{vendor_label or 'this vendor'} is a real vendor."
-            ),
-            queue=CLERK_QUEUE,
-            priority="normal",
-            flow_id=FLOW_ID,
-            run_id=record.id,
-            case_ref=record.case_ref or record.id,
-            refs=[resolution_raw.get("thresholds_ref", "")],
-            evidence=[
-                TaskEvidence(label="Vendor", value=vendor_label or extraction.vendor_name),
-                TaskEvidence(label="Invoice number", value=extraction.invoice_number),
-                TaskEvidence(label="Invoice date", value=extraction.invoice_date),
-                TaskEvidence(label="PO on document", value=extraction.po_number or "—"),
-                TaskEvidence(label="Total", value=f"${extraction.total_usd:,.2f}"),
-                TaskEvidence(label="Lines", value=str(len(extraction.lines))),
-                TaskEvidence(label="Submitted by", value=submitted_by),
-            ] + [
-                TaskEvidence(label="Conflict", value=conflict)
-                for conflict in conflicts[:5]
-            ],
-            proposal=TaskProposal(
-                action="write-exemplar", target="ap-vendor-exemplars",
-                summary=f"Write the one-shot template for {vendor_label}",
-            ),
-            resumes="this run resumes at k1, writes the exemplar, then matches "
-                    "and screens the invoice",
+            resumes="this run resumes at k0 and matches against the chosen "
+                    "vendor's orders",
             created_at_iso=utcnow().isoformat(),
         )
 
@@ -1627,71 +1243,6 @@ class PayableService:
             created_at_iso=utcnow().isoformat(),
         )
 
-    # -- the flywheel -------------------------------------------------------
-
-    def _write_exemplar(
-        self,
-        vendor_id: str,
-        vendor_label: str,
-        extraction: InvoiceExtraction,
-        decision,
-        run_id: str,
-        writer: GraphWriter | None = None,
-    ) -> dict:
-        """The governed-knowledge write: a verified reading becomes a template.
-
-        Only on approve or correct, and only ever through this step — promotion
-        into canonical knowledge is a decision, not a side effect of a
-        successful extraction.
-        """
-        if decision.verdict == "rejected":
-            return {
-                "written": False, "ref": "",
-                "reason": "the verifier rejected the extraction",
-            }
-        vendor = self.graph.get(vendor_id) if self.graph else None
-        slug = str((vendor.props.get("slug") if vendor else "") or "") or _name_to_slug(
-            vendor_label or extraction.vendor_name
-        )
-        asset_id = _exemplar_asset_id(vendor_id, slug)
-        content = _exemplar_content(
-            vendor_label or extraction.vendor_name, slug, extraction, decision, run_id
-        )
-        existing = self.knowledge.repo.get(asset_id)
-        if existing is None:
-            asset = self.knowledge.create(AssetCreate(
-                id=asset_id,
-                path=f"finance/exemplars/{slug}",
-                title=f"Vendor exemplar: {vendor_label or extraction.vendor_name}",
-                content=content,
-                kind="exemplar",
-                origin="flywheel",
-                scope="org",
-                owner="finance-ops",
-                tags=["exemplar", "ap", slug],
-                status="published",
-            ))
-        else:
-            asset = self.knowledge.update(asset_id, AssetUpdate(content=content))
-        # The vendor graduates: a human has now vouched for it.
-        if self.graph is not None and vendor is not None:
-            (writer or self.graph).upsert(
-                "Vendor", vendor.natural_key,
-                [Claim(
-                    field="status", value="active",
-                    source=f"human:{decision.decided_by}",
-                )],
-                label=vendor.label,
-            )
-        log.info(
-            "Vendor exemplar written",
-            extra={
-                "assetId": asset_id, "vendorId": vendor_id, "runId": run_id,
-                "actor": decision.decided_by,
-            },
-        )
-        return {"written": True, "ref": _knowledge_ref(asset), "reason": ""}
-
     # -- the commit ---------------------------------------------------------
 
     def _finish(
@@ -1704,12 +1255,7 @@ class PayableService:
         vendor_id: str,
         vendor_label: str,
         resolution_raw: dict,
-        candidates: VendorCandidates,
-        exemplar: dict,
-        path: ExtractionPath,
         extraction: InvoiceExtraction,
-        conflicts: list[str],
-        candidate_dumps: list[dict],
         match: MatchResult | None,
         screen: dict | None,
         policy: PostingPolicy,
@@ -1728,12 +1274,10 @@ class PayableService:
             vendor_id=vendor_id,
             vendor_slug=extraction.vendor_slug or _name_to_slug(vendor_label),
             vendor_name=vendor_label or extraction.vendor_name,
-            vendor_confidence=candidates.confidence,
+            vendor_confidence=float(resolution_raw.get("score", 0) or 0),
             vendor_resolution=str(resolution_raw.get("disposition", "")),
             vendor_method=str(resolution_raw.get("method", "")),
-            vendor_candidates=list(candidates.names),
-            exemplar_ref=exemplar.get("ref", ""),
-            extraction_path=path,
+            vendor_tax_id=extraction.vendor_tax_id,
             invoice_number=extraction.invoice_number,
             invoice_date=extraction.invoice_date,
             due_date=extraction.due_date,
@@ -1745,8 +1289,6 @@ class PayableService:
             currency=extraction.currency,
             line_summary=extraction.line_summary,
             lines=extraction.lines,
-            candidates=candidate_dumps,
-            conflicts=conflicts,
             match_verdict=match.verdict if match else "",
             match_summary=match.summary() if match else "",
             match_pairings=[p.model_dump() for p in match.pairings] if match else [],
@@ -1795,7 +1337,7 @@ class PayableService:
             extra={
                 "invoiceId": record.id, "runId": ctx.record.id,
                 "state": record.state, "amount": record.total_usd,
-                "path": record.extraction_path, "vendorId": vendor_id,
+                "vendorId": vendor_id,
                 "match": record.match_verdict,
                 "anomalies": len(record.anomaly_findings),
             },
@@ -1817,7 +1359,7 @@ class PayableService:
             return {"objects": 0, "links": 0, "invoice_ref": "", "match_ref": ""}
         graph = writer if writer is not None else self.graph
         source = f"flow:{FLOW_ID}"
-        model_source = f"model:{record.extraction_path}"
+        model_source = "model:invoice-extraction"
         # Keyed by the vendor's slug rather than its generated id: a natural
         # key has to be something a person — or an eval fixture — can write,
         # and the slug normalizes from the same name the id hashes from, so it
@@ -1848,6 +1390,23 @@ class PayableService:
                 props={"invoice_date": record.invoice_date}, provenance=run_id,
             )
             links += 1
+            # The vendor graduates. A vendor minted from an invoice is
+            # `onboarding` until a person posts one of its invoices — that
+            # decision, and nothing automatic, is the confirmation it is real.
+            vendor = self.graph.get(record.vendor_id)
+            if (
+                vendor is not None
+                and record.state == "posted"
+                and record.decided_by
+                and vendor.props.get("status") == "onboarding"
+            ):
+                graph.upsert(
+                    "Vendor", vendor.natural_key,
+                    [Claim(field="status", value="active",
+                           source=f"human:{record.decided_by}")],
+                    label=vendor.label,
+                    provenance=f"vouched for by posting {record.invoice_number}",
+                )
         if record.document_id:
             document = graph.upsert(
                 "Document", record.document_id,
@@ -1970,24 +1529,18 @@ class PayableService:
             return (found.output if found is not None else None) or default
 
         resolution = output("z1", {})
-        exemplar = output("x1", {})
         stored = output("s1", {})
-        one_shot = step("m2") is not None
 
         extraction = InvoiceExtraction()
-        # The last correction wins, then the adjudicated merge, then the
-        # one-shot read — newest reading of the document first.
-        sources = (
-            [f"x6_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)] + ["m2", "x2"]
-        )
+        # The last correction wins, then the extraction itself — newest
+        # reading of the document first.
+        sources = [f"x6_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)] + ["m1"]
         for step_id in sources:
             payload = output(step_id)
             if not payload:
                 continue
             if isinstance(payload, dict) and "extraction" in payload:
                 payload = payload["extraction"]
-            elif isinstance(payload, dict) and "merged" in payload:
-                payload = payload["merged"]
             try:
                 extraction = InvoiceExtraction.model_validate(payload)
                 break
@@ -2004,7 +1557,6 @@ class PayableService:
                 except Exception:  # noqa: BLE001
                     continue
         screen = output("c2", {}) or {}
-        adjudication = output("x2", {}) or {}
         policy = PostingPolicy.model_validate(output("x5", {}) or {})
 
         reasons: list[str] = []
@@ -2046,8 +1598,7 @@ class PayableService:
             vendor_confidence=float(resolution.get("score", 0) or 0),
             vendor_resolution=str(resolution.get("disposition", "")),
             vendor_method=str(resolution.get("method", "")),
-            exemplar_ref=str(exemplar.get("ref", "")),
-            extraction_path="one-shot" if one_shot else "ensemble",
+            vendor_tax_id=extraction.vendor_tax_id,
             invoice_number=extraction.invoice_number,
             invoice_date=extraction.invoice_date,
             due_date=extraction.due_date,
@@ -2059,8 +1610,6 @@ class PayableService:
             currency=extraction.currency,
             line_summary=extraction.line_summary,
             lines=extraction.lines,
-            candidates=list(adjudication.get("candidates") or []),
-            conflicts=list(adjudication.get("conflicts") or []),
             match_verdict=match.verdict if match else "",
             match_summary=match.summary() if match else "",
             match_pairings=[p.model_dump() for p in match.pairings] if match else [],
@@ -2087,19 +1636,6 @@ class PayableService:
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
-
-
-def _adjudicate_output(reads: list[InvoiceExtraction]) -> dict:
-    merged, conflicts = adjudicate(reads)
-    base = reads[0].model_dump()
-    base.update(merged)
-    base["model"] = "adjudicator(" + ", ".join(r.model for r in reads) + ")"
-    base["regions"] = reads[0].regions and [r.model_dump() for r in reads[0].regions] or []
-    return {
-        "merged": base,
-        "conflicts": conflicts,
-        "candidates": [r.model_dump() for r in reads],
-    }
 
 
 def _invoice_match_lines(extraction: InvoiceExtraction) -> list[dict]:
@@ -2219,76 +1755,6 @@ def _apply_invoice_patch(extraction: InvoiceExtraction, payload: dict) -> dict:
     # A clerk who has read the document has resolved the model's uncertainty.
     patched.confidence = 1.0
     return {"extraction": patched.model_dump(), "changed": changed}
-
-
-def _exemplar_content(
-    vendor_name: str,
-    slug: str,
-    extraction: InvoiceExtraction,
-    decision,
-    run_id: str,
-) -> str:
-    """Render a verified reading as a one-shot extraction template."""
-    lines = [
-        f"# Vendor exemplar: {vendor_name}",
-        "",
-        f"One-shot extraction template for `{slug}` invoices, verified by a "
-        "human from an adjudicated ensemble read. The accounts-payable flow "
-        "hands this to the extraction ModelCall when the resolver names this "
-        "vendor, so extraction is a single confident pass.",
-        "",
-        "## Layout",
-        "",
-        f"- Invoice number: format `{extraction.invoice_number}` — match this "
-        "pattern exactly.",
-        f"- Invoice date: {extraction.invoice_date} (ISO 8601, header block).",
-        "- PO number: "
-        + (
-            f"`{extraction.po_number}` in the header block."
-            if extraction.po_number
-            else "this vendor's invoices carry no PO reference."
-        ),
-        f"- Total: bottom-right summary block (verified total "
-        f"${extraction.total_usd:,.2f} {extraction.currency}).",
-    ]
-    if extraction.freight_usd:
-        lines.append(
-            f"- Freight appears as its own line (${extraction.freight_usd:,.2f} "
-            "on the verified invoice) — do not fold it into materials."
-        )
-    if extraction.lines:
-        lines += [
-            "",
-            "## Line items",
-            "",
-            "Columns run SKU · description · quantity · unit price · amount. "
-            "The verified read had:",
-            "",
-        ]
-        for line in extraction.lines:
-            lines.append(
-                f"- `{line.sku or '—'}` {line.description} — "
-                f"{line.quantity:g} × ${line.unit_price_usd:,.2f} = "
-                f"${line.amount_usd:,.2f} ({line.kind})"
-            )
-    lines += [
-        "",
-        "## Provenance",
-        "",
-        f"Verified on run `{run_id}` by {decision.decided_by}"
-        + (f" — {decision.note}" if decision.note else "")
-        + ".",
-        "",
-        "Corrections to this vendor's extractions accumulate in the correction "
-        "set and re-propose this exemplar when they show a pattern.",
-    ]
-    if decision.verdict == "corrected":
-        lines.append("")
-        lines.append(
-            "Correction applied by the verifier: "
-            + (decision.correction or decision.note or "see the task record")
-        )
-    return "\n".join(lines)
 
 
 def build_payable_service(
@@ -2500,7 +1966,7 @@ class SeedInvoice(BaseModel):
 
 def _seed_invoices() -> list[SeedInvoice]:
     return [
-        # 1. Known vendor, exemplar on the shelf, bills its PO exactly.
+        # 1. Known vendor, bills its PO exactly, posts with no human.
         SeedInvoice(
             run_id="run_ap_seed01", submitted_by="ap-intake@customer.example",
             days_ago=13, filename="acme-inv-20881.pdf",
@@ -2520,41 +1986,31 @@ def _seed_invoices() -> list[SeedInvoice]:
                 "payload": {"lines": [{"ordinal": 1, "unit_price_usd": 92.40}]},
             }],
         ),
-        # 3. No exemplar for this vendor yet, so the ensemble runs and a clerk
-        #    verifies it; then the invoice bills more than was received, so it
-        #    stops again at the posting gate — left open, so the AP queue has a
-        #    live exception with a real match set behind it.
+        # 3. The invoice bills more than was received, so the match holds it
+        #    at the posting gate — left open, so the AP queue has a live
+        #    exception with a real match set behind it.
         SeedInvoice(
             run_id="run_ap_seed03", submitted_by="ap-intake@customer.example",
             days_ago=9, filename="baystate-inv-88120.pdf",
             hint="vendor=bay-state-fasteners po=PO-7815 invoice=BSF-INV-88120 "
                  "lines=CNS-HYD:3,FAS-M12:2 overbill",
-            decisions=[{
-                "verdict": "approved", "decided_by": "dana@customer.example",
-                "note": "Fields check out against the document.",
-            }],
         ),
-        # 4. An unknown vendor: ensemble, adjudication, a clerk verifies the
-        #    exemplar (which also onboards the vendor), then the invoice has no
-        #    PO so it goes back for a posting decision. Two gates, one run.
+        # 4. An unknown vendor: nothing in the master resembles the name, so
+        #    it is minted `onboarding`. No PO on the document either, so the
+        #    invoice stops at the posting gate; a clerk posts it, and that
+        #    decision is what graduates the vendor to `active`.
         SeedInvoice(
             run_id="run_ap_seed04", submitted_by="ap-intake@customer.example",
             days_ago=7, filename="meridian-first-invoice.pdf",
             hint="newvendor=meridian-supply nopo invoice=MER-0001 "
                  "lines=PPE-GLV:2 total=190.00",
-            decisions=[
-                {
-                    "verdict": "approved", "decided_by": "dana@customer.example",
-                    "note": "Fields verified against the document; exemplar looks right.",
-                },
-                {
-                    "verdict": "approved", "decided_by": "dana@customer.example",
-                    "note": "First invoice from this vendor, no PO expected at this size.",
-                },
-            ],
+            decisions=[{
+                "verdict": "approved", "decided_by": "dana@customer.example",
+                "note": "First invoice from this vendor, no PO expected at this size.",
+            }],
         ),
-        # 5. The same vendor again — now on the one-shot path, because run 4
-        #    wrote the exemplar. This is the flywheel closing.
+        # 5. The same vendor again — now `active`, and the resolver links to
+        #    the object run 4 minted rather than minting a second one.
         SeedInvoice(
             run_id="run_ap_seed05", submitted_by="ap-intake@customer.example",
             days_ago=5, filename="meridian-second-invoice.pdf",
@@ -2562,7 +2018,7 @@ def _seed_invoices() -> list[SeedInvoice]:
                  "lines=PPE-GLV:1 total=112.00",
             decisions=[{
                 "verdict": "approved", "decided_by": "dana@customer.example",
-                "note": "One-shot read matches the document; no PO at this size.",
+                "note": "Read matches the document; no PO at this size.",
             }],
         ),
         # 6. A large invoice from a vendor whose history says otherwise: over
