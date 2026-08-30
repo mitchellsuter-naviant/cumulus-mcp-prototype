@@ -108,6 +108,8 @@ gets real. Naviant's own back office is the customer (the dogfood story).
 
 ## Track B — the read plane (this repo)
 
+Accepted implementation plan: **WORKPLAN-TRACK-B.md** (stages 1–6, file-level).
+
 - **B1 · The estate connector.** A registered estate (project/base URL +
   namespace, discovered via `/admin/namespaces`) with one connector per
   (app, resource-family): watermark state, `?updatedSince=` pull, page
