@@ -179,7 +179,11 @@ def test_the_last_sweep_is_the_run_that_happened_and_never_a_zeroed_row(booked):
     assert sweep["status"] == "succeeded"
     assert sweep["run_id"].startswith("run_")
     assert sweep["compared"] > sweep["considered"] >= sweep["proposed"] == 3
-    assert sweep["steward_tasks"] == 1
+    # One Task per proposal, and the split between a question and a formality
+    # — which is the difference between five landing on a desk and four of
+    # them being formalities.
+    assert sweep["steward_tasks"] == 3
+    assert sweep["ratifications"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -187,35 +191,39 @@ def test_the_last_sweep_is_the_run_that_happened_and_never_a_zeroed_row(booked):
 # ---------------------------------------------------------------------------
 
 
-def test_a_proposal_under_the_bar_carries_its_task_and_one_above_it_does_not(
-    booked,
-):
-    """The state a workbench normally gets wrong.
+def test_every_standing_proposal_carries_an_open_task_to_decide_it(booked):
+    """The state this workbench used to draw, and the state it draws now.
 
-    The sweep raises a Task only *below* the governed confidence bar, so a
-    high-scoring proposal stands at `in_review` with nobody paged and no
-    decision path at all. That is the policy working as declared, and the row
-    says it out loud rather than drawing a control with nothing to commit
-    through.
+    The screen's third gate branch — a Task-less proposal — was reachable by
+    policy: the sweep raised a Task only *below* the governed bar, so the
+    highest-scoring proposals stood at `in_review` with nobody paged, and the
+    workbench explained that to a steward as if it were fine. It is not a
+    decision path. Every proposal raises a Task now, so the branch survives
+    only for a proposal whose Task is missing, which is a finding rather than
+    a policy, and the row says so.
     """
     body = _screen(booked)
-    bar = body["policy"]["steward_task_below"]
+    assert body["standing"]
+    assert all(p["gate"]["task_id"] for p in body["standing"])
 
-    asked = [p for p in body["standing"] if p["gate"]["task_id"]]
-    quiet = [p for p in body["standing"] if not p["gate"]["task_id"]]
-    assert len(asked) == 1 and len(quiet) == 2
+    bar = body["policy"]["ratify_at"]
+    for proposal in body["standing"]:
+        gate = proposal["gate"]
+        assert gate["task_status"] == "open"
+        assert gate["queue"] == "data-stewardship"
+        assert gate["may_decide"] is True and gate["why_not"] == ""
+    # And both sides of the bar are represented, so this is not passing
+    # because everything happened to land under it.
+    assert [p["confidence"] < bar for p in body["standing"]].count(True) == 1
+    assert [p["confidence"] >= bar for p in body["standing"]].count(True) == 2
 
-    gate = asked[0]["gate"]
-    assert asked[0]["confidence"] < bar
-    assert gate["queue"] == "data-stewardship"
-    assert gate["task_status"] == "open"
-    assert gate["may_decide"] is True and gate["why_not"] == ""
-
-    for proposal in quiet:
-        assert proposal["confidence"] >= bar
-        assert proposal["gate"]["may_decide"] is False
-        assert "Nobody was paged" in proposal["gate"]["why_not"]
-        assert f"{bar:.2f}" in proposal["gate"]["why_not"]
+    # The no-task sentence is now about a missing Task rather than about a
+    # confident proposal — nothing in it claims the policy paged nobody.
+    gate = ui_api._proposal_gate(
+        None, Principal(uid="u", email="u@x", role="user")
+    )
+    assert "No Task carries this proposal" in gate.why_not
+    assert "paged" not in gate.why_not
 
 
 def test_a_persona_that_does_not_own_the_desk_reads_a_sentence(booked):
@@ -241,8 +249,15 @@ def test_a_persona_that_does_not_own_the_desk_reads_a_sentence(booked):
 
 
 def _decide(client, verdict: str, note: str) -> dict:
+    """Rule on the Northwind pair, through the Task the sweep raised for it.
+
+    Named rather than "the first merge_review": every proposal raises a Task
+    now, so taking whichever came back first would make these tests depend on
+    the queue's ordering.
+    """
     task = next(
-        t for t in client.world.tasks.list() if t.kind == "merge_review"
+        t for t in client.world.tasks.list()
+        if t.kind == "merge_review" and STALE_NORTHWIND in t.title
     )
     resp = client.post(
         f"/api/v1/tasks/{task.id}/decide",
@@ -268,7 +283,7 @@ def test_confirming_moves_the_proposal_into_the_decided_record(booked):
     assert ruled["withdrawn_because"] == ""
     # The machine's own score survives the human's answer: it is the number a
     # later tuning pass needs, and confirming is not a claim of certainty.
-    assert ruled["confidence"] < body["policy"]["steward_task_below"]
+    assert ruled["confidence"] < body["policy"]["ratify_at"]
     assert ruled["gate"]["task_status"] == "approved"
     assert ruled["gate"]["may_decide"] is False
     assert "Already decided" in ruled["gate"]["why_not"]

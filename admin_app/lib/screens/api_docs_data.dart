@@ -1399,7 +1399,12 @@ const tasksGroup = EndpointGroup(
           'Once-only: a second decision returns 409 so the second decider '
           'learns the judgment already happened. The decision is durable, '
           'attributed state — the prototype\'s stand-in for the curation '
-          'ledger entry every human decision must land as.',
+          'ledger entry every human decision must land as. Deciding also '
+          'resumes whatever the task suspended, and the two stand or fall '
+          'together: if that write cannot be committed, the decision is '
+          'withdrawn, the task goes back to open and the failure is returned '
+          'rather than logged — a task reading `done` over a world that never '
+          'changed is worse than an error.',
       params: [
         ApiParam(
           'verdict',
@@ -1421,9 +1426,13 @@ const tasksGroup = EndpointGroup(
       requestExample:
           '{"verdict": "approved", "note": "Matches the PO; posting."}',
       errors: [
-        ApiError(403, 'Minted API keys cannot decide tasks.'),
+        ApiError(403, 'Minted API keys cannot decide tasks; or the Action '
+            'Gateway refused the write the decision authorized — the task is '
+            'left open.'),
         ApiError(404, 'Task not found.'),
         ApiError(409, 'Task already decided.'),
+        ApiError(500, 'The decision could not be applied; the task is left '
+            'open.'),
       ],
     ),
   ],

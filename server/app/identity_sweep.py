@@ -23,8 +23,10 @@ So this is a **windowed** Flow — the unit of work is a pass over the book, not
 a row — started by an `IdentityWindowClosed` Event through the Dispatcher like
 everything else. It scores pairs on evidence, writes each survivor as a typed
 identity Link at `status="in_review"` carrying its confidence, method, decider
-and what an un-merge restores, and raises a steward Task for the ones it is not
-confident about.
+and what an un-merge restores, and raises a steward Task for **every one of
+them**. A merge is the doctrine's named reversible-with-provenance case — a
+high-blast-radius change — so confidence buys a proposal a gentler Task, never
+an automatic one, and never a place in the book with nobody able to decide it.
 
 **It proposes. It never merges.** No canonical object is touched: the sweep
 writes edges and nothing else, which is a property you can check rather than a
@@ -582,26 +584,45 @@ def raise_merge_tasks(
     flow_id: str,
     run_id: str,
 ) -> dict:
-    """A Task per proposal the sweep is not confident about.
+    """A Task per proposal. Every one of them, whatever it scored.
 
-    The mirror of the resolver's steward Task, and the same reasoning: a
-    proposal at or above the confidence bar can wait in the workbench with
-    everything else, and one below it is the machine saying out loud that it
-    does not know. The queue comes from the Mapping that owns the book, so a
-    rebind moves this without touching the flow.
+    This used to raise a Task only *below* the governed bar, on the reasoning
+    that a confident proposal could wait in the workbench with everything else.
+    What it actually produced, on the live estate, was the three strongest
+    proposals in the book — Kessler Holdings against Prairie Records at 0.95
+    on a shared domain and a shared switchboard among them — standing at
+    `in_review` with nobody paged, no Task, and therefore **no decision path
+    at all**: the one status the Gateway refuses to act on, held by exactly
+    the proposals most likely to be right.
+    Confidence is not authority. A merge is the doctrine's named
+    reversible-with-provenance case, so nothing here is ever auto-confirmed,
+    and a proposal a machine is sure about still needs somewhere for a person
+    to say yes.
+
+    So the bar governs the *character* of the ask and not its existence:
+
+    - **under it** — a genuine question at normal priority, the machine saying
+      out loud that it does not know;
+    - **at or above it** — a low-priority ratification: the evidence is strong,
+      confirm to let downstream flows treat the two as one party.
+
+    The queue comes from the Mapping that owns the book, so a rebind moves this
+    without touching the flow.
 
     Task ids derive from the edge, so a second pass over an unchanged book
     addresses the same rows — and `TaskService.create` is a put. Raising one
     that already exists would therefore reset a Task a steward had answered
     back to `open` and drop their verdict, which is the quietest possible way
     for a scheduled sweep to undo human judgment. So an existing Task is left
-    alone, decided or not.
+    alone, decided or not. The same property is what backfills the proposals
+    written before this rule: a later pass over the same book finds them
+    Task-less and raises the ones that are missing.
     """
     raised = 0
     standing = 0
+    ratifications = 0
     for proposal in proposals:
-        if proposal.confidence >= thresholds.steward_task_below:
-            continue
+        ratifying = proposal.confidence >= thresholds.ratify_at
         # The desk that owns the book the proposal starts in, read off the
         # Mapping. `company_same_as_vendor` therefore goes to the counterparty
         # book's steward and not to the AP desk, which is right: whether the
@@ -616,17 +637,37 @@ def raise_merge_tasks(
         tasks.create(Task(
             id=task_id,
             kind="merge_review",
-            title=f"Same party? {proposal.from_label} / {proposal.to_label}",
+            title=(
+                f"One party, on the evidence: {proposal.from_label} / "
+                f"{proposal.to_label}"
+                if ratifying
+                else f"Same party? {proposal.from_label} / {proposal.to_label}"
+            ),
             summary=(
                 f"The identity sweep scored these two at "
+                f"{proposal.confidence:.2f}, at or above the "
+                f"{thresholds.ratify_at:.2f} bar where its evidence is strong "
+                "enough that this is a ratification rather than a question. "
+                "It is still a question for you: nothing merges on a score. "
+                "Approve to let downstream flows treat them as one party, "
+                "reject to withdraw the proposal. Both objects keep "
+                "everything they hold either way."
+                if ratifying else
+                f"The identity sweep scored these two at "
                 f"{proposal.confidence:.2f}, under the "
-                f"{thresholds.steward_task_below:.2f} bar it stops assuming "
-                "somebody will get to. Nothing has been merged and nothing "
-                "will be: approve to confirm the proposal, reject to withdraw "
-                "it. Both objects keep everything they hold either way."
+                f"{thresholds.ratify_at:.2f} bar where it would call the "
+                "evidence strong — so this is a genuine question and the "
+                "machine is saying out loud that it does not know. Nothing "
+                "has been merged and nothing will be: approve to confirm the "
+                "proposal, reject to withdraw it. Both objects keep "
+                "everything they hold either way."
             ),
             queue=queue,
-            priority="normal",
+            # The bar as urgency. A ratification a steward never gets to is a
+            # proposal standing unanswered, which is the state this whole
+            # change exists to end — so it is raised low rather than not at
+            # all, and it sorts under every genuine ask in the queue.
+            priority="low" if ratifying else "normal",
             flow_id=flow_id,
             run_id=run_id,
             # The proposal itself is the case. A `match_review` Task points at
@@ -658,7 +699,16 @@ def raise_merge_tasks(
             created_at_iso=utcnow().isoformat(),
         ))
         raised += 1
-    return {"steward_tasks": raised, "steward_tasks_standing": standing}
+        if ratifying:
+            ratifications += 1
+    return {
+        "steward_tasks": raised,
+        "steward_tasks_standing": standing,
+        # Of the ones raised, how many were formalities. Reported because
+        # "five Tasks landed on the desk" and "four of them are ratifications"
+        # are different facts about a steward's morning.
+        "steward_ratifications": ratifications,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -695,8 +745,8 @@ def sweep_body(service, ctx: RunContext, inputs: dict) -> dict:
         fn=lambda: read_sweep_thresholds(service.knowledge).model_dump(),
         summary=lambda out: (
             f"{out['source_ref']}: propose ≥ {out['propose_at']:.2f} · "
-            f"ask a steward < {out['steward_task_below']:.2f} · "
-            f"names alone ≥ {out['name_floor']:.2f}"
+            f"every proposal asks a steward, as a ratification ≥ "
+            f"{out['ratify_at']:.2f} · names alone ≥ {out['name_floor']:.2f}"
         ),
     )
     thresholds = SweepThresholds.model_validate(raw)
@@ -742,11 +792,13 @@ def sweep_body(service, ctx: RunContext, inputs: dict) -> dict:
             flow_id=IDENTITY_SWEEP_FLOW_ID, run_id=ctx.record.id,
         ),
         summary=lambda out: (
-            f"{out['steward_tasks']} Task(s) raised for proposals under "
-            f"{thresholds.steward_task_below:.2f} · "
+            f"{out['steward_tasks']} Task(s) raised — "
+            f"{out['steward_tasks'] - out['steward_ratifications']} ask(s), "
+            f"{out['steward_ratifications']} ratification(s) at or above "
+            f"{thresholds.ratify_at:.2f} · "
             f"{out['steward_tasks_standing']} already open or answered"
             if out["steward_tasks"] or out["steward_tasks_standing"]
-            else "every proposal cleared the confidence bar — nobody paged"
+            else "nothing to propose, so nobody to ask"
         ),
     )
 

@@ -1061,11 +1061,16 @@ class IdentitySide(BaseModel):
 class ProposalGate(BaseModel):
     """Whether this proposal can be decided, by whom, and where.
 
-    Never `None`, and `task_id == ""` is the state worth naming: the sweep
-    raises a Task only for proposals *under* the governed confidence bar, so a
-    high-scoring proposal stands at `in_review` with nobody paged. That is the
-    policy working as declared, and the screen says it out loud rather than
-    drawing a control that has nothing to commit through.
+    Never `None`. Three states: there is a Task and it is yours, there is a
+    Task and it is somebody else's, and — the one worth naming — there is **no
+    Task at all**.
+
+    That third state used to be the policy working as declared: the sweep
+    raised a Task only under the governed confidence bar, so its most confident
+    proposals stood at `in_review` with nobody paged. It is a finding now. A
+    merge is never automatic, so every proposal the sweep writes raises a Task;
+    a standing proposal without one predates that rule or lost its Task, and
+    the row says so instead of explaining that nobody needed to be paged.
     """
 
     task_id: str
@@ -1140,7 +1145,9 @@ class SweepPolicy(BaseModel):
     """The governed thresholds, as the screen quotes them."""
 
     propose_at: float
-    steward_task_below: float
+    #: Where an ask becomes a ratification. Not where one starts: every
+    #: proposal raises a Task, and this only says in what words.
+    ratify_at: float
     name_floor: float
     ceiling: float
     source_ref: str
@@ -1160,6 +1167,10 @@ class SweepRun(BaseModel):
     proposed: int
     standing: int
     steward_tasks: int
+    #: How many of those Tasks were ratifications rather than questions. The
+    #: split matters to whoever holds the desk: "five landed on you" and "four
+    #: of them are formalities" are different mornings.
+    ratifications: int
 
 
 class IdentityScreen(BaseModel):
@@ -1224,23 +1235,26 @@ def _side(graph: GraphService, record: ObjectRecord | None, object_id_: str) -> 
     )
 
 
-def _proposal_gate(
-    task, principal: Principal, confidence: float, threshold: float
-) -> ProposalGate:
+def _proposal_gate(task, principal: Principal) -> ProposalGate:
     """Where this proposal's decision lives, and whether it is this persona's.
 
-    Three states, and the third is the one a screen normally gets wrong: there
-    is a Task and it is yours, there is a Task and it is somebody else's, and
-    there is **no Task at all** because the proposal cleared the governed bar.
-    Only the first draws controls; the other two are sentences.
+    Three states: there is a Task and it is yours, there is a Task and it is
+    somebody else's, and there is no Task at all. Only the first draws
+    controls; the other two are sentences.
+
+    The third is no longer a confidence story — every proposal raises a Task
+    now — so it reads as the anomaly it is, with what closes it. It takes no
+    threshold argument any more precisely so that this sentence cannot quietly
+    go back to quoting a bar that does not gate anything.
     """
     if task is None:
         return ProposalGate(
             task_id="", task_status="", queue="", may_decide=False,
             why_not=(
-                f"Nobody was paged: it scored {confidence:.2f}, at or above "
-                f"the governed {threshold:.2f} bar under which the sweep asks "
-                "a steward. It stands as a proposal until something acts on it."
+                "No Task carries this proposal, so there is nowhere to decide "
+                "it. The sweep raises one for every proposal it writes, in "
+                "the queue that owns the book — this one predates that or its "
+                "Task is gone. The next sweep over this book raises it."
             ),
         )
     status = task.status if task.status == "open" else (
@@ -1292,6 +1306,7 @@ def _last_sweep() -> SweepRun | None:
         proposed=int(outputs.get("proposed", 0) or 0),
         standing=int(outputs.get("standing", 0) or 0),
         steward_tasks=int(outputs.get("steward_tasks", 0) or 0),
+        ratifications=int(outputs.get("steward_ratifications", 0) or 0),
     )
 
 
@@ -1370,10 +1385,7 @@ def identity(
                 link.reversal_reason if status == "withdrawn" else ""
             ),
             left=left, right=right, agree=agree, conflict=conflict,
-            gate=_proposal_gate(
-                tasks_by_case.get(case_ref), principal,
-                link.confidence, thresholds.steward_task_below,
-            ),
+            gate=_proposal_gate(tasks_by_case.get(case_ref), principal),
         )
         (standing if status == "in_review" else decided).append(proposal)
 
@@ -1412,7 +1424,7 @@ def identity(
         books=books,
         policy=SweepPolicy(
             propose_at=thresholds.propose_at,
-            steward_task_below=thresholds.steward_task_below,
+            ratify_at=thresholds.ratify_at,
             name_floor=thresholds.name_floor,
             ceiling=thresholds.ceiling,
             source_ref=thresholds.source_ref,

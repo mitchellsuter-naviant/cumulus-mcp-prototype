@@ -277,7 +277,7 @@ class _TaskRow extends StatelessWidget {
           Row(
             children: [
               if (task.isOpen)
-                _PriorityTag(high: task.isHigh)
+                _PriorityTag(priority: task.priority)
               else
                 StatusBadge(
                   task.decision?.verdict ?? 'done',
@@ -318,13 +318,19 @@ class _TaskRow extends StatelessWidget {
 }
 
 class _PriorityTag extends StatelessWidget {
-  final bool high;
+  final String priority;
 
-  const _PriorityTag({required this.high});
+  const _PriorityTag({required this.priority});
 
   @override
   Widget build(BuildContext context) {
-    final tone = high ? CumulusTone.danger : CumulusTone.neutral;
+    // Three bands, because a ratification that must be answered and a question
+    // nobody knows the answer to are not the same call on somebody's morning.
+    final tone = switch (priority) {
+      'high' => CumulusTone.danger,
+      'low' => CumulusTone.teal,
+      _ => CumulusTone.neutral,
+    };
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -335,7 +341,7 @@ class _PriorityTag extends StatelessWidget {
         ),
         const SizedBox(width: 7),
         Text(
-          high ? 'HIGH' : 'NORMAL',
+          priority.toUpperCase(),
           style: CumulusText.statLabel.copyWith(color: tone.foreground),
         ),
       ],
@@ -444,10 +450,12 @@ class _TaskReviewState extends State<_TaskReview> {
                     children: [
                       if (task.isOpen)
                         StatusBadge(
-                          task.isHigh ? 'high' : 'normal',
-                          tone: task.isHigh
-                              ? CumulusTone.danger
-                              : CumulusTone.neutral,
+                          task.priority,
+                          tone: switch (task.priority) {
+                            'high' => CumulusTone.danger,
+                            'low' => CumulusTone.teal,
+                            _ => CumulusTone.neutral,
+                          },
                           dense: true,
                           uppercase: true,
                         ),

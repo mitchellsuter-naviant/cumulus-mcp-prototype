@@ -2073,16 +2073,27 @@ class SyncService:
             # store's own 409; what this refuses is re-deciding the assertion.
             return None
         verdict = task.decision.verdict
+        # The desk, once, for both halves of the authorization: the queue the
+        # committing principal stands in when nobody human is on the call, and
+        # the queue the Gateway checks the caller against. Off the **Task**,
+        # because that is where the routing decision was written down when the
+        # proposal was raised — and because the two books have two desks. A
+        # `vendor_same_as` pair is `vendor-stewardship`'s work and a
+        # `company_same_as` pair is `data-stewardship`'s; the Action used to
+        # pin the second, which refused the vendor steward at the write on a
+        # Task their own queue was holding. The fallback answers the case with
+        # no Task to ask — a seed, a test, a decision reconstructed.
+        queue = task.queue or steward_queue_for_type(
+            SCAN_BY_LINK[ref.type].from_type
+        )
         act = self.gateway.action(
             "confirm-identity-link",
             principal or flow_principal(
-                task.flow_id or IDENTITY_SWEEP_FLOW_ID,
-                task.queue or steward_queue_for_type(
-                    SCAN_BY_LINK[ref.type].from_type
-                ),
+                task.flow_id or IDENTITY_SWEEP_FLOW_ID, queue,
             ),
             step_id="steward-decision", task_id=task.id,
             decided_by=task.decision.decided_by, target=f"link:{ref.type}/{ref.id}",
+            queue=queue,
         )
         return act.commit(
             lambda w: self._assert_merge_decision(task, link, verdict, w)
@@ -2103,10 +2114,20 @@ class SyncService:
                 extra={"taskId": task.id, "linkId": link.id, "actor": decided_by},
             )
             return {"action": "withdrawn", "link_id": link.id}
-        # Approved or corrected. The confidence stays whatever the machine
-        # scored — overwriting it with 1.0 would erase the only record of how
-        # good the proposal was before a human looked at it — and the method
-        # becomes `human`, because that is now what the assertion rests on.
+        # Approved or corrected. Neither `confidence` nor `method` moves: this
+        # is a props write on a live edge, which `GraphService.link` merges
+        # into the record it already has, and that is the right behaviour
+        # rather than a limitation to work around. The confidence is how good
+        # the proposal was before a human looked at it — the number a later
+        # tuning pass needs — and the method is *how the match was made*, which
+        # a decision does not retroactively change: a fuzzy name match a
+        # steward confirmed is still a fuzzy name match. What the human adds is
+        # recorded where it belongs, in `status`, `decided_by`, `decided_at`,
+        # the `task_id`, and the Gateway's ledger entry naming who committed
+        # under whose authority. (`machine_confidence` and `machine_method`
+        # are copies of the record's own fields, carried in the props so a
+        # reader looking only at the proposal's decision block can see what was
+        # ratified without joining back to the edge header.)
         graph.link(
             link.type, link.from_id, link.to_id,
             props={

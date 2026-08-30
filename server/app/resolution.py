@@ -117,16 +117,20 @@ class SweepThresholds(BaseModel):
     the resolver decides whether an *arriving row* joins an entity, and these
     decide whether two entities we already hold are worth a human's attention.
     Nothing here can merge anything — `propose_at` is the floor for recording a
-    proposal at all, and `steward_task_below` is the confidence under which the
-    sweep stops assuming somebody will get to it and asks.
+    proposal at all, and `ratify_at` is where the *ask* changes character, not
+    where it appears: every proposal raises a Task either way.
     """
 
     #: Below this, the pair is not even recorded. A workbench full of 0.4s is
     #: a workbench nobody opens.
     propose_at: float = 0.55
-    #: A proposal under this raises a `merge_review` Task; one at or above it
-    #: waits in the workbench without paging anybody.
-    steward_task_below: float = 0.80
+    #: Where a question becomes a formality. Under it the sweep is saying out
+    #: loud that it does not know and the Task is a genuine ask; at or above it
+    #: the evidence is strong and the Task is a low-priority ratification. It
+    #: does **not** gate whether anybody is paged — a merge is never automatic,
+    #: so every proposal gets a decision path — only how loudly and in what
+    #: words. See `identity_sweep.raise_merge_tasks`.
+    ratify_at: float = 0.80
     #: The name-similarity floor a pair must clear to be *considered* on names
     #: alone. A shared domain or an identical phone gets a pair considered
     #: whatever its names say — which is the whole point of a trading name.
@@ -141,7 +145,7 @@ def parse_sweep_policy(content: str) -> SweepThresholds:
     values = SweepThresholds(found_asset=True)
     for pattern, field in (
         (r"propose a merge at or above:?\s*(\d+(?:\.\d+)?)", "propose_at"),
-        (r"ask a steward below:?\s*(\d+(?:\.\d+)?)", "steward_task_below"),
+        (r"ratify rather than ask at or above:?\s*(\d+(?:\.\d+)?)", "ratify_at"),
         (r"consider a pair on names alone at or above:?\s*(\d+(?:\.\d+)?)",
          "name_floor"),
         (r"never propose above:?\s*(\d+(?:\.\d+)?)", "ceiling"),

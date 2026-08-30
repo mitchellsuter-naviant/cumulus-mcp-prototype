@@ -117,8 +117,13 @@ void main() {
       );
     });
 
-    testWidgets('a proposal above the confidence bar says nobody was paged, '
-        'rather than drawing a control with nothing behind it', (tester) async {
+    testWidgets('a proposal with no Task reads as having nowhere to be '
+        'decided, not as a confident proposal nobody needed to see',
+        (tester) async {
+      // The state this panel used to explain away. A merge is never automatic,
+      // so every proposal the sweep writes raises a Task; one standing without
+      // a Task is a finding — the highest-confidence pairs in the book used to
+      // land here, unanswerable — and the sentence says so.
       await _pump(
         tester,
         MergeReviewPanel(
@@ -130,17 +135,20 @@ void main() {
               queue: '',
               mayDecide: false,
               whyNot:
-                  'Nobody was paged: it scored 0.95, at or above the governed '
-                  '0.80 bar under which the sweep asks a steward. It stands '
-                  'as a proposal until something acts on it.',
+                  'No Task carries this proposal, so there is nowhere to '
+                  'decide it. The sweep raises one for every proposal it '
+                  'writes, in the queue that owns the book — this one '
+                  'predates that or its Task is gone. The next sweep over '
+                  'this book raises it.',
             ),
           ),
           api: ApiClient(),
         ),
       );
 
-      expect(find.text('Not yours to decide'), findsOneWidget);
-      expect(find.textContaining('Nobody was paged'), findsOneWidget);
+      expect(find.text('Nowhere to decide it'), findsOneWidget);
+      expect(find.text('Not yours to decide'), findsNothing);
+      expect(find.textContaining('No Task carries this proposal'), findsOneWidget);
       expect(find.bySubtype<FilledButton>(), findsNothing);
       expect(find.textContaining('It is waiting as'), findsNothing);
     });

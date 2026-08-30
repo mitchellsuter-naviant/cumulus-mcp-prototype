@@ -68,7 +68,7 @@ class QueueTask {
   final String title;
   final String summary;
   final String queue;
-  final String priority; // normal | high
+  final String priority; // low | normal | high
   final String status; // open | done
   final String flowId;
   final String caseRef;
@@ -100,6 +100,11 @@ class QueueTask {
 
   bool get isOpen => status == 'open';
   bool get isHigh => priority == 'high';
+
+  /// A task that must have a decision path without competing for attention
+  /// with work that is waiting on one — an identity ratification, where the
+  /// evidence is strong and a human still has to say yes.
+  bool get isLow => priority == 'low';
 
   factory QueueTask.fromJson(Map<String, dynamic> json) => QueueTask(
     id: json['id'] as String,

@@ -26,6 +26,8 @@ from app.eval_specs import (
     _IDENTITY_ERP_SALES,
     _IDENTITY_ERP_VENDORS,
 )
+from app.auth import Principal
+from app.gateway import Refused
 from app.graph import object_id
 from app.identity_sweep import (
     IDENTITY_SWEEP_FLOW_ID,
@@ -72,6 +74,19 @@ def booked(world):
     for delivery in (_IDENTITY_CRM, _IDENTITY_ERP_SALES, _IDENTITY_ERP_VENDORS):
         world.sync.deliver(SyncRequest.model_validate(delivery), actor="system:test")
     return world
+
+
+def _merge_task(world, label: str = STALE_NORTHWIND):
+    """The `merge_review` Task for one pair, by a label in its title.
+
+    Named rather than "the first one": every proposal raises a Task now, so a
+    test that took whichever came back first would be asserting about the queue
+    ordering as much as about the decision.
+    """
+    return next(
+        t for t in world.tasks.list()
+        if t.kind == "merge_review" and label in t.title
+    )
 
 
 def _proposals(world) -> dict[tuple[str, str], object]:
@@ -134,11 +149,11 @@ def test_the_thresholds_come_off_the_policy_asset_and_not_out_of_the_code(world)
     # `match_policy` makes on every Mapping that names this asset.
     tuned = parse_sweep_policy(
         "Propose a merge at or above: 0.42\n"
-        "Ask a steward below: 0.91\n"
+        "Ratify rather than ask at or above: 0.91\n"
         "Consider a pair on names alone at or above: 0.33\n"
         "Never propose above: 0.99\n"
     )
-    assert (tuned.propose_at, tuned.steward_task_below) == (0.42, 0.91)
+    assert (tuned.propose_at, tuned.ratify_at) == (0.42, 0.91)
     assert (tuned.name_floor, tuned.ceiling) == (0.33, 0.99)
 
 
@@ -286,15 +301,16 @@ def test_a_second_sweep_changes_nothing(booked):
     that happened to run again."""
     first = booked.sync.sweep_identities(actor="system:test")
     assert first["proposed"] == 3 and first["standing"] == 0
+    assert first["steward_tasks"] == 3
 
     second = booked.sync.sweep_identities(actor="system:test")
     assert second["proposed"] == 0
     assert second["standing"] == 3
     assert len(_proposals(booked)) == 3
-    # And no second Task for the same pair.
+    # And no second Task for any of the three pairs.
     assert second["steward_tasks"] == 0
-    assert second["steward_tasks_standing"] == 1
-    assert len([t for t in booked.tasks.list() if t.kind == "merge_review"]) == 1
+    assert second["steward_tasks_standing"] == 3
+    assert len([t for t in booked.tasks.list() if t.kind == "merge_review"]) == 3
 
 
 def test_a_later_sweep_does_not_re_open_a_decided_task(booked):
@@ -306,7 +322,7 @@ def test_a_later_sweep_does_not_re_open_a_decided_task(booked):
     and nothing anywhere saying it had happened.
     """
     booked.sync.sweep_identities(actor="system:test")
-    task = next(t for t in booked.tasks.list() if t.kind == "merge_review")
+    task = _merge_task(booked)
     decided = booked.tasks.decide(
         task.id, verdict="rejected", decided_by="dana@naviant.com",
         note="Different customers.",
@@ -343,22 +359,54 @@ def test_the_run_is_started_by_a_dispatched_event_like_every_other_flow(booked):
 # ---------------------------------------------------------------------------
 
 
-def test_a_proposal_under_the_bar_asks_a_steward_and_one_above_it_does_not(booked):
+def test_every_proposal_gets_a_decision_path_whatever_it_scored(booked):
+    """The hole this closes, stated as the property that closes it.
+
+    The sweep used to raise a Task only *under* the governed bar, which left
+    its most confident proposals — the ones most likely to be right — standing
+    at `in_review` with nobody paged and nowhere to decide them. Confidence is
+    not authority: a merge is the doctrine's named reversible-with-provenance
+    case, so nothing is auto-confirmed and everything is answerable.
+    """
     out = booked.sync.sweep_identities(actor="system:test")
     tasks = [t for t in booked.tasks.list() if t.kind == "merge_review"]
-    assert out["steward_tasks"] == len(tasks) == 1
-    task = tasks[0]
-    # Northwind at 0.79 sits under the governed bar; Verona and the Bergs
-    # clear it and wait in the workbench without paging anybody.
-    assert STALE_NORTHWIND in task.title
-    assert task.queue == steward_queue_for_type("Company") == "data-stewardship"
-    assert task.case_ref.startswith("link:company_same_as/")
-    assert any("shared-anchor" == e.label for e in task.evidence)
+    assert out["steward_tasks"] == len(tasks) == out["proposed"] == 3
+
+    # Every standing proposal has a Task pointing at its edge, and every Task
+    # is open. No proposal in the book is undecidable.
+    standing = {
+        f"link:{link.type}/{link.id}"
+        for link in booked.graph.store.links()
+        if link.live and str(link.props.get("status")) == "in_review"
+    }
+    assert {t.case_ref for t in tasks} == standing
+    assert all(t.status == "open" for t in tasks)
+
+    thresholds = read_sweep_thresholds(booked.knowledge)
+    by_ref = {t.case_ref: t for t in tasks}
+    for link_ref in standing:
+        link = booked.graph.store.get_link(link_ref.split("/", 1)[1])
+        task = by_ref[link_ref]
+        ratifying = link.confidence >= thresholds.ratify_at
+        # The bar governs the character of the ask and nothing else: urgency
+        # and words, never whether anybody was asked.
+        assert task.priority == ("low" if ratifying else "normal")
+        assert ("ratification" in task.summary) is ratifying
+        assert (task.title.startswith("Same party?")) is not ratifying
+
+    # Northwind at 0.79 is the one genuine question in this book; Verona and
+    # the Bergs clear the bar and are raised as ratifications.
+    ask = next(t for t in tasks if t.priority == "normal")
+    assert STALE_NORTHWIND in ask.title
+    assert out["steward_ratifications"] == 2
+    assert ask.queue == steward_queue_for_type("Company") == "data-stewardship"
+    assert ask.case_ref.startswith("link:company_same_as/")
+    assert any("shared-anchor" == e.label for e in ask.evidence)
 
 
 def test_confirming_flips_the_status_and_merges_nothing(booked):
     booked.sync.sweep_identities(actor="system:test")
-    task = next(t for t in booked.tasks.list() if t.kind == "merge_review")
+    task = _merge_task(booked)
     before = {o.id: o.status for o in booked.graph.store.objects()}
 
     decided = booked.tasks.decide(
@@ -382,7 +430,7 @@ def test_confirming_flips_the_status_and_merges_nothing(booked):
 
 def test_rejecting_withdraws_the_proposal_without_erasing_that_it_was_made(booked):
     booked.sync.sweep_identities(actor="system:test")
-    task = next(t for t in booked.tasks.list() if t.kind == "merge_review")
+    task = _merge_task(booked)
     decided = booked.tasks.decide(
         task.id, verdict="rejected", decided_by="dana@naviant.com",
         note="Different customers.",
@@ -403,7 +451,7 @@ def test_rejecting_withdraws_the_proposal_without_erasing_that_it_was_made(booke
 
 def test_a_decision_on_a_ruled_proposal_is_refused_not_replayed(booked):
     booked.sync.sweep_identities(actor="system:test")
-    task = next(t for t in booked.tasks.list() if t.kind == "merge_review")
+    task = _merge_task(booked)
     decided = booked.tasks.decide(
         task.id, verdict="approved", decided_by="dana@naviant.com",
     )
@@ -412,6 +460,204 @@ def test_a_decision_on_a_ruled_proposal_is_refused_not_replayed(booked):
     # tasks too and must no-op on them — and on its own, once ruled.
     assert booked.sync.apply_merge_decision(decided) is None
     assert booked.sync.apply_match_decision(decided) is None
+
+
+# ---------------------------------------------------------------------------
+# Two desks, one Action — and what happens when the commit is refused
+# ---------------------------------------------------------------------------
+#
+# The sweep proposes across both counterparty books, so a `vendor_same_as` pair
+# is `vendor-stewardship`'s work where a `company_same_as` pair is
+# `data-stewardship`'s. `confirm-identity-link` used to pin the second, which
+# meant a vendor steward's own Task was refused at the write — and the decide
+# route swallowed the refusal, so the Task read `decided` while the link never
+# flipped. Two failures that hid each other: the one that made a legitimate
+# decision impossible, and the one that made it look like it had happened.
+
+#: A steward bound to the vendor book and nothing else. Not a persona — the
+#: roster's only identity curators own *both* desks, which is exactly the shape
+#: that hid this: the Controller could decide either kind, so nobody hit it.
+VENDOR_STEWARD = Principal(
+    uid="persona_vendor_steward", email="ingrid.voss@naviant.com",
+    role="user", scope="own", queues=("vendor-stewardship",),
+)
+
+#: Two spellings of one carrier, delivered as the ERP has them. Unlike the
+#: Cedarline pair they do not normalize together, so both mint and the sweep
+#: has a genuine vendor-book proposal to raise — the pair kind the estate's
+#: answer key has no example of, and the one the pinned desk broke.
+_ERP_FREIGHT = {
+    "source": "erp-vendors",
+    "watermark": "2026-08-31T00:00:00Z",
+    "vendors": [
+        {"external_id": "2101", "name": "Granite State Freight",
+         "email": "ap@gsfreight.example.com", "phone": "(603) 555-0180"},
+        {"external_id": "2102", "name": "GSF Logistics",
+         "email": "billing@gsfreight.example.com"},
+    ],
+}
+
+
+@pytest.fixture()
+def freight(booked):
+    """The answer key's world plus a vendor-book duplicate, swept."""
+    booked.sync.deliver(
+        SyncRequest.model_validate(_ERP_FREIGHT), actor="system:test"
+    )
+    booked.sync.sweep_identities(actor="system:test")
+    return booked
+
+
+@pytest.fixture()
+def as_vendor_steward(_client):
+    """Decide as a persona bound only to the vendor desk."""
+    from app.auth import get_principal
+    from app.main import app
+
+    app.dependency_overrides[get_principal] = lambda: VENDOR_STEWARD
+    try:
+        yield _client
+    finally:
+        app.dependency_overrides.pop(get_principal, None)
+
+
+def test_a_vendor_pair_is_decided_by_the_steward_whose_queue_holds_it(
+    freight, as_vendor_steward
+):
+    """The commit runs under the desk the Task sat in, not one pinned Action.
+
+    Through the route, because both halves of the fix are on that path: the
+    queue binding lets this persona answer the Task at all, and the Gateway
+    check has to reach the same answer at the write — a decision authorized at
+    the door and refused at the commit is the state that produced a Task
+    reading `decided` over a link that never moved.
+    """
+    task = _merge_task(freight, "GSF Logistics")
+    assert task.queue == steward_queue_for_type("Vendor") == "vendor-stewardship"
+    assert task.case_ref.startswith("link:vendor_same_as/")
+
+    resp = as_vendor_steward.post(
+        f"/api/v1/tasks/{task.id}/decide",
+        json={"verdict": "approved", "note": "One carrier, two ERP spellings."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    link = freight.graph.store.get_link(task.case_ref.split("/", 1)[1])
+    assert link.props["status"] == "confirmed"
+    assert link.props["decided_by"] == VENDOR_STEWARD.uid
+    assert freight.tasks.get(task.id).status == "done"
+
+    # And the ledger records it as this steward's commit, under their desk.
+    entry = next(
+        e for e in freight.gateway.ledger.list()
+        if e.action == "confirm-identity-link"
+    )
+    assert entry.outcome == "committed" and entry.refusal == ""
+    assert entry.principal_uid == VENDOR_STEWARD.uid
+    assert entry.task_id == task.id
+
+
+def test_the_pinned_desk_would_have_refused_this_steward(freight):
+    """The mutation proof, on the check itself.
+
+    The old declaration is one line, so the failure is asserted rather than
+    described: with `confirm-identity-link` pinned to `data-stewardship`, the
+    vendor steward holding this Task cannot commit it, and with the desk taken
+    off the Task they can. Nothing about the principal changes between the two.
+    """
+    from app.gateway import ACTIONS, Action, _for_case, _refusal
+
+    task = _merge_task(freight, "GSF Logistics")
+    pinned = Action(id="confirm-identity-link", target="entity-layer",
+                    queue="data-stewardship")
+    assert "data-stewardship" in _refusal(pinned, VENDOR_STEWARD)
+
+    derived = _for_case(ACTIONS["confirm-identity-link"], task.queue)
+    assert derived.queue == "vendor-stewardship"
+    assert _refusal(derived, VENDOR_STEWARD) == ""
+
+    # The derivation is a declared property of the Action and not a parameter
+    # any caller may set: an Action that names its own desk refuses one.
+    with pytest.raises(Refused):
+        _for_case(ACTIONS["post-invoice"], "vendor-stewardship")
+    # And one that derives its desk refuses to commit with none derived, rather
+    # than falling through to an empty queue that passes every check.
+    with pytest.raises(Refused):
+        _for_case(ACTIONS["confirm-identity-link"], "")
+
+
+def test_a_refused_commit_leaves_the_task_open_and_tells_the_caller(
+    freight, as_vendor_steward, monkeypatch
+):
+    """The second half: a resume hook that fails must not leave a decided Task.
+
+    The refusal injected here is the one the pinned desk produced, verbatim.
+    Before this fix the route caught it, logged it, and returned 200 with the
+    Task marked `done` — the queue saying a steward had answered, the graph
+    saying nobody had, and a log line as the only record of the disagreement.
+    """
+    task = _merge_task(freight, "GSF Logistics")
+    link_id_ = task.case_ref.split("/", 1)[1]
+
+    def refuse(*_args, **_kwargs):
+        raise Refused(
+            "confirm-identity-link",
+            "is the 'data-stewardship' queue's work, which this principal "
+            "does not own",
+        )
+
+    monkeypatch.setattr(freight.sync, "apply_merge_decision", refuse)
+    resp = as_vendor_steward.post(
+        f"/api/v1/tasks/{task.id}/decide",
+        json={"verdict": "approved", "note": "One carrier."},
+    )
+    # 403 and not 500: nothing broke, this principal was not allowed to commit.
+    assert resp.status_code == 403, resp.text
+    assert "data-stewardship" in resp.json()["detail"]
+    assert "open again" in resp.json()["detail"]
+
+    after = freight.tasks.get(task.id)
+    assert after.status == "open" and after.decision is None
+    assert freight.graph.store.get_link(link_id_).props["status"] == "in_review"
+
+    # The old behaviour, run rather than described: decide, swallow, carry on.
+    # This is the state the route must never leave behind — and the assertion
+    # that fails if the `except` clause ever goes back to passing.
+    stranded = freight.tasks.decide(
+        task.id, verdict="approved", decided_by=VENDOR_STEWARD.uid,
+    )
+    try:
+        refuse(stranded)
+    except Refused:
+        pass
+    assert stranded.status == "done"
+    assert freight.graph.store.get_link(link_id_).props["status"] == "in_review"
+
+
+def test_a_hook_that_breaks_is_a_500_and_the_task_survives_it(
+    freight, as_vendor_steward, monkeypatch
+):
+    """Not every failure is an authorization one. A hook that raises anything
+    else is a fault, says so, and still leaves the judgment un-recorded rather
+    than recorded over a world that did not change."""
+    task = _merge_task(freight, "GSF Logistics")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("the entity store is unreachable")
+
+    monkeypatch.setattr(freight.sync, "apply_merge_decision", boom)
+    resp = as_vendor_steward.post(
+        f"/api/v1/tasks/{task.id}/decide",
+        json={"verdict": "approved", "note": "One carrier."},
+    )
+    assert resp.status_code == 500, resp.text
+    assert "entity store is unreachable" in resp.json()["detail"]
+
+    after = freight.tasks.get(task.id)
+    assert after.status == "open" and after.decision is None
+    # Still decidable once whatever broke is fixed — the row is back exactly
+    # as the sweep raised it.
+    assert after.priority == "normal" and after.queue == "vendor-stewardship"
 
 
 # ---------------------------------------------------------------------------

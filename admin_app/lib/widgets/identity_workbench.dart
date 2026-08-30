@@ -254,7 +254,9 @@ class _IdentityWorkbenchState extends State<IdentityWorkbench> {
                 if (proposal.gate.hasTask)
                   MetaPill(proposal.gate.queue)
                 else
-                  const MetaPill('no task raised'),
+                  // Not a policy any more — every proposal raises a Task — so
+                  // this reads as the missing thing it is.
+                  const MetaPill('no task carries this'),
                 if (proposal.runId.isNotEmpty)
                   MetaPill('sweep ${proposal.runId}'),
               ],
@@ -429,12 +431,15 @@ class _ProposalRow extends StatelessWidget {
                 switch (p.status) {
                   'confirmed' => 'confirmed',
                   'withdrawn' => 'withdrawn',
-                  _ => p.gate.hasTask ? 'asks a steward' : 'standing',
+                  // Every proposal asks a steward now, so the second branch is
+                  // a proposal with nowhere to be decided — the state this
+                  // list should shout about rather than file under "standing".
+                  _ => p.gate.hasTask ? 'asks a steward' : 'no decision path',
                 },
                 tone: switch (p.status) {
                   'confirmed' => CumulusTone.success,
                   'withdrawn' => CumulusTone.neutral,
-                  _ => p.gate.hasTask ? CumulusTone.warn : CumulusTone.teal,
+                  _ => p.gate.hasTask ? CumulusTone.warn : CumulusTone.danger,
                 },
                 dense: true,
               ),
@@ -481,8 +486,10 @@ class _SweepFooter extends StatelessWidget {
       'Last sweep ${when == null ? sweep.atIso : agoLabel(when.toLocal())}: '
       '${sweep.compared} pair(s) compared, ${sweep.considered} with any '
       'evidence, ${sweep.proposed} above the '
-      '${policy.proposeAt.toStringAsFixed(2)} floor, ${sweep.stewardTasks} '
-      'sent to a steward under ${policy.stewardTaskBelow.toStringAsFixed(2)}. '
+      '${policy.proposeAt.toStringAsFixed(2)} floor. Every one of them raised '
+      'a Task — ${sweep.stewardTasks} in all, ${sweep.ratifications} of those '
+      'a ratification at or above '
+      '${policy.ratifyAt.toStringAsFixed(2)} rather than a question. '
       '${policy.foundAsset ? "Thresholds from ${policy.sourceRef}." : "The policy asset is missing — these are code defaults, not governed values."}',
       style: CumulusText.meta,
     );

@@ -98,10 +98,15 @@ class IdentitySide {
 
 /// Whether this proposal can be decided, by whom, and where.
 ///
-/// Three states, and the third is the one a workbench normally gets wrong:
-/// there is a Task and it is yours, there is a Task and it is somebody else's,
-/// and there is **no Task at all** because the proposal cleared the governed
-/// confidence bar and the sweep paged nobody. Only the first draws controls.
+/// Three states: there is a Task and it is yours, there is a Task and it is
+/// somebody else's, and there is **no Task at all**. Only the first draws
+/// controls.
+///
+/// The third used to be the policy working as declared — the sweep raised a
+/// Task only below the governed confidence bar, so its most confident
+/// proposals stood with nobody paged. It is a finding now: a merge is never
+/// automatic, so every proposal raises a Task, and one without a Task predates
+/// that or lost it. The server's `why_not` says which; this side draws it.
 class ProposalGate {
   final String taskId;
 
@@ -281,7 +286,10 @@ class IdentityBook {
 /// The governed thresholds, as the screen quotes them.
 class SweepPolicy {
   final double proposeAt;
-  final double stewardTaskBelow;
+
+  /// Where an ask becomes a ratification. Not where one starts: every proposal
+  /// raises a Task, and this only says in what words.
+  final double ratifyAt;
   final double nameFloor;
   final double ceiling;
   final String sourceRef;
@@ -292,7 +300,7 @@ class SweepPolicy {
 
   const SweepPolicy({
     required this.proposeAt,
-    required this.stewardTaskBelow,
+    required this.ratifyAt,
     required this.nameFloor,
     required this.ceiling,
     required this.sourceRef,
@@ -301,7 +309,7 @@ class SweepPolicy {
 
   factory SweepPolicy.fromJson(Map<String, dynamic> json) => SweepPolicy(
     proposeAt: (json['propose_at'] as num? ?? 0).toDouble(),
-    stewardTaskBelow: (json['steward_task_below'] as num? ?? 0).toDouble(),
+    ratifyAt: (json['ratify_at'] as num? ?? 0).toDouble(),
     nameFloor: (json['name_floor'] as num? ?? 0).toDouble(),
     ceiling: (json['ceiling'] as num? ?? 0).toDouble(),
     sourceRef: json['source_ref'] as String? ?? '',
@@ -320,6 +328,9 @@ class SweepRun {
   final int standing;
   final int stewardTasks;
 
+  /// How many of those Tasks were ratifications rather than questions.
+  final int ratifications;
+
   const SweepRun({
     required this.runId,
     required this.atIso,
@@ -329,6 +340,7 @@ class SweepRun {
     required this.proposed,
     required this.standing,
     required this.stewardTasks,
+    required this.ratifications,
   });
 
   factory SweepRun.fromJson(Map<String, dynamic> json) => SweepRun(
@@ -340,6 +352,7 @@ class SweepRun {
     proposed: json['proposed'] as int? ?? 0,
     standing: json['standing'] as int? ?? 0,
     stewardTasks: json['steward_tasks'] as int? ?? 0,
+    ratifications: json['ratifications'] as int? ?? 0,
   );
 }
 

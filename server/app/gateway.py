@@ -83,6 +83,14 @@ class Action(BaseModel):
     regime: Regime = "decision"
     min_role: str = "user"
     queue: str = ""
+    #: True when the desk is a property of the *case* rather than of the
+    #: Action: one mutation over several books, where the Task that authorized
+    #: it is what says whose work this instance is. The call site then passes
+    #: `queue=` and the check runs against that. Declared, so "my desk comes
+    #: from the Task" is something an Action says about itself and not
+    #: something any caller may assert about any Action — an undeclared
+    #: override is refused, and so is a declared one with nothing to derive.
+    queue_from_task: bool = False
 
 
 #: The closed set of guarded mutations. A write naming anything else is refused
@@ -108,19 +116,31 @@ ACTIONS: dict[str, Action] = {a.id: a for a in (
     # nothing may act on (`status=in_review`) and the second is the judgment
     # that makes it actionable.
     #
-    # The proposer carries **no queue** and the confirmation carries the
-    # steward's. That is the queue doing its job rather than a gap: a queue
-    # binding says whose *work* an Action is, proposing is nobody's work —
-    # the Flow does it on its own authority, unasked — and deciding is the
-    # counterparty book's steward's alone. A queue on the proposer would also
-    # refuse the Flow outright, since a Flow principal owns only the queues
-    # its declaration binds it to.
+    # The proposer carries **no queue** and the confirmation takes its desk
+    # from the Task. Two different silences, and neither is a gap. A queue
+    # binding says whose *work* an Action is; proposing is nobody's work — the
+    # Flow does it on its own authority, unasked — and a queue on the proposer
+    # would refuse the Flow outright, since a Flow principal owns only the
+    # queues its declaration binds it to.
+    #
+    # Confirming is somebody's work, but not always the *same* somebody: the
+    # sweep proposes across both counterparty books, and a `vendor_same_as`
+    # pair is `vendor-stewardship`'s call where a `company_same_as` pair is
+    # `data-stewardship`'s. Pinning one desk here meant the vendor steward's
+    # own Task was refused at the write — the queue that raised it and the
+    # queue that could commit it were different queues — so the desk is
+    # derived from the Task being answered, the same way `apply_match_decision`
+    # already takes its principal's queue off the Task rather than re-deriving
+    # it. The alternative, a second Action per book (as `link-source-record`
+    # and `link-company-record` are), buys separation the identity link does
+    # not need: those two differ in the book they *write*, and these would
+    # differ in nothing but the desk the Task already names.
     #
     # `decision` and not `resolution`: a Rule picking the winner is what
     # `resolution` means, and nothing here picks a winner.
     Action(id="propose-identity-link", target="entity-layer"),
     Action(id="confirm-identity-link", target="entity-layer",
-           queue="data-stewardship"),
+           queue_from_task=True),
     # observations — a source reported this; audited by lineage, not approval
     Action(id="land-source-records", target="source-landing",
            regime="observation"),
@@ -219,6 +239,33 @@ class FirestoreLedgerStore:
         return LedgerEntry.model_validate(snap.to_dict()) if snap.exists else None
 
 
+def _for_case(action: Action, queue: str) -> Action:
+    """The Action as it applies to one case, when its desk is per-case.
+
+    Both refusals matter. An Action that declares its own desk must not accept
+    one from a caller — that would turn the queue check into a parameter and
+    let any call site name a queue it happens to own. And an Action that
+    derives its desk must not fall back to *no* desk when nothing was named,
+    because an empty queue passes `_refusal` silently: the one failure here
+    that would look exactly like success.
+    """
+    if not action.queue_from_task:
+        if queue:
+            raise Refused(
+                action.id,
+                "declares the desk it commits under; a caller does not get "
+                "to name one",
+            )
+        return action
+    if not queue:
+        raise Refused(
+            action.id,
+            "commits under the queue of the Task it answers, and no queue "
+            "was named",
+        )
+    return action.model_copy(update={"queue": queue})
+
+
 def _refusal(action: Action, principal: Principal) -> str:
     """Why this principal may not commit this Action, or "" if it may."""
     if not principal.outranks_or_is(action.min_role):
@@ -304,12 +351,17 @@ class ActionGateway:
     def action(
         self, action_id: str, principal: Principal, *,
         run: RunRecord | None = None, step_id: str = "", target: str = "",
-        task_id: str = "", decided_by: str = "",
+        task_id: str = "", decided_by: str = "", queue: str = "",
     ) -> PendingAction:
-        """Name an Action and who is committing it. Nothing is written yet."""
+        """Name an Action and who is committing it. Nothing is written yet.
+
+        `queue` is the desk this particular case belongs to, and only an Action
+        declaring `queue_from_task` accepts one — see `_for_case`.
+        """
         action = ACTIONS.get(action_id)
         if action is None:
             raise Refused(action_id, "not a declared Action")
+        action = _for_case(action, queue)
         run_id = run.id if run is not None else ""
         entry = LedgerEntry(
             id=f"led_{secrets.token_hex(5)}",

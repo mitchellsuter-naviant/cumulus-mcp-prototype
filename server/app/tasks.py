@@ -51,7 +51,12 @@ TaskKind = Literal[
 ]
 TaskStatus = Literal["open", "done"]
 TaskVerdict = Literal["approved", "rejected", "corrected"]
-TaskPriority = Literal["normal", "high"]
+#: `low` is for work that must have a decision path without competing for
+#: attention with work that is waiting on one — the identity sweep's
+#: ratifications are the case it exists for: a merge is never automatic
+#: however strong the evidence, so a confident proposal still raises a Task,
+#: and that Task must not sit level with the ones a machine is unsure about.
+TaskPriority = Literal["low", "normal", "high"]
 
 
 class TaskNotFoundError(Exception):
@@ -197,12 +202,19 @@ class FirestoreTaskDirectory:
 # ---------------------------------------------------------------------------
 
 
+#: Three bands, so a ratification sorts under a genuine ask rather than beside
+#: it. An unknown value sorts with `normal`: a task with a priority nobody
+#: declared is still work, and hiding it at the bottom would be worse than
+#: filing it in the middle.
+_PRIORITY_ORDER = {"high": 0, "normal": 1, "low": 2}
+
+
 def _sort_key(t: Task) -> tuple:
     # Open before done; high priority first among open; newest last within a
     # band so a queue reads oldest-first — the fair order for shared work.
     return (
         0 if t.status == "open" else 1,
-        0 if t.priority == "high" else 1,
+        _PRIORITY_ORDER.get(t.priority, 1),
         t.created_at_iso,
     )
 
@@ -289,6 +301,38 @@ class TaskService:
             },
         )
         return decided
+
+    def withdraw_decision(self, task_id: str, reason: str) -> Task:
+        """Put a decided Task back to open, because the decision did not take.
+
+        Deciding and applying are two writes and only the second can fail. A
+        Task left reading `done` over a world that never changed is the worst
+        of the two possible outcomes: the queue says somebody answered it, the
+        graph says nobody did, the work has left every worklist that would have
+        surfaced it, and nothing anywhere reconciles the two. So a resume hook
+        that raises unwinds this half — the row goes back the way it was found
+        and the caller is told — which keeps the invariant the queue is worth
+        anything for: a Task reads `done` only when what it authorized
+        actually happened.
+
+        Not an undo of the *judgment*: nobody changed their mind. The judgment
+        was never recorded, and the steward is still looking at the screen when
+        they learn it, which is the only moment they can do anything about it.
+        """
+        task = self.require(task_id)
+        reopened = task.model_copy(update={"status": "open", "decision": None})
+        self.directory.put(reopened)
+        log.warning(
+            "Task decision withdrawn — it could not be applied",
+            extra={
+                "taskId": task_id,
+                "queue": task.queue,
+                "kind": task.kind,
+                "actor": task.decision.decided_by if task.decision else "",
+                "reason": reason,
+            },
+        )
+        return reopened
 
     def stats(self, queues: Collection[str] | None = None) -> TaskStats:
         """Counts over the open queue, narrowed to `queues` when given.

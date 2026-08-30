@@ -637,7 +637,11 @@ class _GateStatement extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            decided ? 'Already decided' : 'Not yours to decide',
+            decided
+                ? 'Already decided'
+                : gate.hasTask
+                ? 'Not yours to decide'
+                : 'Nowhere to decide it',
             style: CumulusText.statLabel,
           ),
           const SizedBox(height: 6),

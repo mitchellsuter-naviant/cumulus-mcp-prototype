@@ -48,9 +48,16 @@ book against itself. The `identity-sweep` flow reads these values at run time.
   signals that produced it, and what an un-merge restores. **Nothing merges.**
   No canonical object changes, and the Action Gateway refuses to act on the
   proposal until a human confirms it.
-- Ask a steward below: 0.80. A proposal under this raises a `merge_review`
-  Task in the queue the Mapping names, with the evidence written out. At or
-  above it the proposal waits in the identity workbench without paging anybody.
+- Every proposal raises a `merge_review` Task in the queue the Mapping names,
+  with the evidence written out. A merge is a high-blast-radius change and is
+  never automatic, however strong the evidence: a proposal with nobody paged
+  would be an assertion standing in the book with no way to decide it.
+- Ratify rather than ask at or above: 0.80. This governs the *character* of
+  that Task and nothing else. Under it the sweep is saying out loud that it
+  does not know: the Task is a genuine question at normal priority. At or above
+  it the evidence is strong and the Task is a low-priority ratification —
+  confirm to let downstream flows treat the two as one party. Either way
+  nothing merges until a human answers.
 - Consider a pair on names alone at or above: 0.55. Below that similarity a
   pair is only looked at when a domain or a phone number joins it — which is
   how a trading name (`GSF Logistics` for Granite State Freight) gets
