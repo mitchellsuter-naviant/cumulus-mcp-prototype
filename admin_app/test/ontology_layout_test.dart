@@ -3,10 +3,16 @@ import 'package:cumulus_admin/widgets/ontology/ontology_layout.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The diagram's whole argument is in [layoutOntology], and it is pure, so it
-/// is tested here rather than by squinting at a canvas. The fixture is the
-/// seeded model as `/api/ui/v1/ontology` serves it — seventeen types, seven
-/// Collections that exactly partition them, twenty-four links of which two
-/// are self-loops.
+/// is tested here rather than by squinting at a canvas. The fixture is a fixed
+/// slice of the model in the shape `/api/ui/v1/ontology` serves — the
+/// seventeen types the expense and payables flows write, seven Collections
+/// that exactly partition them, twenty-four links of which two are self-loops.
+///
+/// Deliberately a snapshot and not a mirror of the live ontology, which has
+/// since grown a counterparty book, a sell side and a mail mirror. What is
+/// pinned below is layout *shape* — ranks, partitioning, fan-out, self-loops —
+/// and a fixture that grew with every new type would need rewriting each time
+/// the model did, which is how a test stops asserting anything.
 void main() {
   group('layoutOntology', () {
     test('is deterministic across repeated runs', () {

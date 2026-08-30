@@ -141,6 +141,74 @@ def test_every_object_type_is_governed_by_exactly_one_collection():
     assert {t: ids for t, ids in claims.items() if len(ids) > 1} == {}
 
 
+def test_the_collections_added_for_the_estate_claim_what_they_say_they_do():
+    """The partition above is derived, so it stays true while saying nothing
+    about *which* Collection took a type. These four were added together and
+    the split between them is the argument: contacts sit with the companies
+    they work at rather than in a book of their own, the whole sell-side
+    lifecycle is one set, correspondence is capped at a mirror, and the
+    document library governs the filing tree only — `Document` has exactly one
+    home by type, and a DMS row is placed here per instance by `collection_id`.
+    A future edit that quietly moves one of these would still pass the derived
+    sweep.
+    """
+    claimed = {
+        c.id: set(c.object_types)
+        for c in data_collections.COLLECTIONS
+        if c.id in {
+            "company-master", "sales-records", "correspondence",
+            "document-library",
+        }
+    }
+    assert claimed == {
+        "company-master": {"Company", "Person"},
+        "sales-records": {"Opportunity", "SalesOrder", "SalesOrderLine", "Item"},
+        "correspondence": {"Mailbox", "MailMessage"},
+        "document-library": {"Folder"},
+    }
+    assert data_collections.for_object_type("Document").id == "audit-documents"
+
+    # Custody is the governed property that separates them, and the DMS half
+    # is the one that must never quietly become a copy.
+    by_id = {c.id: c for c in data_collections.COLLECTIONS}
+    assert by_id["document-library"].custody == "reference"
+    assert by_id["correspondence"].custody == "copy"
+    # Mirrors are not authoritative: a correction belongs in the source.
+    assert by_id["company-master"].authoritative is True
+    for mirrored in ("sales-records", "correspondence", "document-library"):
+        assert by_id[mirrored].authoritative is False, mirrored
+
+
+def test_the_estate_flows_are_declared_before_they_are_written():
+    """Declared ahead of their writers, the way the org-chart links were.
+
+    None of these flows is registered yet, so every one of them projects as
+    `never_ran` with a non-empty declared half — which is exactly the
+    governance gap the ontology overlay draws as an outline. A declaration
+    that only appeared once its writer did could never show that state, and
+    the screen's whole point is the difference between declared and observed.
+    """
+    for flow_id, expected in (
+        ("crm-sync", {"company-master", "sales-records", "source-landing"}),
+        ("sales-sync", {"company-master", "sales-records", "source-landing"}),
+        ("mail-sync", {"correspondence"}),
+        ("dms-sync", {"document-library"}),
+        ("employment-event-sync", {"source-landing"}),
+    ):
+        writes = {c.id for c in data_collections.written_by(flow_id)}
+        assert writes == expected, flow_id
+
+    # mail-sync reads the counterparty book instead of writing it: a message
+    # resolves its correspondents against the book and counts the ones it
+    # cannot place, rather than minting a Person per sending domain.
+    assert {c.id for c in data_collections.read_by("mail-sync")} == {
+        "company-master"
+    }
+    assert "company-master" not in {
+        c.id for c in data_collections.written_by("mail-sync")
+    }
+
+
 def test_the_tbox_and_the_registry_agree_on_who_governs_what():
     """The same fact is stated from both ends, and the route reads one of them.
 
