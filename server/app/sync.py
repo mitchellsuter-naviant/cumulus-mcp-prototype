@@ -55,11 +55,13 @@ VENDOR_FLOW_ID = "vendor-sync"
 PO_FLOW_ID = "purchase-order-sync"
 RECEIVING_FLOW_ID = "receiving-sync"
 WORKFORCE_FLOW_ID = "workforce-sync"
+CALENDAR_FLOW_ID = "calendar-sync"
 STEWARD_QUEUE = "vendor-stewardship"
 PEOPLE_QUEUE = "people-ops"
 
 SyncKind = Literal[
     "vendors", "purchase-orders", "receiving-reports", "workforce",
+    "calendars",
 ]
 
 
@@ -146,6 +148,50 @@ class EmployeeRecord(BaseModel):
     team_slug: str = ""
 
 
+class CalendarRecord(BaseModel):
+    """One calendar as the provider holds it."""
+
+    external_id: str
+    address: str
+    name: str = ""
+    provider: str = ""
+    timezone: str = "America/New_York"
+    # Bind column: whose calendar this is.
+    owner_email: str = ""
+
+
+class CalendarEventRecord(BaseModel):
+    """One block on one calendar — the provider's row, not the meeting.
+
+    A meeting with four attendees arrives as four of these, one per calendar,
+    each with its own `external_id`. That is not duplication to be normalized
+    away: the copies can genuinely differ (a private note, a moved reminder,
+    a declined response), and collapsing them would invent a shared object no
+    provider actually has. What they agree on is expressed as links to the
+    same people.
+
+    Times are wall-clock local, in the calendar's own zone — the way every
+    provider stores them. A UTC instant would be wrong for the recurring
+    9am that has to stay 9am across a daylight-saving change.
+    """
+
+    external_id: str
+    calendar_address: str
+    title: str
+    kind: str = "meeting"
+    starts_at: str = ""
+    ends_at: str = ""
+    all_day: bool = False
+    location: str = ""
+    status: str = "confirmed"
+    # Bind columns: attendance by work email, resolved on the way in.
+    organizer_email: str = ""
+    attendee_emails: list[str] = Field(default_factory=list)
+    optional_emails: list[str] = Field(default_factory=list)
+    agenda_ref: str = ""
+    notes: str = ""
+
+
 class SyncRequest(BaseModel):
     """One delivery from one source system.
 
@@ -164,6 +210,11 @@ class SyncRequest(BaseModel):
     # until both ends of every edge exist, so one delivery is one run.
     teams: list[TeamRecord] = Field(default_factory=list)
     employees: list[EmployeeRecord] = Field(default_factory=list)
+    # Calendars and their events travel together for the same reason teams
+    # and employees do: an event cannot hang off a calendar that has not
+    # landed yet.
+    calendars: list[CalendarRecord] = Field(default_factory=list)
+    calendar_events: list[CalendarEventRecord] = Field(default_factory=list)
 
 
 class SourceStatus(BaseModel):
@@ -213,6 +264,7 @@ class SyncService:
             engine.register(PO_FLOW_ID, self._po_body)
             engine.register(RECEIVING_FLOW_ID, self._receiving_body)
             engine.register(WORKFORCE_FLOW_ID, self._workforce_body)
+            engine.register(CALENDAR_FLOW_ID, self._calendar_body)
 
     # -- entry point --------------------------------------------------------
 
@@ -228,8 +280,14 @@ class SyncService:
         ]
         if request.teams or request.employees:
             plan.append((WORKFORCE_FLOW_ID, "workforce", []))
+        if request.calendars or request.calendar_events:
+            plan.append((CALENDAR_FLOW_ID, "calendars", []))
+        # The two multi-shape feeds carry their records in named lists rather
+        # than one `records` column, so they are exempt from the emptiness
+        # check and build their own inputs below.
+        multi_shape = (WORKFORCE_FLOW_ID, CALENDAR_FLOW_ID)
         for flow_id, field, records in plan:
-            if flow_id != WORKFORCE_FLOW_ID and not records:
+            if flow_id not in multi_shape and not records:
                 continue
             inputs = {
                 "source": request.source,
@@ -242,6 +300,15 @@ class SyncService:
                     "watermark": request.watermark,
                     "teams": [t.model_dump() for t in request.teams],
                     "employees": [e.model_dump() for e in request.employees],
+                }
+            elif flow_id == CALENDAR_FLOW_ID:
+                inputs = {
+                    "source": request.source,
+                    "watermark": request.watermark,
+                    "calendars": [c.model_dump() for c in request.calendars],
+                    "events": [
+                        e.model_dump() for e in request.calendar_events
+                    ],
                 }
             run_id = None
             if request.idempotency_key:
@@ -857,6 +924,225 @@ class SyncService:
                     counts["led_by"] += 1
         return counts
 
+    # -- calendars ----------------------------------------------------------
+
+    def _calendar_body(self, ctx: RunContext, inputs: dict) -> dict:
+        """Mirror the provider's calendars. A bind mapping, like the HRIS.
+
+        A calendar address and a provider event id are exact identifiers, so
+        there is nothing for a steward to adjudicate and no landing record
+        worth keeping. Attendance is the one place judgment could creep in —
+        an attendee named by an address nobody in the workforce holds — and it
+        does not: an external guest is simply not a person in this graph, and
+        the run reports how many references went unresolved rather than
+        minting an Employee for a client's CFO.
+        """
+        source = inputs["source"]
+        calendars = [
+            CalendarRecord.model_validate(c) for c in inputs.get("calendars", [])
+        ]
+        events = [
+            CalendarEventRecord.model_validate(e) for e in inputs.get("events", [])
+        ]
+        ctx.event(
+            "t1", "SourceDelivered",
+            f"{len(calendars)} calendar(s) and {len(events)} event(s) from "
+            f"`{source}`",
+            kind="trigger",
+        )
+
+        calendar_writer = self.graph.writer(ctx.record.id, "a1")
+        calendar_out = ctx.step(
+            "a1", "apply-calendars", "action",
+            fn=lambda: self._apply_calendars(
+                source, calendars, ctx.record.id, calendar_writer
+            ),
+            writes=lambda _out: calendar_writer.refs,
+            summary=lambda out: (
+                f"{out['calendars']} calendar(s) written, "
+                f"{out['owners']} owner link(s)"
+            ),
+        )
+        event_writer = self.graph.writer(ctx.record.id, "a2")
+        event_out = ctx.step(
+            "a2", "apply-events", "action",
+            fn=lambda: self._apply_events(
+                source, events, ctx.record.id, event_writer
+            ),
+            writes=lambda _out: event_writer.refs,
+            summary=lambda out: f"{out['events']} event(s) written",
+        )
+        attendance_writer = self.graph.writer(ctx.record.id, "a3")
+        attendance_out = ctx.step(
+            "a3", "wire-attendance", "action",
+            fn=lambda: self._wire_attendance(events, attendance_writer),
+            writes=lambda _out: attendance_writer.refs,
+            summary=lambda out: (
+                f"{out['attended_by']} attendance(s), "
+                f"{out['organized_by']} organizer(s)"
+                + (
+                    f" · {out['unresolved']} guest(s) outside the workforce"
+                    if out["unresolved"]
+                    else ""
+                )
+            ),
+        )
+        ctx.event(
+            "e1", "CalendarsSynced",
+            f"{len(calendars)} calendar(s), {len(events)} event(s)",
+        )
+        return {
+            "source": source, "watermark": inputs.get("watermark", ""),
+            "kind": "calendars",
+            "records": len(calendars) + len(events),
+            "landed": len(calendars) + len(events),
+            **calendar_out, **event_out, **attendance_out,
+        }
+
+    def _apply_calendars(
+        self,
+        source: str,
+        records: list[CalendarRecord],
+        run_id: str,
+        writer: GraphWriter | None = None,
+    ) -> dict:
+        graph = writer if writer is not None else self.graph
+        claim_source = f"{_authority(source)}:{source}"
+        owners = 0
+        for record in records:
+            calendar = graph.upsert(
+                "Calendar", record.address,
+                [
+                    Claim(field="address", value=record.address,
+                          source=claim_source),
+                    Claim(field="name", value=record.name, source=claim_source),
+                    Claim(field="provider", value=record.provider,
+                          source=claim_source),
+                    Claim(field="external_id", value=record.external_id,
+                          source=claim_source),
+                    Claim(field="timezone", value=record.timezone,
+                          source=claim_source),
+                    Claim(field="owner_email", value=record.owner_email,
+                          source=claim_source),
+                    Claim(field="synced_at", value=utcnow().isoformat(),
+                          source=claim_source),
+                ],
+                label=record.name or record.address,
+                provenance=f"synced by {run_id}",
+            )
+            owner = (
+                self.graph.get(object_id("Employee", record.owner_email))
+                if record.owner_email
+                else None
+            )
+            if owner is not None:
+                graph.link(
+                    "has_calendar", owner.id, calendar.id,
+                    method="declared", provenance="calendar owner_email",
+                )
+                owners += 1
+        return {"calendars": len(records), "owners": owners}
+
+    def _apply_events(
+        self,
+        source: str,
+        records: list[CalendarEventRecord],
+        run_id: str,
+        writer: GraphWriter | None = None,
+    ) -> dict:
+        graph = writer if writer is not None else self.graph
+        claim_source = f"{_authority(source)}:{source}"
+        written = 0
+        orphaned = 0
+        for record in records:
+            calendar = self.graph.get(
+                object_id("Calendar", record.calendar_address)
+            )
+            if calendar is None:
+                # No calendar, no event: a part cannot exist without its
+                # owner, so the honest outcome is to drop it and say so.
+                orphaned += 1
+                continue
+            event = graph.upsert(
+                "CalendarEvent", _event_key(record),
+                [
+                    Claim(field="title", value=record.title, source=claim_source),
+                    Claim(field="kind", value=record.kind, source=claim_source),
+                    Claim(field="starts_at", value=record.starts_at,
+                          source=claim_source),
+                    Claim(field="ends_at", value=record.ends_at,
+                          source=claim_source),
+                    Claim(field="all_day", value="true" if record.all_day
+                          else "false", source=claim_source),
+                    Claim(field="location", value=record.location,
+                          source=claim_source),
+                    Claim(field="status", value=record.status,
+                          source=claim_source),
+                    Claim(field="external_id", value=record.external_id,
+                          source=claim_source),
+                    Claim(field="organizer_email", value=record.organizer_email,
+                          source=claim_source),
+                    Claim(field="agenda_ref", value=record.agenda_ref,
+                          source=claim_source),
+                    Claim(field="notes", value=record.notes,
+                          source=claim_source),
+                ],
+                label=record.title,
+                provenance=f"synced by {run_id}",
+            )
+            graph.link(
+                "has_event", calendar.id, event.id,
+                method="declared", provenance="calendar_address",
+            )
+            written += 1
+        return {"events": written, "orphaned_events": orphaned}
+
+    def _wire_attendance(
+        self,
+        records: list[CalendarEventRecord],
+        writer: GraphWriter | None = None,
+    ) -> dict:
+        graph = writer if writer is not None else self.graph
+        counts = {"attended_by": 0, "organized_by": 0, "unresolved": 0}
+        for record in records:
+            event = self.graph.get(
+                object_id("CalendarEvent", _event_key(record))
+            )
+            if event is None:
+                continue
+            if record.organizer_email:
+                organizer = self.graph.get(
+                    object_id("Employee", record.organizer_email)
+                )
+                if organizer is None:
+                    counts["unresolved"] += 1
+                else:
+                    graph.link(
+                        "organized_by", event.id, organizer.id,
+                        method="declared", provenance="calendar organizer",
+                    )
+                    counts["organized_by"] += 1
+            optional = {e.lower() for e in record.optional_emails}
+            for email in record.attendee_emails:
+                person = self.graph.get(object_id("Employee", email))
+                if person is None:
+                    # A client sponsor is a real attendee and not our
+                    # employee. Counted, never minted.
+                    counts["unresolved"] += 1
+                    continue
+                graph.link(
+                    "attended_by", event.id, person.id,
+                    props={
+                        "required": email.lower() not in optional,
+                        # The provider reports a response per invitation; the
+                        # mirror carries it on the link, where it belongs.
+                        "response": "accepted",
+                    },
+                    method="declared", provenance="calendar attendee list",
+                )
+                counts["attended_by"] += 1
+        return counts
+
     def _apply_receipts(
         self,
         source: str,
@@ -1069,6 +1355,7 @@ class SyncService:
             PO_FLOW_ID: "purchase-orders",
             RECEIVING_FLOW_ID: "receiving-reports",
             WORKFORCE_FLOW_ID: "workforce",
+            CALENDAR_FLOW_ID: "calendars",
         }
         for flow_id, kind in flows.items():
             for run in sorted(
@@ -1099,6 +1386,13 @@ class SyncService:
         return sorted(by_key.values(), key=lambda s: (s.source, s.kind))
 
 
+def _event_key(record: CalendarEventRecord) -> str:
+    """A part's key embeds its owner's — the weak-entity rule, enforced by
+    `GraphService.check_invariants`, and true to the provider besides: an
+    event id is only unique within the calendar that holds it."""
+    return f"{record.calendar_address}#{record.external_id}"
+
+
 def _authority(source: str) -> str:  # noqa: D401
     """Map a source name onto a precedence bucket from the ontology.
 
@@ -1115,6 +1409,14 @@ def _authority(source: str) -> str:  # noqa: D401
         return "procurement"
     if "hris" in lowered or "workday" in lowered or "bamboo" in lowered:
         return "hris"
+    if (
+        "calendar" in lowered
+        or "m365" in lowered
+        or "exchange" in lowered
+        or "outlook" in lowered
+        or "gcal" in lowered
+    ):
+        return "calendar"
     return "flow"
 
 

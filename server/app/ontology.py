@@ -260,6 +260,79 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
     ),
     ObjectType(
+        name="Calendar",
+        label="Calendar",
+        summary=(
+            "One person's schedule, as the calendar provider keeps it. "
+            "Cumulus is not the system of record here — the provider is — so "
+            "the calendar is a governed *mirror*: it exists in the graph "
+            "because a day only means something next to the work it is "
+            "about, and neither the org chart nor the queue can say when "
+            "somebody is actually free."
+        ),
+        natural_key="calendar address at the provider",
+        fields=(
+            FieldSpec("address", "string",
+                      "the calendar's address at the provider"),
+            FieldSpec("name", "string", "what the owner calls it"),
+            FieldSpec("provider", "string", "microsoft-365 | google | …"),
+            FieldSpec("external_id", "string"),
+            FieldSpec("timezone", "string",
+                      "the zone its wall-clock times are written in"),
+            FieldSpec("owner_email", "string",
+                      "denormalized from has_calendar, for cheap reads"),
+            FieldSpec("synced_at", "date", "when the mirror last landed"),
+        ),
+        # The provider owns the id and the truth; we hold a copy that a
+        # steward may not overwrite.
+        authoritative=False,
+        collection="calendars",
+        tags=("people", "calendar", "scheduling"),
+        competency_questions=(
+            "What is on {label} today, and which work does each block touch?",
+            "When does {label} have two clear hours this week?",
+            "Who is {label}'s owner committed to meeting this week?",
+        ),
+    ),
+    ObjectType(
+        name="CalendarEvent",
+        label="Calendar event",
+        summary=(
+            "One block of time on one calendar: a meeting, a focus block, a "
+            "task block, or a deadline. A **part** of the calendar that holds "
+            "it — which is not a modelling flourish but how providers "
+            "actually work: every attendee's copy of a meeting is a distinct "
+            "row with its own id, its own reminders and its own response, "
+            "identified through the calendar it sits on and deleted with it. "
+            "The shared meeting is not the row; it is what the rows agree on, "
+            "and `attended_by` is where that agreement lives."
+        ),
+        natural_key="calendar address + provider event id",
+        fields=(
+            FieldSpec("title", "string"),
+            FieldSpec("kind", "enum",
+                      "meeting | focus | task-block | deadline | "
+                      "out-of-office"),
+            FieldSpec("starts_at", "date",
+                      "wall-clock local time, in the calendar's zone"),
+            FieldSpec("ends_at", "date"),
+            FieldSpec("all_day", "enum", "true | false"),
+            FieldSpec("location", "string"),
+            FieldSpec("status", "enum", "confirmed | tentative | cancelled"),
+            FieldSpec("external_id", "string", "the provider's id for this copy"),
+            FieldSpec("organizer_email", "string",
+                      "denormalized from organized_by, for cheap reads"),
+            FieldSpec("agenda_ref", "string",
+                      "the task, run or case this block is held for — an "
+                      "observation awaiting promotion, not a Link: Tasks and "
+                      "runs are execution state, not graph objects, so this "
+                      "stays a string until something in the graph is what "
+                      "the block is about"),
+            FieldSpec("notes", "string"),
+        ),
+        collection="calendars",
+    ),
+    ObjectType(
         name="ExpenseRequest",
         label="Expense request",
         summary=(
@@ -546,6 +619,20 @@ LINK_TYPES: tuple[LinkType, ...] = (
     LinkType("has_capability", "Employee", "Capability", "many-to-many",
              "an encoded skill — proficiency and how it was evidenced live "
              "on the link, not on either endpoint"),
+    LinkType("has_calendar", "Employee", "Calendar", "one-to-many",
+             "a calendar this person owns — one owner per calendar, several "
+             "calendars per person (personal, on-call, a room they manage)"),
+    LinkType("has_event", "Calendar", "CalendarEvent", "one-to-many",
+             "the blocks on the calendar", nature="composition"),
+    LinkType("organized_by", "CalendarEvent", "Employee", "many-to-one",
+             "who called this meeting. Authorship, not attendance: an "
+             "organizer can book a room they never enter, and 'what did "
+             "Priya call this week' is a different question from 'where was "
+             "Priya'"),
+    LinkType("attended_by", "CalendarEvent", "Employee", "many-to-many",
+             "who is expected in the room; the response and whether they are "
+             "required live on the link, because both are facts about the "
+             "invitation rather than about the person or the meeting"),
     LinkType("identified_as", "Vendor", "SourceRecord", "one-to-many",
              "an external system's id for this vendor — reversible, and "
              "carrying the confidence and method that produced it",
@@ -584,9 +671,12 @@ LINK_TYPES: tuple[LinkType, ...] = (
 # confirms it.
 # `hris` sits with `erp`: each is the system of record for its own subject
 # (people, commerce), and precedence is declared over authorities rather than
-# per field, so the two never actually compete.
+# per field, so the two never actually compete. `calendar` joins them on the
+# same argument and ranks just below: the provider is the only thing that
+# knows what is on somebody's Friday, but where it restates a fact the HRIS
+# owns — a display name, an office — the HRIS wins.
 PRECEDENCE: tuple[str, ...] = (
-    "human", "erp", "hris", "procurement", "flow", "model",
+    "human", "erp", "hris", "calendar", "procurement", "flow", "model",
 )
 
 ONTOLOGY = Ontology(objects=OBJECT_TYPES, links=LINK_TYPES, precedence=PRECEDENCE)

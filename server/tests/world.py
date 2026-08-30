@@ -36,6 +36,7 @@ def install(world: EvalWorld) -> EvalWorld:
     deps._document_service = world.documents
     deps._anomaly_service = world.anomaly
     deps._sync_service = world.sync
+    deps._calendar_service = world.calendars
     deps._reimbursement_service = world.expenses
     deps._payable_service = world.payables
     # The eval service copies *this* corpus into each case's world, so a test

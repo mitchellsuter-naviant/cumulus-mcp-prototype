@@ -132,6 +132,7 @@ Local dev uses the in-memory backend and auto-seeds from [server/seed](server/se
 - Accounts payable: `GET/POST /api/v1/payables`, `GET .../stats`, `GET .../{id}` — see [Accounts payable](#accounts-payable-the-second-live-flow)
 - Refs: `GET /api/v1/refs/{ref}` — resolve `knowledge:{id}@rev{n}` read-set references; every asset carries a `revision` that bumps on write
 - Employee Hub: `GET /api/v1/employee/me`, `GET/POST /api/v1/employee/pto`, `POST /api/v1/employee/hr-chat` — see [Employee Hub](#employee-hub)
+- Calendars: `GET /api/v1/calendar/me`, `GET /api/v1/calendar/calendars` — read-only; the provider is the system of record — see [Calendars](#calendars-the-schedule-as-a-mirror)
 - MCP: `POST /mcp/` — tools `list_docs`, `get_doc`, `search_docs`, `get_context`; resource template `kb://{doc_id}`
 - A2A: `POST /a2a` with JSON-RPC `message/send`; agent card at `/.well-known/agent-card.json`
 
@@ -569,13 +570,15 @@ admin write a key *may* do, so CI can kick off evals.
 ## Tasks
 
 The Task Queue is the console's human-in-the-loop spine: *an agent proposes, a
-person decides, the system resumes.* It is global rather than a nav section —
-an inbox icon in the top bar's account cluster, badged with the open count
-(red when anything is high priority), because judgment is requested from
-wherever you are, not from a place you visit. Opening it slides in **My
-Tasks**: open tasks grouped by Queue (the doctrinal unit of work
-distribution), high priority first, oldest first within a band, plus a
-Decided view where the record lives on.
+person decides, the system resumes.* It is a rail stop — **My Tasks**, third
+in the personal group and badged with the open count — with the queue list on
+the left and a full review pane on the right. It used to be a badged icon in
+the top bar opening a 660px drawer, and that was the wrong shape for the work:
+deciding a task means reading the evidence, following the refs it rests on,
+and often opening the full review to correct the facts. Open tasks read high
+priority first and oldest first within a band, filtered by Queue (the
+doctrinal unit of work distribution); a Decided tab is where the record lives
+on.
 
 Three streams raise tasks, and all three are knowledge-layer streams:
 
@@ -725,8 +728,8 @@ Canonical Objects, typed Links, retained Claims.
   mints the same id rather than a duplicate.
 - Field values are the **resolution of claims**, not a write. Every value
   arrives as a Claim carrying its source and confidence; `props` is those claims
-  reduced under the ontology's precedence order (`human` → `erp` →
-  `procurement` → `flow` → `model`). Losing claims stay on the record, so two
+  reduced under the ontology's precedence order (`human` → `erp` → `hris` →
+  `calendar` → `procurement` → `flow` → `model`). Losing claims stay on the record, so two
   systems disagreeing about a vendor's payment terms is a normal state you can
   look at, and changing precedence **re-resolves history rather than rewriting
   it**.
@@ -830,6 +833,56 @@ receiving reports and runs the matching sync Flow. The rules that matter:
 
 `GET /api/v1/sources` is assembled from the sync runs themselves — there is no
 second bookkeeping store to disagree with them.
+
+### Calendars: the schedule as a mirror (`server/app/calendars.py`)
+
+The home screen and the week view needed a schedule, and the honest way to
+build one was to ask what a calendar *is* in the ontology rather than to put a
+table beside it. Two types earned their place:
+
+- **Calendar** — one person's schedule at a provider. A root, deliberately
+  **not authoritative**: Microsoft 365 owns it, we mirror it. Its competency
+  questions are ones nothing else here answers — what is on somebody's Friday,
+  and when are they free.
+- **CalendarEvent** — one block, and a **part** of the calendar holding it.
+  That is not a modelling flourish: a meeting with four attendees is four
+  rows, one per calendar, each with its own provider id, reminders and
+  response. The shared meeting is not a row; it is what the rows agree on, and
+  `attended_by` is where that agreement lives. The part rule is enforced —
+  each event's natural key embeds its calendar's, checked by
+  `GraphService.check_invariants`.
+
+Attendance and authorship are separate links on purpose: `organized_by` is
+many-to-one (who called it — an organizer can book a room they never enter),
+`attended_by` is many-to-many with `required` and `response` on the *link*,
+because both are facts about the invitation rather than about the person or
+the meeting. Times land as **wall-clock local** in the calendar's own zone, as
+every provider stores them: a recurring 9am has to stay 9am across a
+daylight-saving change.
+
+The feed is a real Flow — `calendar-sync`, a **bind** Mapping like the HRIS,
+declared in `mappings.py` and journalled like every other delivery. An
+attendee the workforce does not contain (a client sponsor) is counted as
+unresolved and **never minted**: an invitation is not evidence of employment.
+The mock delivery in `calendars.py` builds three weeks around the current
+Monday and is the only fiction — it goes in through `POST`-shaped
+`SyncRequest`, and everything downstream is the running system.
+
+The roster includes **the console's operator** (`workforce.OPERATOR_EMAIL`), a
+real work address among the fictional ones, because a signed-in principal that
+resolves to nobody turns every personal surface into a demo persona with an
+apology attached. Both seeds only fire on an empty store, so a person added to
+the roster later would never arrive in a deployment that was seeded last week;
+`sync_workforce_additions` and `sync_calendar_additions` run on every start and
+deliver exactly the people the graph is missing — same Flow, same `hris:` and
+`calendar:` claims, so a late arrival is indistinguishable from a founder.
+
+The read surface is deliberately read-only. A block created in Cumulus would
+be a fact the mirror could not defend, and the next sync would delete it;
+booking time is a Flow that calls the provider, and it does not exist yet. A
+principal with no Employee record — every local-dev session — gets a demo
+persona's calendar with a `persona_note` saying whose it is, rather than a
+silent substitution.
 
 ### Entity resolution (`server/app/resolution.py`)
 
@@ -1029,7 +1082,7 @@ company in two systems was two vendors.
    duplicate, out-of-cadence, round-number — because "unusual" only has a
    useful definition per vendor. Derived statistics are data; the thresholds
    that judge them are governed knowledge in the policy document.
-7. **post-or-review (Rule)** reads governed values from the
+5. **post-or-review (Rule)** reads governed values from the
    `invoice-posting-policy` asset at run time (auto-post limit $2,500,
    extraction-confidence floor 0.75, match tolerances, anomaly thresholds).
    Under the limit and clean, it posts; otherwise a review Task, and a clerk's
@@ -1057,6 +1110,7 @@ without a credential:
 | `nopo` | no purchase order — `unmatched` |
 | `blurry` | drops confidence below the governed floor |
 | `total=9800.00` | over the auto-post limit, and an amount outlier once the vendor has history |
+| `taxid` | prints a tax id — the resolver's strongest signal |
 
 With `RECEIPT_BACKEND=vertex` the extractions are real multimodal calls.
 
@@ -1094,11 +1148,16 @@ flutter run -d chrome --dart-define=API_BASE_URL=http://localhost:8080
 Inside the dev container there is no display, so use the web-server device and
 your host browser instead — see [.devcontainer/README.md](.devcontainer/README.md).
 
-The left rail has four stops: **Knowledge layer**, **Flows**, **Workspaces** —
-a dropdown, because a workspace is a business view onto rows a flow wrote
-rather than a plane of the map — and **Identities, access & keys**. The
-Employee Hub hangs off the account avatar and the Task Queue off the top bar,
-since both are asked for from every section rather than being one.
+The left rail reads in two groups, separated by a hairline, and the order is an
+argument about what a console is for. The first group is **yours**: **Home**
+(today's schedule and where accounts payable stands), **Calendar** (your week,
+mirrored from the provider), **My Tasks** (the queue, badged with its open
+count), and **Workspaces** — a dropdown, because a workspace is a business
+view onto rows a flow wrote rather than a plane of the map. The second is the
+platform: **Knowledge layer** first, because everything after it either writes
+into the layer (**Flows**) or governs who may touch it (**Identities, access &
+keys**). The Employee Hub hangs off the account avatar, since it is about you
+rather than about a workstream.
 
 The Knowledge layer itself opens on an **Overview** — the landing screen and
 the only place metrics live, because reporting on the layer as a whole is a
@@ -1110,7 +1169,6 @@ cut by **origin** — who or what put each thing there:
   authority lens applies here and only here, because authority is a property
   of documents that argue.
 - **Ontology** — what we encoded: **Entities & Links** (the TBox as a
-| `taxid` | prints a tax id — the resolver's strongest signal |
   navigable table — a core-entity rail on the left, every link touching the
   selected type on the right, both panes scrolling themselves so the schema
   stays on screen), the **Authored ABox** fragments, the Collection

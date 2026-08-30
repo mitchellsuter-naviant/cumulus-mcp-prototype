@@ -6,9 +6,11 @@ import '../services/auth_service.dart';
 import '../theme/cumulus_theme.dart';
 import '../widgets/command_palette.dart';
 import '../widgets/cumulus_shell.dart';
-import '../widgets/task_queue.dart';
+import '../widgets/tasks_view.dart';
 import 'api_docs_screen.dart';
+import '../widgets/calendar_view.dart';
 import '../widgets/data_plane.dart';
+import '../widgets/home_view.dart';
 import '../widgets/knowledge_overview.dart';
 import '../widgets/learned_plane.dart';
 import '../widgets/payables_view.dart';
@@ -24,33 +26,50 @@ import 'flows_screen.dart';
 /// stop at all — it is personal rather than a workstream, so the account
 /// button carries its active state and the rail correctly shows nothing
 /// selected.
-const int _knowledgeIndex = 0;
-const int _flowsIndex = 1;
-const int _identitiesIndex = 2;
-const int _employeeHubIndex = 3;
+///
+/// The rail reads in two groups, and the order is an argument about what a
+/// console is for. The first four stops are *yours* — your day, your week,
+/// your queue, the workspaces you work in. The rest are the platform: the
+/// knowledge layer first, because everything else is either written into it
+/// (Flows) or governs who may touch it (Identities).
+const int _homeIndex = 0;
+const int _calendarIndex = 1;
+const int _tasksIndex = 2;
+const int _expenseWorkspaceIndex = 3;
+const int _payablesWorkspaceIndex = 4;
+const int _knowledgeIndex = 5;
+const int _flowsIndex = 6;
+const int _identitiesIndex = 7;
+const int _employeeHubIndex = 8;
+
 /// The Library's tab index inside the Knowledge layer section. Named because
 /// the palette navigates to it and a bare `1` would not survive a reorder.
 const int _libraryPlane = 1;
 
-const int _expenseWorkspaceIndex = 4;
-const int _payablesWorkspaceIndex = 5;
-
-const _destinations = <RailDestination>[
-  RailDestination(
-    icon: Icons.hub_outlined,
-    label: 'Knowledge layer',
-    index: _knowledgeIndex,
+/// The rail. `badge` on the Tasks stop is filled in per build from the open
+/// count — the badge moved off the top bar with the queue itself.
+List<RailDestination> _destinations(int openTasks) => [
+  const RailDestination(
+    icon: Icons.home_outlined,
+    label: 'Home',
+    index: _homeIndex,
+  ),
+  const RailDestination(
+    icon: Icons.calendar_today_outlined,
+    label: 'Calendar',
+    index: _calendarIndex,
   ),
   RailDestination(
-    icon: Icons.account_tree_outlined,
-    label: 'Flows',
-    index: _flowsIndex,
+    icon: Icons.inbox_outlined,
+    label: 'My Tasks',
+    index: _tasksIndex,
+    badge: openTasks,
   ),
   // A Workspace is a business view onto rows the flows write — scoped work,
-  // not a plane of the map. They hung off the Knowledge layer's Data tab until
-  // now, which put a business surface inside the governance surface; the
+  // not a plane of the map. They hung off the Knowledge layer's Data tab
+  // once, which put a business surface inside the governance surface; the
   // dropdown is where they belong.
-  RailDestination(
+  const RailDestination(
     icon: Icons.grid_view_outlined,
     label: 'Workspaces',
     children: [
@@ -66,7 +85,18 @@ const _destinations = <RailDestination>[
       ),
     ],
   ),
-  RailDestination(
+  const RailDestination(
+    icon: Icons.hub_outlined,
+    label: 'Knowledge layer',
+    index: _knowledgeIndex,
+    startsGroup: true,
+  ),
+  const RailDestination(
+    icon: Icons.account_tree_outlined,
+    label: 'Flows',
+    index: _flowsIndex,
+  ),
+  const RailDestination(
     icon: Icons.groups_outlined,
     label: 'Identities, access & keys',
     index: _identitiesIndex,
@@ -103,7 +133,15 @@ class _HomeShellState extends State<HomeShell> {
   final ValueNotifier<({String query, SearchFilters filters})?> _pageResults =
       ValueNotifier(null);
 
-  int _index = 0;
+  int _index = _homeIndex;
+
+  /// The open-task count behind the rail badge. Held here because the badge
+  /// lives on a rail stop the shell draws, and refreshed whenever the queue
+  /// might have moved: on first build, and after any decision made in the
+  /// Tasks section. It does not poll — there is no push channel yet, and a
+  /// silently wrong number is worse than a slightly stale one that corrects
+  /// itself on every interaction.
+  int _openTasks = 0;
 
   /// Which plane of the Knowledge layer is showing — see the tab labels in
   /// [_KnowledgeSection]. Held here so opening an asset from the palette can
@@ -112,7 +150,13 @@ class _HomeShellState extends State<HomeShell> {
 
   /// Sections fetch on first build, so a section that has never been opened
   /// stays unbuilt rather than firing a request the user did not ask for.
-  final Set<int> _visited = {0};
+  final Set<int> _visited = {_homeIndex};
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshTaskBadge();
+  }
 
   @override
   void dispose() {
@@ -123,6 +167,15 @@ class _HomeShellState extends State<HomeShell> {
     _knowledgePlane.dispose();
     _api.close();
     super.dispose();
+  }
+
+  Future<void> _refreshTaskBadge() async {
+    try {
+      final stats = await _api.taskStats();
+      if (mounted) setState(() => _openTasks = stats.open);
+    } on ApiException {
+      // The badge is a convenience; a failed count never blocks the shell.
+    }
   }
 
   void _show(int index) {
@@ -136,17 +189,17 @@ class _HomeShellState extends State<HomeShell> {
   void _handleIntent(PaletteIntent intent) {
     switch (intent) {
       case OpenAssetIntent(:final assetId):
-        _show(0);
+        _show(_knowledgeIndex);
         _knowledgePlane.value = _libraryPlane;
         _pageResults.value = null;
         _openAsset.value = assetId;
       case CreateAssetIntent():
-        _show(0);
+        _show(_knowledgeIndex);
         _knowledgePlane.value = _libraryPlane;
         _pageResults.value = null;
         _openAsset.value = '';
       case ShowAllResultsIntent(:final query, :final filters):
-        _show(0);
+        _show(_knowledgeIndex);
         _knowledgePlane.value = _libraryPlane;
         _openAsset.value = null;
         _pageResults.value = (query: query, filters: filters);
@@ -164,25 +217,40 @@ class _HomeShellState extends State<HomeShell> {
   Widget _lazy(int index, Widget Function() build) =>
       _visited.contains(index) ? build() : const SizedBox.shrink();
 
-
   @override
   Widget build(BuildContext context) {
     return CumulusShell(
-      destinations: _destinations,
+      destinations: _destinations(_openTasks),
       selectedIndex: _index,
       onDestinationSelected: _show,
       palette: _palette,
       accountLabel: AuthService.instance.email,
       onSignOut: AuthService.instance.signOut,
-      taskButton: TaskQueueButton(api: _api),
       onOpenApiDocs: () => Navigator.of(context).push(
         MaterialPageRoute(builder: (_) => const ApiDocsScreen()),
       ),
       onOpenEmployeeHub: () => _show(_employeeHubIndex),
       employeeHubActive: _index == _employeeHubIndex,
+      // Ordered by section index, which is what IndexedStack selects on.
       child: IndexedStack(
         index: _index,
         children: [
+          _lazy(
+            _homeIndex,
+            () => HomeSection(
+              api: _api,
+              onOpenCalendar: () => _show(_calendarIndex),
+              onOpenPayables: () => _show(_payablesWorkspaceIndex),
+              onOpenTasks: () => _show(_tasksIndex),
+            ),
+          ),
+          _lazy(_calendarIndex, () => CalendarSection(api: _api)),
+          _lazy(
+            _tasksIndex,
+            () => TasksSection(api: _api, onQueueChanged: _refreshTaskBadge),
+          ),
+          _lazy(_expenseWorkspaceIndex, () => ReimbursementsView(api: _api)),
+          _lazy(_payablesWorkspaceIndex, () => PayablesView(api: _api)),
           _lazy(
             _knowledgeIndex,
             () => _KnowledgeSection(
@@ -200,8 +268,6 @@ class _HomeShellState extends State<HomeShell> {
           _lazy(_flowsIndex, () => const FlowsSection()),
           _lazy(_identitiesIndex, () => const IdentitiesSection()),
           _lazy(_employeeHubIndex, () => EmployeeHubSection(api: _api)),
-          _lazy(_expenseWorkspaceIndex, () => ReimbursementsView(api: _api)),
-          _lazy(_payablesWorkspaceIndex, () => PayablesView(api: _api)),
         ],
       ),
     );

@@ -23,12 +23,20 @@ class RailDestination {
   /// Non-empty when this stop opens a panel rather than selecting a section.
   final List<RailChild> children;
 
+  /// Draws a hairline above this stop. The rail carries two kinds of
+  /// destination — the personal ones (your day, your week, your queue, your
+  /// workspaces) and the platform ones (the knowledge layer, the flows that
+  /// write into it, who may touch either) — and the rule is worth one pixel:
+  /// without it the two groups read as one undifferentiated column of icons.
+  final bool startsGroup;
+
   const RailDestination({
     required this.icon,
     required this.label,
     this.index,
     this.children = const [],
     this.badge = 0,
+    this.startsGroup = false,
   });
 
   bool get isMenu => children.isNotEmpty;
@@ -80,11 +88,6 @@ class CumulusShell extends StatefulWidget {
   /// selected.
   final bool employeeHubActive;
 
-  /// The Task Queue button — lives in the account cluster because judgment is
-  /// requested from every screen, not from a section. The application supplies
-  /// it (it needs the ApiClient); the shell only places it.
-  final Widget? taskButton;
-
   final Widget child;
 
   const CumulusShell({
@@ -99,7 +102,6 @@ class CumulusShell extends StatefulWidget {
     this.onOpenApiDocs,
     this.onOpenEmployeeHub,
     this.employeeHubActive = false,
-    this.taskButton,
     required this.child,
   });
 
@@ -187,7 +189,6 @@ class _CumulusShellState extends State<CumulusShell> {
                     onOpenApiDocs: widget.onOpenApiDocs,
                     onOpenEmployeeHub: widget.onOpenEmployeeHub,
                     employeeHubActive: widget.employeeHubActive,
-                    taskButton: widget.taskButton,
                   ),
                   Expanded(
                     child: Row(
@@ -250,7 +251,6 @@ class _TopBar extends StatelessWidget {
   final VoidCallback? onOpenApiDocs;
   final VoidCallback? onOpenEmployeeHub;
   final bool employeeHubActive;
-  final Widget? taskButton;
 
   const _TopBar({
     required this.palette,
@@ -260,7 +260,6 @@ class _TopBar extends StatelessWidget {
     this.onOpenApiDocs,
     this.onOpenEmployeeHub,
     this.employeeHubActive = false,
-    this.taskButton,
   });
 
   @override
@@ -285,10 +284,6 @@ class _TopBar extends StatelessWidget {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
-                if (taskButton != null) ...[
-                  taskButton!,
-                  const SizedBox(width: 10),
-                ],
                 _HelpButton(onOpenApiDocs: onOpenApiDocs),
                 const SizedBox(width: 10),
                 _AccountButton(
@@ -711,7 +706,12 @@ class _Rail extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            for (final destination in destinations)
+            for (final destination in destinations) ...[
+              if (destination.startsGroup)
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                  child: Divider(height: 1),
+                ),
               if (destination.isMenu)
                 _RailMenuButton(
                   destination: destination,
@@ -724,6 +724,7 @@ class _Rail extends StatelessWidget {
                   selected: destination.index == selectedIndex,
                   onTap: () => onSelected(destination.index!),
                 ),
+            ],
           ],
         ),
       ),

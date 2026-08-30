@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from . import (
     a2a,
     api_keys_api,
+    calendar_api,
     data_api,
     evals_api,
     graph_api,
@@ -29,6 +30,7 @@ from . import (
 from .config import settings
 from .deps import (
     get_api_key_directory,
+    get_calendar_service,
     get_asset_usage,
     get_anomaly_service,
     get_document_service,
@@ -83,9 +85,12 @@ async def lifespan(app: FastAPI):
     get_document_service()
     get_run_engine()
     get_anomaly_service()
-    get_sync_service()  # registers the three inbound sync bodies
+    get_sync_service()  # registers the four inbound sync bodies
     get_reimbursement_service()  # hydrate the table (and seed decided history)
     get_payable_service()  # hydrate the AP world (vendors, POs, invoices)
+    # Last of the seeds: calendars hang off the employees the workforce seed
+    # (which rides along with payables) has just landed.
+    get_calendar_service()
 
     # Hard cutover to identity-bound credentials: a key minted before
     # identities existed authenticates nothing (auth.py refuses it), so mark
@@ -131,6 +136,7 @@ async def lifespan(app: FastAPI):
             "flows": len(get_flow_service().list()),
             "openTasks": get_task_service().stats().open,
             "graphObjects": get_graph_service().stats()["objects"],
+            "calendars": len(get_calendar_service().calendars()),
             "runs": len(get_run_engine().list()),
         },
     )
@@ -187,6 +193,7 @@ app.include_router(tasks_api.router)
 app.include_router(reimbursements_api.router)
 app.include_router(payables_api.router)
 app.include_router(employee_api.router)
+app.include_router(calendar_api.router)
 app.include_router(graph_api.router)
 app.include_router(mappings_api.router)
 app.include_router(runs_api.router)

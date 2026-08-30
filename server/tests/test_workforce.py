@@ -41,8 +41,8 @@ def test_the_firm_lands_once(world):
     counts = world.graph.stats()["by_type"]
     assert counts["Team"] == len(TEAMS)
     assert counts["Capability"] == len(CAPABILITIES)
-    # Ten employees, not fourteen: the four the expense flow already minted
-    # resolved to the same entities the HRIS names.
+    # The roster exactly, not the roster plus four: the employees the expense
+    # flow already minted resolved to the same entities the HRIS names.
     assert counts["Employee"] == len(EMPLOYEES)
 
 

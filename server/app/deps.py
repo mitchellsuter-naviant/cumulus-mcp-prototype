@@ -22,7 +22,13 @@ from .teams import TeamService, build_team_directory
 from .usage import AssetUsageStore, build_asset_usage_store
 from .users import UserDirectory, build_user_directory
 from .flows import FlowService, build_flow_service, seed_flows_if_empty
-from .workforce import seed_workforce_if_empty
+from .workforce import seed_workforce_if_empty, sync_workforce_additions
+from .calendars import (
+    CalendarService,
+    build_calendar_service,
+    seed_calendars_if_empty,
+    sync_calendar_additions,
+)
 from .tasks import TaskService, build_task_service, seed_tasks_if_empty
 from .reimbursements import (
     ReimbursementService,
@@ -63,6 +69,7 @@ _document_service: DocumentService | None = None
 _run_engine: RunEngine | None = None
 _anomaly_service: AnomalyService | None = None
 _sync_service: SyncService | None = None
+_calendar_service: CalendarService | None = None
 _eval_service: EvalService | None = None
 # The generative backend is expensive to construct (a Vertex client) and holds
 # no request state, so it is cached; the AnswerService wrapper around it is
@@ -303,6 +310,28 @@ def get_sync_service() -> SyncService:
     return _sync_service
 
 
+def get_calendar_service() -> CalendarService:
+    """The mirrored schedules, and the seed that lands them.
+
+    Ordering, not decoration: the calendar seed hangs its calendars off
+    Employees, and the workforce lands as part of the payables seed, so that
+    has to have run first. A calendar with no owner would be a mirror of
+    nobody.
+    """
+    global _calendar_service
+    if _calendar_service is None:
+        graph = get_graph_service()
+        sync = get_sync_service()
+        get_payable_service()  # seeds the workforce the calendars hang off
+        service = build_calendar_service(graph)
+        with _lock:
+            if _calendar_service is None:
+                seed_calendars_if_empty(sync, graph)
+                sync_calendar_additions(sync, graph)
+                _calendar_service = service
+    return _calendar_service
+
+
 def get_eval_service() -> EvalService:
     """Graph-shaped evals over the declared specs.
 
@@ -402,6 +431,11 @@ def get_payable_service() -> PayableService:
                 # The org chart rides the same sync service, and the expense
                 # seed has already minted the employees it attaches to.
                 seed_workforce_if_empty(sync, get_graph_service())
+                # And the people added to the roster since this store was
+                # first seeded — including the console's operator, who has to
+                # resolve to somebody or every personal surface falls back to
+                # a demo persona.
+                sync_workforce_additions(sync, get_graph_service())
                 _payable_service = service
     return _payable_service
 

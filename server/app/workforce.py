@@ -14,9 +14,12 @@ of fact:
   proficiency and the evidence live on the `has_capability` link — on the
   relationship, because that is what they are about.
 
-The firm is small on purpose: ten people over six nested teams is enough to
+The firm is small on purpose: eleven people over six nested teams is enough to
 make the org chart a real traversal (a lead's reports, a team's parent, a
-partner's whole line) without inventing a directory nobody reads.
+partner's whole line) without inventing a directory nobody reads. Ten of them
+are fictional; the eleventh is whoever signs in to the console, because a
+principal that resolves to nobody turns every personal surface into a demo
+persona with an apology attached.
 """
 
 from __future__ import annotations
@@ -24,11 +27,19 @@ from __future__ import annotations
 import logging
 
 from .graph import Claim, GraphService, object_id
+from .models import utcnow
 
 log = logging.getLogger("cumulus.workforce")
 
 HRIS_SOURCE = "hris-workday"
 PEOPLE_AUTHORITY = "human:people-ops"
+
+# The console's operator: the person who signs in to this prototype. A real
+# work address sits among the fictional `customer.example` ones on purpose —
+# the signed-in principal has to *resolve to somebody* or every personal
+# surface falls back to a demo persona and says so. Title, team and manager
+# below are placeholders for the demo's sake; change them freely.
+OPERATOR_EMAIL = "masuter@naviant.com"
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +95,13 @@ TEAMS: tuple[dict, ...] = (
 )
 
 EMPLOYEES: tuple[dict, ...] = (
+    {
+        "external_id": "WD-1002", "email": OPERATOR_EMAIL,
+        "name": "Mitchell Suter", "title": "Director, Platform & Operations",
+        "location": "Boston, MA", "start_date": "2021-01-11",
+        "manager_email": "rowan@customer.example",
+        "team_slug": "firm-leadership",
+    },
     {
         "external_id": "WD-1001", "email": "rowan@customer.example",
         "name": "Rowan Ellis", "title": "Managing Partner",
@@ -214,6 +232,12 @@ CAPABILITIES: tuple[dict, ...] = (
 
 # (employee email, capability slug, proficiency, how it was evidenced)
 ASSIGNMENTS: tuple[tuple[str, str, str, str], ...] = (
+    (OPERATOR_EMAIL, "engagement-management", "expert",
+     "owns the platform programme end to end"),
+    (OPERATOR_EMAIL, "gcp-architecture", "practising",
+     "designed the Cumulus landing zone with Sam"),
+    (OPERATOR_EMAIL, "change-management", "practising",
+     "ran the knowledge-layer rollout"),
     ("rowan@customer.example", "engagement-management", "expert",
      "11 engagements as partner-in-charge"),
     ("rowan@customer.example", "stakeholder-facilitation", "expert",
@@ -266,6 +290,65 @@ ASSIGNMENTS: tuple[tuple[str, str, str, str], ...] = (
 # ---------------------------------------------------------------------------
 # Seeding
 # ---------------------------------------------------------------------------
+
+
+def sync_workforce_additions(sync, graph: GraphService) -> int:
+    """Deliver the people on the roster who are not in the graph yet.
+
+    `seed_workforce_if_empty` only fires on an empty store, which means a
+    person added to `EMPLOYEES` after a deployment was first seeded would never
+    arrive — and the console would keep telling them they are not in the
+    workforce. This runs on every start instead, and is a no-op the moment the
+    roster and the graph agree.
+
+    It is a delivery, not a patch: the same `workforce-sync` Flow, the same
+    `hris:` claims, the same bind columns, so a person who arrives late is
+    indistinguishable from one who was there at the start. Teams travel along
+    because the org chart cannot be wired until both ends of every edge exist;
+    re-asserting a team that already exists changes nothing.
+    """
+    missing = [
+        person for person in EMPLOYEES
+        if graph.get(object_id("Employee", person["email"])) is None
+    ]
+    if not missing:
+        return 0
+
+    from .sync import SyncRequest
+
+    emails = {person["email"] for person in missing}
+    request = SyncRequest.model_validate({
+        "source": HRIS_SOURCE,
+        "watermark": utcnow().isoformat(),
+        "teams": list(TEAMS),
+        "employees": missing,
+    })
+    sync.deliver(request, actor="system:roster")
+
+    linked = 0
+    for email, slug, proficiency, evidence in ASSIGNMENTS:
+        if email not in emails:
+            continue
+        person = graph.get(object_id("Employee", email))
+        capability = graph.get(object_id("Capability", slug))
+        if person is None or capability is None:
+            log.warning(
+                "Skipping capability assignment",
+                extra={"email": email, "capability": slug},
+            )
+            continue
+        graph.link(
+            "has_capability", person.id, capability.id,
+            props={"proficiency": proficiency, "evidenced_by": evidence},
+            method="human",
+            provenance="asserted by people-ops",
+        )
+        linked += 1
+    log.info(
+        "Delivered roster additions",
+        extra={"employees": len(missing), "assignments": linked},
+    )
+    return len(missing)
 
 
 def seed_workforce_if_empty(sync, graph: GraphService) -> int:

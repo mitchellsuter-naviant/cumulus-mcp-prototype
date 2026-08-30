@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import '../models/api_key.dart';
 import '../models/asset.dart';
+import '../models/calendar.dart';
 import '../models/identity.dart';
 import '../models/platform_user.dart';
 import '../models/team.dart';
@@ -630,6 +631,39 @@ class ApiClient {
     );
     _check(resp);
     return HrChatReply.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  // ---- calendars ----
+
+  /// Your week, mirrored from the calendar provider. `start` is a Monday-ish
+  /// ISO date; omitting it asks the server for the current week.
+  ///
+  /// When the signed-in principal is not in the workforce — every local-dev
+  /// session — the server answers with a demo persona's calendar and says so
+  /// in `personaNote`. The UI shows that note rather than pretending.
+  Future<Agenda> calendarAgenda({String? start, int days = 7}) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/calendar/me', {
+          if (start != null && start.isNotEmpty) 'start': start,
+          'days': '$days',
+        }),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return Agenda.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  /// Every mirrored calendar in the system, one per person.
+  Future<List<CalendarSummary>> calendars() async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/calendar/calendars'), headers: await _headers()),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => CalendarSummary.fromJson(j as Map<String, dynamic>))
+        .toList();
   }
 
   // ---- tasks ----

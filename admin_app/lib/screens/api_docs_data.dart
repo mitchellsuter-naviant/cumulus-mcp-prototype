@@ -1365,7 +1365,81 @@ const employeeGroup = EndpointGroup(
   ],
 );
 
-// ---- Tasks -----------------------------------------------------------------
+// ---- Calendars ---------------------------------------------------------------
+
+const _agendaShape = '''{
+  "email": "dana@customer.example",
+  "name": "Dana Whitfield",
+  "title": "Engagement Director",
+  "calendar": {
+    "id": "calendar_9f71ad7259af",
+    "ref": "graph:Calendar/calendar_9f71ad7259af@rev2",
+    "address": "dana@customer.example",
+    "provider": "microsoft-365",
+    "timezone": "America/New_York",
+    "events": 46
+  },
+  "start_date": "2026-08-24",
+  "days": 7,
+  "events": [
+    {
+      "id": "calendarevent_171d00c49333",
+      "ref": "graph:CalendarEvent/calendarevent_171d00c49333@rev2",
+      "title": "Acme Phase 1 — daily standup",
+      "kind": "meeting",
+      "starts_at": "2026-08-28T08:45:00",
+      "ends_at": "2026-08-28T09:00:00",
+      "all_day": false,
+      "location": "Teams",
+      "organizer_email": "dana@customer.example",
+      "agenda_ref": "engagement:acme-phase-1",
+      "attendees": [
+        {"email": "dana@customer.example", "name": "Dana Whitfield",
+         "required": true, "response": "accepted", "is_owner": true}
+      ]
+    }
+  ],
+  "persona_note": ""
+}''';
+
+const calendarGroup = EndpointGroup(
+  title: 'Calendars',
+  blurb:
+      'Schedules, mirrored from the calendar provider into the graph: a '
+      'Calendar per person, and CalendarEvents as parts of it — one row per '
+      'attendee\'s copy, which is what the provider actually stores. Read-only '
+      'on purpose: the provider is the system of record, so a block created '
+      'here would be a fact the mirror could not defend and the next sync '
+      'would delete it. Times are wall-clock local in the calendar\'s own '
+      'zone, never UTC instants.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/calendar/me',
+      summary: 'The caller\'s window of time, current week by default.',
+      auth: ApiAuth.reader,
+      params: [
+        ApiParam('start', 'string',
+            description: 'ISO date the window starts on. Defaults to Monday '
+                'of the current week.'),
+        ApiParam('days', 'number', description: '1–31; defaults to 7.'),
+      ],
+      notes:
+          'A principal with no Employee record — every local-dev session — '
+          'gets a demo persona\'s calendar, and `persona_note` says whose it '
+          'is rather than substituting silently.',
+      responseExample: _agendaShape,
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/calendar/calendars',
+      summary: 'Every mirrored calendar, with its owner, count and next block.',
+      auth: ApiAuth.reader,
+    ),
+  ],
+);
+
+// ---- Tasks -------------------------------------------------------------------
 
 const _taskShape = '''{
   "id": "task_mdm_0071",
@@ -2138,6 +2212,7 @@ const restGroups = <EndpointGroup>[
   reimbursementsGroup,
   payablesGroup,
   employeeGroup,
+  calendarGroup,
   runsGroup,
   graphGroup,
   worldsGroup,

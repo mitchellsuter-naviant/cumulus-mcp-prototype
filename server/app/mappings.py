@@ -222,6 +222,47 @@ MAPPINGS: tuple[Mapping, ...] = (
         ),
     ),
     Mapping(
+        id="calendar-m365",
+        source="calendar-m365",
+        system="Microsoft 365 calendars",
+        summary=(
+            "Every employee's schedule, mirrored per calendar. A **bind** "
+            "contract like the HRIS: a calendar address and a provider event "
+            "id are exact, and attendees are named by work email, so nothing "
+            "is reified and nothing needs a steward. Attendees the workforce "
+            "does not contain — a client sponsor, an external recruiter — are "
+            "counted as unresolved rather than minted: an invitation is not "
+            "evidence of employment."
+        ),
+        transport="pull",
+        payload="CalendarRecord + CalendarEventRecord",
+        strategy="bind",
+        resolves_to=("Calendar", "CalendarEvent", "Employee"),
+        identity=(
+            IdentityBinding(column="address", object_type="Calendar",
+                            key="calendar address"),
+            IdentityBinding(column="owner_email", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="calendar_address", object_type="Calendar",
+                            key="calendar address"),
+            IdentityBinding(column="organizer_email", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="attendee_emails", object_type="Employee",
+                            key="work email"),
+        ),
+        precedence_source="calendar",
+        freshness="every 15 minutes, delta by watermark",
+        custody="copy",
+        collection="calendars",
+        escalation="windowed aggregate",
+        notes=(
+            "Times land as wall-clock local in the calendar's own zone, not "
+            "as UTC instants: a recurring 9am has to stay 9am across a "
+            "daylight-saving change, and normalizing it away would move "
+            "every recurring meeting twice a year."
+        ),
+    ),
+    Mapping(
         id="wms-receiving",
         source="wms-receiving",
         system="Warehouse management (receiving)",

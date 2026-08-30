@@ -7,9 +7,9 @@
 /// geometries would hide it.
 ///
 /// Hand-assigned rather than computed. Each row is a spine — the expense chain,
-/// the vendor/AP chain, procurement, receiving — so reading left to right
-/// follows the direction facts actually flow. At this size a layout that means
-/// something beats any automatic one.
+/// the vendor/AP chain, procurement, receiving, and the people the first two
+/// hang off — so reading left to right follows the direction facts actually
+/// flow. At this size a layout that means something beats any automatic one.
 library;
 
 const ontologyLayout = <String, (int column, int row)>{
@@ -26,14 +26,21 @@ const ontologyLayout = <String, (int column, int row)>{
   'PurchaseOrderLine': (2, 2),
   'ReceivingReport': (1, 3),
   'ReceivingReportLine': (2, 3),
+  // The people spine: everything that hangs off an Employee rather than off
+  // a document. Kept on its own row so the expense chain above it still reads
+  // left to right.
+  'Team': (0, 4),
+  'Capability': (1, 4),
+  'Calendar': (2, 4),
+  'CalendarEvent': (3, 4),
 };
 
 const ontologyColumns = 5;
-const ontologyRows = 4;
+const ontologyRows = 5;
 
 /// Where an unlisted type goes — the far column of the last row, so a type
 /// added to the ontology without a layout entry still appears rather than
 /// silently vanishing from every diagram.
-const ontologyFallbackCell = (4, 3);
+const ontologyFallbackCell = (4, 4);
 
 (int, int) cellFor(String type) => ontologyLayout[type] ?? ontologyFallbackCell;

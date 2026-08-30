@@ -110,6 +110,27 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         read_by=("expense-reimbursement", "hr-agent"),
     ),
     DataCollection(
+        id="calendars",
+        name="Calendars",
+        summary=(
+            "Each person's schedule, mirrored from the calendar provider so a "
+            "day can be read next to the work it is about. Copied rather than "
+            "referenced — the console renders a week without a round trip — "
+            "but deliberately not authoritative: the provider is the system "
+            "of record, and a correction belongs there, not here."
+        ),
+        role="data", kind="entities", origin="synced",
+        container="graph_objects", custody="copy", authoritative=False,
+        retention="P1Y",
+        retention_note=(
+            "a working record, not a financial one; no question asked of a "
+            "schedule reaches back further than a year"
+        ),
+        object_types=("Calendar", "CalendarEvent"),
+        written_by=("calendar-sync",),
+        read_by=("hr-agent",),
+    ),
+    DataCollection(
         id="vendor-master",
         name="Vendor master",
         summary=(

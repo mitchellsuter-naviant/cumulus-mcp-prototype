@@ -154,7 +154,12 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
     });
     try {
       final world = id == _live
-          ? await widget.api.graphInstances(limit: 400)
+          // The whole live world in one payload; every query below runs
+          // client-side against it. Raised from 400 when the calendar mirror
+          // landed: a week of blocks per person is a few hundred instances on
+          // its own, and a truncated world would answer questions wrongly
+          // rather than visibly failing.
+          ? await widget.api.graphInstances(limit: 1200)
           : await widget.api.materializeWorld(id);
       if (!mounted) return;
       setState(() {

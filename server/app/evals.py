@@ -48,6 +48,7 @@ from typing import Any, Callable, Literal, Protocol
 from pydantic import BaseModel, Field
 
 from .anomaly import AnomalyService, InMemoryProfileStore
+from .calendars import CalendarService
 from .documents import DocumentService, InMemoryDocumentStore
 from .graph import (
     Claim,
@@ -485,6 +486,7 @@ class EvalWorld(BaseModel):
     sync: Any
     expenses: Any
     payables: Any
+    calendars: Any = None
     knowledge_revisions: dict[str, int] = Field(default_factory=dict)
 
 
@@ -537,10 +539,11 @@ def build_world(source_knowledge=None, *, seed_dir: str | None = None) -> EvalWo
         InMemoryPayableDirectory(), StubInvoiceReader(), knowledge, tasks,
         engine, graph, documents, anomaly,
     )
+    calendars = CalendarService(graph)
     return EvalWorld(
         knowledge=knowledge, tasks=tasks, engine=engine, graph=graph,
         documents=documents, anomaly=anomaly, sync=sync, expenses=expenses,
-        payables=payables, knowledge_revisions=revisions,
+        payables=payables, calendars=calendars, knowledge_revisions=revisions,
     )
 
 

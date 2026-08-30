@@ -346,27 +346,48 @@ class CommandCatalog extends ChangeNotifier {
       intent: CreateAssetIntent(),
     ),
     CatalogEntry(
+      label: 'Home',
+      detail: 'your day, and where accounts payable stands',
+      keywords: 'home today schedule day start dashboard',
+      icon: Icons.home_outlined,
+      intent: OpenSectionIntent(0),
+    ),
+    CatalogEntry(
+      label: 'Calendar',
+      detail: 'your week, mirrored from the calendar provider',
+      keywords: 'calendar week schedule meetings agenda free busy',
+      icon: Icons.calendar_today_outlined,
+      intent: OpenSectionIntent(1),
+    ),
+    CatalogEntry(
+      label: 'My Tasks',
+      detail: 'the queue — judgments waiting on a person',
+      keywords: 'tasks queue inbox decisions approve review hitl',
+      icon: Icons.inbox_outlined,
+      intent: OpenSectionIntent(2),
+    ),
+    CatalogEntry(
       label: 'Knowledge layer',
       detail: 'the governed corpus',
       keywords: 'assets documents corpus taxonomy',
       icon: Icons.hub_outlined,
-      intent: OpenSectionIntent(0),
+      intent: OpenSectionIntent(5),
     ),
     CatalogEntry(
       label: 'Flows',
       detail: 'authored logic — definitions, runs, cost and audit',
       keywords: 'flows workflows dataflows agents pipelines runs cost roi testing',
       icon: Icons.account_tree_outlined,
-      intent: OpenSectionIntent(1),
+      intent: OpenSectionIntent(6),
     ),
     CatalogEntry(
       label: 'Identities, access & keys',
       detail: 'people, agents, teams and API keys',
       keywords: 'users agents teams api keys access',
       icon: Icons.groups_outlined,
-      intent: OpenSectionIntent(2),
+      intent: OpenSectionIntent(7),
     ),
-    // The workspaces. Section indices, like the three above, mirror the
+    // The workspaces. Section indices, like the ones above, mirror the
     // constants in home_shell.dart — they are the shell's vocabulary, and the
     // palette navigates in it.
     CatalogEntry(
@@ -374,14 +395,14 @@ class CommandCatalog extends ChangeNotifier {
       detail: 'workspace — requests, decisions, spend',
       keywords: 'workspace expenses reimbursement receipts claims spend',
       icon: Icons.folder_outlined,
-      intent: OpenSectionIntent(4),
+      intent: OpenSectionIntent(3),
     ),
     CatalogEntry(
       label: 'Accounts Payable',
       detail: 'workspace — invoices, matching, posting',
       keywords: 'workspace ap accounts payable invoices vendors posting',
       icon: Icons.folder_outlined,
-      intent: OpenSectionIntent(5),
+      intent: OpenSectionIntent(4),
     ),
   ];
 

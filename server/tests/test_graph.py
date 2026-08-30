@@ -672,9 +672,13 @@ def test_part_ness_is_derived_never_declared():
     # lifecycle, so `submitted` stays an association.
     assert ONTOLOGY.owner_of("ExpenseRequest") is None
     assert set(ONTOLOGY.parts_of("Invoice")) == {"InvoiceLine", "MatchSet"}
+    # A calendar owns its events the same way an invoice owns its lines: the
+    # provider gives every attendee's copy its own id, so the event is
+    # identified through the calendar and dies with it.
+    assert ONTOLOGY.owner_of("CalendarEvent") == "Calendar"
     assert [o.name for o in ONTOLOGY.roots()] == [
-        "Employee", "Team", "Capability", "ExpenseRequest", "Document",
-        "Vendor", "SourceRecord", "Invoice", "PurchaseOrder",
+        "Employee", "Team", "Capability", "Calendar", "ExpenseRequest",
+        "Document", "Vendor", "SourceRecord", "Invoice", "PurchaseOrder",
         "ReceivingReport",
     ]
 
