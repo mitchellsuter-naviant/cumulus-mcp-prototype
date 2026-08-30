@@ -13,6 +13,7 @@ import 'api_docs_screen.dart';
 import '../widgets/calendar_view.dart';
 import '../widgets/abox_explorer.dart';
 import '../widgets/home_view.dart';
+import '../widgets/identity_workbench.dart';
 import '../widgets/ontology/ontology_canvas.dart';
 import '../widgets/payables_view.dart';
 import '../widgets/reimbursements_view.dart';
@@ -39,10 +40,11 @@ const int _calendarIndex = 1;
 const int _tasksIndex = 2;
 const int _expenseWorkspaceIndex = 3;
 const int _payablesWorkspaceIndex = 4;
-const int _knowledgeIndex = 5;
-const int _flowsIndex = 6;
-const int _identitiesIndex = 7;
-const int _employeeHubIndex = 8;
+const int _identityWorkspaceIndex = 5;
+const int _knowledgeIndex = 6;
+const int _flowsIndex = 7;
+const int _identitiesIndex = 8;
+const int _employeeHubIndex = 9;
 
 /// The Library's tab index inside the Knowledge layer section. Named because
 /// the palette navigates to it and a bare `1` would not survive a reorder.
@@ -62,6 +64,11 @@ const int _ontologyPlane = 0;
 /// error came with a Retry button that could never succeed.
 List<RailDestination> _destinations(int openTasks, Session? session) {
   final governs = session == null || session.scope != 'own';
+  // Not `governs`. Identity curation is work with a queue behind it, and the
+  // persona that owns it — the Controller — is own-scoped. The server answers
+  // this on the session because the rule is its own (`may_open_identity`), and
+  // deriving it here would mean a copy of the queue names in Dart.
+  final curatesIdentity = session == null || session.mayOpenIdentity;
   return [
     const RailDestination(
       icon: Icons.home_outlined,
@@ -83,20 +90,30 @@ List<RailDestination> _destinations(int openTasks, Session? session) {
     // not a plane of the map. They hung off the Knowledge layer's Data tab
     // once, which put a business surface inside the governance surface; the
     // dropdown is where they belong.
-    const RailDestination(
+    RailDestination(
       icon: Icons.grid_view_outlined,
       label: 'Workspaces',
       children: [
-        RailChild(
+        const RailChild(
           label: 'Expense Reimbursement',
           detail: 'requests, decisions, spend',
           index: _expenseWorkspaceIndex,
         ),
-        RailChild(
+        const RailChild(
           label: 'Accounts Payable',
           detail: 'invoices, matching, posting',
           index: _payablesWorkspaceIndex,
         ),
+        // Named for what it holds rather than "Identity", which this rail
+        // already spends on the roster of people who may sign in. These are
+        // counterparties: the companies, vendors and contacts the estate keeps
+        // more than one row about.
+        if (curatesIdentity)
+          const RailChild(
+            label: 'Counterparty identity',
+            detail: 'proposed merges, evidence, decisions',
+            index: _identityWorkspaceIndex,
+          ),
       ],
     ),
     if (governs)
@@ -171,6 +188,10 @@ class _HomeShellState extends State<HomeShell> {
   /// stays unbuilt rather than firing a request the user did not ask for.
   final Set<int> _visited = {_homeIndex};
 
+  /// A proposal to land the identity workbench on, by `link:` case ref — how
+  /// a Company or Person detail sends you to the desk that judges it.
+  String? _openProposal;
+
   @override
   void initState() {
     super.initState();
@@ -228,6 +249,14 @@ class _HomeShellState extends State<HomeShell> {
     });
   }
 
+  /// Open the identity workbench on one proposal. An entity's "also known as"
+  /// is part of what the entity is, so the explorer names its proposals — and
+  /// naming one is only useful if it goes somewhere.
+  void _showProposal(String caseRef) {
+    setState(() => _openProposal = caseRef);
+    _show(_identityWorkspaceIndex);
+  }
+
   /// The palette finds things; this decides what "open" means for each of them.
   void _handleIntent(PaletteIntent intent) {
     switch (intent) {
@@ -269,6 +298,13 @@ class _HomeShellState extends State<HomeShell> {
     if (session != null &&
         session.scope == 'own' &&
         _governance.contains(index)) {
+      return const SizedBox.shrink();
+    }
+    // The workbench answers to its own rule rather than to scope. Same halving
+    // of the same problem: the rail drops the child, and this unmounts it.
+    if (index == _identityWorkspaceIndex &&
+        session != null &&
+        !session.mayOpenIdentity) {
       return const SizedBox.shrink();
     }
     return build();
@@ -336,11 +372,24 @@ class _HomeShellState extends State<HomeShell> {
             session,
           ),
           _lazy(
+            _identityWorkspaceIndex,
+            // Keyed by the proposal so arriving from a second entity lands on
+            // that one rather than reusing the workbench parked on the last.
+            () => IdentityWorkbench(
+              key: ValueKey(_openProposal ?? 'all'),
+              api: _api,
+              onQueueChanged: _refreshTaskBadge,
+              initialCaseRef: _openProposal,
+            ),
+            session,
+          ),
+          _lazy(
             _knowledgeIndex,
             () => _KnowledgeSection(
               api: _api,
               plane: _knowledgePlane,
               session: session,
+              onOpenProposal: _showProposal,
               library: AssetsSection(
                 palette: _palette,
                 openAsset: _openAsset,
@@ -395,11 +444,17 @@ class _KnowledgeSection extends StatefulWidget {
   /// answer 403 to an own-scoped persona, so the section says so itself.
   final Session? session;
 
+  /// Opens the identity workbench on one proposal — passed through to the ABox
+  /// explorer, where an entity's standing merge proposals are part of what the
+  /// entity is.
+  final ValueChanged<String> onOpenProposal;
+
   const _KnowledgeSection({
     required this.api,
     required this.plane,
     required this.library,
     required this.session,
+    required this.onOpenProposal,
   });
 
   @override
@@ -497,6 +552,7 @@ class _KnowledgeSectionState extends State<_KnowledgeSection> {
               key: ValueKey(type),
               api: widget.api,
               initialType: type,
+              onOpenProposal: widget.onOpenProposal,
             ),
           ),
         ],

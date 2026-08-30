@@ -88,6 +88,15 @@ class Session {
   final bool inWorkforce;
   final String? impersonatedBy;
   final bool maySwitchPersona;
+
+  /// Whether the identity workbench has anything for this persona.
+  ///
+  /// Answered by the server rather than derived here from [scope], because the
+  /// rule is not the one the rest of the rail's governance group uses: a
+  /// steward reads only its own work and still owns the counterparty desk. The
+  /// alternative was a copy of the queue names in Dart, drifting the moment a
+  /// Mapping changed hands.
+  final bool mayOpenIdentity;
   final List<PersonaGroup> groups;
 
   const Session({
@@ -103,6 +112,7 @@ class Session {
     required this.inWorkforce,
     required this.impersonatedBy,
     required this.maySwitchPersona,
+    required this.mayOpenIdentity,
     required this.groups,
   });
 
@@ -120,6 +130,7 @@ class Session {
     inWorkforce: json['in_workforce'] as bool? ?? false,
     impersonatedBy: json['impersonated_by'] as String?,
     maySwitchPersona: json['may_switch_persona'] as bool? ?? false,
+    mayOpenIdentity: json['may_open_identity'] as bool? ?? false,
     groups: (json['groups'] as List<dynamic>? ?? [])
         .map((g) => PersonaGroup.fromJson(g as Map<String, dynamic>))
         .toList(),

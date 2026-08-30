@@ -30,7 +30,19 @@ class ABoxExplorer extends StatefulWidget {
   /// Null means land on whichever type this world holds most of.
   final String? initialType;
 
-  const ABoxExplorer({super.key, required this.api, this.initialType});
+  /// Opens the identity workbench on one proposed merge, by `link:` case ref.
+  /// Null in a context that has nowhere to send you — an eval fragment, or a
+  /// persona with no counterparty desk — and then the proposals still render,
+  /// because whether they are actionable is a different question from whether
+  /// they are part of what the entity is.
+  final ValueChanged<String>? onOpenProposal;
+
+  const ABoxExplorer({
+    super.key,
+    required this.api,
+    this.initialType,
+    this.onOpenProposal,
+  });
 
   @override
   State<ABoxExplorer> createState() => _ABoxExplorerState();
@@ -819,6 +831,19 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
     final instance = _stack.isEmpty ? null : _object(_stack.last);
     if (instance == null) return _instanceList();
     final edges = _edges(instance.id);
+    // Proposed and confirmed merges are pulled out of the link list and given
+    // their own heading. An entity's "also known as" is part of what the
+    // entity *is* — the question "which other row in this book is the same
+    // firm" is not one more association to scroll past — and the raw row
+    // rendered its evidence as a single unreadable props string.
+    final identity = [
+      for (final edge in edges)
+        if (_isMergeProposal(edge.$1)) edge,
+    ];
+    final rest = [
+      for (final edge in edges)
+        if (!_isMergeProposal(edge.$1)) edge,
+    ];
     return CumulusCard(
       padding: EdgeInsets.zero,
       child: Column(
@@ -882,13 +907,19 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
                         'for the claims behind it'),
                     for (final e in instance.props.entries)
                       _fieldRow(instance, e.key, e.value),
+                    if (identity.isNotEmpty) ...[
+                      _strip('ALSO KNOWN AS · other records the book holds '
+                          'about this same party'),
+                      for (final (link, other, _) in identity)
+                        _identityRow(link, other),
+                    ],
                     _strip('LINKS · everything attached to this instance'),
-                    if (edges.isEmpty)
+                    if (rest.isEmpty)
                       const Padding(
                         padding: EdgeInsets.all(20),
                         child: Text('No links yet.', style: CumulusText.meta),
                       ),
-                    for (final (link, other, outbound) in edges)
+                    for (final (link, other, outbound) in rest)
                       _edgeRow(link, other, outbound),
                   ],
                 ),
@@ -986,6 +1017,100 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
             ),
           ),
       ],
+    );
+  }
+
+  /// Whether this edge is one of the sweep's cross-source merge proposals.
+  ///
+  /// Read off the edge's own properties rather than from a copy of the
+  /// server's scan table: the sweep is the only thing that writes `pair_kind`
+  /// and `status` together onto a link, so a new pair shape shows up here the
+  /// day it is declared, and no list in Dart has to be kept in step. It also
+  /// keeps `identified_as` — which is also nature `identity`, and joins an
+  /// entity to a landed row rather than to another entity — out of this strip.
+  static bool _isMergeProposal(WorldLink link) =>
+      link.props['pair_kind'] != null && link.props['status'] != null;
+
+  /// One proposed or confirmed identity, with the number and the reason.
+  ///
+  /// Withdrawn ones are absent because the edge is reversed and reversed edges
+  /// are not live — which is the right reading here: a proposal a person
+  /// rejected is not part of what this entity is. The record that it was
+  /// proposed and refused lives in the workbench's decided list.
+  Widget _identityRow(WorldLink link, WorldObject other) {
+    final status = '${link.props['status']}';
+    final confirmed = status == 'confirmed';
+    final signals = link.props['signals'];
+    final why = signals is List && signals.isNotEmpty
+        ? [
+            for (final s in signals)
+              if (s is Map && s['detail'] != null) '${s['detail']}',
+          ].join('  ·  ')
+        : '';
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 11, 20, 11),
+      decoration: const BoxDecoration(
+        color: CumulusColors.surfaceMuted,
+        border: Border(
+          bottom: BorderSide(color: CumulusColors.border, width: 0.5),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              StatusBadge(
+                confirmed ? 'confirmed' : 'proposed',
+                tone: confirmed ? CumulusTone.success : CumulusTone.warn,
+                dense: true,
+              ),
+              const SizedBox(width: 10),
+              Flexible(
+                child: InkWell(
+                  onTap: () => _push(other),
+                  child: Text(
+                    other.label,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: CumulusColors.accentInk,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                '${link.confidence.toStringAsFixed(2)} · ${link.method}',
+                style: CumulusText.mono.copyWith(fontSize: 11.5),
+              ),
+              const Spacer(),
+              if (widget.onOpenProposal != null)
+                RowAction(
+                  label: confirmed ? 'Open the record' : 'Judge it',
+                  onTap: () => widget.onOpenProposal!(
+                    'link:${link.type}/${link.id}',
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          Text(
+            confirmed
+                ? 'A person confirmed these are one party. Neither record was '
+                      'collapsed into the other — both keep their own key and '
+                      'claims, and the assertion can be withdrawn.'
+                : 'Proposed by the identity sweep and not yet judged. Nothing '
+                      'treats these two as one party until somebody confirms '
+                      'it.',
+            style: CumulusText.meta,
+          ),
+          if (why.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(why, style: CumulusText.meta),
+          ],
+        ],
+      ),
     );
   }
 

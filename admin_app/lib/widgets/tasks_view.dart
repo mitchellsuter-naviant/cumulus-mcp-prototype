@@ -585,11 +585,7 @@ class _TaskReviewState extends State<_TaskReview> {
         ),
       ),
       const SizedBox(height: 8),
-      Text(
-        'Opens the full screen, where the facts themselves can be corrected '
-        '— the checks then run again over what you changed.',
-        style: CumulusText.meta,
-      ),
+      Text(reviewHint(task), style: CumulusText.meta),
       const SizedBox(height: 18),
       const Divider(height: 1),
       const SizedBox(height: 18),
@@ -726,17 +722,39 @@ CumulusTone _toneFor(QueueTask task) => switch (task.kind) {
 /// Which tasks have a bespoke review screen. Everything else gets the pane's
 /// approve/reject, which is the honest affordance when there is nothing
 /// structured to edit.
+///
+/// `merge_review` joined the list once there was something to open onto. The
+/// generic pane showed it the evidence rows the sweep attached and nothing
+/// else — no side-by-side records, no way to see which fields disagree, and an
+/// Approve button that said nothing about what approving does. On the one
+/// screen where "approve" could plausibly be read as "merge these two rows",
+/// that was the wrong affordance.
 bool hasReviewScreen(QueueTask task) =>
     task.kind == 'match_review' ||
+    task.kind == 'merge_review' ||
     task.flowId == 'expense-reimbursement' ||
     task.flowId == 'accounts-payable';
 
 String reviewLabel(QueueTask task) {
   if (task.kind == 'match_review') return 'Open the match review';
+  if (task.kind == 'merge_review') return 'Open the merge review';
   if (task.flowId == 'expense-reimbursement') return 'Open the expense review';
   if (task.kind == 'curation') return 'Open the extraction verification';
   return 'Open the invoice review';
 }
+
+/// What the full screen is *for*, per kind. Not one sentence for all of them:
+/// three of these screens exist so a person can correct the facts, and a
+/// proposed merge has no facts to correct — both records are what their
+/// sources say they are, and the judgment is about the edge between them.
+/// Telling a steward the checks will re-run would promise something that does
+/// not happen.
+String reviewHint(QueueTask task) => task.kind == 'merge_review'
+    ? 'Opens the two records side by side, with every signal the score was '
+          'blended from and the governed policy behind the weights. Nothing '
+          'merges on either verdict.'
+    : 'Opens the full screen, where the facts themselves can be corrected — '
+          'the checks then run again over what you changed.';
 
 /// `12m`, `2h`, `3d` — how long this has been waiting.
 String _age(String iso) {

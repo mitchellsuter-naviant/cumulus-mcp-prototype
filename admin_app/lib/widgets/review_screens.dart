@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 
+import '../models/identity_screen.dart';
 import '../models/payable.dart';
 import '../models/reimbursement.dart';
 import '../models/task.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'merge_review.dart';
 import 'ui_kit.dart';
 
 /// The custom human-in-the-loop screens: where a person edits the *facts*
@@ -45,6 +47,8 @@ Future<ReviewOutcome?> openReviewScreen({
   final Widget body;
   if (task.kind == 'match_review') {
     body = _EntityMatchReview(task: task);
+  } else if (task.kind == 'merge_review') {
+    body = _MergeReview(api: api, task: task);
   } else if (task.flowId == 'expense-reimbursement') {
     body = _ExpenseReview(api: api, task: task);
   } else if (task.flowId == 'accounts-payable') {
@@ -1227,6 +1231,97 @@ class _EntityMatchReviewState extends State<_EntityMatchReview> {
             ),
         ],
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Proposed merge
+// ---------------------------------------------------------------------------
+
+/// A `merge_review` Task, opened onto the proposal it points at.
+///
+/// The odd one out among these screens, deliberately: the other three look at
+/// facts that arrived, and this one looks at an assertion the sweep already
+/// wrote into the graph at `in_review`. There is nothing here to correct — the
+/// two records are what their sources say they are — so the verdict is binary
+/// and every consequence is about the edge rather than about the records.
+///
+/// It loads the workbench's own payload and finds this Task's case in it,
+/// rather than fetching the two objects itself. One composition, two surfaces:
+/// what a steward reads in the modal is the row the workbench draws, so the
+/// two can never describe one proposal differently.
+class _MergeReview extends StatefulWidget {
+  final ApiClient api;
+  final QueueTask task;
+
+  const _MergeReview({required this.api, required this.task});
+
+  @override
+  State<_MergeReview> createState() => _MergeReviewState();
+}
+
+class _MergeReviewState extends State<_MergeReview> {
+  IdentityProposal? _proposal;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final screen = await widget.api.identityScreen();
+      if (!mounted) return;
+      setState(() {
+        _proposal = screen.byCaseRef(widget.task.caseRef);
+        _error = _proposal == null
+            ? 'This task points at ${widget.task.caseRef}, and the '
+                  'counterparty book holds no such proposal. It may have been '
+                  'withdrawn and purged, or raised against another world.'
+            : null;
+      });
+    } on ApiException catch (e) {
+      if (mounted) setState(() => _error = e.message);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final proposal = _proposal;
+    return _ReviewFrame(
+      eyebrow: 'Proposed merge · ${widget.task.queue}',
+      title: widget.task.title,
+      subtitle:
+          'Two records the book already holds, and one question: are they one '
+          'party? Nothing merges either way — the proposal\'s status flips, '
+          'reversibly, and both records keep everything they hold.',
+      footer: Text(
+        proposal == null
+            ? 'Reading the proposal this task points at.'
+            : 'Proposed by the identity sweep on the evidence above. A verdict '
+                  'is recorded against ${widget.task.id} and flips the link; '
+                  'it does not collapse the two records.',
+        style: CumulusText.meta,
+      ),
+      child: _error != null
+          ? ErrorNotice(message: _error!, onRetry: _load)
+          : proposal == null
+          ? const CumulusLoading()
+          : MergeReviewPanel(
+              proposal: proposal,
+              api: widget.api,
+              // The dialog does not commit: it answers with a verdict, and the
+              // Task pane posts it — so a merge decision travels the same path
+              // as every other decision in the queue.
+              onDecide: proposal.gate.mayDecide
+                  ? (verdict, note) => Navigator.of(
+                      context,
+                    ).pop(ReviewOutcome(verdict: verdict, note: note))
+                  : null,
+            ),
     );
   }
 }

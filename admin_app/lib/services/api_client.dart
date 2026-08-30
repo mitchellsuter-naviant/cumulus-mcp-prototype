@@ -15,6 +15,7 @@ import '../models/flow.dart';
 import '../models/data_layer.dart';
 import '../models/eval.dart';
 import '../models/graph.dart';
+import '../models/identity_screen.dart';
 import '../models/ontology_screen.dart';
 import '../models/payable.dart';
 import '../models/reimbursement.dart';
@@ -1121,6 +1122,27 @@ class ApiClient {
     );
     _check(resp);
     return SyncNowOutcome.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// The identity workbench: every proposed merge, the evidence under it, the
+  /// two records it joins, and what has been ruled on — in one call.
+  ///
+  /// One call because the four are one question. A proposal is an edge, its
+  /// evidence is on the edge, the records are the objects it joins, and
+  /// whether you may answer it is a property of a Task somewhere else
+  /// entirely. Fetching those separately would assemble the argument here,
+  /// where it could drift from what the server thinks it means.
+  ///
+  /// Throws 403 for a persona that owns neither stewardship desk and reads
+  /// only its own work — the refusal carries the sentence the screen prints.
+  Future<IdentityScreen> identityScreen() async {
+    final resp = await _send(
+      _http.get(_uri('/api/ui/v1/identity'), headers: await _headers()),
+    );
+    _check(resp);
+    return IdentityScreen.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
   }

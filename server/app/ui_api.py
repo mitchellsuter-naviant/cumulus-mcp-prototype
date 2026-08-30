@@ -36,9 +36,11 @@ from .config import settings
 from .deps import get_graph_service
 from .estate_api import pull_feed_now
 from .flow_projection import ProjectionState, project_flow, project_flows
-from .graph import GraphService, object_id
-from .mappings import MAPPINGS, Mapping, validate_mappings
+from .graph import GraphService, LinkRecord, ObjectRecord, object_id
+from .identity_sweep import IDENTITY_SWEEP_FLOW_ID, SCANS, SCAN_BY_LINK
+from .mappings import MAPPINGS, Mapping, steward_queue_for_type, validate_mappings
 from .ontology import ONTOLOGY
+from .resolution import read_sweep_thresholds
 
 log = logging.getLogger("cumulus.ui.api")
 
@@ -101,6 +103,12 @@ class Session(BaseModel):
     impersonated_by: str | None
     #: Whether the persona switcher should be offered at all.
     may_switch_persona: bool
+    #: Whether the identity workbench has anything for this persona. Answered
+    #: here because the rule is not the one the rest of the rail's governance
+    #: group uses — a steward reads only its own work and still owns the
+    #: counterparty desk — and a stop that can only ever 403 is worse than no
+    #: stop. See `may_open_identity`.
+    may_open_identity: bool
     groups: list[PersonaGroup]
 
 
@@ -163,6 +171,7 @@ def session(principal: Principal = Depends(get_ui_principal)) -> Session:
         in_workforce=_in_workforce(principal.email),
         impersonated_by=principal.impersonated_by,
         may_switch_persona=may_switch,
+        may_open_identity=may_open_identity(principal),
         groups=[
             PersonaGroup(label=label, personas=[_option(p) for p in group])
             for label, group in personas.GROUPS
@@ -932,6 +941,487 @@ def library(
             ),
         ))
     return LibraryScreen(days=days, assets=rows)
+
+
+# ---------------------------------------------------------------------------
+# Identity — the curation workbench
+# ---------------------------------------------------------------------------
+#
+# The sweep proposes; this is where a person reads the proposal. It composes
+# three things that live apart and are illegible apart: the identity Links the
+# sweep wrote (what is proposed, and what a steward has since said about it),
+# the two objects each one joins (the records a person compares), and the
+# `merge_review` Tasks that carry the decision (whose work it is, and whether
+# this persona may do it).
+#
+# **It writes nothing.** Confirming a proposal goes through the Task the sweep
+# raised — `POST /api/v1/tasks/{id}/decide`, which resumes into
+# `SyncService.apply_merge_decision` — so the workbench and My Tasks commit
+# through one path and there is one place where a merge decision is authorized.
+# A second write route here would be a quieter copy of that policy.
+
+
+#: The decided history is a window, not a page. Standing proposals are the
+#: work and are never capped — a worklist that silently stops is a lie — but
+#: the record of what has been ruled on grows without bound, so the list says
+#: what it is a window onto the way `artifacts_total` does.
+DECIDED_WINDOW = 50
+
+
+def identity_desks() -> set[str]:
+    """The queues that judge identity, read off the Mappings.
+
+    Derived rather than listed, so a Mapping that changes hands moves the gate
+    and the queue together. Today it is `data-stewardship` (the counterparty
+    book) and `vendor-stewardship` (who we pay).
+    """
+    return {
+        steward_queue_for_type(type_name)
+        for scan in SCANS
+        for type_name in (scan.from_type, scan.to_type)
+    }
+
+
+def may_open_identity(principal: Principal) -> bool:
+    """Whether the workbench has anything for this principal.
+
+    Deliberately **not** the Knowledge layer's rule, and the difference is the
+    whole persona story of this screen. The Knowledge layer describes the whole
+    map, so an own-scoped persona is refused outright. Identity curation is
+    *work*, and the person who owns it — the Controller — is own-scoped: he
+    reads only his own, and both master-data desks are his. Gating this on read
+    reach would refuse the one persona the screen exists for while admitting a
+    tenant admin who owns neither desk.
+
+    So: a queue binding gets you in as a curator, read reach gets you in as an
+    observer, and a persona with neither is told it is not theirs rather than
+    shown an empty book. Answered here rather than in the dependency because
+    `/session` needs the same answer to decide whether to draw the rail stop —
+    a stop that can only ever 403 is worse than no stop.
+    """
+    return principal.reads_beyond_self or any(
+        principal.owns_queue(queue) for queue in identity_desks()
+    )
+
+
+def get_identity_principal(
+    principal: Principal = Depends(get_ui_principal),
+) -> Principal:
+    """The workbench's door. See `may_open_identity` for the rule."""
+    if may_open_identity(principal):
+        return principal
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "The identity workbench is the counterparty book's curation desk. "
+            "This persona owns neither stewardship queue and reads only its "
+            "own work, so there is nothing here for it."
+        ),
+    )
+
+
+class IdentitySignal(BaseModel):
+    """One piece of evidence, exactly as the sweep recorded it.
+
+    Weight and detail travel together because the number is only useful beside
+    the sentence that produced it — which is the whole reason the sweep is
+    rules and not a model.
+    """
+
+    name: str
+    weight: float
+    detail: str
+
+
+class IdentitySide(BaseModel):
+    """One of the two records, as a person compares them.
+
+    `fields` is the *resolved* props — what the object reads as under
+    precedence — because that is what a steward is deciding about. The claims
+    behind a field are one drill-down further and live in the ABox explorer;
+    duplicating them here would be a second, staler answer.
+    """
+
+    id: str
+    ref: str
+    type: str
+    label: str
+    natural_key: str
+    status: str
+    fields: dict[str, str]
+    #: Which systems assert this object exists, through its declared source
+    #: identity edge. A record only one system has ever seen is a different
+    #: kind of duplicate from one three systems agree on.
+    sources: list[str]
+    #: Fields where this object's own sources already disagree. Carried per
+    #: side because it changes what a merge would even mean.
+    conflicted: list[str]
+
+
+class ProposalGate(BaseModel):
+    """Whether this proposal can be decided, by whom, and where.
+
+    Never `None`, and `task_id == ""` is the state worth naming: the sweep
+    raises a Task only for proposals *under* the governed confidence bar, so a
+    high-scoring proposal stands at `in_review` with nobody paged. That is the
+    policy working as declared, and the screen says it out loud rather than
+    drawing a control that has nothing to commit through.
+    """
+
+    task_id: str
+    #: `open`, or the verdict a steward already recorded.
+    task_status: str
+    queue: str
+    may_decide: bool
+    #: Why not, when not — a sentence, never a disabled button with no reason.
+    why_not: str
+
+
+class IdentityProposal(BaseModel):
+    """One proposed merge: the pair, the evidence, and where it stands."""
+
+    link_id: str
+    link_type: str
+    #: `link:<type>/<id>` — the same ref the Task carries as its `case_ref`,
+    #: so the review screen can find its proposal without a second contract.
+    case_ref: str
+    pair_kind: str
+    #: `in_review` · `confirmed` · `withdrawn`. Read from the edge's liveness
+    #: first and its `status` prop second: a rejected proposal is *reversed*,
+    #: and its props still say `in_review` because withdrawing an assertion
+    #: does not rewrite what it said.
+    status: str
+    #: The machine's score and method, untouched by any decision — confirming
+    #: does not promote it to 1.0, because that would erase how good the
+    #: proposal was before a human looked at it.
+    confidence: float
+    method: str
+    signals: list[IdentitySignal]
+    reversible_with: str
+    policy_ref: str
+    proposed_at: str
+    run_id: str
+    #: Who ruled, and when. Empty on a standing proposal — the sweep records
+    #: itself as the decider of record, and rendering that as a decision would
+    #: be inventing history.
+    decided_by: str
+    decided_at: str
+    #: The reversal reason, on a withdrawn one. The steward's own words.
+    withdrawn_because: str
+    left: IdentitySide
+    right: IdentitySide
+    #: Fields both records hold and agree on / disagree on. Computed once here
+    #: so the screen cannot count them differently from the table it draws.
+    agree: list[str]
+    conflict: list[str]
+    gate: ProposalGate
+
+
+class IdentityBook(BaseModel):
+    """One counterparty book, and what is outstanding against it.
+
+    A proposal is booked to the type it starts from — the same rule the sweep
+    uses to pick a queue — so a Company↔Vendor proposal counts against the
+    company book and lands on the counterparty desk, not on AP.
+    """
+
+    type: str
+    label: str
+    steward_queue: str
+    objects: int
+    standing: int
+    confirmed: int
+    withdrawn: int
+    #: Whether this persona owns the desk that judges this book.
+    yours: bool
+
+
+class SweepPolicy(BaseModel):
+    """The governed thresholds, as the screen quotes them."""
+
+    propose_at: float
+    steward_task_below: float
+    name_floor: float
+    ceiling: float
+    source_ref: str
+    #: False when the policy asset is missing and the defaults are in force —
+    #: a fact about the deployment, not a number to be quoted as governed.
+    found_asset: bool
+
+
+class SweepRun(BaseModel):
+    """The last pass over the book. `None` when there has never been one."""
+
+    run_id: str
+    at_iso: str
+    status: str
+    compared: int
+    considered: int
+    proposed: int
+    standing: int
+    steward_tasks: int
+
+
+class IdentityScreen(BaseModel):
+    standing: list[IdentityProposal]
+    decided: list[IdentityProposal]
+    #: What `decided` is a window onto. Equal to `len(decided)` until the
+    #: history outgrows `DECIDED_WINDOW`.
+    decided_total: int
+    books: list[IdentityBook]
+    policy: SweepPolicy
+    last_sweep: SweepRun | None
+    #: The identity desks this persona holds. Empty for an observer, which is
+    #: what turns every gate's `may_decide` false with a reason.
+    desks: list[str]
+    #: True when this persona is here as a curator rather than an observer.
+    curates: bool
+
+
+def _proposal_status(link: LinkRecord) -> str:
+    """`in_review` · `confirmed` · `withdrawn`, from the edge itself.
+
+    Liveness is asked first because a rejection reverses the link and leaves
+    its `status` prop saying `in_review` — correctly, since withdrawing an
+    assertion does not rewrite what the assertion said. Reading the prop alone
+    would show every rejected proposal as still standing.
+    """
+    if not link.live:
+        return "withdrawn"
+    return str(link.props.get("status") or "in_review")
+
+
+def _side(graph: GraphService, record: ObjectRecord | None, object_id_: str) -> IdentitySide:
+    """One object as the comparison shows it, or an honest stub if it is gone.
+
+    An object can leave the book under a proposal that still points at it — a
+    supersede, a purge between sweeps. The row says the record is missing
+    rather than dropping the proposal, because a proposal pointing at nothing
+    is a finding and a silently shorter list is not.
+    """
+    if record is None:
+        return IdentitySide(
+            id=object_id_, ref=f"graph:{object_id_}", type="", label="",
+            natural_key="", status="missing", fields={}, sources=[],
+            conflicted=[],
+        )
+    declared = ONTOLOGY.source_identity_link(record.type)
+    sources = sorted({
+        str(other.props.get("source") or "")
+        for _link, other in graph.neighbors(record.id, declared.name, "out")
+        if other.props.get("source")
+    }) if declared is not None else []
+    return IdentitySide(
+        id=record.id,
+        ref=record.ref(),
+        type=record.type,
+        label=record.label or record.natural_key,
+        natural_key=record.natural_key,
+        status=record.status,
+        fields={k: str(v) for k, v in record.props.items()},
+        sources=sources,
+        conflicted=sorted(record.conflicts()),
+    )
+
+
+def _proposal_gate(
+    task, principal: Principal, confidence: float, threshold: float
+) -> ProposalGate:
+    """Where this proposal's decision lives, and whether it is this persona's.
+
+    Three states, and the third is the one a screen normally gets wrong: there
+    is a Task and it is yours, there is a Task and it is somebody else's, and
+    there is **no Task at all** because the proposal cleared the governed bar.
+    Only the first draws controls; the other two are sentences.
+    """
+    if task is None:
+        return ProposalGate(
+            task_id="", task_status="", queue="", may_decide=False,
+            why_not=(
+                f"Nobody was paged: it scored {confidence:.2f}, at or above "
+                f"the governed {threshold:.2f} bar under which the sweep asks "
+                "a steward. It stands as a proposal until something acts on it."
+            ),
+        )
+    status = task.status if task.status == "open" else (
+        task.decision.verdict if task.decision is not None else task.status
+    )
+    if task.status != "open":
+        return ProposalGate(
+            task_id=task.id, task_status=status, queue=task.queue,
+            may_decide=False,
+            why_not=f"Already decided in {task.queue}; the record is below.",
+        )
+    mine = principal.owns_queue(task.queue)
+    bound = ", ".join(principal.queues) or "no queue"
+    return ProposalGate(
+        task_id=task.id, task_status=status, queue=task.queue,
+        may_decide=mine,
+        why_not=(
+            "" if mine
+            else f"this is {task.queue}'s work; you are bound to {bound}"
+        ),
+    )
+
+
+def _compare(left: IdentitySide, right: IdentitySide) -> tuple[list[str], list[str]]:
+    """Fields both records hold, split into agreeing and disagreeing.
+
+    Only fields *both* sides carry are compared: one side holding a phone the
+    other has never had is not a disagreement, and counting it as one would
+    make every pair look conflicted.
+    """
+    shared = sorted(set(left.fields) & set(right.fields))
+    agree = [f for f in shared if left.fields[f].strip().lower() == right.fields[f].strip().lower()]
+    return agree, [f for f in shared if f not in set(agree)]
+
+
+def _last_sweep() -> SweepRun | None:
+    """The most recent pass, or nothing. Never a zeroed row standing in for one."""
+    runs = deps.get_run_engine().list(flow_id=IDENTITY_SWEEP_FLOW_ID)
+    if not runs:
+        return None
+    latest = max(runs, key=lambda r: r.started_at_iso)
+    outputs = latest.outputs or {}
+    return SweepRun(
+        run_id=latest.id,
+        at_iso=latest.started_at_iso,
+        status=latest.status,
+        compared=int(outputs.get("compared", 0) or 0),
+        considered=int(outputs.get("considered", 0) or 0),
+        proposed=int(outputs.get("proposed", 0) or 0),
+        standing=int(outputs.get("standing", 0) or 0),
+        steward_tasks=int(outputs.get("steward_tasks", 0) or 0),
+    )
+
+
+@router.get("/identity", response_model=IdentityScreen)
+def identity(
+    principal: Principal = Depends(get_identity_principal),
+) -> IdentityScreen:
+    """What is proposed, what was decided, and what the evidence said.
+
+    One call, because the three are one question. The proposal is an edge, the
+    evidence is on the edge, the records are the two objects it joins, and
+    whether you may answer it is a property of a Task somewhere else entirely —
+    a screen that fetched those separately would be stitching the argument
+    together in the client, where it could drift.
+    """
+    graph = deps.get_graph_service()
+    thresholds = read_sweep_thresholds(deps.get_service())
+    tasks_by_case = {
+        task.case_ref: task
+        for task in deps.get_task_service().list(kind="merge_review")
+        if task.case_ref
+    }
+    desks = sorted(q for q in identity_desks() if principal.owns_queue(q))
+
+    standing: list[IdentityProposal] = []
+    decided: list[IdentityProposal] = []
+    for link in graph.store.links():
+        scan = SCAN_BY_LINK.get(link.type)
+        if scan is None:
+            continue
+        status = _proposal_status(link)
+        left = _side(graph, graph.store.get_object(link.from_id), link.from_id)
+        right = _side(graph, graph.store.get_object(link.to_id), link.to_id)
+        agree, conflict = _compare(left, right)
+        case_ref = f"link:{link.type}/{link.id}"
+        proposal = IdentityProposal(
+            link_id=link.id,
+            link_type=link.type,
+            case_ref=case_ref,
+            pair_kind=str(link.props.get("pair_kind") or scan.kind),
+            status=status,
+            confidence=link.confidence,
+            method=link.method,
+            signals=[
+                IdentitySignal(
+                    name=str(s.get("name") or ""),
+                    weight=float(s.get("weight") or 0),
+                    detail=str(s.get("detail") or ""),
+                )
+                for s in (link.props.get("signals") or [])
+                if isinstance(s, dict)
+            ],
+            reversible_with=str(link.props.get("reversible_with") or ""),
+            policy_ref=str(link.props.get("policy_ref") or ""),
+            proposed_at=str(link.props.get("proposed_at") or link.valid_from_iso),
+            run_id=str(link.props.get("run_id") or link.run_id),
+            # A standing proposal has no decider. The sweep stamps itself as
+            # `decided_by` so the edge always names who stands behind it, and
+            # reporting that as a *decision* would put a machine's name where a
+            # person's belongs.
+            decided_by=(
+                "" if status == "in_review"
+                else (
+                    link.reversed_by if status == "withdrawn"
+                    else str(link.props.get("decided_by") or "")
+                )
+            ),
+            decided_at=(
+                "" if status == "in_review"
+                else (
+                    link.reversed_at_iso if status == "withdrawn"
+                    else str(link.props.get("decided_at") or "")
+                )
+            ),
+            withdrawn_because=(
+                link.reversal_reason if status == "withdrawn" else ""
+            ),
+            left=left, right=right, agree=agree, conflict=conflict,
+            gate=_proposal_gate(
+                tasks_by_case.get(case_ref), principal,
+                link.confidence, thresholds.steward_task_below,
+            ),
+        )
+        (standing if status == "in_review" else decided).append(proposal)
+
+    standing.sort(key=lambda p: (-p.confidence, p.left.label))
+    decided.sort(key=lambda p: p.decided_at, reverse=True)
+
+    # Every count on a book is answered by rows in the lists above it: the
+    # books are counted *from* the proposals rather than re-queried, so the
+    # two cannot disagree.
+    booked_to = {
+        link_type: scan.from_type for link_type, scan in SCAN_BY_LINK.items()
+    }
+    books: list[IdentityBook] = []
+    for type_name in dict.fromkeys(scan.from_type for scan in SCANS):
+        declared = ONTOLOGY.object_type(type_name)
+        queue = steward_queue_for_type(type_name)
+        mine = [p for p in standing if booked_to[p.link_type] == type_name]
+        ruled = [p for p in decided if booked_to[p.link_type] == type_name]
+        books.append(IdentityBook(
+            type=type_name,
+            label=declared.label if declared is not None else type_name,
+            steward_queue=queue,
+            objects=sum(
+                1 for o in graph.find(type_name) if o.status != "superseded"
+            ),
+            standing=len(mine),
+            confirmed=sum(1 for p in ruled if p.status == "confirmed"),
+            withdrawn=sum(1 for p in ruled if p.status == "withdrawn"),
+            yours=principal.owns_queue(queue),
+        ))
+
+    return IdentityScreen(
+        standing=standing,
+        decided=decided[:DECIDED_WINDOW],
+        decided_total=len(decided),
+        books=books,
+        policy=SweepPolicy(
+            propose_at=thresholds.propose_at,
+            steward_task_below=thresholds.steward_task_below,
+            name_floor=thresholds.name_floor,
+            ceiling=thresholds.ceiling,
+            source_ref=thresholds.source_ref,
+            found_asset=thresholds.found_asset,
+        ),
+        last_sweep=_last_sweep(),
+        desks=desks,
+        curates=bool(desks),
+    )
 
 
 # ---------------------------------------------------------------------------
