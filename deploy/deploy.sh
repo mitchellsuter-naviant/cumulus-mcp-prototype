@@ -113,7 +113,7 @@ EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-vertex}"
 # pretending to generate.
 MODEL_BACKEND="${MODEL_BACKEND:-vertex}"
 
-# Both current models (gemini-embedding-2, gemini-3.7-flash) are served
+# Both current models (gemini-embedding-2, gemini-3.5-flash-lite) are served
 # only from the `global` endpoint; a regional one 404s. This is deliberately
 # NOT $REGION — Cloud Run and Firestore stay regional, only the model calls
 # are global. Override if you pin back to a regional model such as

@@ -756,7 +756,7 @@ def recommendations(
         )
 
     for step in model_steps:
-        model = step.config.get("model", "gemini-3.7-flash")
+        model = step.config.get("model", "gemini-3.5-flash-lite")
         cheaper = _DOWNGRADE_PATH.get(model)
         if not cheaper:
             continue
@@ -1157,7 +1157,7 @@ def _seed_definitions() -> list[FlowDefinition]:
                          config={"event": "ExpenseSubmitted"}, next=["m1"]),
                 FlowStep(id="m1", type="modelcall", name="extract-receipt",
                          summary="reads the receipt image: vendor, date, total, category — with a confidence per field",
-                         config={"model": "gemini-3.7-flash",
+                         config={"model": "gemini-3.5-flash-lite",
                                  "prompt": "knowledge:receipt-extraction-prompt"},
                          next=["x1"]),
                 FlowStep(id="x1", type="transform", name="read-policy",
@@ -1211,7 +1211,7 @@ def _seed_definitions() -> list[FlowDefinition]:
                          next=["m1"]),
                 FlowStep(id="m1", type="modelcall", name="extract-invoice",
                          summary="one pass over the document: the vendor as printed, the invoice number, dates, PO, totals and the billed lines — with a confidence",
-                         config={"model": "gemini-3.7-flash",
+                         config={"model": "gemini-3.5-flash-lite",
                                  "prompt": "knowledge:invoice-extraction-prompt"},
                          next=["z1"]),
                 FlowStep(id="z1", type="resolve", name="resolve-vendor",

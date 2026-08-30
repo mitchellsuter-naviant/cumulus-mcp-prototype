@@ -205,7 +205,7 @@ class Settings:
         # that reasons about its own cost should have one number to reason
         # about, and a golden set graded against two different models is
         # measuring two systems.
-        self.model: str = os.environ.get("MODEL", "gemini-3.7-flash")
+        self.model: str = os.environ.get("MODEL", "gemini-3.5-flash-lite")
         # `global`-only, for the same reason as the encoder above.
         self.model_location: str = os.environ.get(
             "MODEL_LOCATION", os.environ.get("VERTEX_LOCATION", "global")

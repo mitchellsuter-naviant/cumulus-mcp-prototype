@@ -103,6 +103,37 @@ def priced_runs(
         world.engine.start(flow_id, {"i": index}, run_id=f"run_{flow_id}_{index}")
 
 
+def probe_flow(client, owner, flow_id: str) -> None:
+    """Register a one-ModelCall flow declared on the upper Gemini rung.
+
+    The seeded flows run the cheapest rung, so the downgrade ladder has
+    nothing to propose against them — which is correct, and useless for
+    testing the ladder. A probe declared one rung up is how the machinery
+    stays exercised without falsifying a seeded export.
+    """
+    payload = {
+        "id": flow_id,
+        "name": "Downgrade probe",
+        "kind": "flow",
+        "description": "A one-step flow on the upper Gemini rung.",
+        "team": "finance-ops",
+        "steps": [
+            {"id": "t1", "type": "trigger", "name": "ProbeSubmitted",
+             "summary": "one run per probe",
+             "config": {"event": "ProbeSubmitted"}, "next": ["m1"]},
+            {"id": "m1", "type": "modelcall", "name": "extract-receipt",
+             "summary": "the priced step",
+             "config": {"model": "gemini-3.7-flash"}, "next": []},
+        ],
+    }
+    created = client.post("/api/v1/flows", json=payload, headers=owner)
+    assert created.status_code == 201, created.text
+    activated = client.patch(
+        f"/api/v1/flows/{flow_id}", json={"status": "active"}, headers=owner
+    )
+    assert activated.status_code == 200, activated.text
+
+
 # ---- registry ----
 
 
@@ -624,7 +655,9 @@ def test_the_recommender_states_its_basis_when_evidence_is_thin(client, world, o
     basis = recs[0]
     assert "3 run(s) / 30d" in basis["evidence"]
     assert "none carrying a cost" in basis["evidence"]
-    assert "model downgrade on extract-receipt (no measured spend)" in basis["detail"]
+    # The extract step already runs the cheapest rung, so a downgrade is not
+    # even considered — the withheld list names only checks that wanted a
+    # measurement and did not get one.
     assert "budget check (no measured cost per run)" in basis["detail"]
 
     # And nothing priced off spend that was never recorded survives.
@@ -649,11 +682,14 @@ def test_measured_spend_earns_the_cards_it_used_to_be_given(client, world, owner
     """The gates are about evidence, not about withholding on principle.
 
     Record real costs on real runs and the cost cards come back — which is
-    what makes their absence above a statement rather than a policy.
+    what makes their absence above a statement rather than a policy. The
+    seeded flows already run the cheapest rung, so the ladder is exercised
+    on a probe flow declared one rung up.
     """
-    priced_runs(world, "expense-reimbursement", 250, cost_usd=0.14, tokens=5200)
+    probe_flow(client, owner, "probe-downgrade")
+    priced_runs(world, "probe-downgrade", 250, cost_usd=0.14, tokens=5200)
     recs = client.get(
-        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
+        "/api/v1/flows/probe-downgrade/recommendations", headers=owner
     ).json()
     kinds = {r["kind"] for r in recs}
     assert {"evidence", "model-downgrade", "prompt-cache", "coverage"} == kinds
@@ -671,7 +707,7 @@ def test_measured_spend_earns_the_cards_it_used_to_be_given(client, world, owner
     assert "$35.00 attributed to this step" in downgrade["evidence"]
 
     applied = client.post(
-        f"/api/v1/flows/expense-reimbursement/recommendations/{downgrade['id']}/apply",
+        f"/api/v1/flows/probe-downgrade/recommendations/{downgrade['id']}/apply",
         headers=owner,
     )
     assert applied.status_code == 200, applied.text
@@ -682,7 +718,7 @@ def test_measured_spend_earns_the_cards_it_used_to_be_given(client, world, owner
         s for s in draft["steps"] if s["id"] == downgrade["proposed_change"]["step_id"]
     )
     assert step["config"]["model"] == "gemini-3.5-flash-lite"
-    live = client.get("/api/v1/flows/expense-reimbursement", headers=owner).json()
+    live = client.get("/api/v1/flows/probe-downgrade", headers=owner).json()
     active_step = next(
         s for s in live["steps"] if s["id"] == downgrade["proposed_change"]["step_id"]
     )
@@ -698,11 +734,12 @@ def test_downgrade_is_withheld_while_the_flow_is_failing(client, world, owner):
     two reasons withheld it, because "no evidence" and "the evidence says no"
     are different answers.
     """
+    probe_flow(client, owner, "probe-failing")
     priced_runs(
-        world, "expense-reimbursement", 200, cost_usd=0.30, fail_every=5,
+        world, "probe-failing", 200, cost_usd=0.30, fail_every=5,
     )
     recs = client.get(
-        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
+        "/api/v1/flows/probe-failing/recommendations", headers=owner
     ).json()
     assert not [r for r in recs if r["kind"] == "model-downgrade"]
     assert "below the bar to spend less" in recs[0]["detail"]

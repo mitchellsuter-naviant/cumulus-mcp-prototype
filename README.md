@@ -178,8 +178,8 @@ systems.
 | `DOCUMENT_MAX_BYTES` | `700000` | Refuse artifacts larger than the document-store adapter can hold |
 | `VENDOR_PROFILES_COLLECTION` | `vendor_profiles` | Derived per-vendor statistics behind the anomaly screen |
 | `MODEL_BACKEND` | `none` | One switch for every ModelCall: `none` (deterministic local readers, retrieval-only `/ask` — no credential, no network, what the tests run against) or `vertex` |
-| `MODEL` | `gemini-3.7-flash` | The model behind every ModelCall — document readers, HR agent, `/ask` planner |
-| `MODEL_LOCATION` | `global` | `gemini-3.7-flash` is served only from the `global` endpoint; a regional one 404s |
+| `MODEL` | `gemini-3.5-flash-lite` | The model behind every ModelCall — document readers, HR agent, `/ask` planner |
+| `MODEL_LOCATION` | `global` | The Gemini models are served only from the `global` endpoint; a regional one 404s |
 | `AUTH_BACKEND` | `none` | `none` (dev: sessions open as the Naviant Engineer persona) or `firebase` (verify ID tokens) |
 | `USER_BACKEND` | follows `AUTH_BACKEND` | `memory` or `firebase` — where platform users live |
 | `SEED_DIR` | `server/seed` | Seed docs loaded when store is empty |
