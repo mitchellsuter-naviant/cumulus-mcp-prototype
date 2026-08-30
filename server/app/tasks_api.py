@@ -152,6 +152,10 @@ def decide_task(
             # A steward's entity-resolution decision is the *first* write on
             # that record: a batch sync asserts nothing while the Task is open.
             lambda t: get_sync_service().apply_match_decision(t, principal),
+            # And its sibling on the other kind: a proposed cross-source merge
+            # already sits in the graph at `in_review`, so this decision flips
+            # it or withdraws it rather than asserting anything new.
+            lambda t: get_sync_service().apply_merge_decision(t, principal),
         ):
             try:
                 resume(decided)

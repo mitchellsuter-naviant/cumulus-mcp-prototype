@@ -268,6 +268,9 @@ def seeded():
         world.sync.deliver(
             build(rows, _access), actor="system:test"
         )
+    # And the one flow no source pushes: it reads the book the deliveries
+    # above wrote, so it goes last.
+    world.sync.sweep_identities(actor="system:test")
     return world
 
 
@@ -290,22 +293,32 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
         "mail-sync",
         "employment-event-sync",
         "dms-sync",
+        "identity-sweep",
     }
-    # Ten of the twelve are inbound syncs. They all have FlowDefinitions now,
+    # Ten of the thirteen are inbound syncs. They all have FlowDefinitions now,
     # but the projection is still drawn from the engine and from stored runs:
     # a definition says what a flow is *meant* to touch, and this module is
     # about what it did.
     for projection in projections.values():
         assert projection.state == "observed", projection.flow_id
-        assert projection.writes, projection.flow_id
         if projection.flow_id == "employment-event-sync":
             # The one flow that establishes no link, and the projection is
             # right to say so: it lands the employment ledger and asserts
             # nothing about anybody. A projection that quietly excused an
             # empty `establishes` would stop being able to tell "this flow
             # draws no edges" from "this flow was never read".
+            assert projection.writes
             assert projection.establishes == []
             continue
+        if projection.flow_id == "identity-sweep":
+            # And its exact mirror, which is the sweep's central promise made
+            # visible in telemetry rather than only in prose: it draws edges
+            # and touches no object. A projection here that listed a written
+            # type would mean the proposer had merged something.
+            assert projection.writes == []
+            assert projection.establishes
+            continue
+        assert projection.writes, projection.flow_id
         assert projection.establishes, projection.flow_id
 
 

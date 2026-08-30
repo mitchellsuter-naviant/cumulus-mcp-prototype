@@ -689,9 +689,14 @@ class _TaskReviewState extends State<_TaskReview> {
 // Shared vocabulary
 // ---------------------------------------------------------------------------
 
+// `match_review` is one arriving row against the book — approve and it links.
+// `merge_review` is two entities the book already holds, and the proposal is
+// already on the graph at `in_review`; the answer flips its status. Named
+// apart here because they read apart to the person holding the queue.
 String kindLabel(String kind) => switch (kind) {
   'decision' => 'Flow decision',
   'match_review' => 'Entity match review',
+  'merge_review' => 'Proposed merge',
   'curation' => 'Knowledge curation',
   'eval_review' => 'Eval review',
   'exception' => 'Exception',
@@ -701,6 +706,7 @@ String kindLabel(String kind) => switch (kind) {
 IconData _iconFor(String kind) => switch (kind) {
   'decision' => Icons.gavel_outlined,
   'match_review' => Icons.join_left_outlined,
+  'merge_review' => Icons.merge_outlined,
   'curation' => Icons.auto_stories_outlined,
   'eval_review' => Icons.grading_outlined,
   'exception' => Icons.report_gmailerrorred_outlined,
@@ -710,6 +716,7 @@ IconData _iconFor(String kind) => switch (kind) {
 CumulusTone _toneFor(QueueTask task) => switch (task.kind) {
   'decision' => CumulusTone.accent,
   'match_review' => CumulusTone.teal,
+  'merge_review' => CumulusTone.teal,
   'curation' => CumulusTone.violet,
   'eval_review' => CumulusTone.neutral,
   'exception' => CumulusTone.danger,

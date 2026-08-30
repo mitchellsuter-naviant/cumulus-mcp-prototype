@@ -166,6 +166,33 @@ class Ontology:
                 return link
         return None
 
+    def source_identity_link(self, type_name: str) -> "LinkType | None":
+        """The identity edge that binds this type to the rows sources sent.
+
+        Read off the declarations rather than kept in a second table beside
+        them: `identified_as`, `company_identified_as` and
+        `person_identified_as` are the same relationship qualified by the
+        endpoint that varies (see the note above their declarations), and the
+        resolver, the steward's decision and the sweep all need to name the
+        right one for a type. A lookup here means adding a reified type is one
+        `LinkType` and nothing else — the alternative, which this replaces, was
+        a resolver that hardcoded `identified_as` and therefore silently never
+        fired its source-link signal for a Company or a Person.
+
+        Filtered to `SourceRecord` on purpose: the merge proposals B5 writes
+        are identity links too, and they join two canonical objects rather than
+        an object to a landed row.
+        """
+        return next(
+            (
+                link for link in self.links
+                if link.nature == "identity"
+                and link.from_type == type_name
+                and link.to_type == "SourceRecord"
+            ),
+            None,
+        )
+
     def roots(self) -> list["ObjectType"]:
         return [o for o in self.objects if self.owner_of(o.name) is None]
 
@@ -500,6 +527,14 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("status", "enum", "active | inactive | onboarding"),
             FieldSpec("payment_terms", "string"),
             FieldSpec("remit_country", "string"),
+            # The two the ERP has always sent and the wire shape used to drop.
+            # They are here because they are what a *cross-book* match is
+            # decided on: a name says a vendor and a company might be the same
+            # firm, and a domain or a switchboard number is what settles it.
+            FieldSpec("email", "string",
+                      "the remit-to or billing address, usually functional "
+                      "(`billing@…`) rather than a person"),
+            FieldSpec("phone", "string"),
             FieldSpec("aliases", "string", "other names this vendor arrived under"),
             FieldSpec("onboarding_state", "enum",
                       "unconfirmed until a human vouches for the vendor"),
@@ -1131,6 +1166,53 @@ LINK_TYPES: tuple[LinkType, ...] = (
              "the addressing and not about either end"),
     LinkType("addressed_to_employee", "MailMessage", "Employee", "many-to-many",
              "an internal recipient, on the same terms"),
+    # ---- proposed identity: two canonical objects, one real-world party ----
+    #
+    # The `*_identified_as` edges above answer "which source row is this
+    # entity". These four answer the harder question no single source can:
+    # *these two entities we already minted are one party*. Per-source
+    # resolution cannot see it — an ERP customer is scored against the book
+    # before its sibling row lands, and a Vendor is never scored against a
+    # Company at all — so it is proposed by a windowed sweep across sources
+    # instead, with evidence attached and `status=in_review` until a steward
+    # rules.
+    #
+    # Four declarations for the same relationship, qualified by the endpoints
+    # that vary, for the reason spelled out above `company_identified_as`: one
+    # widened edge would be validated against whichever pair was declared
+    # first. `many-to-many`, because a stale row can plausibly belong to more
+    # than one survivor and the sweep's job is to show a steward the field,
+    # not to pick.
+    #
+    # Nothing here supersedes anything. A confirmed proposal flips its own
+    # `status` and stays reversible; collapsing the two rows into one canonical
+    # object is a separate, later decision made in the workbench with the
+    # `reversibleWith` note this link carries.
+    LinkType("company_same_as", "Company", "Company", "many-to-many",
+             "a proposed merge inside the counterparty book — the ERP's 2019 "
+             "`Northwind Trading Co.` and today's `Northwind Traders`, "
+             "different natural keys and one company. Carries the confidence, "
+             "the signals that produced it, who decided, what an un-merge "
+             "restores, and a status nothing may act on until it reads "
+             "`confirmed`",
+             nature="identity"),
+    LinkType("company_same_as_vendor", "Company", "Vendor", "many-to-many",
+             "a proposed merge *across* the two books: the firm we sell to is "
+             "the firm we buy from. Company and Vendor stay separate types "
+             "because the roles are separate; this is the edge that says they "
+             "are one party without collapsing either role",
+             nature="identity"),
+    LinkType("vendor_same_as", "Vendor", "Vendor", "many-to-many",
+             "a proposed merge inside the vendor master, for the duplicates "
+             "normalization does not catch — a trading name against a legal "
+             "one, joined by a domain rather than a spelling",
+             nature="identity"),
+    LinkType("person_same_as", "Person", "Person", "many-to-many",
+             "a proposed merge between two outside humans — `Tom Berg` and "
+             "`Thomas Berg` at one account. Deliberately never asserted by "
+             "the CRM feed, which keys people on an address precisely so that "
+             "two spellings stay two people until somebody looks",
+             nature="identity"),
 )
 
 # Ordered highest-authority first. A human correction outranks every system;

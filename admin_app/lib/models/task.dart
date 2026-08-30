@@ -63,7 +63,8 @@ class QueueTask {
   final String id;
   /// The run this task suspended. Non-empty for anything a live flow raised.
   final String runId;
-  final String kind; // decision | match_review | curation | eval_review | exception
+  // decision | match_review | merge_review | curation | eval_review | exception
+  final String kind;
   final String title;
   final String summary;
   final String queue;

@@ -93,7 +93,13 @@ log = logging.getLogger("cumulus.evals")
 # ---------------------------------------------------------------------------
 
 FieldMatch = Literal[
-    "exact", "approx", "fuzzy", "one_of", "present", "absent", "ignore"
+    "exact", "approx", "fuzzy", "one_of", "present", "absent", "ignore",
+    # A bound rather than a value. `approx` can express a band and cannot
+    # express a floor, and a confidence is judged by a floor: "the sweep must
+    # be at least this sure these two are one company" is the promise, and
+    # writing it as 0.82 ± 0.12 would make a spec that reads like a
+    # measurement out of one that is a contract.
+    "at_least", "at_most",
 ]
 
 
@@ -564,10 +570,14 @@ def compare(rule: FieldRule, expected: Any, actual: Any) -> tuple[bool, str]:
         )
         ok = str(actual) in options
         return ok, "one of the allowed values" if ok else f"not in {options}"
-    if rule.match == "approx":
+    if rule.match in ("approx", "at_least", "at_most"):
         left, right = _as_float(expected), _as_float(actual)
         if left is None or right is None:
             return False, "not numeric"
+        if rule.match == "at_least":
+            return right >= left - 1e-9, f"{right} vs a floor of {left}"
+        if rule.match == "at_most":
+            return right <= left + 1e-9, f"{right} vs a ceiling of {left}"
         tolerance = rule.tolerance or 0.01
         delta = abs(left - right)
         return delta <= tolerance + 1e-9, f"off by {delta:.4f} (tolerance {tolerance})"
@@ -1007,7 +1017,14 @@ class EvalService:
         if entrypoint is None:
             return None
         row = entrypoint(world, dict(case.trigger))
-        run_id = getattr(row, "run_id", "") or ""
+        # An entrypoint returns whatever its own callers get — a submitted
+        # request row, or the dispatch summary a windowed flow answers with.
+        # Both name the run; only the shape differs, and this is the seam
+        # rather than a wrapper type per flow.
+        run_id = (
+            str(row.get("run_id") or "") if isinstance(row, dict)
+            else getattr(row, "run_id", "") or ""
+        )
         for decision in case.decisions:
             run = world.engine.get(run_id)
             if run is None or run.status != "suspended" or not run.open_task_id:
@@ -1179,6 +1196,10 @@ class EvalService:
                 continue
             if link_rule.expect == "count":
                 wanted = expected.link_counts.get(link_rule.type)
+                # No count declared for this object is how an expectation opts
+                # out: one rule can then serve both "this one has a proposal"
+                # and "this one must not", which `exists` cannot express and
+                # a second milestone would only express by saying it twice.
                 if wanted is None:
                     continue
                 results.append(AssertionResult(
@@ -1187,19 +1208,32 @@ class EvalService:
                     actual=f"{len(edges)}",
                     detail=f"{len(edges)} edge(s) of {link_rule.type}",
                 ))
-                continue
-            results.append(AssertionResult(
-                milestone=milestone.id, target=label, rule="exists",
-                passed=bool(edges), expected="≥1", actual=f"{len(edges)}",
-                detail=(
-                    f"→ {edges[0][1].label}" if edges else "no such edge"
-                ),
-            ))
+            else:
+                results.append(AssertionResult(
+                    milestone=milestone.id, target=label, rule="exists",
+                    passed=bool(edges), expected="≥1", actual=f"{len(edges)}",
+                    detail=(
+                        f"→ {edges[0][1].label}" if edges else "no such edge"
+                    ),
+                ))
+            # Edge props are graded under either expectation, because the
+            # question "is there one" and the question "what does it say" are
+            # independent — a count of exactly one proposal at a confidence
+            # floor is one claim about one edge.
             for prop_rule in link_rule.props:
                 key = f"{link_rule.type}.{prop_rule.field}"
                 if key not in expected.link_props:
                     continue
-                actual = edges[0][0].props.get(prop_rule.field) if edges else None
+                edge = edges[0][0] if edges else None
+                actual = (
+                    # A link's own columns are properties of the link too:
+                    # `confidence` and `method` are first-class on the record
+                    # precisely because every link has them, and a spec
+                    # grading a proposal's confidence should not have to know
+                    # which side of that line the field fell on.
+                    edge.props.get(prop_rule.field, getattr(edge, prop_rule.field, None))
+                    if edge is not None else None
+                )
                 passed, why = compare(prop_rule, expected.link_props[key], actual)
                 results.append(AssertionResult(
                     milestone=milestone.id, target=label, field=prop_rule.field,

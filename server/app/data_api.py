@@ -265,6 +265,36 @@ def deliver(
     return {"source": body.source, "runs": outcomes}
 
 
+@router.post("/identity/sweep", status_code=202)
+def sweep_identities(
+    window: str = Query(default="", max_length=200),
+    principal: Principal = Depends(get_principal),
+) -> dict:
+    """Close an identity window: score the counterparty book against itself.
+
+    Safe to call at any time, and for a stronger reason than the profile
+    refresh below is: this one changes no canonical object at all. It writes
+    proposals at `in_review` — visible, queryable, and refused by the Gateway
+    until a steward confirms them — so the worst a spurious sweep costs is the
+    pass itself and a few edges a human can withdraw.
+
+    Admin, because it raises work into somebody's queue.
+    """
+    require_role(principal, "admin")
+    outcome = deps.get_sync_service().sweep_identities(
+        actor=principal.uid, window=window,
+    )
+    log.info(
+        "Identity sweep run",
+        extra={
+            "actor": principal.uid, "runId": outcome.get("run_id"),
+            "proposed": outcome.get("proposed"),
+            "stewardTasks": outcome.get("steward_tasks"),
+        },
+    )
+    return outcome
+
+
 # ---- the derived anomaly baseline -----------------------------------------
 
 

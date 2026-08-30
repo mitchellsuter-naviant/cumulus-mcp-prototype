@@ -517,10 +517,16 @@ def _build_erp_sales(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest:
 def _build_erp_vendors(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest:
     """ERP vendors → the existing `VendorRecord`, onto the existing flow.
 
-    A rename and nothing else. The estate carries no tax id on a vendor, so
+    Renames and nothing else. The estate carries no tax id on a vendor, so
     the field stays empty rather than being filled from something adjacent —
     a fabricated hard identifier is worse than an absent one, because the
     resolver treats a tax-id match as decisive.
+
+    `email` and `phone` are carried now and were not before. They are not
+    commercial facts the AP flow reads; they are *identity evidence*, and the
+    two the estate's vendor rows have always held. A vendor with no domain and
+    no number is a vendor the cross-source sweep can only judge on its name,
+    which is the one signal a trading name defeats.
     """
     return SyncRequest(
         source=ERP_VENDORS,
@@ -529,6 +535,8 @@ def _build_erp_vendors(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest
                 external_id=_text(v, "id"),
                 name=_text(v, "companyName"),
                 payment_terms=_text(v, "terms"),
+                email=_text(v, "email"),
+                phone=_text(v, "phone"),
             )
             for v in rows.get("vendors", [])
         ],

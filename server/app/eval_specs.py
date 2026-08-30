@@ -205,6 +205,7 @@ def declared_fixtures() -> list[Fixture]:
             )],
             **expense,
         ),
+        _identity_world(),
         _demo_world(),
     ]
 
@@ -912,11 +913,433 @@ EXPENSE_CASES = [
 
 
 # ---------------------------------------------------------------------------
+# Identity sweep — the roster's answer key, graded
+# ---------------------------------------------------------------------------
+#
+# The estate's namespace design ships an **answer key**: which records across
+# the CRM, the ERP, Office and the DMS are the same real-world entity, and —
+# the half that is easy to forget and expensive to get wrong — which pairs are
+# designed to *look* like one and are not. The key is deliberately never stored
+# in any app; it is ground truth held on the Cumulus side. This is where it
+# stops being a design document and becomes a promise something checks.
+#
+# The rows below are recorded from the live estate, field for field, in the
+# shape its feeds deliver. Not invented: `Northwind Trading Co.` really does
+# carry `(312) 555-0100` and no email, `Apex Mfg. Services LLC` really has a
+# phone in the 815 and no email at all, and those absences are what the
+# scoring turns on. A fixture that tidied them up would grade a world the
+# sweep will never meet.
+#
+# What each row is doing here:
+#
+# - **Northwind** — the ERP's 2019 stale duplicate under an old trading name.
+#   The one the per-source resolver *correctly* mints as a second Company
+#   (0.64 against the book, below the review floor) and only a pass over the
+#   book can catch.
+# - **Verona Foods / Verona Foods Group** — a CRM duplicate in one delivery.
+#   Both mint, because a feed scores its rows against the book as it stood
+#   before the batch; the sweep is the only thing that sees them together.
+# - **Tom Berg / Thomas Berg** — the re-typed contact. Same account, same
+#   surname, one has no phone. Two Persons by design, because people key on an
+#   address.
+# - **Cedarline ×2** — the duplicate normalization already catches. It is here
+#   as a must-link that must *not* become a proposal: the answer is one Vendor
+#   carrying both ERP rows, and a sweep proposing a merge on top of that would
+#   be proposing to merge something with itself.
+# - **Summit Healthcare Staffing / Apex Mfg. Services** — the two bait pairs.
+#   A Rockford staffing agency that is not the Madison hospital system, and a
+#   Rockford refurbisher that is not the Milwaukee manufacturer. The traps are
+#   three deep on the Apex side: Naviant's own mail abbreviates the customer to
+#   "Apex Mfg.", which is the vendor's legal name.
+# - **Sauk Prairie / Sugar River school districts** and **Kestrel / Harbor
+#   District credit unions** — ambient confusability the roster documents as
+#   *not* designed pairs. They share two words of three and resolve instantly
+#   on domain and area code. They are here because a suite that only tested
+#   the designed traps would not notice a scorer that had started proposing
+#   every pair of school districts in Wisconsin.
+
+_IDENTITY_CRM = {
+    "source": "crm-book",
+    "watermark": "2026-08-30T00:00:00Z",
+    "accounts": [
+        {"external_id": "001e7ed1a4e7135", "name": "Northwind Traders",
+         "industry": "Wholesale Distribution",
+         "website": "https://northwindtraders.example.com",
+         "phone": "(312) 555-0134"},
+        {"external_id": "001351b23a6e8d3", "name": "Verona Foods Group",
+         "industry": "Food Processing",
+         "website": "https://veronafoods.example.com",
+         "phone": "(608) 555-0184"},
+        # The badge-list import: no website, no phone, no contacts.
+        {"external_id": "001e3b0a58dac4f", "name": "Verona Foods"},
+        {"external_id": "001b5cfd3d20648", "name": "Summit Health Partners",
+         "industry": "Healthcare",
+         "website": "https://summithealth.example.com",
+         "phone": "(608) 555-0117"},
+        {"external_id": "00166bfaec768cf", "name": "Apex Manufacturing",
+         "industry": "Industrial Manufacturing",
+         "website": "https://apexmfg.example.com", "phone": "(414) 555-0188"},
+        {"external_id": "001f0046335b3b9", "name": "Sauk Prairie School District",
+         "website": "https://saukprairieschools.example.com",
+         "phone": "(608) 555-0125"},
+        {"external_id": "001c3d9e0355efd", "name": "Sugar River School District",
+         "website": "https://sugarriverschools.example.com",
+         "phone": "(608) 555-0165"},
+        {"external_id": "001756b5cf0c82f", "name": "Kestrel Credit Union",
+         "website": "https://kestrelcu.example.com", "phone": "(608) 555-0192"},
+        {"external_id": "001b64ade4e7b5f", "name": "Harbor District Credit Union",
+         "website": "https://harbordistrictcu.example.com",
+         "phone": "(414) 555-0162"},
+    ],
+    "contacts": [
+        {"external_id": "003a1b2c3d4e5f6", "first_name": "Tom",
+         "last_name": "Berg", "title": "Purchasing Manager",
+         "email": "tom.berg@northwindtraders.example.com",
+         "phone": "(312) 555-0135",
+         "account_external_id": "001e7ed1a4e7135"},
+        # The duplicate: re-entered from a trade-show list, no phone.
+        {"external_id": "003b2c3d4e5f6a7", "first_name": "Thomas",
+         "last_name": "Berg", "title": "Purchasing",
+         "email": "thomas.berg@northwindtraders.example.com",
+         "account_external_id": "001e7ed1a4e7135"},
+        # A colleague, not a duplicate. The control that keeps "same company"
+        # from being enough on its own.
+        {"external_id": "003c3d4e5f6a7b8", "first_name": "Maria",
+         "last_name": "Delgado", "title": "Operations Director",
+         "email": "maria.delgado@northwindtraders.example.com",
+         "phone": "(312) 555-0137",
+         "account_external_id": "001e7ed1a4e7135"},
+    ],
+}
+
+_IDENTITY_ERP_SALES = {
+    "source": "erp-sales",
+    "watermark": "2026-08-30T00:00:00Z",
+    "customers": [
+        {"external_id": "1000", "name": "Northwind Traders Inc.",
+         "email": "ap@northwindtraders.example.com", "phone": "(312) 555-0134",
+         "payment_terms": "Net 30"},
+        {"external_id": "1016", "name": "Northwind Trading Co.",
+         "phone": "(312) 555-0100", "payment_terms": "Net 60"},
+        {"external_id": "1003", "name": "Summit Health Partners",
+         "email": "ap@summithealth.example.com", "phone": "(608) 555-0117",
+         "payment_terms": "Net 45"},
+        {"external_id": "1001", "name": "Apex Manufacturing Co.",
+         "email": "accounts.payable@apexmfg.example.com",
+         "phone": "(414) 555-0188", "payment_terms": "Net 60"},
+    ],
+}
+
+_IDENTITY_ERP_VENDORS = {
+    "source": "erp-vendors",
+    "watermark": "2026-08-30T00:00:00Z",
+    "vendors": [
+        {"external_id": "2003", "name": "Cedarline Office Systems",
+         "email": "service@cedarlineoffice.example.com",
+         "phone": "(608) 555-0163", "payment_terms": "Due on receipt"},
+        {"external_id": "2011", "name": "Cedarline Office Systems, Inc.",
+         "email": "billing@cedarlineoffice.example.com",
+         "payment_terms": "Net 30"},
+        {"external_id": "2012", "name": "Summit Healthcare Staffing LLC",
+         "email": "billing@summitstaffing.example.com",
+         "phone": "(815) 555-0144"},
+        {"external_id": "2013", "name": "Apex Mfg. Services LLC",
+         "phone": "(815) 555-0166", "payment_terms": "Net 30"},
+        # The staffing vendor Naviant really uses, so that a staffing company
+        # in the vendor master looks unremarkable — which is what keeps the
+        # Summit bait honest.
+        {"external_id": "2006", "name": "Badger Staffing Partners LLC",
+         "email": "billing@badgerstaffing.example.com",
+         "phone": "(608) 555-0154", "payment_terms": "Net 15"},
+    ],
+}
+
+
+def _identity_world() -> Fixture:
+    return Fixture(
+        id="identity/naviant-answer-key",
+        flow_id="identity-sweep",
+        name="The estate's answer key, as its feeds delivered it",
+        summary=(
+            "Nine CRM accounts, three contacts, four ERP customers and five "
+            "ERP vendors, recorded from the live estate. Holds every duplicate "
+            "the namespace design plants across two books, both bait pairs, "
+            "and two pairs of merely-similar neighbours — so a suite can fail "
+            "for proposing too little and for proposing too much."
+        ),
+        deliveries=[_IDENTITY_CRM, _IDENTITY_ERP_SALES, _IDENTITY_ERP_VENDORS],
+        origin="declared",
+        derived_from=DECLARED_IN,
+        authored_by="platform-eng",
+        read_set=["knowledge:entity-resolution-policy@rev1"],
+    )
+
+
+_PROPOSAL_PROPS = [
+    FieldRule(
+        field="confidence", match="at_least",
+        note="a floor, not a value: the weights are governed knowledge and "
+             "may be tuned, but a proposal below the floor is the wrong answer",
+    ),
+    FieldRule(
+        field="status", match="exact",
+        note="`in_review` on every path. A proposal the sweep wrote as "
+             "anything else would be a merge nobody authorized",
+    ),
+    FieldRule(field="method", match="one_of", options=["exact", "fuzzy"]),
+]
+
+IDENTITY_SPEC = EvalSpec(
+    id="identity-sweep",
+    flow_id="identity-sweep",
+    version=1,
+    summary=(
+        "What the cross-source identity sweep is answerable for: the merges "
+        "the estate's answer key says exist, none of the ones it says do not, "
+        "and nothing merged either way. Every assertion here is a link "
+        "assertion — the sweep writes no claim on any object, so a case that "
+        "graded an object's fields would be grading somebody else's flow."
+    ),
+    milestones=[
+        Milestone(
+            id="proposed",
+            label="once the sweep has committed its proposals",
+            anchor="terminal",
+            note=(
+                "Terminal because a windowed pass has no gate to anchor on: "
+                "it raises Tasks without suspending, so the only point where "
+                "its proposals are all on the graph is the end."
+            ),
+            objects=[
+                ObjectRule(
+                    type="Company",
+                    links=[
+                        LinkRule(
+                            type="company_same_as", direction="out",
+                            expect="count", props=_PROPOSAL_PROPS,
+                            note="counted rather than asserted to exist, so "
+                                 "one rule can say 'this one has a proposal' "
+                                 "and 'this one must not'",
+                        ),
+                        LinkRule(
+                            type="company_same_as_vendor", direction="out",
+                            expect="count",
+                            note="the bait pairs, from the sell side",
+                        ),
+                    ],
+                ),
+                ObjectRule(
+                    type="Vendor",
+                    links=[
+                        LinkRule(
+                            type="company_same_as_vendor", direction="in",
+                            expect="count",
+                            note="a bait vendor must carry no inbound "
+                                 "proposal from the counterparty book",
+                        ),
+                        LinkRule(type="vendor_same_as", direction="out",
+                                 expect="count"),
+                        LinkRule(
+                            type="identified_as", direction="out",
+                            expect="count",
+                            note="how many source rows resolved onto this one "
+                                 "vendor — the shape a duplicate the resolver "
+                                 "already caught takes",
+                        ),
+                    ],
+                ),
+                ObjectRule(
+                    type="Person",
+                    links=[
+                        LinkRule(type="person_same_as", direction="out",
+                                 expect="count", props=_PROPOSAL_PROPS),
+                    ],
+                ),
+            ],
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(
+                    kind="read", expected="knowledge:entity-resolution-policy",
+                    note="the thresholds are governed knowledge and the run "
+                         "must show it read them, or the numbers below are a "
+                         "constant wearing a policy's name",
+                ),
+                TrajectoryRule(
+                    kind="model_calls_at_most", expected="0",
+                    note="rules and evidence. A model call here would buy "
+                         "non-determinism and an unexplainable number in "
+                         "place of a sentence a steward can argue with",
+                ),
+                TrajectoryRule(kind="wrote"),
+            ],
+        ),
+    ],
+)
+
+_IN_REVIEW = "in_review"
+
+IDENTITY_CASES = [
+    EvalCase(
+        id="identity/northwind-stale-duplicate",
+        spec_id=IDENTITY_SPEC.id,
+        name="The ERP's 2019 Northwind is proposed against today's",
+        summary=(
+            "`Northwind Trading Co.` and `Northwind Traders` share no domain "
+            "(the stale row has no email at all) and no phone number. What "
+            "joins them is the anchor word, the 312 they are both in, and a "
+            "name that is close without being close enough for the resolver — "
+            "which is precisely why the per-source path minted a second "
+            "company and was right to."
+        ),
+        fixture_id="identity/naviant-answer-key",
+        expectations=[MilestoneExpectation(
+            milestone="proposed",
+            objects=[
+                ExpectedObject(
+                    type="Company", key="Northwind Traders",
+                    link_counts={"company_same_as": 1,
+                                 "company_same_as_vendor": 0},
+                    link_props={
+                        "company_same_as.confidence": 0.70,
+                        "company_same_as.status": _IN_REVIEW,
+                        "company_same_as.method": "fuzzy",
+                    },
+                ),
+            ],
+            trajectory={
+                "terminal_status": "succeeded",
+                "wrote": "link:company_same_as/",
+            },
+        )],
+    ),
+    EvalCase(
+        id="identity/berg-duplicate-contact",
+        spec_id=IDENTITY_SPEC.id,
+        name="Tom and Thomas Berg are proposed; their colleague is not",
+        summary=(
+            "The pair the CRM feed deliberately refuses to merge, because it "
+            "keys people on an address. Maria Delgado is in the case for the "
+            "reason the whole suite is: a scorer that proposed everyone at "
+            "Northwind to everyone else at Northwind would pass a case that "
+            "only looked at the Bergs."
+        ),
+        fixture_id="identity/naviant-answer-key",
+        expectations=[MilestoneExpectation(
+            milestone="proposed",
+            objects=[
+                ExpectedObject(
+                    type="Person", key="thomas.berg@northwindtraders.example.com",
+                    link_counts={"person_same_as": 1},
+                    link_props={
+                        "person_same_as.confidence": 0.85,
+                        "person_same_as.status": _IN_REVIEW,
+                        "person_same_as.method": "fuzzy",
+                    },
+                ),
+                ExpectedObject(
+                    type="Person", key="maria.delgado@northwindtraders.example.com",
+                    link_counts={"person_same_as": 0},
+                ),
+            ],
+            trajectory={
+                "terminal_status": "succeeded",
+                "wrote": "link:person_same_as/",
+            },
+        )],
+    ),
+    EvalCase(
+        id="identity/cedarline-one-vendor",
+        spec_id=IDENTITY_SPEC.id,
+        name="Cedarline is one vendor with two ERP rows, not a proposal",
+        summary=(
+            "A must-link the sweep must not touch. `Cedarline Office Systems` "
+            "and `Cedarline Office Systems, Inc.` normalize to one key, so the "
+            "resolver linked them at landing and the answer is a single Vendor "
+            "carrying both source rows. A `vendor_same_as` proposal on top of "
+            "that would be the sweep offering to merge something with itself, "
+            "which is the failure mode a scorer that ignored what resolution "
+            "already did would produce."
+        ),
+        fixture_id="identity/naviant-answer-key",
+        expectations=[MilestoneExpectation(
+            milestone="proposed",
+            objects=[ExpectedObject(
+                type="Vendor", key="Cedarline Office Systems",
+                link_counts={
+                    "identified_as": 2,
+                    "vendor_same_as": 0,
+                    "company_same_as_vendor": 0,
+                },
+            )],
+            trajectory={"terminal_status": "succeeded"},
+        )],
+    ),
+    EvalCase(
+        id="identity/bait-pairs-are-not-proposed",
+        spec_id=IDENTITY_SPEC.id,
+        name="Neither bait pair is proposed — and the real duplicate still is",
+        summary=(
+            "Summit Healthcare Staffing is a Rockford temp agency, not the "
+            "Madison hospital system; Apex Mfg. Services is a Rockford "
+            "refurbisher, not the Milwaukee manufacturer whose own abbreviated "
+            "name it happens to be. Different domains, different area codes, "
+            "opposite sides of the ledger. Verona Foods and the two school "
+            "districts are in the same case on purpose: a must-not-link suite "
+            "that a sweep proposing nothing at all would pass is not testing "
+            "anything, so this case fails both ways round."
+        ),
+        fixture_id="identity/naviant-answer-key",
+        expectations=[MilestoneExpectation(
+            milestone="proposed",
+            objects=[
+                ExpectedObject(
+                    type="Vendor", key="Summit Healthcare Staffing LLC",
+                    link_counts={"company_same_as_vendor": 0,
+                                 "vendor_same_as": 0},
+                ),
+                ExpectedObject(
+                    type="Vendor", key="Apex Mfg. Services LLC",
+                    link_counts={"company_same_as_vendor": 0,
+                                 "vendor_same_as": 0},
+                ),
+                ExpectedObject(
+                    type="Company", key="Sauk Prairie School District",
+                    link_counts={"company_same_as": 0},
+                ),
+                ExpectedObject(
+                    type="Company", key="Kestrel Credit Union",
+                    link_counts={"company_same_as": 0},
+                ),
+                # The discriminator: the sweep is not passing by silence.
+                ExpectedObject(
+                    type="Company", key="Verona Foods",
+                    link_counts={"company_same_as": 1},
+                    link_props={
+                        "company_same_as.confidence": 0.80,
+                        "company_same_as.status": _IN_REVIEW,
+                    },
+                ),
+            ],
+            trajectory={
+                "terminal_status": "succeeded",
+                "model_calls_at_most": "0",
+                "read": "knowledge:entity-resolution-policy",
+            },
+        )],
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # The store
 # ---------------------------------------------------------------------------
 
-SPECS = [AP_SPEC, EXPENSE_SPEC]
-CASES = {AP_SPEC.id: AP_CASES, EXPENSE_SPEC.id: EXPENSE_CASES}
+SPECS = [AP_SPEC, EXPENSE_SPEC, IDENTITY_SPEC]
+CASES = {
+    AP_SPEC.id: AP_CASES,
+    EXPENSE_SPEC.id: EXPENSE_CASES,
+    IDENTITY_SPEC.id: IDENTITY_CASES,
+}
 
 
 class DeclaredSpecStore:

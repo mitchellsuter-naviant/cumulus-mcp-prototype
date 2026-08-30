@@ -10,14 +10,21 @@ against a problem the estate does not have.
 import pytest
 
 from app.graph import object_id
+from app.mappings import steward_queue_for, steward_queue_for_type
 from app.sync import (
     CRM_FLOW_ID,
-    DATA_STEWARD_QUEUE,
     SALES_FLOW_ID,
     SyncRequest,
 )
+
 from tests import estate_fixtures as fx
 from tests import world as test_world
+
+#: The desk the counterparty book's Mappings name. Read off the contract
+#: rather than off a module constant, because that constant is gone: the
+#: routing decision has one home now, and a test asserting against a second
+#: copy of it would have been asserting the copies agreed.
+DATA_STEWARD_QUEUE = steward_queue_for_type("Company")
 
 
 @pytest.fixture()
@@ -428,8 +435,6 @@ def test_an_ambiguous_company_raises_a_task_and_asserts_nothing(booked, world):
 def test_the_queue_comes_from_the_mapping_not_the_flow(booked, world):
     """`Mapping.steward_queue` is the contract, and both commerce feeds
     declare the same desk while the vendor feeds keep theirs."""
-    from app.mappings import steward_queue_for
-
     assert steward_queue_for("crm-book") == DATA_STEWARD_QUEUE
     assert steward_queue_for("erp-sales") == DATA_STEWARD_QUEUE
     assert steward_queue_for("erp-vendors") == "vendor-stewardship"

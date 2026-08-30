@@ -48,10 +48,18 @@ from .graph import (
     GraphService,
     GraphWriter,
     InMemoryGraphStore,
+    LinkRecord,
     normalize_key,
     object_id,
+    parse_ref,
 )
-from .mappings import steward_queue_for
+from . import identity_sweep
+from .identity_sweep import (
+    IDENTITY_SWEEP_FLOW_ID,
+    IDENTITY_WINDOW_EVENT,
+    SCAN_BY_LINK,
+)
+from .mappings import steward_queue_for, steward_queue_for_type
 from .matching import parse_match_tolerances
 from .models import utcnow
 from .ontology import ONTOLOGY
@@ -76,14 +84,13 @@ SALES_FLOW_ID = "sales-sync"
 MAIL_FLOW_ID = "mail-sync"
 EMPLOYMENT_EVENT_FLOW_ID = "employment-event-sync"
 DMS_FLOW_ID = "dms-sync"
-STEWARD_QUEUE = "vendor-stewardship"
-#: Counterparties and the humans in them are not the AP steward's work: an
-#: ambiguous Company is a master-data question, and the person who answers it
-#: is not the person who decides whether an invoice gets paid. Which queue a
-#: feed escalates into is declared per Mapping (`Mapping.steward_queue`) so
-#: C4 can rebind it without touching a flow; this is the default for the
-#: counterparty book.
-DATA_STEWARD_QUEUE = "data-stewardship"
+#: Which desk an ambiguous row or a proposed merge goes to is declared per
+#: Mapping (`Mapping.steward_queue`) and read back through
+#: `mappings.steward_queue_for` (per feed) and `steward_queue_for_type` (per
+#: book), so C4 can rebind it in one edit. The two module constants that used
+#: to hold the answers here are gone: a second copy of a routing decision is a
+#: second thing that can disagree with the contract, and this module's own
+#: `MatchTarget` was the reader that made the drift possible.
 
 # The fact each feed shape reports. One name per shape rather than a single
 # `SourceDelivered`, because a name bound to five Triggers would start five
@@ -137,6 +144,15 @@ class VendorRecord(BaseModel):
     status: str = "active"
     payment_terms: str = ""
     remit_country: str = ""
+    # The ERP has always sent these and this shape dropped them, which cost
+    # nothing while the only question asked of a vendor was "which vendor is
+    # this row" — a name and a tax id answer that. It costs a great deal once
+    # the question is "is this vendor the company we also sell to", because a
+    # name is exactly the evidence that fails there: `Apex Mfg. Services LLC`
+    # is not Apex Manufacturing, and the only thing that says so is that one
+    # is on `apexmfgservices.example.com` in the 815 and the other is not.
+    email: str = ""
+    phone: str = ""
     aliases: list[str] = Field(default_factory=list)
     # A source saying "this one is gone". Never a delete on our side: a vendor
     # with open invoices has to stay resolvable.
@@ -595,42 +611,60 @@ class MatchedRecord(BaseModel):
 
 @dataclass(frozen=True)
 class MatchTarget:
-    """Where a decision on one landed row lands, keyed by its `record_kind`."""
+    """Where a decision on one landed row lands, keyed by its `record_kind`.
+
+    Two of the five columns this used to carry were copies of facts already
+    declared elsewhere, and a copy is a thing that can disagree. Both are
+    derived now:
+
+    - **`identity_link`** comes from the ontology, which is where the three
+      sibling identity edges are declared and which endpoint each joins.
+    - **`queue`** comes from the Mapping, which is where the routing decision
+      is written down and where `mappings.py` promises C4 can rebind it in one
+      edit. That promise was only half kept while a constant here held the
+      answer for the fallback path.
+
+    What is left is genuinely per-kind and declared nowhere else: which book a
+    kind writes into, the governed Action it commits under (per book, because
+    the Action carries the desk that may commit it), whose authority signs a
+    write no human authorized, and the natural key a *rejected* match mints
+    under — names for the two counterparty books, an address for a human,
+    because two people who share a name are two people.
+    """
 
     object_type: str
-    #: The identity Link that carries it. Three declarations rather than one
-    #: widened edge (see `ontology.py`) — so this table is where a kind meets
-    #: its own.
-    identity_link: str
-    #: The governed Action the decision commits under. Per book, because the
-    #: Action carries the queue that may commit it, and the two desks are not
-    #: interchangeable.
     action_id: str
-    #: Whose authority commits the write when no live principal carried one.
     flow_id: str
-    #: The queue that binding falls back to for a Task carrying none. Not the
-    #: routing decision — `mappings.steward_queue_for` made that per *feed*,
-    #: and the Task records the answer. Two tables that could disagree about
-    #: which desk a decision came from is exactly the drift this is not.
-    queue: str
-    #: The natural key a *rejected* match mints under. Names for the two
-    #: counterparty books; an address for a human, because two people who
-    #: share a name are two people.
     key: Callable[[MatchedRecord], str]
+
+    @property
+    def identity_link(self) -> str:
+        declared = ONTOLOGY.source_identity_link(self.object_type)
+        return declared.name if declared is not None else ""
+
+    @property
+    def queue(self) -> str:
+        """The desk this book's judgments belong to, per the Mappings.
+
+        Only ever the *fallback*: a Task carries the queue it was raised into,
+        and `apply_match_decision` prefers that, because re-deriving the desk
+        at decision time would let a Mapping rebound after the escalation
+        commit under a desk the Task never sat in. This answers the case where
+        there is no Task to ask — a seed, a test, a decision reconstructed.
+        """
+        return steward_queue_for_type(self.object_type)
 
 
 MATCH_TARGETS: dict[str, MatchTarget] = {
     "vendor": MatchTarget(
-        "Vendor", "identified_as", "link-source-record",
-        VENDOR_FLOW_ID, STEWARD_QUEUE, lambda r: r.name,
+        "Vendor", "link-source-record", VENDOR_FLOW_ID, lambda r: r.name,
     ),
     "company": MatchTarget(
-        "Company", "company_identified_as", "link-company-record",
-        CRM_FLOW_ID, DATA_STEWARD_QUEUE, lambda r: r.name,
+        "Company", "link-company-record", CRM_FLOW_ID, lambda r: r.name,
     ),
     "person": MatchTarget(
-        "Person", "person_identified_as", "link-company-record",
-        CRM_FLOW_ID, DATA_STEWARD_QUEUE, lambda r: r.email.strip().lower(),
+        "Person", "link-company-record", CRM_FLOW_ID,
+        lambda r: r.email.strip().lower(),
     ),
 }
 
@@ -680,6 +714,11 @@ class SyncService:
             sync_commerce.register(self)
             sync_office.register(self)
             sync_dms.register(self)
+            # Not a feed: it reads the book the feeds wrote. It registers here
+            # with them because this service is the one place that knows which
+            # flow bodies exist, and because the steward decision it produces
+            # is applied a few hundred lines below, beside its sibling.
+            identity_sweep.register(self)
 
     def _act(self, ctx: RunContext, action_id: str, step_id: str) -> PendingAction:
         """A sync write, committed by the Flow that is running.
@@ -964,6 +1003,11 @@ class SyncService:
                     field="remit_country", value=record.remit_country,
                     source=claim_source,
                 ))
+            for field, value in (("email", record.email), ("phone", record.phone)):
+                if value:
+                    claims.append(Claim(
+                        field=field, value=value, source=claim_source
+                    ))
             if record.aliases:
                 claims.append(Claim(
                     field="aliases", value=record.aliases, source=claim_source
@@ -1973,6 +2017,112 @@ class SyncService:
             "action": "created", "object_type": target.object_type,
             "object_id": entity.id, "vendor_id": entity.id,
         }
+
+    # -- the cross-source sweep, and the steward's answer to one -----------
+
+    def sweep_identities(self, actor: str = "", window: str = "") -> dict:
+        """Close an identity window. The Dispatcher decides what responds.
+
+        `deliver`'s shape, for `deliver`'s reason: the caller states a fact and
+        the Trigger table says what starts. Nothing here names a flow, so the
+        console button, the interval loop and a graded eval case all reach the
+        sweep the same way, and the run's `caused_by` points at a logged Event
+        rather than at whoever happened to call.
+        """
+        if self.engine is None or self.dispatcher is None:
+            raise RuntimeError("Sync service has no run engine wired")
+        record = self.dispatcher.emit(
+            IDENTITY_WINDOW_EVENT,
+            {"window": window or "the whole counterparty book"},
+            actor=actor or f"flow:{IDENTITY_SWEEP_FLOW_ID}",
+        ).one()
+        return {
+            "flow_id": record.flow_id, "run_id": record.id,
+            "status": record.status, **(record.outputs or {}),
+        }
+
+    def apply_merge_decision(
+        self, task: Task, principal: Principal | None = None
+    ) -> dict | None:
+        """Confirm or withdraw a proposed merge. The sibling of the above.
+
+        A sibling and not a branch of `apply_match_decision`, because the two
+        are opposites in the one way that matters: a `match_review` decision is
+        the **first** write on a record nothing asserted, and a `merge_review`
+        decision is a write on an assertion that is already in the graph at
+        `in_review`. Approving flips its status; rejecting withdraws it, which
+        is a reversal rather than a delete, so the fact that the machine
+        proposed it and a human said no stays readable.
+
+        **Nothing is merged on either verdict.** A confirmed proposal is an
+        identity assertion two objects now carry — which is what makes them one
+        party to a traversal — and collapsing them into a single canonical row
+        is a further decision, made in the workbench, with the `reversible_with`
+        note this link is carrying for exactly that moment.
+        """
+        if task.kind != "merge_review" or task.decision is None:
+            return None
+        ref = parse_ref(task.case_ref)
+        if ref.namespace != "link" or ref.type not in SCAN_BY_LINK:
+            return None
+        link = self.graph.store.get_link(ref.id)
+        if link is None or not link.live:
+            return None
+        if str(link.props.get("status") or "in_review") != "in_review":
+            # Already ruled on. A second decider learns that from the Task
+            # store's own 409; what this refuses is re-deciding the assertion.
+            return None
+        verdict = task.decision.verdict
+        act = self.gateway.action(
+            "confirm-identity-link",
+            principal or flow_principal(
+                task.flow_id or IDENTITY_SWEEP_FLOW_ID,
+                task.queue or steward_queue_for_type(
+                    SCAN_BY_LINK[ref.type].from_type
+                ),
+            ),
+            step_id="steward-decision", task_id=task.id,
+            decided_by=task.decision.decided_by, target=f"link:{ref.type}/{ref.id}",
+        )
+        return act.commit(
+            lambda w: self._assert_merge_decision(task, link, verdict, w)
+        )
+
+    def _assert_merge_decision(
+        self, task: Task, link: LinkRecord, verdict: str, graph: GraphWriter
+    ) -> dict:
+        decided_by = task.decision.decided_by
+        if verdict == "rejected":
+            graph.reverse_link(
+                link.id, decided_by,
+                f"steward rejected the proposed merge ({task.id}): "
+                f"{task.decision.note or 'not the same party'}",
+            )
+            log.info(
+                "Proposed merge withdrawn",
+                extra={"taskId": task.id, "linkId": link.id, "actor": decided_by},
+            )
+            return {"action": "withdrawn", "link_id": link.id}
+        # Approved or corrected. The confidence stays whatever the machine
+        # scored — overwriting it with 1.0 would erase the only record of how
+        # good the proposal was before a human looked at it — and the method
+        # becomes `human`, because that is now what the assertion rests on.
+        graph.link(
+            link.type, link.from_id, link.to_id,
+            props={
+                "status": "confirmed",
+                "decided_by": decided_by,
+                "decided_at": utcnow().isoformat(),
+                "task_id": task.id,
+                "machine_confidence": link.confidence,
+                "machine_method": link.method,
+            },
+        )
+        log.info(
+            "Proposed merge confirmed",
+            extra={"taskId": task.id, "linkId": link.id, "actor": decided_by},
+        )
+        return {"action": "confirmed", "link_id": link.id}
 
     # -- the Sources lens ---------------------------------------------------
 

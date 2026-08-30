@@ -135,5 +135,9 @@ def build_world(source_knowledge=None, *, seed_dir: str | None = None) -> EvalWo
 FLOW_ENTRYPOINTS: dict[str, Callable[[EvalWorld, dict], Any]] = {
     "expense-reimbursement": lambda world, trigger: world.expenses.submit(**trigger),
     "accounts-payable": lambda world, trigger: world.payables.submit(**trigger),
+    # The first graded flow with no case to submit. Its trigger is a window
+    # closing over the world the fixture's deliveries built, which is why its
+    # `trigger` dict is usually empty: the precondition *is* the fixture.
+    "identity-sweep": lambda world, trigger: world.sync.sweep_identities(**trigger),
 }
 

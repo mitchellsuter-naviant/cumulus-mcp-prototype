@@ -274,7 +274,15 @@ def test_the_ledger_route_scopes_reads_and_lists_the_closed_action_set(
         "post-invoice", "record-expense", "link-source-record",
         "link-company-record", "confirm-vendor", "land-source-records",
         "apply-source-records", "resolve-identities",
+        "propose-identity-link", "confirm-identity-link",
     }
+    # The proposer is the one Action in the table with no queue, and that is
+    # the queue doing its job: a queue says whose *work* an Action is, and a
+    # Flow proposing a merge nobody asked for is nobody's work. Deciding it is
+    # the counterparty book steward's alone.
+    by_id = {a["id"]: a for a in actions}
+    assert by_id["propose-identity-link"]["queue"] == ""
+    assert by_id["confirm-identity-link"]["queue"] == "data-stewardship"
     # Every Action names one of the three regimes and nothing else.
     assert {a["regime"] for a in actions} == {
         "decision", "observation", "resolution"
