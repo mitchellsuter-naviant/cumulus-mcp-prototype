@@ -26,8 +26,17 @@ a re-pull of the same window is safe anyway (the wire is idempotent and the
 upserts are keyed). They are unpaged, so a delta arrives whole and *chunking*
 is ours to do: a delivery is capped and split on `updatedAt` boundaries, so a
 cursor that advances per acknowledged chunk never skips the tail of a
-timestamp. And deletes are invisible to `updatedSince` — accepted for this
-phase, and stated rather than papered over.
+timestamp.
+
+**Two gaps the delta model leaves, accepted for this phase and stated rather
+than papered over.** Deletes are invisible to `updatedSince`: a row the estate
+removes is a row this connector never hears about again, so the graph keeps it.
+And a row whose `updatedAt` is *null* is delivered by the first, cursorless
+pull and then invisible to every delta after it — the live DMS has three such
+folders, hand-made before the namespace was seeded — so renaming one of them
+would never sync. Both are properties of a watermark cursor over a source that
+does not journal its changes; closing either needs a change log or a periodic
+full re-pull, and neither is engineered here.
 
 **Scheduling is a sourced capability** (DOCTRINE.md: no continuously-warm
 component of our own). The deployed form is a managed scheduler POSTing
@@ -264,9 +273,19 @@ _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 def team_slug(name: str) -> str:
     """A department name as the Team natural key the wire shape declares.
 
-    Deterministic, and the only derivation the connector performs: `team_slug`
-    and `parent_slug` are keys, so both ends of the org edge have to spell them
-    the same way or the flow wires nothing.
+    Deterministic, and one of the three derivations this module allows itself,
+    all of them addressing rather than meaning: **a key** (this, and the
+    `parent_slug` on the other end of the same org edge — both ends have to
+    spell it the same way or the flow wires nothing), **a name composed from
+    the parts a source hands separately** (`legalFirstName` + `legalLastName`
+    where there is no `fullName`), and **a URL** (`_storage_ref`, and
+    `_Access.url` under it, because only the connector knows the project and
+    namespace an address is spelled with).
+
+    What is *not* here is any decision about what a value means: no vocabulary
+    mapped onto a declared enum, no score, no precedence, no minting. Those are
+    the flow's, and `sync._event_status` and `sync_office._importance` are
+    where the two enums this estate implies actually get decided.
     """
     return _SLUG_STRIP.sub("-", (name or "").lower()).strip("-")
 
@@ -288,19 +307,6 @@ def _number(row: dict, field: str) -> float:
         return float(row.get(field))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0.0
-
-
-def _memo(cache: dict[str, dict], deref: Deref, resource: str, record_id: str) -> dict:
-    """One referenced row, fetched at most once per pull.
-
-    A delta of forty orders against four vendors is four GETs, and the same
-    vendor reappearing in the next chunk is none.
-    """
-    if not record_id:
-        return {}
-    if record_id not in cache:
-        cache[record_id] = deref(resource, record_id)
-    return cache[record_id]
 
 
 def _build_hris_workforce(
@@ -332,12 +338,15 @@ def _build_hris_workforce(
     jobs = {j["id"]: j for j in rows.get("jobs", [])}
     workers = {e["id"]: e for e in rows.get("employees", [])}
 
-    def off_page(cache: dict[str, dict], resource: str, record_id: str) -> dict:
-        if not record_id:
-            return {}
-        if record_id not in cache:
-            cache[record_id] = deref(resource, record_id)
-        return cache[record_id]
+    def off_page(page: dict[str, dict], resource: str, record_id: str) -> dict:
+        """The pulled page first, then one GET for what it does not hold.
+
+        No cache of its own: `_deref` memoizes every fetch for the whole pull,
+        and a second cache in front of it would only make two places able to
+        disagree about what was already read. The page dicts stay page-only, so
+        `on_page_*` below means what it says.
+        """
+        return page.get(record_id) or deref(resource, record_id)
 
     def slug_of(dept_id: str) -> str:
         return team_slug(
@@ -535,18 +544,18 @@ def _build_erp_purchase_orders(
     was declared against a system that sends names: a PO row carries only
     `vendorId`, and `PurchaseOrderRecord.vendor_name` is what the flow matches
     a Vendor on. Same for a line's internal `itemId`, where the shape wants a
-    SKU and a description. Both are declared keys read off one record each,
-    memoized for the whole pull, and both are named in the Mapping's notes —
-    which is the rule this exception exists under.
+    SKU and a description. Both are declared keys read off one record each, and
+    both are named in the Mapping's notes — which is the rule this exception
+    exists under. Neither is cached here: `_deref` memoizes for the whole pull,
+    so a delta of forty orders against four vendors is four GETs and the same
+    vendor reappearing in the next chunk is none.
     """
-    vendors: dict[str, dict] = {}
-    items: dict[str, dict] = {}
     orders: list[PurchaseOrderRecord] = []
     for record in rows.get("purchaseOrders", []):
         vendor_id = _text(record, "vendorId")
         lines: list[PurchaseOrderLineRecord] = []
         for line in record.get("lines") or []:
-            item = _memo(items, deref, "items", _text(line, "itemId"))
+            item = deref("items", _text(line, "itemId"))
             lines.append(PurchaseOrderLineRecord(
                 sku=_text(item, "itemId"),
                 description=_text(item, "displayName"),
@@ -557,9 +566,7 @@ def _build_erp_purchase_orders(
             external_id=_text(record, "id"),
             po_number=_text(record, "tranId"),
             vendor_external_id=vendor_id,
-            vendor_name=_text(
-                _memo(vendors, deref, "vendors", vendor_id), "companyName"
-            ),
+            vendor_name=_text(deref("vendors", vendor_id), "companyName"),
             ordered_date=_text(record, "tranDate"),
             status=_text(record, "status"),
             lines=lines,
@@ -573,19 +580,17 @@ def _mailbox_addresses(rows: dict[str, list[dict]], deref: Deref):
     The estate references a mailbox by its internal uuid while both office wire
     shapes key on the address, so this is the same declared-key dereference the
     purchase-order feed makes for `vendorId` — the pulled page first, one GET
-    for anything it does not hold, memoized for the whole pull. Shared by the
-    two feeds because a mailbox is a mailbox: two copies of this lookup that
-    drifted would put the calendar and the mail of one person under two
-    different keys, which is the one mistake that would make the mirror useless.
+    for anything it does not hold, and `_deref` memoizing that GET for the whole
+    pull so six events across three mailboxes cost three. Shared by the two
+    feeds because a mailbox is a mailbox: two copies of this lookup that drifted
+    would put the calendar and the mail of one person under two different keys,
+    which is the one mistake that would make the mirror useless.
     """
     mailboxes = {m["id"]: m for m in rows.get("mailboxes", [])}
 
     def address_of(mailbox_id: str) -> str:
-        if not mailbox_id:
-            return ""
-        if mailbox_id not in mailboxes:
-            mailboxes[mailbox_id] = deref("mailboxes", mailbox_id)
-        return _text(mailboxes[mailbox_id], "address")
+        page = mailboxes.get(mailbox_id) if mailbox_id else None
+        return _text(page or deref("mailboxes", mailbox_id), "address")
 
     return address_of
 
@@ -631,7 +636,11 @@ def _build_office_calendar(
             ends_at=_text(e, "end"),
             all_day=bool(e.get("isAllDay")),
             location=_text(e, "location"),
-            status="cancelled" if e.get("isCancelled") else "confirmed",
+            # The flag as the source spells it, not the enum it implies:
+            # `CalendarEvent.status` is `confirmed | tentative | cancelled` and
+            # deciding which of those a boolean means is a vocabulary question
+            # the flow answers (`sync._event_status`).
+            cancelled=bool(e.get("isCancelled")),
             organizer_email=_text(e, "organizer"),
             attendee_emails=[str(a) for a in (e.get("attendees") or [])],
             notes=_text(e, "body"),
@@ -1082,7 +1091,13 @@ class EstateConnector:
             "namespace": self.namespace,
             "url_template": self.url_template,
             "discovery_url": self.discovery_url() if self.registered else "",
-            "deliver_url": self.deliver_url,
+            # No `deliver_url`. This view is read at `require_reader`, and the
+            # address of our own write door is machinery config rather than
+            # anything about the customer's estate — the same reason the API
+            # key is reported as a boolean below. The console's estate card
+            # curates it away too; reporting one shape to the screen and a
+            # wider one to the route it does not use would be the leak.
+            #
             # Whether, not what — a credential never leaves this process.
             "authenticated": bool(self.api_key),
             "pull_interval_seconds": self.interval_seconds,
@@ -1163,17 +1178,23 @@ class EstateConnector:
     def _deref(self, app: str) -> EstateAccess:
         """One GET for a referenced record the pulled page does not hold.
 
-        Memoized for the whole pull, not per chunk: a hundred people reporting
-        to one manager is one GET, and so is that manager reappearing in the
-        next chunk. A miss is empty rather than fatal — a manager who left
-        between the pull and the dereference is a dangling reference, and the
-        flow already counts those on the aggregate instead of failing the batch.
+        **The only cache in the connector.** Memoized here for the whole pull,
+        not per chunk and not again inside a `build`: a hundred people reporting
+        to one manager is one GET, so is that manager reappearing in the next
+        chunk, and a second cache in front of this one would only be two places
+        able to disagree about what has already been read. A miss is empty
+        rather than fatal — a manager who left between the pull and the
+        dereference is a dangling reference, and the flow already counts those
+        on the aggregate instead of failing the batch. So is an empty id: a row
+        that names nothing is answered without a round trip.
         """
         seen: dict[tuple[str, str], dict] = {}
         connector = self
 
         class _Access:
             def __call__(self, resource: str, record_id: str) -> dict:
+                if not record_id:
+                    return {}
                 if (resource, record_id) in seen:
                     return seen[(resource, record_id)]
                 try:

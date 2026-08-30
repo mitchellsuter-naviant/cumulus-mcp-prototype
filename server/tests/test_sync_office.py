@@ -443,26 +443,72 @@ def test_availability_is_not_promoted_into_an_event_kind(calendared, world):
     assert trip.props["kind"] == "meeting"
 
 
+def test_the_cancellation_flag_becomes_an_enum_in_the_flow_not_the_connector(
+    peopled,
+):
+    """Which of a source's values belong to which declared enum is the flow's.
+
+    The source reports a boolean `isCancelled`; the ontology declares
+    `confirmed | tentative | cancelled`. The connector carries the flag as it
+    found it — asserted here on the built record, so a connector that quietly
+    started deciding the enum again would fail — and `sync._event_status` is
+    where it becomes one.
+    """
+    cancelled_row = {**fx.OFFICE_EVENTS[0], "id": "EVT-CALLED-OFF",
+                     "isCancelled": True}
+    request = _calendar_request(events=[*fx.OFFICE_EVENTS, cancelled_row])
+
+    built = {e.external_id: e for e in request.calendar_events}
+    assert built["EVT-CALLED-OFF"].cancelled is True
+    # The wire shape's default is untouched: the connector states no enum.
+    assert built["EVT-CALLED-OFF"].status == "confirmed"
+
+    assert _deliver(peopled, request)["status"] == "succeeded"
+    called_off = peopled.graph.get(object_id(
+        "CalendarEvent",
+        f"{built['EVT-CALLED-OFF'].calendar_address}#EVT-CALLED-OFF",
+    ))
+    assert called_off.props["status"] == "cancelled"
+    # And an event the source did not cancel is not swept along with it.
+    live = peopled.graph.get(object_id(
+        "CalendarEvent",
+        f"{built[fx.OFFICE_EVENTS[1]['id']].calendar_address}"
+        f"#{fx.OFFICE_EVENTS[1]['id']}",
+    ))
+    assert live.props["status"] == "confirmed"
+
+
 def test_an_event_names_its_mailbox_by_an_id_the_page_may_not_hold(world):
     """The one declared-key dereference both office feeds make.
 
     An event carries `mailboxId`; the contract keys a calendar by address. A
     delta of events whose mailboxes did not move is exactly the case, and it
     costs one GET per mailbox for the whole pull rather than one per row.
+
+    Driven through the connector's real `_deref`, because that is the only
+    place the memo lives: a stand-in that cached for itself would prove the
+    property about the test rather than about the code.
     """
-    calls: list[tuple[str, str]] = []
+    from app.estate import (
+        EstateConnector,
+        InMemoryConnectorStateStore,
+        _build_office_calendar,
+    )
 
-    def counting_deref(resource: str, record_id: str) -> dict:
-        calls.append((resource, record_id))
-        return next(
-            (m for m in fx.MAILBOXES if m["id"] == record_id),
-            fx.MAILBOX_OFF_PAGE if fx.MAILBOX_OFF_PAGE["id"] == record_id else {},
-        )
+    fetched: list[str] = []
+    rows = {m["id"]: m for m in (*fx.MAILBOXES, fx.MAILBOX_OFF_PAGE)}
 
-    from app.estate import _build_office_calendar
+    def fetch(url: str) -> dict:
+        fetched.append(url)
+        return rows.get(url.rsplit("/", 1)[-1], {})
 
+    connector = EstateConnector(
+        InMemoryConnectorStateStore(), project="p", namespace="naviant",
+        fetch=fetch,
+    )
     built = _build_office_calendar(
-        {"mailboxes": [], "events": fx.OFFICE_EVENTS}, counting_deref,
+        {"mailboxes": [], "events": fx.OFFICE_EVENTS},
+        connector._deref("office"),
     )
     assert built.calendars == []
     assert {e.calendar_address for e in built.calendar_events} == {
@@ -470,8 +516,8 @@ def test_an_event_names_its_mailbox_by_an_id_the_page_may_not_hold(world):
         "marcus.reyes@naviant.com",
     }
     # Six events across three mailboxes, memoized: three GETs, not six.
-    assert len(calls) == 3
-    assert {resource for resource, _id in calls} == {"mailboxes"}
+    assert len(fetched) == 3
+    assert all("/v1/mailboxes/" in url for url in fetched)
 
 
 # ---------------------------------------------------------------------------

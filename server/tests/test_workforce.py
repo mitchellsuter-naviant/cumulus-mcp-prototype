@@ -118,7 +118,7 @@ def test_a_skill_is_asserted_by_people_not_observed_by_a_system(world):
     capability = graph.get(object_id("Capability", "dbt"))
     assert {c.source for c in capability.claims} == {"human:people-ops"}
     person = graph.get(object_id("Employee", "kim@customer.example"))
-    assert any(c.source == "hris:hris-workday" for c in person.claims)
+    assert any(c.source == "hris:hris-workforce" for c in person.claims)
 
 
 def test_the_hris_outranks_the_flow_that_minted_the_employee(world):
@@ -128,7 +128,7 @@ def test_the_hris_outranks_the_flow_that_minted_the_employee(world):
     person = world.graph.get(object_id("Employee", "kim@customer.example"))
     sources = [c.source for c in person.claims if c.field == "email"]
     assert "flow:expense-reimbursement" in sources
-    assert "hris:hris-workday" in sources
+    assert "hris:hris-workforce" in sources
     assert person.props["email"] == "kim@customer.example"
     # Same value from both, so it is history rather than disagreement.
     assert "email" not in person.conflicts()
@@ -140,7 +140,7 @@ def test_the_org_chart_conforms(world):
 
 def test_the_feed_shows_up_as_a_source(world):
     rows = {(s.source, s.kind): s for s in world.sync.sources()}
-    status = rows[("hris-workday", "workforce")]
+    status = rows[("hris-workforce", "workforce")]
     assert status.flow_id == "workforce-sync"
     assert status.last_status == "succeeded"
     assert status.records_landed == len(TEAMS) + len(EMPLOYEES)
@@ -150,10 +150,9 @@ def test_the_hris_mapping_binds_rather_than_reifies():
     """An exact key needs no landing record.
 
     One HRIS contract, not two. The registry used to carry a fictional
-    `hris-workday` row beside this one describing the same subject; the seeded
-    delivery below still arrives under that source id and now shows on the
-    Sources screen as a feed under no contract — which is true, and is what
-    B4 deletes when the seed goes.
+    `hris-workday` row beside this one describing the same subject; both it and
+    the seed that delivered under that id are gone, so the mock workforce and
+    the estate's HRIS feed now arrive under the one source this Mapping names.
     """
     from app.mappings import MAPPINGS
 
@@ -177,7 +176,7 @@ def test_an_unresolved_reference_escalates_as_one_aggregate(world):
 
     outcomes = world.sync.deliver(
         SyncRequest.model_validate({
-            "source": "hris-workday",
+            "source": "hris-workforce",
             "employees": [{
                 "external_id": "WD-9999",
                 "email": "ghost@customer.example",

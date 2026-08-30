@@ -34,7 +34,7 @@ from . import data_collections, deps, payables, personas
 from .auth import Principal, get_principal, require_reader, require_role
 from .config import settings
 from .deps import get_graph_service
-from .estate import EstateError
+from .estate_api import pull_feed_now
 from .flow_projection import ProjectionState, project_flow, project_flows
 from .graph import GraphService, object_id
 from .mappings import MAPPINGS, Mapping, validate_mappings
@@ -497,11 +497,13 @@ class PullState(BaseModel):
     which is why it is joined rather than computed: a pull that found nothing
     starts no run, and a pull that *failed* has no run at all. Both are states
     an operator needs, and both are invisible to `SyncService.sources()`.
+
+    Registration is not on this shape. It is one fact for the whole connector,
+    the `EstateCard` above the list carries it, and no `PullState` is built at
+    all unless an estate is registered — so a per-row copy could only ever have
+    said True.
     """
 
-    #: Whether an estate is registered at all. False makes every field below
-    #: read as "nothing has happened yet" instead of "something is wrong".
-    registered: bool
     #: Whether discovery says the namespace actually runs this feed's app. A
     #: registry row for an app the customer does not run is inert, not broken.
     active: bool
@@ -716,7 +718,6 @@ def _estate_view(principal: Principal) -> tuple[EstateCard, dict[str, PullState]
         app = str(feed.get("app") or "")
         active = bool(feed.get("active"))
         states[str(feed.get("feed") or "")] = PullState(
-            registered=True,
             active=active,
             estate_app=app,
             namespace=namespace,
@@ -842,37 +843,17 @@ def sync_source_now(
     The answer is also given in advance: `PullState.sync_now_allowed` tells the
     screen not to draw the control, so a persona that may not pull reads a
     sentence rather than pressing a button that refuses.
+
+    The pull itself is `estate_api.pull_feed_now` — the same function the
+    machine route calls, so the 404/400/502 an operator gets is the same
+    refusal whichever door they came through. What this route adds is the row.
     """
     require_role(principal, "admin")
-    connector = deps.get_estate_connector()
-    if connector.spec(source) is None:
-        raise HTTPException(
-            status_code=404, detail=f"No such feed: {source}"
-        )
-    if not connector.registered:
-        raise HTTPException(
-            status_code=400,
-            detail="No estate is registered — set ESTATE_PROJECT.",
-        )
-    try:
-        outcome = connector.pull(source)
-    except EstateError as exc:
-        # The failure is upstream, and reporting it as our own 500 would send
-        # an operator to read the wrong logs.
-        log.warning(
-            "Console sync-now failed",
-            extra={"feed": source, "actor": principal.uid, "error": str(exc)},
-        )
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    outcome = pull_feed_now(source, principal.uid)
 
     _, pulls = _estate_view(principal)
     row = next((r for r in _source_rows(pulls) if r.source == source), None)
     chunks = outcome.get("chunks") or []
-    log.info(
-        "Console sync-now completed",
-        extra={"feed": source, "actor": principal.uid,
-               "outcome": outcome.get("outcome"), "chunks": len(chunks)},
-    )
     return SyncNowOutcome(
         source=source,
         outcome=str(outcome.get("outcome") or ""),

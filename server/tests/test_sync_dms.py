@@ -329,6 +329,20 @@ def test_a_redelivery_changes_nothing(world, filed):
     assert world.graph.stats() == before
 
 
+def test_the_feed_reports_what_it_put_in_the_graph(world, filed):
+    """`landed` is the Sources lens's word, and a bind feed has to say it.
+
+    There is no landing step here — the rows become Folders and Documents
+    directly — so nothing counts them unless the body does, and the operator's
+    row read a permanent zero beside three sibling feeds that report honestly.
+    """
+    rows = {(s.source, s.kind): s for s in world.sync.sources()}
+    row = rows[("dms-library", "documents")]
+    assert row.flow_id == DMS_FLOW_ID
+    assert row.last_status == "succeeded"
+    assert row.records_landed == len(fx.FOLDERS) + len(fx.DMS_DOCUMENTS)
+
+
 # ---------------------------------------------------------------------------
 # The ledger
 # ---------------------------------------------------------------------------

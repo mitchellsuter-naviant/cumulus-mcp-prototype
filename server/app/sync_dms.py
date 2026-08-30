@@ -106,12 +106,20 @@ def dms_body(service: SyncService, ctx: RunContext, inputs: dict) -> dict:
         kind="trigger",
     )
 
+    # The graph's existing folders for this source, read once and passed down.
+    # Three places need it — placing a batch folder whose parent arrived in an
+    # earlier delta, drawing that parent edge, and filing a document into a
+    # folder this delta did not carry — and each of them used to scan for
+    # itself, the last one per record.
+    known_paths = _known_folder_paths(service, source)
+    paths = _folder_paths(source, folders, known_paths)
+
     tree = service._act(ctx, "apply-source-records", "a1")
     tree_out = ctx.step(
         "a1", "apply-folders", "action",
-        fn=lambda: tree.commit(
-            lambda w: _apply_folders(service, w, source, folders, ctx.record.id)
-        ),
+        fn=lambda: tree.commit(lambda w: _apply_folders(
+            service, w, source, folders, ctx.record.id, paths, known_paths,
+        )),
         writes=lambda _out: tree.writes,
         summary=lambda out: (
             f"{out['folders']} folder(s) · {out['subfolder_of']} nested"
@@ -126,7 +134,7 @@ def dms_body(service: SyncService, ctx: RunContext, inputs: dict) -> dict:
     file_out = ctx.step(
         "a2", "apply-documents", "action",
         fn=lambda: files.commit(lambda w: _apply_documents(
-            service, w, source, documents, ctx.record.id,
+            service, w, source, documents, ctx.record.id, paths, known_paths,
         )),
         writes=lambda _out: files.writes,
         summary=lambda out: (
@@ -148,19 +156,38 @@ def dms_body(service: SyncService, ctx: RunContext, inputs: dict) -> dict:
     return {
         "source": source, "watermark": watermark, "kind": "documents",
         "records": len(folders) + len(documents),
+        # `landed` is the Sources lens's word for how many rows a delivery put
+        # into the graph, summed across runs — a bind feed has no landing step
+        # to count, so it states the bound-record count the way the workforce,
+        # calendar and mail bodies do.
+        "landed": len(folders) + len(documents),
         **tree_out, **file_out,
     }
 
 
+def _known_folder_paths(service: SyncService, source: str) -> dict[str, str]:
+    """Every folder this source has already landed, by its DMS id, as a path.
+
+    One read per run. The tree walk, the parent edge and the document filing
+    all ask the same question of the same rows, and asking it three times —
+    once per record, in the third case — was three scans of one index.
+    """
+    return {
+        str(o.props.get("external_id")): str(o.props.get("path") or "")
+        for o in service.graph.find("Folder", prop_equals={"source": source})
+        if o.props.get("external_id")
+    }
+
+
 def _folder_paths(
-    service: SyncService, source: str, records: list[FolderRecord]
+    source: str, records: list[FolderRecord], known: dict[str, str]
 ) -> dict[str, str]:
     """Every folder in the batch that can be placed, by id, as a full path.
 
     The path is the natural key, so this is the step that decides which rows
     can land at all. It walks parent pointers through the batch first and falls
-    back to the paths already in the graph, which is what makes a delta of one
-    renamed subfolder resolvable without re-pulling the tree.
+    back to `known` — the paths already in the graph — which is what makes a
+    delta of one renamed subfolder resolvable without re-pulling the tree.
 
     A folder whose parent is in neither place is simply absent from the result.
     Landing it under its own name would have filed it at the root, and a
@@ -168,11 +195,6 @@ def _folder_paths(
     answer than an honest count of what could not be placed.
     """
     in_batch = {r.external_id: r for r in records if r.external_id}
-    known = {
-        str(o.props.get("external_id")): str(o.props.get("path") or "")
-        for o in service.graph.find("Folder", prop_equals={"source": source})
-        if o.props.get("external_id")
-    }
     resolved: dict[str, str] = {}
 
     def path_of(external_id: str, seen: frozenset[str]) -> str:
@@ -209,10 +231,11 @@ def _apply_folders(
     source: str,
     records: list[FolderRecord],
     run_id: str,
+    paths: dict[str, str],
+    known_paths: dict[str, str],
 ) -> dict:
     counts = {"folders": 0, "subfolder_of": 0, "unplaced": 0}
     claim_source = f"{_authority(source)}:{source}"
-    paths = _folder_paths(service, source, records)
 
     # Two passes: every folder exists before any edge is drawn, so the order
     # the estate happened to return the tree in decides nothing.
@@ -238,7 +261,7 @@ def _apply_folders(
         counts["folders"] += 1
 
     for record in records:
-        parent_path = _parent_path(service, source, record, paths)
+        parent_path = _path_of(record.parent_external_id, paths, known_paths)
         if not record.parent_external_id or not parent_path:
             continue
         child = _folder(service, source, paths.get(record.external_id, ""))
@@ -259,6 +282,8 @@ def _apply_documents(
     source: str,
     records: list[DmsDocumentRecord],
     run_id: str,
+    paths: dict[str, str],
+    known_paths: dict[str, str],
 ) -> dict:
     """Each file as a pointer, filed where the customer filed it.
 
@@ -266,16 +291,15 @@ def _apply_documents(
     a content hash is what a *read* document has. Minting one from the metadata
     would make an unread file indistinguishable from one we hold the bytes of,
     which is the single fact this whole mapping exists to keep straight.
+
+    The folder a file names is looked up in the same two places the tree walk
+    used — this delta's paths, then the ones the graph already held — rather
+    than re-scanning the Folder rows a third time.
     """
     counts = {
         "documents": 0, "filed_under": 0, "at_root": 0, "folder_unresolved": 0,
     }
     claim_source = f"{_authority(source)}:{source}"
-    by_external = {
-        str(o.props.get("external_id")): o
-        for o in service.graph.find("Folder", prop_equals={"source": source})
-        if o.props.get("external_id")
-    }
 
     for record in records:
         claims = [
@@ -308,7 +332,9 @@ def _apply_documents(
             # in the mirror when it is a fact about the customer's filing.
             counts["at_root"] += 1
             continue
-        folder = by_external.get(record.folder_external_id)
+        folder = _folder(service, source, _path_of(
+            record.folder_external_id, paths, known_paths,
+        ))
         if folder is None:
             counts["folder_unresolved"] += 1
             continue
@@ -344,20 +370,18 @@ def _folder(service: SyncService, source: str, path: str) -> Any:
     return service.graph.get(object_id("Folder", _folder_key(source, path)))
 
 
-def _parent_path(
-    service: SyncService, source: str, record: FolderRecord,
-    paths: dict[str, str],
+def _path_of(
+    external_id: str, paths: dict[str, str], known_paths: dict[str, str]
 ) -> str:
-    parent = record.parent_external_id
-    if not parent:
+    """This delta's placement first, then the one the graph already held.
+
+    In that order because a delta that renamed a folder is the newer truth,
+    and the graph's copy is what makes a delta of one document resolvable
+    against a tree nobody re-pulled.
+    """
+    if not external_id:
         return ""
-    if parent in paths:
-        return paths[parent]
-    found = service.graph.find(
-        "Folder", prop_equals={"source": source, "external_id": parent},
-        limit=1,
-    )
-    return str(found[0].props.get("path") or "") if found else ""
+    return paths.get(external_id) or known_paths.get(external_id, "")
 
 
 # ---------------------------------------------------------------------------

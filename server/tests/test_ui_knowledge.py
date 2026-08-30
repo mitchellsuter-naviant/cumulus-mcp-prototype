@@ -381,16 +381,46 @@ def test_the_sources_route_puts_health_and_contract_on_one_row(client):
     # the run and not the flow.
     assert sum(1 for r in rows.values() if r["flow_id"] == "vendor-sync") == 3
 
-    # One row arrives under no contract, and it is the seeded mock HRIS. The
-    # registry used to carry a fictional `hris-workday` Mapping beside the
-    # real `hris-workforce` one — two contracts for one subject, one of them
-    # describing a system that does not exist. Reconciling them to the true
-    # row leaves this delivery visibly undeclared, which is the honest
-    # reading: nothing is behind it, and B4 deletes the seed that emits it.
+    # Every feed Cumulus itself emits now lands under a declared contract. The
+    # registry used to carry a fictional `hris-workday` Mapping beside the real
+    # `hris-workforce` one — two contracts for one subject, one of them
+    # describing a system that does not exist — and the seed kept delivering
+    # under the fictional id after it was removed. Both halves are reconciled,
+    # so an undeclared row here would now be a finding about *us*. The screen's
+    # ability to report one is staged on purpose below.
     undeclared = {s for s, r in rows.items() if r["contract"] is None}
-    assert undeclared == {"hris-workday"}
-    assert rows["hris-workday"]["records_landed"] > 0
+    assert undeclared == set()
+    assert rows["hris-workforce"]["records_landed"] > 0
     assert body["problems"] == []
+
+
+def test_a_delivery_under_an_undeclared_source_is_reported_as_one(_client):
+    """The screen's oldest finding, staged rather than borrowed from a seed.
+
+    Every seed now delivers under a source `mappings.py` declares, so the
+    undeclared row has to be made deliberately: a feed nobody wrote a contract
+    for still gets a row, and the row says the contract is missing rather than
+    the delivery being dropped off the list. Its own world, because a delivery
+    into the module's shared one would be a row every other test here had to
+    know about.
+    """
+    from app.sync import SyncRequest
+
+    world = test_world.fresh()
+    world.sync.deliver(
+        SyncRequest.model_validate({
+            "source": "psa-timesheets",
+            "vendors": [{"external_id": "V-1", "name": "Contoso Consulting"}],
+        }),
+        actor="system:test",
+    )
+
+    rows = {r["source"]: r for r in _client.get(SOURCES_ROUTE).json()["sources"]}
+    assert {s for s, r in rows.items() if r["contract"] is None} == {
+        "psa-timesheets"
+    }
+    assert rows["psa-timesheets"]["records_landed"] > 0
+    assert rows["psa-timesheets"]["flow_id"] == "vendor-sync"
 
 
 def test_a_feed_with_no_mapping_is_reported_rather_than_dropped(client, monkeypatch):

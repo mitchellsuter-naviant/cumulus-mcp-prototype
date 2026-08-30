@@ -479,6 +479,37 @@ def test_a_steward_approving_links_the_company_the_run_would_not(booked, world):
     assert "Northwnd Traders" in northwind.props["aliases"]
 
 
+def test_the_decision_commits_under_the_queue_the_task_sat_in(booked, world):
+    """The routing was decided once, when the row escalated, and recorded.
+
+    `steward_queue_for(source)` chose the desk and the Task carries the answer.
+    Re-deriving it here from `record_kind` would be a second table able to
+    disagree with the first — and a Task that sat in the vendor queue would
+    then commit against the counterparty book on the data stewards' authority,
+    which nobody granted it. So the same decision on a Task filed at the other
+    desk is refused rather than quietly upgraded.
+    """
+    from app.gateway import Refused
+    from app.tasks import TaskDecision
+
+    _deliver(world, _ambiguous_customer())
+    task = next(
+        t for t in world.tasks.list()
+        if t.kind == "match_review" and "Northwnd" in t.title
+    )
+    assert task.queue == DATA_STEWARD_QUEUE
+    decision = TaskDecision(
+        verdict="corrected", decided_by="steward@naviant.com",
+        note="same company, the ERP row is a typo",
+        payload={"object_id": _company(world, "Northwind Traders").id},
+    )
+    misfiled = task.model_copy(update={
+        "decision": decision, "queue": "vendor-stewardship",
+    })
+    with pytest.raises(Refused):
+        world.sync.apply_match_decision(misfiled)
+
+
 def test_a_steward_rejecting_mints_a_company_not_a_vendor(booked, world):
     from app.tasks import TaskDecision
 

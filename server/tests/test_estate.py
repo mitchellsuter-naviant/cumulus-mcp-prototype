@@ -340,21 +340,36 @@ def test_team_slug_is_the_declared_natural_key():
     assert team_slug("") == ""
 
 
+#: The three modules `estate.py`'s own docstring says it may not reach. A
+#: connector that scored, ranked or minted would be a second copy of the
+#: resolution policy sitting below the Mapping where nobody could read it.
+OFF_LIMITS = {"graph", "resolution", "gateway"}
+
+
 def test_the_connector_does_nothing_semantic():
     """Risk decision 2, enforced rather than promised: no scoring, no
     precedence, no minting in `estate.py` — so it may not reach the entity
-    layer or the resolver to do any of it."""
+    layer or the resolver to do any of it.
+
+    Module paths are normalized to their last segment, because one import has
+    several spellings: `from .graph import`, `from app.graph import`,
+    `from . import graph` and `import app.graph` are the same reach, and a
+    guard that only knew the relative one would have waved the rest through.
+    """
     source = pathlib.Path(__file__).parent.parent / "app" / "estate.py"
     tree = ast.parse(source.read_text())
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            imported.add((node.module or "").lstrip("."))
+            module = (node.module or "").strip(".")
+            if module:
+                imported.add(module.rsplit(".", 1)[-1])
+            else:
+                # `from . import graph` — the module is named in the alias.
+                imported.update(a.name.rsplit(".", 1)[-1] for a in node.names)
         elif isinstance(node, ast.Import):
-            imported.update(a.name.split(".")[-1] for a in node.names)
-    assert "graph" not in imported
-    assert "resolution" not in imported
-    assert "gateway" not in imported
+            imported.update(a.name.rsplit(".", 1)[-1] for a in node.names)
+    assert imported & OFF_LIMITS == set()
 
 
 # -- through the real door ----------------------------------------------------
@@ -452,18 +467,23 @@ def test_every_feed_in_the_registry_declares_a_contract():
     A FeedSpec with no Mapping is a feed pulling rows under no declared
     contract — which the Sources screen would report as a finding, and which is
     a finding about *us* rather than about the customer's estate.
+
+    Both sides are derived rather than spelled out. A roster pinned here would
+    have to be edited by the very change that adds a feed — which means the
+    guard would be relaxed by the same hand that needs guarding, and a feed
+    added without a Mapping would look like a test that simply needed updating.
     """
     from app.mappings import MAPPINGS
 
     declared = {m.source for m in MAPPINGS}
-    assert {f.feed for f in FEEDS} == {
-        HRIS_WORKFORCE, "crm-book", "erp-sales", "erp-vendors",
-        "erp-purchase-orders", "office-calendar", "office-mail",
-        "hris-employment-events", "dms-library",
-    }
+    assert FEEDS and {f.feed for f in FEEDS} <= declared
+    # Every app the registry names is one this estate actually serves. Read off
+    # the recorded discovery payload, which changes only when somebody
+    # deliberately re-records it — so a sixth app moves the fixture and the
+    # registry together, the way a real sixth app does.
+    served = set(fx.NAMESPACES["namespaces"][0]["apps"])
     for spec in FEEDS:
-        assert spec.feed in declared, spec.feed
-        assert spec.app in ("crm", "erp", "office", "hris", "dms"), spec.feed
+        assert spec.app in served, spec.feed
         assert spec.resources
     workforce = next(f for f in FEEDS if f.feed == HRIS_WORKFORCE)
     assert workforce.resources == ("departments", "jobs", "employees")
@@ -539,9 +559,14 @@ def test_sync_now_pulls_one_feed_through_the_api(client, world, monkeypatch):
     ).json()
     assert body["outcome"] == "delivered"
     assert body["pulled"]["employees"] == 10
-    assert client.get("/api/v1/estate").json()["feeds"][0]["state"][
-        "last_outcome"
-    ] == "delivered"
+    # By id, not by position: the registry's order is not a contract, and a
+    # feed inserted above this one would otherwise silently move the assertion
+    # onto a feed that never pulled.
+    listed = next(
+        f for f in client.get("/api/v1/estate").json()["feeds"]
+        if f["feed"] == HRIS_WORKFORCE
+    )
+    assert listed["state"]["last_outcome"] == "delivered"
     assert world.graph.stats()["by_type"]["Employee"] == 8
 
 

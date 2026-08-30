@@ -345,7 +345,12 @@ def get_anomaly_service() -> AnomalyService:
 
 
 def get_sync_service() -> SyncService:
-    """The inbound feeds. Registers three flow bodies on the engine."""
+    """The inbound feeds. Registers ten flow bodies on the engine.
+
+    Five live in `sync.py` and the rest in `sync_commerce`, `sync_office` and
+    `sync_dms`, which register through `SyncService.__init__` so this stays the
+    one call that puts every feed on the engine.
+    """
     global _sync_service
     if _sync_service is None:
         graph = get_graph_service()

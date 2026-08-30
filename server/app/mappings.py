@@ -76,12 +76,16 @@ class Mapping:
     # `reference` (the map holds a pointer; the store stays external).
     custody: Literal["copy", "reference"] = "copy"
     collection: str = ""  # the Collection landed rows belong to
+    # `per-row task` means this feed's flow raises a Task per ambiguous row —
+    # the only escalation that reaches `steward_queue`. `windowed aggregate`
+    # means the flow counts what it could not resolve and reports it on the
+    # run; nobody is paged, and the export says so by omitting the queue.
     escalation: Literal["per-row task", "windowed aggregate"] = "per-row task"
-    # Where an ambiguous row goes for a human answer. Declared per feed
-    # because the person who can say whether two Northwinds are one company is
-    # not the person who decides whether an invoice gets paid; the default
-    # keeps every feed that predates the counterparty book exactly where it
-    # was, and C4 rebinds it without touching a flow.
+    # Where an ambiguous row goes for a human answer, when one is asked for.
+    # Declared per feed because the person who can say whether two Northwinds
+    # are one company is not the person who decides whether an invoice gets
+    # paid; the default keeps every feed that predates the counterparty book
+    # exactly where it was, and C4 rebinds it without touching a flow.
     steward_queue: str = "vendor-stewardship"
     notes: str = ""
 
@@ -411,7 +415,11 @@ MAPPINGS: tuple[Mapping, ...] = (
         freshness="pull, delta by updatedAt watermark",
         custody="copy",
         collection="source-landing",
-        escalation="windowed aggregate",
+        # Per row, like the CRM feed it shares a book with: an ambiguous
+        # customer raises a `match_review` Task and asserts nothing. Only the
+        # *item* side of this contract escalates on the aggregate, and it
+        # reaches no desk — see the note below.
+        escalation="per-row task",
         steward_queue="data-stewardship",
         notes=(
             "No dereference: an order line names an item by the ERP's "
@@ -684,9 +692,16 @@ def mappings_markdown(mappings: tuple[Mapping, ...] = MAPPINGS) -> str:
             lines.append(f"- Match policy: {m.match_policy}")
         if m.collection:
             lines.append(f"- Landed rows governed by Collection `{m.collection}`")
-        lines.append(
-            f"- Escalation: {m.escalation}, to the `{m.steward_queue}` queue"
+        # The queue is only named where a Task is actually raised. `per-row
+        # task` is the escalation that reaches a desk; a windowed aggregate is
+        # counted on the run and reported on a screen, and printing a steward
+        # queue beside it would have this published contract promise a human
+        # who is never asked.
+        queue = (
+            f", to the `{m.steward_queue}` queue"
+            if m.escalation == "per-row task" else ""
         )
+        lines.append(f"- Escalation: {m.escalation}{queue}")
         if m.notes:
             lines.append(f"- {m.notes}")
         lines.append("")

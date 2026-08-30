@@ -12,12 +12,13 @@ the run count, a flow with no runs reports zeroes rather than a distribution,
 and a $0.00 spend tile can say whether it means "nothing ran" or "nobody
 recorded what it cost".
 
-The fleet is eleven flows and ten definitions. One inbound feed —
-`calendar-sync` — is the last one with no declarative export, down from the
-five the workplan opened with. The registry still cannot be the list of what
-exists, and the tests below read the fleet off the engine either way: a
-definition is a *map*, a run is the territory, and the day the two disagree is
-the day this module has to be able to say so.
+The fleet is twelve flows and twelve definitions: two authored, and ten inbound
+feeds that every one of them now carries a declarative export for — down from
+the five with no map the workplan opened with, and no undeclared feed left. The
+registry still cannot be the list of what exists, and the tests below read the
+fleet off the engine either way: a definition is a *map*, a run is the
+territory, and the day the two disagree is the day this module has to be able
+to say so.
 """
 
 from datetime import timedelta
@@ -36,7 +37,8 @@ from app.reimbursements import SubmittedDocument
 from app.runs import RunRecord
 from tests import world as test_world
 
-# The eleven flows that run: two authored definitions and nine inbound feeds.
+# The ten inbound feeds that write the graph. With the two authored flows below
+# they are the twelve the fleet holds.
 SYNC_FLOWS = {
     "vendor-sync", "purchase-order-sync", "receiving-sync",
     "workforce-sync", "calendar-sync", "crm-sync", "sales-sync",
@@ -52,7 +54,7 @@ DECLARED_FLOWS = SYNC_FLOWS | {
 
 @pytest.fixture()
 def world():
-    """A fresh world: nine registered flow bodies, no runs, no tasks."""
+    """A fresh world: twelve registered flow bodies, no runs, no tasks."""
     return test_world.fresh()
 
 

@@ -217,7 +217,7 @@ def test_a_late_arrival_lands_on_an_already_seeded_store(monkeypatch):
     person = w.graph.get(object_id("Employee", OPERATOR_EMAIL))
     assert person.props["title"] == "Director, Platform & Operations"
     # Delivered, not patched in: the same feed, the same authority.
-    assert any(c.source == "hris:hris-workday" for c in person.claims)
+    assert any(c.source == "hris:hris-workforce" for c in person.claims)
     # The org chart and the skills came with him.
     assert [m.label for _, m in w.graph.neighbors(person.id, "reports_to", "out")] == [
         "Rowan Ellis"

@@ -821,16 +821,15 @@ def _apply_sales_orders(
             return None
         sku = by_external.get(external_id)
         if sku is None:
-            sku = next(
-                (
-                    str(known.props.get("sku") or known.natural_key)
-                    for known in service.graph.find("Item")
-                    if str(known.props.get("external_id") or "") == external_id
-                ),
-                None,
+            # Asked of the store by the property, the way `sync_dms` asks for a
+            # folder — a bare `find("Item")` filtered in Python here reads the
+            # whole catalogue to answer one order line.
+            known = service.graph.find(
+                "Item", prop_equals={"external_id": external_id}, limit=1,
             )
-            if sku is None:
+            if not known:
                 return None
+            sku = str(known[0].props.get("sku") or known[0].natural_key)
             by_external[external_id] = sku
         return service.graph.get(object_id("Item", sku))
 

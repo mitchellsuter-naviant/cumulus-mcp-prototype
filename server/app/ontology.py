@@ -617,9 +617,13 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("payload_hash", "string",
                       "what makes a byte-identical redelivery recognizable"),
             FieldSpec("record_kind", "enum",
-                      "vendor | po | rr | company | person — which book a "
-                      "steward's decision on this row writes into, and the "
-                      "only thing that survives from the flow that landed it"),
+                      "vendor | po | rr | company | person | employment-event "
+                      "— which book a steward's decision on this row writes "
+                      "into, and the only thing that survives from the flow "
+                      "that landed it. `employment-event` resolves to no book "
+                      "and reaches no steward, which is the ledger feed's "
+                      "whole claim: the row is kept, and nothing is asserted "
+                      "from it"),
             FieldSpec("landed_at", "date"),
         ),
         collection="source-landing",

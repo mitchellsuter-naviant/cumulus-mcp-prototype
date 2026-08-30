@@ -263,6 +263,13 @@ class CalendarEventRecord(BaseModel):
     all_day: bool = False
     location: str = ""
     status: str = "confirmed"
+    #: The provider's cancellation flag, carried raw. `None` from a feed that
+    #: states `status` itself; a bool from one that only has the flag, and then
+    #: the flow — not the connector — decides which declared enum value it is.
+    #: Which of a source's values belong to which enum is a mapping question,
+    #: and mapping questions are the flow's (`sync_office._importance` states
+    #: the same rule for `importance`).
+    cancelled: bool | None = None
     # Bind columns: attendance by work email, resolved on the way in.
     organizer_email: str = ""
     attendee_emails: list[str] = Field(default_factory=list)
@@ -419,6 +426,8 @@ class MailMessageRecord(BaseModel):
     conversation_id: str = ""
     received_at: str = ""
     sent_at: str = ""
+
+
 class EmploymentEventRecord(BaseModel):
     """One row of the HRIS's append-only employment ledger, carried whole.
 
@@ -597,9 +606,12 @@ class MatchTarget:
     #: Action carries the queue that may commit it, and the two desks are not
     #: interchangeable.
     action_id: str
-    #: Whose authority commits the write when no live principal carried one,
-    #: and which queue the Task sat in.
+    #: Whose authority commits the write when no live principal carried one.
     flow_id: str
+    #: The queue that binding falls back to for a Task carrying none. Not the
+    #: routing decision — `mappings.steward_queue_for` made that per *feed*,
+    #: and the Task records the answer. Two tables that could disagree about
+    #: which desk a decision came from is exactly the drift this is not.
     queue: str
     #: The natural key a *rejected* match mints under. Names for the two
     #: counterparty books; an address for a human, because two people who
@@ -1613,7 +1625,7 @@ class SyncService:
                           else "false", source=claim_source),
                     Claim(field="location", value=record.location,
                           source=claim_source),
-                    Claim(field="status", value=record.status,
+                    Claim(field="status", value=_event_status(record),
                           source=claim_source),
                     Claim(field="external_id", value=record.external_id,
                           source=claim_source),
@@ -1831,8 +1843,14 @@ class SyncService:
             # The steward, when a live caller carried one. A seed or a test
             # that did not is committing on the Flow's declared authority, and
             # `decided_by` on the entry still names whose judgment it was.
+            #
+            # The queue comes off the Task, because the Task is where the
+            # routing decision was written down: `steward_queue_for(source)`
+            # answered it per *feed* when the row escalated, and re-deriving it
+            # here from `record_kind` would let a rebound Mapping commit under
+            # a desk the Task never sat in.
             principal or flow_principal(
-                task.flow_id or target.flow_id, target.queue
+                task.flow_id or target.flow_id, task.queue or target.queue
             ),
             step_id="steward-decision", task_id=task.id,
             decided_by=task.decision.decided_by, target=source_record.ref(),
@@ -2002,6 +2020,24 @@ def _event_key(record: CalendarEventRecord) -> str:
     `GraphService.check_invariants`, and true to the provider besides: an
     event id is only unique within the calendar that holds it."""
     return f"{record.calendar_address}#{record.external_id}"
+
+
+def _event_status(record: CalendarEventRecord) -> str:
+    """A provider's cancellation flag as the declared `status` enum.
+
+    `CalendarEvent.status` is `confirmed | tentative | cancelled`, and a source
+    that reports a boolean `isCancelled` says which of those it means without
+    spelling it. Translating that is a vocabulary decision — the same kind
+    `sync_office._importance` makes — so it lives in the flow: the connector
+    carries the flag as it found it and has no opinion about the enum.
+
+    A feed that states `status` itself carries no flag and is taken at its
+    word, which is what keeps the mock seed's `tentative` a real third value
+    rather than something a boolean could never express.
+    """
+    if record.cancelled is None:
+        return record.status
+    return "cancelled" if record.cancelled else "confirmed"
 
 
 def _authority(source: str) -> str:  # noqa: D401

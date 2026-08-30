@@ -31,7 +31,12 @@ from .models import utcnow
 
 log = logging.getLogger("cumulus.workforce")
 
-HRIS_SOURCE = "hris-workday"
+#: The feed id this seed delivers under — the same one `mappings.py` declares
+#: and the estate connector's HRIS feed pulls into. One HRIS contract, one
+#: source id: a seed arriving under a name no Mapping claims would show on the
+#: Sources screen as a feed under no declared contract, which is a finding
+#: about us rather than about the customer's estate.
+HRIS_SOURCE = "hris-workforce"
 PEOPLE_AUTHORITY = "human:people-ops"
 
 # The console's operator: the person who signs in to this prototype. A real

@@ -1259,9 +1259,10 @@ def _seed_definitions() -> list[FlowDefinition]:
         ),
         # -- the sync fleet -------------------------------------------------
         #
-        # Five feeds used to write the graph with no declarative export to
-        # audit — a flow you can watch run and cannot read. These four are the
-        # first of them to get one, and every step id below was read off a
+        # Ten definitions, one per inbound feed that writes the graph, and the
+        # whole fleet: the carried debt the workplan opened with — "five flows
+        # write the graph with no map" — is closed, and nothing registers a
+        # sync body without a definition below it. Every step id was read off a
         # real journal rather than designed: an export that draws a step the
         # engine does not run is the exact divergence the transparency bar
         # exists to catch, and a map of a batch feed is only worth having if
@@ -1482,12 +1483,6 @@ def _seed_definitions() -> list[FlowDefinition]:
                          config={"event": "SalesRecordsSynced"}),
             ],
         ),
-        # The last four. Every feed that writes the graph now has a
-        # declarative export to audit, which is the carried debt the workplan
-        # opened with — "five flows write the graph with no map" — closed.
-        # The step ids below are the ones the runs actually journal, not a
-        # tidied-up spelling of them: an export that renamed a step would be
-        # a map of a flow nobody runs.
         FlowDefinition(
             id="workforce-sync",
             name="Workforce sync",
