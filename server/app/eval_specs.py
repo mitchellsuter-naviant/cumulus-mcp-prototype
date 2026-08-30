@@ -96,12 +96,189 @@ def _ap_deliveries(short: float = 0.0) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# The AP demo world
+# ---------------------------------------------------------------------------
+#
+# These deliveries used to live in `payables.py` as a startup seed, and this
+# module imported them. The seed is gone — the estate is the only world a
+# running server fills from — so the *data* moved here rather than dying with
+# it: it is a declared eval fixture, which is the one place invented records
+# still belong. It is copied verbatim, because the case worlds are graded and a
+# world that quietly changed shape would move every pass rate with it.
+#
+# Four vendors from the ERP, one cross-system match, one byte-identical
+# redelivery (echo suppression), and one misspelling that scores into the
+# steward band; then the orders and the receipts they are matched against.
+
+AP_CATALOG_LINES: dict[str, list[tuple[str, float]]] = {
+    "PO-7741": [("STL-0250", 2.0), ("FAS-M12", 3.0)],
+    "PO-7802": [("WLD-6013", 4.0), ("PPE-GLV", 2.0)],
+    "PO-7815": [("CNS-HYD", 3.0), ("FAS-M12", 2.0)],
+}
+
+#: sku -> (description, unit price). Held here rather than read out of
+#: `payables.CATALOG` so the fixture cannot drift when the stub reader's
+#: catalogue is edited: a graded world is a frozen thing.
+AP_CATALOG: dict[str, tuple[str, float]] = {
+    "STL-0250": ("Hot-rolled steel plate, 1/4 in", 486.00),
+    "FAS-M12": ("Grade 8 hex bolt, M12 x 60mm, box of 100", 128.75),
+    "WLD-6013": ("Welding rod E6013, 5kg", 92.40),
+    "PPE-GLV": ("Cut-resistant gloves, size L, 12 pair", 64.20),
+    "CNS-HYD": ("Hydraulic fluid ISO 46, 20L drum", 214.90),
+}
+
+
+def _catalog_lines(po_number: str) -> list[dict]:
+    return [
+        {
+            "sku": sku,
+            "description": AP_CATALOG[sku][0],
+            "quantity_ordered": quantity,
+            "unit_price_usd": AP_CATALOG[sku][1],
+        }
+        for sku, quantity in AP_CATALOG_LINES[po_number]
+    ]
+
+
+def _received_lines(po_number: str, shortfall: dict | None = None) -> list[dict]:
+    out = []
+    for sku, quantity in AP_CATALOG_LINES[po_number]:
+        received = quantity - (shortfall or {}).get(sku, 0)
+        out.append({
+            "sku": sku,
+            "description": AP_CATALOG[sku][0],
+            "quantity_received": received,
+            "condition": "short" if received < quantity else "good",
+        })
+    return out
+
+
+def ap_demo_deliveries() -> list[dict]:
+    """The vendor, order and receipt deliveries the AP demo world stands on."""
+    return [
+        {
+            "source": "erp-vendors",
+            "watermark": "2026-08-01T00:00:00Z",
+            "idempotency_key": "erp-vendors-001",
+            "vendors": [
+                {
+                    "external_id": "V-10041", "name": "Acme Industrial Inc.",
+                    "tax_id": "94-2711883", "status": "active",
+                    "payment_terms": "NET30", "remit_country": "US",
+                },
+                {
+                    "external_id": "V-10088", "name": "Northwind Traders LLC",
+                    "tax_id": "81-4410072", "status": "active",
+                    "payment_terms": "NET45", "remit_country": "US",
+                },
+                {
+                    "external_id": "V-10102", "name": "Bay State Fasteners Co.",
+                    "tax_id": "04-3390118", "status": "active",
+                    "payment_terms": "NET30", "remit_country": "US",
+                },
+                {
+                    "external_id": "V-10190", "name": "Cascade Welding Supply",
+                    "tax_id": "91-2038844", "status": "active",
+                    "payment_terms": "NET15", "remit_country": "US",
+                },
+            ],
+        },
+        # A second system's id for a vendor we already hold: the legal-form
+        # variant normalizes to the same key, so this auto-links and the vendor
+        # ends up with two source records. This is the master-data payoff.
+        {
+            "source": "procurement-coupa",
+            "watermark": "2026-08-02T00:00:00Z",
+            "idempotency_key": "coupa-001",
+            "vendors": [{
+                "external_id": "C-5501", "name": "ACME INDUSTRIAL, INCORPORATED",
+                "tax_id": "94-2711883", "status": "active",
+                "payment_terms": "NET30",
+            }],
+        },
+        # Byte-identical re-delivery: everything lands as `unchanged`.
+        {
+            "source": "erp-vendors",
+            "watermark": "2026-08-03T00:00:00Z",
+            "idempotency_key": "erp-vendors-002",
+            "vendors": [{
+                "external_id": "V-10041", "name": "Acme Industrial Inc.",
+                "tax_id": "94-2711883", "status": "active",
+                "payment_terms": "NET30", "remit_country": "US",
+            }],
+        },
+        # A misspelling from a legacy feed: scores in the steward band, so
+        # nothing is asserted and a match_review Task waits in the queue.
+        {
+            "source": "legacy-ap-extract",
+            "watermark": "2026-08-04T00:00:00Z",
+            "idempotency_key": "legacy-001",
+            "vendors": [{
+                "external_id": "L-77", "name": "Acme Industial Inc",
+                "status": "active",
+            }],
+        },
+        {
+            "source": "erp-purchase-orders",
+            "watermark": "2026-08-05T00:00:00Z",
+            "idempotency_key": "erp-po-001",
+            "purchase_orders": [
+                {
+                    "external_id": "PO-7741", "po_number": "PO-7741",
+                    "vendor_external_id": "V-10041",
+                    "vendor_name": "Acme Industrial Inc.",
+                    "ordered_date": "2026-08-05", "status": "open",
+                    "lines": _catalog_lines("PO-7741"),
+                },
+                {
+                    "external_id": "PO-7802", "po_number": "PO-7802",
+                    "vendor_external_id": "V-10088",
+                    "vendor_name": "Northwind Traders LLC",
+                    "ordered_date": "2026-08-07", "status": "open",
+                    "lines": _catalog_lines("PO-7802"),
+                },
+                {
+                    "external_id": "PO-7815", "po_number": "PO-7815",
+                    "vendor_external_id": "V-10102",
+                    "vendor_name": "Bay State Fasteners Co.",
+                    "ordered_date": "2026-08-09", "status": "open",
+                    "lines": _catalog_lines("PO-7815"),
+                },
+            ],
+        },
+        {
+            "source": "wms-receiving",
+            "watermark": "2026-08-12T00:00:00Z",
+            "idempotency_key": "wms-001",
+            "receiving_reports": [
+                {
+                    "external_id": "RR-5501", "receipt_number": "RR-5501",
+                    "po_number": "PO-7741", "received_date": "2026-08-11",
+                    "status": "complete", "lines": _received_lines("PO-7741"),
+                },
+                # One line short: the invoice that bills the full quantity will
+                # land a quantity variance, which is the point.
+                {
+                    "external_id": "RR-5510", "receipt_number": "RR-5510",
+                    "po_number": "PO-7802", "received_date": "2026-08-13",
+                    "status": "partial", "lines": _received_lines("PO-7802"),
+                },
+                {
+                    "external_id": "RR-5533", "receipt_number": "RR-5533",
+                    "po_number": "PO-7815", "received_date": "2026-08-15",
+                    "status": "complete", "lines": _received_lines("PO-7815"),
+                },
+            ],
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
 # The fixtures
 # ---------------------------------------------------------------------------
 #
-# Built by a function rather than held as module constants because the demo
-# world's deliveries come from `payables.py`, which imports its way back here
-# through the world builder. Nothing needs them at import time.
+# Built by a function rather than held as module constants: nothing needs a
+# `Fixture` at import time, and the seeder is the only caller.
 
 
 def declared_fixtures() -> list[Fixture]:
@@ -167,41 +344,42 @@ def declared_fixtures() -> list[Fixture]:
             **ap,
         ),
         Fixture(
-            id="expense/pat-on-the-roster",
-            name="Pat, on the roster",
+            id="expense/felicia-on-the-roster",
+            name="Felicia, on the roster",
             summary=(
                 "One Employee and nothing else. Org membership is a member_of "
                 "link rather than a field, so a fixture claiming `team` here "
                 "would be re-smuggling the string the ontology just retired."
             ),
             objects=[FixtureObject(
-                type="Employee", key="pat@customer.example",
+                type="Employee", key="felicia.marks@naviant.com",
                 props={
-                    "email": "pat@customer.example", "title": "Field Engineer",
+                    "email": "felicia.marks@naviant.com",
+                    "title": "Account Executive",
                 },
-                label="pat@customer.example",
+                label="felicia.marks@naviant.com",
             )],
             **expense,
         ),
         Fixture(
-            id="expense/kim-on-the-roster",
-            name="Kim, on the roster",
+            id="expense/john-on-the-roster",
+            name="John, on the roster",
             summary="One Employee, for the compound receipt a reviewer trims.",
             objects=[FixtureObject(
-                type="Employee", key="kim@customer.example",
-                props={"email": "kim@customer.example"},
-                label="kim@customer.example",
+                type="Employee", key="john.smith@naviant.com",
+                props={"email": "john.smith@naviant.com"},
+                label="john.smith@naviant.com",
             )],
             **expense,
         ),
         Fixture(
-            id="expense/sam-on-the-roster",
-            name="Sam, on the roster",
+            id="expense/nathan-on-the-roster",
+            name="Nathan, on the roster",
             summary="One Employee, for the restricted category that is denied.",
             objects=[FixtureObject(
-                type="Employee", key="sam@customer.example",
-                props={"email": "sam@customer.example"},
-                label="sam@customer.example",
+                type="Employee", key="nathan.pryce@naviant.com",
+                props={"email": "nathan.pryce@naviant.com"},
+                label="nathan.pryce@naviant.com",
             )],
             **expense,
         ),
@@ -210,33 +388,25 @@ def declared_fixtures() -> list[Fixture]:
 
 
 def _demo_world() -> Fixture:
-    """The world every seeded run stands on, as one fragment.
+    """The whole AP demo world as one fragment.
 
-    It belongs to no flow — it is what the whole prototype is set on — so its
-    `flow_id` is empty rather than guessed at.
+    It belongs to no flow — it is what the AP story as a whole is set on — so
+    its `flow_id` is empty rather than guessed at. It was the world a startup
+    seed built; now that the running server fills only from the estate, it is
+    a fixture and nothing else, which is why `derived_from` names this module.
     """
-    from .payables import (
-        _seed_po_delivery,
-        _seed_receiving_delivery,
-        _seed_vendor_deliveries,
-    )
-
     return Fixture(
         id="seed/demo-world",
         name="Demo world",
         summary=(
-            "The vendors, purchase orders and receiving reports every seeded "
-            "run stands on — including a byte-identical redelivery, a "
+            "The vendors, purchase orders and receiving reports the AP demo "
+            "history stands on — including a byte-identical redelivery, a "
             "cross-system match that auto-links, and a misspelling that waits "
             "for a steward."
         ),
-        deliveries=[
-            *_seed_vendor_deliveries(),
-            _seed_po_delivery(),
-            _seed_receiving_delivery(),
-        ],
+        deliveries=ap_demo_deliveries(),
         origin="declared",
-        derived_from="server/app/payables.py",
+        derived_from=DECLARED_IN,
         authored_by="platform-eng",
     )
 
@@ -466,7 +636,7 @@ AP_CASES = [
         ),
         fixture_id="ap/acme-po-7741-clean",
         trigger={
-            "submitted_by": "ap-intake@customer.example",
+            "submitted_by": "connie.alberts@naviant.com",
             "filename": "acme.pdf",
             "hint": "vendor=acme-industrial po=PO-7741 invoice=ACME-INV-1 "
                     "lines=STL-0250:2,FAS-M12:3",
@@ -526,7 +696,7 @@ AP_CASES = [
         ),
         fixture_id="ap/acme-po-7741-clean",
         trigger={
-            "submitted_by": "ap-intake@customer.example",
+            "submitted_by": "connie.alberts@naviant.com",
             "filename": "acme.pdf",
             "hint": "vendor=acme-industrial po=PO-7741 invoice=ACME-INV-2 "
                     "lines=STL-0250:2,FAS-M12:3 pricebump",
@@ -566,7 +736,7 @@ AP_CASES = [
         ),
         fixture_id="ap/acme-po-7741-short-receipt",
         trigger={
-            "submitted_by": "ap-intake@customer.example",
+            "submitted_by": "connie.alberts@naviant.com",
             "filename": "acme.pdf",
             "hint": "vendor=acme-industrial po=PO-7741 invoice=ACME-INV-3 "
                     "lines=STL-0250:2,FAS-M12:3",
@@ -604,7 +774,7 @@ AP_CASES = [
         ),
         fixture_id="ap/acme-po-7741-clean",
         trigger={
-            "submitted_by": "ap-intake@customer.example",
+            "submitted_by": "connie.alberts@naviant.com",
             "filename": "mer.pdf",
             "hint": "newvendor=meridian-supply nopo invoice=MER-1 "
                     "lines=PPE-GLV:2 total=190.00",
@@ -643,7 +813,7 @@ AP_CASES = [
         ),
         fixture_id="ap/acme-po-7741-meridian-onboarded",
         trigger={
-            "submitted_by": "ap-intake@customer.example",
+            "submitted_by": "connie.alberts@naviant.com",
             "filename": "mer2.pdf",
             "hint": "newvendor=meridian-supply nopo invoice=MER-2 "
                     "lines=PPE-GLV:1 total=112.00",
@@ -763,9 +933,9 @@ EXPENSE_CASES = [
         id="expense-in-policy-auto-approves",
         spec_id=EXPENSE_SPEC.id,
         name="An in-policy receipt with a stated purpose needs nobody",
-        fixture_id="expense/pat-on-the-roster",
+        fixture_id="expense/felicia-on-the-roster",
         trigger={
-            "employee": "pat@customer.example",
+            "employee": "felicia.marks@naviant.com",
             "commentary": "Team lunch after the Acme Phase 1 review.",
             "hint": "total=64.20 category=meals vendor=corner-bistro",
         },
@@ -778,7 +948,7 @@ EXPENSE_CASES = [
                         "requested_usd": 64.20,
                         "approved_usd": 64.20,
                         "state": "approved",
-                        "employee_email": "pat@customer.example",
+                        "employee_email": "felicia.marks@naviant.com",
                     },
                     link_counts={"has_expense_line": 1, "decided_by": 0},
                 ),
@@ -804,9 +974,9 @@ EXPENSE_CASES = [
             "less than the paper is legitimate and must not need a human; the "
             "two amounts are kept apart so the difference stays legible."
         ),
-        fixture_id="expense/pat-on-the-roster",
+        fixture_id="expense/felicia-on-the-roster",
         trigger={
-            "employee": "pat@customer.example",
+            "employee": "felicia.marks@naviant.com",
             "commentary": "Client dinner, Acme Phase 2.",
             "documents": [{
                 "filename": "dinner.jpg",
@@ -846,9 +1016,9 @@ EXPENSE_CASES = [
             "Rule. `origin: human` on both lines is what proves the reviewer's "
             "values were applied rather than logged."
         ),
-        fixture_id="expense/kim-on-the-roster",
+        fixture_id="expense/john-on-the-roster",
         trigger={
-            "employee": "kim@customer.example",
+            "employee": "john.smith@naviant.com",
             "commentary": "Two nights at the Acme onsite.",
             "hint": "compound total=210.00 category=lodging vendor=harbor-hotel",
         },
@@ -885,9 +1055,9 @@ EXPENSE_CASES = [
         id="expense-restricted-category-denied",
         spec_id=EXPENSE_SPEC.id,
         name="A restricted category is always reviewed, and can be denied",
-        fixture_id="expense/sam-on-the-roster",
+        fixture_id="expense/nathan-on-the-roster",
         trigger={
-            "employee": "sam@customer.example",
+            "employee": "nathan.pryce@naviant.com",
             "commentary": "Client gift wine for the Acme close.",
             "hint": "total=96.40 category=alcohol vendor=vintners-cellar",
         },

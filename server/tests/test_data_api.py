@@ -9,8 +9,8 @@ the graph has no write route.
 import pytest
 
 from app import data_collections
-from app.payables import seed_payables_if_empty
-from app.reimbursements import SubmittedDocument, seed_reimbursements_if_empty
+from app.reimbursements import SubmittedDocument
+from tests import demo_world
 from tests import world as test_world
 
 
@@ -59,7 +59,7 @@ def test_every_collection_declares_its_governed_properties():
 
 
 def test_collections_endpoint_carries_live_counts(client, world):
-    seed_reimbursements_if_empty(world.expenses)
+    demo_world.seed_expenses(world.expenses)
     rows = client.get("/api/v1/collections").json()
     by_id = {r["id"]: r for r in rows}
     assert by_id["knowledge-library"]["rows"] >= 9
@@ -89,7 +89,7 @@ def test_the_exported_collections_document_matches_the_registry(world):
 
 def test_documents_carry_regions_and_a_retention_date(client, world):
     request = world.expenses.submit(
-        "pat@customer.example",
+        "felicia.marks@naviant.com",
         documents=[SubmittedDocument(filename="r.jpg", hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
@@ -106,7 +106,7 @@ def test_documents_carry_regions_and_a_retention_date(client, world):
 
 def test_a_document_with_no_bytes_says_so(client, world):
     request = world.expenses.submit(
-        "pat@customer.example",
+        "felicia.marks@naviant.com",
         documents=[SubmittedDocument(filename="r.jpg", hint="total=10.00")],
     )
     resp = client.get(
@@ -142,7 +142,7 @@ def test_expiring_is_reported_not_swept(client, world):
     from app.models import utcnow
 
     world.expenses.submit(
-        "pat@customer.example",
+        "felicia.marks@naviant.com",
         documents=[SubmittedDocument(filename="r.jpg", hint="total=10.00")],
     )
     record = world.documents.store.list()[0]
@@ -158,7 +158,7 @@ def test_expiring_is_reported_not_swept(client, world):
 
 
 def test_sources_are_assembled_from_the_runs(client, world):
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     rows = client.get("/api/v1/sources").json()
     by_key = {(r["source"], r["kind"]): r for r in rows}
     erp = by_key[("erp-vendors", "vendors")]
@@ -202,7 +202,7 @@ def test_an_idempotent_redelivery_replays_the_same_run(client, owner, world):
 
 
 def test_runs_list_and_detail(client, world):
-    seed_reimbursements_if_empty(world.expenses)
+    demo_world.seed_expenses(world.expenses)
     rows = client.get(
         "/api/v1/runs", params={"flow_id": "expense-reimbursement"}
     ).json()
@@ -221,7 +221,7 @@ def test_runs_list_and_detail(client, world):
 
 
 def test_run_stats_counts_human_involvement(client, world):
-    seed_reimbursements_if_empty(world.expenses)
+    demo_world.seed_expenses(world.expenses)
     stats = client.get(
         "/api/v1/runs/stats", params={"flow_id": "expense-reimbursement"}
     ).json()
@@ -232,7 +232,7 @@ def test_run_stats_counts_human_involvement(client, world):
 
 
 def test_resuming_a_run_is_admin_only(client, world, owner):
-    seed_reimbursements_if_empty(world.expenses)
+    demo_world.seed_expenses(world.expenses)
     # With the owner fixture active every request needs a credential, so the
     # reads carry one too.
     run_id = client.get("/api/v1/runs", headers=owner).json()[0]["id"]
@@ -244,7 +244,7 @@ def test_resuming_a_run_is_admin_only(client, world, owner):
 
 
 def test_profiles_refresh_on_demand(client, owner, world):
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     resp = client.post("/api/v1/vendor-profiles/refresh", headers=owner)
     assert resp.status_code == 200
     assert resp.json()["vendors_profiled"] > 0
@@ -268,7 +268,10 @@ def test_the_catalog_lists_the_worlds_declared_in_code(client, world):
     # the same kind of thing as the world an eval case runs in.
     assert "seed:demo-world" not in by_id
     assert by_id["seed/demo-world"]["flow_id"] == ""
-    assert by_id["seed/demo-world"]["derived_from"].endswith("payables.py")
+    # It is a declared fixture and nothing else now: the startup seed that
+    # used to own these deliveries is gone, so the module that declares them
+    # is the module the catalog names.
+    assert by_id["seed/demo-world"]["derived_from"].endswith("eval_specs.py")
     assert len([r for r in rows if r["flow_id"]]) >= 6
 
 
@@ -316,7 +319,7 @@ def test_materializing_touches_nothing_real(client, world):
 
 
 def test_an_expense_fixture_is_thin_and_says_so(client, world):
-    body = client.get("/api/v1/worlds/expense/pat-on-the-roster").json()
+    body = client.get("/api/v1/worlds/expense/felicia-on-the-roster").json()
     # One Employee and no edges — correct, and worth being able to see rather
     # than inferring from a count.
     assert body["by_type"] == {"Employee": 1}
@@ -333,13 +336,13 @@ def test_a_world_is_shown_by_what_it_asserts_not_by_its_payload(client, world):
     """
     listed = client.get("/api/v1/worlds").json()[0]
     assert "deliveries" not in listed and "objects" not in listed
-    body = client.get("/api/v1/worlds/expense/pat-on-the-roster").json()
+    body = client.get("/api/v1/worlds/expense/felicia-on-the-roster").json()
     assert "deliveries" not in body["world"]
 
 
 def test_the_live_graph_comes_back_in_the_same_shape(client, world):
     """One renderer for the running graph and a declared one."""
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     body = client.get("/api/v1/graph/instances?limit=50").json()
     assert body["world"]["id"] == "live"
     assert "deliveries" not in body["world"]

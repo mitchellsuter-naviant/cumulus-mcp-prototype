@@ -143,7 +143,7 @@ class Session {
   }
 
   /// Who to name in the account menu — the person actually signed in, never
-  /// the persona they are watching as. The bar says "acting as Kim Reyes"; the
+  /// the persona they are watching as. The bar says "acting as John Smith"; the
   /// account menu is the one anchor that has to keep saying who you really
   /// are, and it used to say `dev@localhost` regardless of who was signed in.
   String get operatorEmail => operator?.email ?? email;

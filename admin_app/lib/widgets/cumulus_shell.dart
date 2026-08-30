@@ -620,11 +620,11 @@ class _KeyHint extends StatelessWidget {
 /// the same eyebrow/title/subtitle rhythm every page heading uses.
 ///
 /// While an impersonation is running the eyebrow spends itself on the operator
-/// instead of the role — "MITCHELL SUTER · ACTING AS" over "Kim Reyes" — so
+/// instead of the role — "MITCHELL SUTER · ACTING AS" over "John Smith" — so
 /// the bar answers *whose session is this* with two names rather than one and
 /// an inference. The role is worth the line the rest of the time, except when
 /// it is the person's own name, which is how the customer-user personas are
-/// named on the server: "TOMAS BERG" above "Tomas Berg" says nothing.
+/// named on the server: "TOMAS BERG" above "Connie Alberts" says nothing.
 class _PersonaFace extends StatelessWidget {
   final Session session;
   final bool canSwitch;

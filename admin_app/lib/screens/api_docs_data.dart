@@ -1237,13 +1237,13 @@ const employeeGroup = EndpointGroup(
 // ---- Calendars ---------------------------------------------------------------
 
 const _agendaShape = '''{
-  "email": "dana@customer.example",
-  "name": "Dana Whitfield",
+  "email": "dana.prentiss@naviant.com",
+  "name": "Dana Prentiss",
   "title": "Engagement Director",
   "calendar": {
     "id": "calendar_9f71ad7259af",
     "ref": "graph:Calendar/calendar_9f71ad7259af@rev2",
-    "address": "dana@customer.example",
+    "address": "dana.prentiss@naviant.com",
     "provider": "microsoft-365",
     "timezone": "America/New_York",
     "events": 46
@@ -1260,10 +1260,10 @@ const _agendaShape = '''{
       "ends_at": "2026-08-28T09:00:00",
       "all_day": false,
       "location": "Teams",
-      "organizer_email": "dana@customer.example",
+      "organizer_email": "dana.prentiss@naviant.com",
       "agenda_ref": "engagement:acme-phase-1",
       "attendees": [
-        {"email": "dana@customer.example", "name": "Dana Whitfield",
+        {"email": "dana.prentiss@naviant.com", "name": "Dana Prentiss",
          "required": true, "response": "accepted", "is_owner": true}
       ]
     }

@@ -62,7 +62,7 @@ LinkMethod = Literal["declared", "exact", "fuzzy", "human", "derived"]
 class Claim(BaseModel):
     """One source's assertion about one field of one object.
 
-    `source` is a namespaced actor: `human:dana@customer.example`,
+    `source` is a namespaced actor: `human:dana.prentiss@naviant.com`,
     `erp:vendors`, `flow:accounts-payable`, `model:gemini-3.7-flash`. The
     prefix before the colon is what precedence sorts on.
     """

@@ -64,7 +64,7 @@ class PersonaOption(BaseModel):
     id: str
     #: The principal uid this persona acts as. Carried so the console can
     #: resolve `impersonated_by` back to a name and say "Mitchell Suter,
-    #: acting as Kim Reyes" rather than only that impersonation is happening.
+    #: acting as John Smith" rather than only that impersonation is happening.
     uid: str
     label: str
     title: str

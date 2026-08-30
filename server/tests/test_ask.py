@@ -536,13 +536,13 @@ def test_graph_tools_answer_a_question_no_document_contains():
         "total=41.00 category=meals",
     ):
         world.expenses.submit(
-            "john.smith@customer.example",
+            "erin.tavares@naviant.com",
             documents=[SubmittedDocument(hint=hint)],
             commentary="Client visit to Acme.",
         )
 
     tools = Toolbox(world.knowledge, None, graph=world.graph)
-    resolved = tools.resolve_entity("Employee", "john.smith@customer.example")
+    resolved = tools.resolve_entity("Employee", "erin.tavares@naviant.com")
     assert resolved["resolved"] is not None
 
     rollup = tools.aggregate_edges(

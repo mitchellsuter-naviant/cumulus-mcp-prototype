@@ -17,6 +17,7 @@ from app.graph import (
     resolve_props,
 )
 from app.ontology import ONTOLOGY
+from tests import demo_world
 from tests import world as test_world
 
 
@@ -219,7 +220,7 @@ def test_ontology_endpoint_reports_declaration_and_reality(client, world):
     from app.reimbursements import SubmittedDocument
 
     world.expenses.submit(
-        "pat@customer.example",
+        "felicia.marks@naviant.com",
         documents=[SubmittedDocument(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
@@ -268,12 +269,12 @@ def test_the_analytical_question_is_a_traversal(client, world):
 
     for hint in ("total=64.20 category=meals", "total=32.50 category=travel"):
         world.expenses.submit(
-            "john.smith@customer.example",
+            "erin.tavares@naviant.com",
             documents=[SubmittedDocument(hint=hint)],
             commentary="Client visit to Acme.",
         )
     body = client.get(
-        "/api/v1/graph/employees/john.smith@customer.example/expenses",
+        "/api/v1/graph/employees/erin.tavares@naviant.com/expenses",
         params={"days": 180},
     ).json()
     assert body["requests"] == 2
@@ -287,27 +288,26 @@ def test_the_analytical_question_is_a_traversal(client, world):
 def test_an_own_scoped_persona_may_only_walk_from_itself(client, world):
     """The root of the traversal is a colleague's address, and anybody could
     guess one. Scope decides which roots a persona may start from."""
-    from app.reimbursements import seed_reimbursements_if_empty
-
-    seed_reimbursements_if_empty(world.expenses)
-    kim = {"X-Cumulus-Persona": "customer-user:kim"}
+    
+    demo_world.seed_expenses(world.expenses)
+    kim = {"X-Cumulus-Persona": "customer-user:ae"}
     own = client.get(
-        "/api/v1/graph/employees/kim@customer.example/expenses", headers=kim
+        "/api/v1/graph/employees/john.smith@naviant.com/expenses", headers=kim
     )
     assert own.status_code == 200 and own.json()["requests"] > 0
     refused = client.get(
-        "/api/v1/graph/employees/sam@customer.example/expenses", headers=kim
+        "/api/v1/graph/employees/nathan.pryce@naviant.com/expenses", headers=kim
     )
     assert refused.status_code == 403
     # A platform-scoped persona still reads anyone's spend; that is its job.
     assert client.get(
-        "/api/v1/graph/employees/sam@customer.example/expenses"
+        "/api/v1/graph/employees/nathan.pryce@naviant.com/expenses"
     ).status_code == 200
 
 
 def test_an_unknown_employee_is_an_empty_rollup_not_an_error(client, world):
     body = client.get(
-        "/api/v1/graph/employees/nobody@customer.example/expenses"
+        "/api/v1/graph/employees/nobody@naviant.com/expenses"
     ).json()
     assert body["requests"] == 0 and body["requested_usd"] == 0
     assert body["employee_object_id"] == ""
@@ -394,11 +394,9 @@ def test_authored_worlds_are_read_only_too(client):
 
 
 def test_the_seeded_world_conforms_to_its_ontology(world):
-    from app.payables import seed_payables_if_empty
-    from app.reimbursements import seed_reimbursements_if_empty
-
-    seed_reimbursements_if_empty(world.expenses)
-    seed_payables_if_empty(world.payables, sync=world.sync)
+        
+    demo_world.seed_expenses(world.expenses)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     violations = world.graph.check_invariants()
     assert violations == [], "\n".join(str(v) for v in violations)
 
@@ -504,9 +502,8 @@ def test_a_permissive_graph_reports_instead_of_refusing():
 
 
 def test_the_invariants_endpoint_reports_conformance(client, world):
-    from app.reimbursements import seed_reimbursements_if_empty
-
-    seed_reimbursements_if_empty(world.expenses)
+    
+    demo_world.seed_expenses(world.expenses)
     body = client.get("/api/v1/graph/invariants").json()
     assert body["ok"] is True
     assert body["violations"] == []
@@ -521,7 +518,7 @@ def test_claims_and_links_name_the_run_and_step_that_wrote_them(world):
     from app.reimbursements import SubmittedDocument
 
     request = world.expenses.submit(
-        "pat@customer.example",
+        "felicia.marks@naviant.com",
         documents=[SubmittedDocument(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
@@ -539,7 +536,7 @@ def test_a_step_records_what_it_wrote(world):
     from app.reimbursements import SubmittedDocument
 
     request = world.expenses.submit(
-        "pat@customer.example",
+        "felicia.marks@naviant.com",
         documents=[SubmittedDocument(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
@@ -560,13 +557,13 @@ def test_a_replayed_step_keeps_its_recorded_write_set(world):
     from app.reimbursements import SubmittedDocument
 
     request = world.expenses.submit(
-        "sam@customer.example",
+        "nathan.pryce@naviant.com",
         documents=[SubmittedDocument(hint="total=612.00 category=lodging")],
         commentary="Conference block rate for the finance summit.",
     )
     before = world.engine.get(request.run_id).writes()
     decided = world.tasks.decide(
-        request.task_id, "approved", "dana@customer.example"
+        request.task_id, "approved", "dana.prentiss@naviant.com"
     )
     world.expenses.resume_for_task(decided)
     after = world.engine.get(request.run_id)
@@ -645,9 +642,8 @@ def test_two_sources_disagreeing_is_still_a_conflict(graph):
 @pytest.fixture()
 def seeded(client, world):
     """The demo world: vendors landed by the sync feeds, POs, invoices."""
-    from app.payables import seed_payables_if_empty
-
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    
+    demo_world.seed_payables(world.payables, sync=world.sync)
     return client
 
 
@@ -965,8 +961,8 @@ def test_identity_survives_a_key_change(graph):
     """The email-changes case. Ids are minted, keys are aliases: re-keying an
     employee changes how records find them, not what anything references."""
     kim = graph.upsert(
-        "Employee", "kim@customer.example",
-        [Claim(field="name", value="Kim Reyes", source="flow:test")],
+        "Employee", "john.smith@naviant.com",
+        [Claim(field="name", value="John Smith", source="flow:test")],
     )
     request = graph.upsert(
         "ExpenseRequest", "run_x",
@@ -975,14 +971,14 @@ def test_identity_survives_a_key_change(graph):
     graph.link("submitted", kim.id, request.id)
 
     rekeyed = graph.rekey(
-        kim.id, "kim.reyes@customer.example", by="human:hr-admin",
+        kim.id, "john.q.smith@naviant.com", by="human:hr-admin",
     )
     assert rekeyed.id == kim.id  # identity unchanged
     # Both addresses resolve to the same entity — a journal that recorded the
     # old alias still dereferences.
-    assert graph.get(object_id("Employee", "kim@customer.example")).id == kim.id
+    assert graph.get(object_id("Employee", "john.smith@naviant.com")).id == kim.id
     assert (
-        graph.get(object_id("Employee", "kim.reyes@customer.example")).id == kim.id
+        graph.get(object_id("Employee", "john.q.smith@naviant.com")).id == kim.id
     )
     # The link never noticed.
     neighbors = graph.neighbors(kim.id, "submitted", "out")
@@ -995,14 +991,14 @@ def test_identity_survives_a_key_change(graph):
 
 
 def test_rekeying_onto_another_entity_is_refused(graph):
-    graph.upsert("Employee", "kim@customer.example",
+    graph.upsert("Employee", "john.smith@naviant.com",
                  [Claim(field="name", value="Kim", source="flow:test")])
-    dana = graph.upsert("Employee", "dana@customer.example",
+    dana = graph.upsert("Employee", "dana.prentiss@naviant.com",
                         [Claim(field="name", value="Dana", source="flow:test")])
     from app.graph import TBoxError
 
     with pytest.raises(TBoxError, match="supersede, not a rekey"):
-        graph.rekey(dana.id, "kim@customer.example", by="human:hr-admin")
+        graph.rekey(dana.id, "john.smith@naviant.com", by="human:hr-admin")
 
 
 def test_same_key_still_lands_on_one_entity(graph):

@@ -20,8 +20,8 @@ from app.reimbursements import (
     SubmittedDocument,
     apply_correction,
     parse_requested_amount,
-    seed_reimbursements_if_empty,
 )
+from tests import demo_world
 from tests import world as test_world
 
 
@@ -54,7 +54,7 @@ def test_policy_values_come_from_the_document(world):
 
 def test_editing_the_policy_changes_the_flow_without_code(world):
     request = world.expenses.submit(
-        "pat@customer.example", documents=[_doc(hint="total=150.00 category=meals")],
+        "felicia.marks@naviant.com", documents=[_doc(hint="total=150.00 category=meals")],
         commentary="Team lunch with the Acme delivery crew.",
     )
     assert request.state == "approved"
@@ -67,7 +67,7 @@ def test_editing_the_policy_changes_the_flow_without_code(world):
         )),
     )
     again = world.expenses.submit(
-        "pat@customer.example", documents=[_doc(hint="total=150.00 category=meals")],
+        "felicia.marks@naviant.com", documents=[_doc(hint="total=150.00 category=meals")],
         commentary="Second lunch, same crew.",
     )
     assert again.state == "pending"
@@ -110,7 +110,7 @@ def test_the_modelcall_records_the_prompt_revision_it_ran_on(world):
     steered, which is the same guarantee one step earlier.
     """
     request = world.expenses.submit(
-        "pat@customer.example", documents=[_doc(hint="total=64.20 category=meals")],
+        "felicia.marks@naviant.com", documents=[_doc(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme Phase 1 review.",
     )
     run = world.engine.get(request.run_id)
@@ -136,7 +136,7 @@ def test_editing_the_prompt_changes_what_the_modelcall_runs_on(world):
     assert prompt.source_ref == "knowledge:receipt-extraction-prompt@rev2"
 
     request = world.expenses.submit(
-        "pat@customer.example", documents=[_doc(hint="total=64.20 category=meals")],
+        "felicia.marks@naviant.com", documents=[_doc(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme Phase 1 review.",
     )
     run = world.engine.get(request.run_id)
@@ -157,7 +157,7 @@ def test_a_corpus_without_the_prompt_still_extracts():
     assert prompt.source_ref == "knowledge:receipt-extraction-prompt"
 
     request = world.expenses.submit(
-        "pat@customer.example", documents=[_doc(hint="total=64.20 category=meals")],
+        "felicia.marks@naviant.com", documents=[_doc(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme Phase 1 review.",
     )
     assert request.state == "approved"
@@ -172,7 +172,7 @@ def test_a_corpus_without_the_prompt_still_extracts():
 
 def test_a_compound_receipt_becomes_two_lines(world):
     request = world.expenses.submit(
-        "kim@customer.example",
+        "john.smith@naviant.com",
         documents=[_doc(hint="compound total=210.00 category=lodging")],
         commentary="Room and parking on one folio at the Acme onsite.",
     )
@@ -186,7 +186,7 @@ def test_a_compound_receipt_becomes_two_lines(world):
 
 def test_several_documents_in_one_submission(world):
     request = world.expenses.submit(
-        "sam@customer.example",
+        "nathan.pryce@naviant.com",
         documents=[
             _doc(hint="total=42.00 category=travel", filename="cab.jpg"),
             _doc(hint="total=38.50 category=meals", filename="lunch.jpg"),
@@ -222,7 +222,7 @@ def test_a_stated_claim_is_read_out_of_the_note(note, expected):
 
 def test_the_submitter_can_claim_less_than_the_receipt(world):
     request = world.expenses.submit(
-        "pat@customer.example",
+        "felicia.marks@naviant.com",
         documents=[_doc(
             hint="total=110.00 category=meals",
             note=(
@@ -241,14 +241,14 @@ def test_the_submitter_can_claim_less_than_the_receipt(world):
 
 def test_claiming_more_than_the_document_is_always_elevated(world):
     request = world.expenses.submit(
-        "pat@customer.example", documents=[_doc(hint="total=40.00 category=meals")],
+        "felicia.marks@naviant.com", documents=[_doc(hint="total=40.00 category=meals")],
     )
     # Patch the line upward the way a mis-parse would, then re-check.
     from app.reimbursements import PolicyValues, _check
 
     lines = apply_correction(
         request.lines, {"lines": [{"ordinal": 1, "requested_usd": 400.0}]},
-        "someone@customer.example",
+        "someone@naviant.com",
     )
     result = _check(lines, PolicyValues())
     assert any(e["kind"] == "amount-mismatch" for e in result["escalations"])
@@ -256,13 +256,13 @@ def test_claiming_more_than_the_document_is_always_elevated(world):
 
 def test_a_purpose_is_required_above_the_governed_amount(world):
     bare = world.expenses.submit(
-        "sam@customer.example", documents=[_doc(hint="total=120.00 category=meals")],
+        "nathan.pryce@naviant.com", documents=[_doc(hint="total=120.00 category=meals")],
     )
     assert bare.state == "pending"
     assert any(e.kind == "purpose-missing" for e in bare.escalations)
 
     stated = world.expenses.submit(
-        "sam@customer.example",
+        "nathan.pryce@naviant.com",
         documents=[_doc(hint="total=120.00 category=meals")],
         commentary="Dinner with the Acme team after the Phase 2 review.",
     )
@@ -274,7 +274,7 @@ def test_a_purpose_is_required_above_the_governed_amount(world):
 
 def test_over_limit_suspends_into_a_task_and_a_decision_resumes(world):
     request = world.expenses.submit(
-        "sam@customer.example",
+        "nathan.pryce@naviant.com",
         documents=[_doc(hint="total=612.00 category=lodging")],
         commentary="Conference block rate for the finance summit.",
     )
@@ -286,24 +286,24 @@ def test_over_limit_suspends_into_a_task_and_a_decision_resumes(world):
     assert run.status == "suspended" and run.suspended_at_step == "k1"
 
     decided = world.tasks.decide(
-        request.task_id, "approved", "dana@customer.example",
+        request.task_id, "approved", "dana.prentiss@naviant.com",
         note="Block rate confirmed against the event contract.",
     )
     resumed = world.expenses.resume_for_task(decided)
     assert resumed.state == "approved"
-    assert resumed.decided_by == "dana@customer.example"
+    assert resumed.decided_by == "dana.prentiss@naviant.com"
     assert world.engine.get(request.run_id).status == "succeeded"
 
 
 def test_rejection_denies(world):
     request = world.expenses.submit(
-        "sam@customer.example",
+        "nathan.pryce@naviant.com",
         documents=[_doc(hint="total=96.40 category=alcohol")],
         commentary="Client gift wine for the Acme close.",
     )
     assert any(e.kind == "restricted-category" for e in request.escalations)
     decided = world.tasks.decide(
-        request.task_id, "rejected", "dana@customer.example",
+        request.task_id, "rejected", "dana.prentiss@naviant.com",
         note="Out of policy §4.2 — use the gifting desk.",
     )
     resumed = world.expenses.resume_for_task(decided)
@@ -313,13 +313,13 @@ def test_rejection_denies(world):
 
 def test_a_correction_re_runs_the_checks_and_can_finish_the_run(world):
     request = world.expenses.submit(
-        "kim@customer.example",
+        "john.smith@naviant.com",
         documents=[_doc(hint="compound total=210.00 category=lodging")],
         commentary="Two nights at the Acme onsite.",
     )
     assert request.state == "pending"
     decided = world.tasks.decide(
-        request.task_id, "corrected", "dana@customer.example",
+        request.task_id, "corrected", "dana.prentiss@naviant.com",
         note="Trimmed the parking line to the reimbursable rate.",
         payload={"lines": [
             {"ordinal": 1, "purpose": "Two nights at the Acme onsite."},
@@ -341,12 +341,12 @@ def test_a_reviewer_can_add_a_line_the_extraction_missed(world):
     # No commentary, so the purpose check holds it: this is the escalation a
     # reviewer answers by editing the facts rather than by overriding a rule.
     request = world.expenses.submit(
-        "kim@customer.example",
+        "john.smith@naviant.com",
         documents=[_doc(hint="total=180.00 category=meals")],
     )
     assert request.state == "pending"
     decided = world.tasks.decide(
-        request.task_id, "corrected", "dana@customer.example",
+        request.task_id, "corrected", "dana.prentiss@naviant.com",
         note="Second receipt was stapled behind the first.",
         payload={
             "lines": [{
@@ -364,7 +364,7 @@ def test_a_reviewer_can_add_a_line_the_extraction_missed(world):
     resumed = world.expenses.resume_for_task(decided)
     assert len(resumed.lines) == 2
     added = resumed.lines[1]
-    assert added.origin == "human" and added.corrected_by == "dana@customer.example"
+    assert added.origin == "human" and added.corrected_by == "dana.prentiss@naviant.com"
     # A human-entered line is certain by definition: there is no model to be
     # uncertain about it.
     assert added.confidence == 1.0
@@ -373,13 +373,13 @@ def test_a_reviewer_can_add_a_line_the_extraction_missed(world):
 
 def test_confidence_correction_stops_the_uncertainty_flag_repeating(world):
     request = world.expenses.submit(
-        "pat@customer.example",
+        "felicia.marks@naviant.com",
         documents=[_doc(hint="blurry total=58.75 category=travel")],
         commentary="Airport transfer for the customer visit.",
     )
     assert any(e.kind == "extraction-uncertain" for e in request.escalations)
     decided = world.tasks.decide(
-        request.task_id, "corrected", "dana@customer.example",
+        request.task_id, "corrected", "dana.prentiss@naviant.com",
         note="Amount matches the card feed.",
         payload={"lines": [{"ordinal": 1, "requested_usd": 58.75}]},
     )
@@ -393,7 +393,7 @@ def test_confidence_correction_stops_the_uncertainty_flag_repeating(world):
 
 def test_documents_land_in_the_audit_collection_with_a_retention_date(world):
     request = world.expenses.submit(
-        "pat@customer.example", documents=[_doc(hint="total=64.20 category=meals")],
+        "felicia.marks@naviant.com", documents=[_doc(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
     document = world.documents.get(request.documents[0].document_id)
@@ -408,12 +408,12 @@ def test_documents_land_in_the_audit_collection_with_a_retention_date(world):
 
 def test_the_run_writes_the_expense_graph(world):
     request = world.expenses.submit(
-        "pat@customer.example", documents=[_doc(hint="total=64.20 category=meals")],
+        "felicia.marks@naviant.com", documents=[_doc(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
     from app.graph import object_id
 
-    employee = world.graph.get(object_id("Employee", "pat@customer.example"))
+    employee = world.graph.get(object_id("Employee", "felicia.marks@naviant.com"))
     assert employee is not None
     requests = world.graph.neighbors(employee.id, "submitted", "out")
     assert len(requests) == 1
@@ -430,11 +430,11 @@ def test_the_run_writes_the_expense_graph(world):
 
 def test_a_human_correction_outranks_the_model_in_the_claims(world):
     request = world.expenses.submit(
-        "kim@customer.example", documents=[_doc(hint="blurry total=90.00 category=meals")],
+        "john.smith@naviant.com", documents=[_doc(hint="blurry total=90.00 category=meals")],
         commentary="Dinner with the Acme team.",
     )
     decided = world.tasks.decide(
-        request.task_id, "corrected", "dana@customer.example",
+        request.task_id, "corrected", "dana.prentiss@naviant.com",
         payload={"lines": [{"ordinal": 1, "requested_usd": 72.0}]},
     )
     resumed = world.expenses.resume_for_task(decided)
@@ -447,7 +447,7 @@ def test_a_human_correction_outranks_the_model_in_the_claims(world):
 
 def test_replaying_a_finished_run_does_not_double_write_the_graph(world):
     request = world.expenses.submit(
-        "pat@customer.example", documents=[_doc(hint="total=64.20 category=meals")],
+        "felicia.marks@naviant.com", documents=[_doc(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
     before = world.graph.stats()
@@ -459,9 +459,9 @@ def test_replaying_a_finished_run_does_not_double_write_the_graph(world):
 
 
 def test_seed_drives_real_runs(world):
-    seeded = seed_reimbursements_if_empty(world.expenses)
+    seeded = demo_world.seed_expenses(world.expenses)
     assert seeded > 0
-    assert seed_reimbursements_if_empty(world.expenses) == 0  # idempotent
+    assert demo_world.seed_expenses(world.expenses) == 0  # idempotent
     rows = world.expenses.list()
     assert len(rows) == seeded
     assert all(row.run_id for row in rows)
@@ -499,21 +499,21 @@ def test_a_submission_is_filed_under_the_submitter_s_email(client, world):
     body = client.post(
         "/api/v1/reimbursements",
         json={"documents": [{"hint": "total=21.00 category=meals"}]},
-        headers={"X-Cumulus-Persona": "customer-user:kim"},
+        headers={"X-Cumulus-Persona": "customer-user:ae"},
     ).json()
-    assert body["employee"] == "kim@customer.example"
+    assert body["employee"] == "john.smith@naviant.com"
 
 
 def test_an_own_scoped_persona_only_ever_sees_its_own(client, world):
     """`mine=true` and the bare list are one answer for somebody whose reach
     is their own work. Unasked, this endpoint used to hand every submitter's
     receipts to anybody who was signed in."""
-    seed_reimbursements_if_empty(world.expenses)
-    kim = {"X-Cumulus-Persona": "customer-user:kim"}
+    demo_world.seed_expenses(world.expenses)
+    kim = {"X-Cumulus-Persona": "customer-user:ae"}
     mine = client.get(
         "/api/v1/reimbursements", params={"mine": True}, headers=kim
     ).json()
-    assert mine and {r["employee"] for r in mine} == {"kim@customer.example"}
+    assert mine and {r["employee"] for r in mine} == {"john.smith@naviant.com"}
     assert client.get("/api/v1/reimbursements", headers=kim).json() == mine
 
     everyone = client.get("/api/v1/reimbursements").json()
@@ -566,14 +566,14 @@ def test_a_suspended_run_shows_the_newest_facts(world):
     extraction and the reason already dealt with.
     """
     request = world.expenses.submit(
-        "sam@customer.example",
+        "nathan.pryce@naviant.com",
         documents=[_doc(hint="total=487.90 category=lodging")],
     )
     assert {e.kind for e in request.escalations} == {
         "over-limit", "purpose-missing"
     }
     decided = world.tasks.decide(
-        request.task_id, "corrected", "dana@customer.example",
+        request.task_id, "corrected", "dana.prentiss@naviant.com",
         note="Purpose confirmed against the event contract.",
         payload={"lines": [{
             "ordinal": 1,
@@ -585,7 +585,7 @@ def test_a_suspended_run_shows_the_newest_facts(world):
     assert resumed.state == "pending"
     assert {e.kind for e in resumed.escalations} == {"over-limit"}
     assert resumed.review_rounds == 1
-    assert resumed.decided_by == "dana@customer.example"
+    assert resumed.decided_by == "dana.prentiss@naviant.com"
     assert resumed.lines[0].purpose.startswith("Conference block rate")
     assert resumed.lines[0].origin == "human"
     # And the row points at the *new* gate, not the decided one.
@@ -594,7 +594,7 @@ def test_a_suspended_run_shows_the_newest_facts(world):
 
     final = world.expenses.resume_for_task(
         world.tasks.decide(
-            resumed.task_id, "approved", "dana@customer.example",
+            resumed.task_id, "approved", "dana.prentiss@naviant.com",
             note="Rate is contractual; approving over the limit.",
         )
     )
@@ -624,11 +624,11 @@ EXPENSE_VISIBLE = {
     # workspace is theirs — the six that stopped for a decision and the six
     # that auto-approved. Lens 4 calls a Workspace impersonal: you watch how
     # a workstream runs, not only the parts that stopped for you.
-    "customer-user:nadia": 12,
-    "customer-user:rowan": 12,
+    "customer-user:controller": 12,
+    "customer-user:ceo": 12,
     # Submits and owns no queue: her own four, and this is what she saw
     # before too — she is the persona that was already scoped correctly.
-    "customer-user:kim": 4,
+    "customer-user:ae": 4,
     # Bound to `ap-clerk` only, and has never filed an expense.
     "customer-user:ap": 0,
 }
@@ -638,7 +638,7 @@ EXPENSE_VISIBLE = {
 def test_the_expense_table_shows_the_work_you_are_accountable_for(
     client, world, persona, expected
 ):
-    seed_reimbursements_if_empty(world.expenses)
+    demo_world.seed_expenses(world.expenses)
     rows = client.get(
         "/api/v1/reimbursements", headers={"X-Cumulus-Persona": persona}
     ).json()
@@ -650,7 +650,7 @@ def test_the_expense_strip_counts_the_table_under_it(
     client, world, persona, expected
 ):
     """The same agreement the AP strip owes its table, for the same reason."""
-    seed_reimbursements_if_empty(world.expenses)
+    demo_world.seed_expenses(world.expenses)
     headers = {"X-Cumulus-Persona": persona}
     rows = client.get("/api/v1/reimbursements", headers=headers).json()
     stats = client.get("/api/v1/reimbursements/stats", headers=headers).json()
@@ -662,10 +662,10 @@ def test_the_approver_of_a_queue_can_open_the_queue_s_rows(client, world):
     """The defect, named. Nadia owns `expense-review` and has filed nothing
     herself, so narrowing her to `principal.email` emptied the very table her
     open tasks are about."""
-    seed_reimbursements_if_empty(world.expenses)
-    nadia = {"X-Cumulus-Persona": "customer-user:nadia"}
+    demo_world.seed_expenses(world.expenses)
+    nadia = {"X-Cumulus-Persona": "customer-user:controller"}
     rows = client.get("/api/v1/reimbursements", headers=nadia).json()
-    assert rows and "nadia@customer.example" not in {r["employee"] for r in rows}
+    assert rows and "raymond.fitzgerald@naviant.com" not in {r["employee"] for r in rows}
 
     # Owning the queue this flow routes to makes the whole workstream hers —
     # the requests that stopped for her decision *and* the ones that never
@@ -683,13 +683,13 @@ def test_mine_stays_a_real_filter_for_an_approver(client, world):
     """"My expenses" and "the queue I approve" are two questions, and an
     approver asks both. Collapsing them would hide Nadia's own receipts inside
     the queue she reviews."""
-    seed_reimbursements_if_empty(world.expenses)
-    nadia = {"X-Cumulus-Persona": "customer-user:nadia"}
+    demo_world.seed_expenses(world.expenses)
+    nadia = {"X-Cumulus-Persona": "customer-user:controller"}
     assert client.get(
         "/api/v1/reimbursements", params={"mine": True}, headers=nadia
     ).json() == []
     # For a submitter who owns no queue the two answers coincide, as before.
-    kim = {"X-Cumulus-Persona": "customer-user:kim"}
+    kim = {"X-Cumulus-Persona": "customer-user:ae"}
     assert (
         client.get("/api/v1/reimbursements", params={"mine": True}, headers=kim).json()
         == client.get("/api/v1/reimbursements", headers=kim).json()
@@ -699,14 +699,14 @@ def test_mine_stays_a_real_filter_for_an_approver(client, world):
 def test_a_request_outside_your_slice_is_missing_not_forbidden(client, world):
     """404 rather than 403: a 403 confirms the id exists, which is the one bit
     an unauthorized caller should not get back."""
-    seed_reimbursements_if_empty(world.expenses)
+    demo_world.seed_expenses(world.expenses)
     request_id = "run_er_seed11"  # Sam's, pending in expense-review
     assert client.get(
         f"/api/v1/reimbursements/{request_id}",
-        headers={"X-Cumulus-Persona": "customer-user:nadia"},
+        headers={"X-Cumulus-Persona": "customer-user:controller"},
     ).status_code == 200
     refused = client.get(
         f"/api/v1/reimbursements/{request_id}",
-        headers={"X-Cumulus-Persona": "customer-user:kim"},
+        headers={"X-Cumulus-Persona": "customer-user:ae"},
     )
     assert refused.status_code == 404

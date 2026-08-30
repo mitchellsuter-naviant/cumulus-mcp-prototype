@@ -7,10 +7,17 @@ is the whole of that, for the platform kind of Role.
 The roster, and the shape of each entry is two facts plus its queues:
 
     persona            authority   scope     acts as
-    naviant-engineer   owner       platform  Mitchell Suter
+    naviant-engineer   owner       platform  Mitchell Suter — operates the deployment
     naviant-support    user        platform  nobody — not in the org chart
-    customer-admin     admin       tenant    Sam Okafor
-    customer-user      user        own       Tomas · Nadia · Kim · Rowan
+    customer-admin     admin       tenant    Nathan Pryce, IT Manager
+    customer-user      user        own       Raymond · Connie · Karen · Diane · John
+
+**Everybody below the two Naviant rows is a real Naviant employee**, at the
+work address the estate's HRIS actually holds for them. The invented cast that
+used to sit here (`@customer.example`) was replaced when the estate became the
+only world: a persona whose email resolves to nothing opens onto an empty hub
+and an empty calendar, and every screen it is used to test then tests the
+fallback rather than the screen.
 
 `authority` is a rung on the existing write ladder, so every `require_role`
 call in the server keeps working unchanged. `scope` is the orthogonal read
@@ -31,6 +38,12 @@ the only thing an audit reader needs that the rewrite would otherwise lose.
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+#: The console's operator: whoever signs in to this deployment. It used to live
+#: in `workforce.py` beside an invented org chart; that module was the mock
+#: world and went with it, and the operator's identity belongs here anyway —
+#: `ENGINEER` below is the same fact with the rest of the answer attached.
+OPERATOR_EMAIL = "masuter@naviant.com"
 
 #: Every queue Tasks actually route to. Declared here because a persona binds
 #: to queues and nothing else in the system enumerates them — `tasks.py` only
@@ -77,18 +90,19 @@ class Persona:
 # The roster
 # ---------------------------------------------------------------------------
 #
-# Every persona is a real person wherever one exists, because a persona with
-# no `Employee` behind it opens onto an empty hub, an empty calendar and no
-# expense history — which teaches you nothing about the screen you are
-# testing. Naviant Support is the one exception, and honestly so: support
-# staff are not in the customer's org chart, and their hub should say that
-# rather than invent a record.
+# Every customer persona is a real person in the estate's HRIS, because a
+# persona with no `Employee` behind it opens onto an empty hub, an empty
+# calendar and no expense history — which teaches you nothing about the screen
+# you are testing. The two **Naviant** personas are the honest exceptions:
+# neither the engineer operating the deployment nor a support engineer
+# diagnosing a ticket is in the customer's org chart, and their hub should say
+# so rather than invent a record.
 #
 # The customer-user personas differ from each other in the *queues* they bind
-# to, which is the whole point. "Can Tomas post this invoice" and "can Kim post
-# this invoice" are different questions with different answers, and the write
-# ladder cannot tell them apart — they sit on the same rung and own different
-# work.
+# to, which is the whole point. "Can Connie post this invoice" and "can John
+# post this invoice" are different questions with different answers, and the
+# write ladder cannot tell them apart — they sit on the same rung and own
+# different work.
 
 ENGINEER = Persona(
     id="naviant-engineer",
@@ -96,12 +110,13 @@ ENGINEER = Persona(
     authority="owner",
     scope="platform",
     queues=ALL_QUEUES,
-    email="masuter@naviant.com",
+    email=OPERATOR_EMAIL,
     uid="persona_naviant_engineer",
     person="Mitchell Suter",
     title="Director, Platform & Operations",
     blurb="Builds and operates the deployment. Sees every plane, decides "
-          "anything, and is the only persona that may act as another.",
+          "anything, and is the only persona that may act as another. Not in "
+          "the customer's HRIS, so the personal surfaces say so.",
 )
 
 SUPPORT = Persona(
@@ -124,57 +139,76 @@ CUSTOMER_ADMIN = Persona(
     label="Customer Admin",
     authority="admin",
     scope="tenant",
-    queues=("vendor-stewardship", "data-stewardship", "knowledge-curation",
-            "eval-review"),
-    email="sam@customer.example",
+    queues=("knowledge-curation", "eval-review"),
+    email="nathan.pryce@naviant.com",
     uid="persona_customer_admin",
-    person="Sam Okafor",
-    title="Cloud Platform Lead",
-    blurb="Governs the customer's own map — knowledge, flows, access — and "
-          "sees none of Naviant's platform internals.",
+    person="Nathan Pryce",
+    title="IT Manager",
+    blurb="Governs the customer's own map — knowledge, flows, connectors, "
+          "access — and sees none of Naviant's platform internals. The IT "
+          "owner, not a finance approver: the master-data desks belong to the "
+          "Controller, who is accountable for what they decide.",
 )
 
-_USERS: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
+# (persona slug, work email, person, title, queues, blurb). The slug is written
+# out rather than sliced off the email because these ids are typed into a
+# header by hand — `customer-user:controller` says which desk is being tested,
+# where `customer-user:raymond.fitzgerald` says only who sits at it.
+_USERS: tuple[tuple[str, str, str, str, tuple[str, ...], str], ...] = (
     (
-        "ap@customer.example", "Tomas Berg", "Accounts Payable Specialist",
+        "controller", "raymond.fitzgerald@naviant.com", "Raymond Fitzgerald",
+        "Controller",
+        ("ap-clerk", "expense-review", "vendor-stewardship",
+         "data-stewardship"),
+        "The finance decision-maker: approves the spend and owns both "
+        "master-data desks — who Cumulus pays, and who it thinks it is "
+        "dealing with. Test a reimbursement above the policy limit, a "
+        "posting gate, and a steward call on a vendor that will not resolve.",
+    ),
+    (
+        "ap", "connie.alberts@naviant.com", "Connie Alberts",
+        "Accounts Payable Specialist",
         ("ap-clerk",),
-        "Works the AP queue. Test the posting gate, a vendor that will not "
-        "resolve, and a three-way match that misses.",
+        "Works the AP queue and nothing else. Test the posting gate and a "
+        "three-way match that misses — then the same act as the Controller, "
+        "who may also rule on the vendor behind it.",
     ),
     (
-        "nadia@customer.example", "Nadia Farrell", "Finance & Operations Lead",
-        ("expense-review", "ap-clerk"),
-        "Approves expenses and owns the spend picture. Test the management "
-        "dashboard and a reimbursement above the policy limit.",
+        "hr", "karen.boothe@naviant.com", "Karen Boothe", "HR Generalist",
+        ("hr",),
+        "The only persona bound to the HR queue, so a PTO request routed "
+        "there has an owner. Her worker status is On Leave in the live HRIS, "
+        "which is a fact the hub should show rather than smooth over.",
     ),
     (
-        "kim@customer.example", "Kim Reyes", "Senior Data Engineer",
+        "ceo", "diane.vogel@naviant.com", "Diane Vogel",
+        "Chief Executive Officer",
+        ("expense-review",),
+        "The org-wide read. Every department rolls up here, so it is the "
+        "persona for a view that should span the whole company.",
+    ),
+    (
+        "ae", "john.smith@naviant.com", "John Smith", "Account Executive",
         (),
         "Submits expenses and owns no queue at all. The persona that proves "
         "scoping works: everything an approver can do is refused here.",
-    ),
-    (
-        "rowan@customer.example", "Rowan Ellis", "Managing Partner",
-        ("expense-review",),
-        "The org-wide read. Every team rolls up here, so it is the persona "
-        "for a view that should span the whole company.",
     ),
 )
 
 CUSTOMER_USERS: tuple[Persona, ...] = tuple(
     Persona(
-        id=f"customer-user:{email.split('@')[0]}",
+        id=f"customer-user:{slug}",
         label=name,
         authority="user",
         scope="own",
         queues=queues,
         email=email,
-        uid=f"persona_{email.split('@')[0]}",
+        uid=f"persona_{slug}",
         person=name,
         title=title,
         blurb=blurb,
     )
-    for email, name, title, queues, blurb in _USERS
+    for slug, email, name, title, queues, blurb in _USERS
 )
 
 #: Grouped the way the switcher shows them.
@@ -190,8 +224,11 @@ ALL_PERSONAS: tuple[Persona, ...] = tuple(
 _BY_ID = {p.id: p for p in ALL_PERSONAS}
 
 #: The persona a session starts in. The engineer, because the console's first
-#: job is to be developed against — and because he is a real employee, so the
-#: personal surfaces have something in them from the first render.
+#: job is to be developed against and only an `owner` reaches every screen.
+#: He is deliberately *not* in the customer's org chart, so the personal
+#: surfaces open on their not-in-the-workforce state — which is the state a
+#: deployed operator actually sees, and therefore the one worth developing
+#: against. Switch to a customer persona to work a populated hub.
 DEFAULT_PERSONA = ENGINEER
 
 

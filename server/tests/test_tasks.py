@@ -12,8 +12,9 @@ import app.deps as deps
 from app.api_keys import InMemoryApiKeyDirectory
 from app.config import settings
 from app.identities import IdentityService, InMemoryMachineIdentityDirectory
-from app.tasks import InMemoryTaskDirectory, TaskService, seed_tasks_if_empty
+from app.tasks import InMemoryTaskDirectory, TaskService
 from app.users import InMemoryUserDirectory
+from tests import demo_world
 from tests import world as test_world
 
 
@@ -28,10 +29,10 @@ def client(_client):
     ordering and filter assertions below are actually about.
     """
     deps._task_service = TaskService(InMemoryTaskDirectory())
-    seed_tasks_if_empty(deps._task_service)
+    demo_world.seed_tasks(deps._task_service)
     oldest = deps._task_service.list(status="open")[-1]
     deps._task_service.decide(
-        oldest.id, verdict="approved", decided_by="nadia@customer.example"
+        oldest.id, verdict="approved", decided_by="raymond.fitzgerald@naviant.com"
     )
     return _client
 
@@ -57,7 +58,7 @@ def test_no_seeded_task_names_a_ref_that_does_not_resolve(_client):
     thought to re-check.
     """
     world = test_world.fresh()
-    seed_tasks_if_empty(world.tasks)
+    demo_world.seed_tasks(world.tasks)
     tasks = world.tasks.list()
     assert tasks
 
@@ -75,7 +76,7 @@ def test_no_seeded_task_names_a_ref_that_does_not_resolve(_client):
 
 
 def test_seed_is_idempotent(client):
-    assert seed_tasks_if_empty(deps._task_service) == 0
+    assert demo_world.seed_tasks(deps._task_service) == 0
 
 
 def test_seeded_queue_lists_open_first_high_priority_first(client):

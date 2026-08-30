@@ -28,9 +28,10 @@ def my_agenda(
 ) -> Agenda:
     """The signed-in person's window. Defaults to the current week, Monday-first.
 
-    A principal with no Employee record — Naviant Support, a machine
-    credential — gets the demo persona's calendar, with `persona_note` saying
-    whose it is.
+    A principal with no Employee record — the Naviant engineer, Naviant
+    Support, a machine credential — gets an empty week with `persona_note`
+    saying they are not in the workforce. No substitute is shown: somebody
+    else's week reads as your own.
     """
     require_reader(principal)
     return get_calendar_service().agenda(principal.email, start=start, days=days)
@@ -42,8 +43,9 @@ def list_calendars(
 ) -> list[CalendarSummary]:
     """Every mirrored calendar, with its owner and next block.
 
-    The org-wide view: it is what shows that the mirror covers the whole
-    workforce rather than one demo persona.
+    The org-wide view: it is what shows how much of the workforce the mirror
+    actually covers — and, before any office feed has pulled, that it covers
+    none of it yet.
     """
     require_reader(principal)
     return get_calendar_service().calendars()

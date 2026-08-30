@@ -505,18 +505,3 @@ def build_employee_service(
     return EmployeeService(
         directory, knowledge, tasks, graph, answer_backend, teams
     )
-
-
-def seed_employee_if_empty(service: EmployeeService) -> int:
-    """One pending PTO request paired with the seeded task_pto_seed_01."""
-    if service.directory.get_request("pto_seed_01") is not None:
-        return 0
-    service.directory.put_request(PtoRequest(
-        id="pto_seed_01", email=personas.DEFAULT_PERSONA.email,
-        start_date="2026-10-12", end_date="2026-10-20", days=7,
-        note="Family trip", state="pending",
-        reason="over the governed 3-day window; routed to HR",
-        task_id="task_pto_seed_01",
-        created_at_iso=(utcnow() - timedelta(hours=20)).isoformat(),
-    ))
-    return 1

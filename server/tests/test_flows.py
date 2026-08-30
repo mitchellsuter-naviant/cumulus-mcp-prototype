@@ -78,7 +78,7 @@ def submit_expenses(world, count: int, hint: str = "total=42.00 category=meals")
     """Real runs of the real flow — the only kind this module measures now."""
     for index in range(count):
         world.expenses.submit(
-            "pat@customer.example",
+            "felicia.marks@naviant.com",
             documents=[SubmittedDocument(filename=f"r{index}.jpg", hint=hint)],
             commentary="Team lunch with the Acme delivery crew.",
         )

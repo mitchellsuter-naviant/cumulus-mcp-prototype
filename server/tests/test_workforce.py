@@ -8,16 +8,9 @@ why the fields became links.
 import pytest
 
 from app.graph import object_id
-from app.payables import seed_payables_if_empty
-from app.reimbursements import seed_reimbursements_if_empty
-from app.workforce import (
-    ASSIGNMENTS,
-    CAPABILITIES,
-    EMPLOYEES,
-    TEAMS,
-    seed_workforce_if_empty,
-)
+from tests import demo_world
 from tests import world as test_world
+from tests.demo_world import ASSIGNMENTS, CAPABILITIES, EMPLOYEES, TEAMS
 
 
 @pytest.fixture()
@@ -26,9 +19,9 @@ def world():
     # Order matters, and it is the point: the expense seed mints employees
     # from submissions, so the HRIS delivery lands onto people who already
     # exist rather than minting a parallel set.
-    seed_reimbursements_if_empty(w.expenses)
-    seed_payables_if_empty(w.payables, sync=w.sync)
-    seed_workforce_if_empty(w.sync, w.graph)
+    demo_world.seed_expenses(w.expenses)
+    demo_world.seed_payables(w.payables, sync=w.sync)
+    demo_world.seed_workforce(w.sync, w.graph)
     return w
 
 
@@ -48,15 +41,15 @@ def test_the_firm_lands_once(world):
 
 def test_seeding_twice_changes_nothing(world):
     before = world.graph.stats()
-    assert seed_workforce_if_empty(world.sync, world.graph) == 0
+    assert demo_world.seed_workforce(world.sync, world.graph) == 0
     assert world.graph.stats() == before
 
 
 def test_the_org_chart_is_a_traversal(world):
-    """"Who is in Rowan's line" — four levels, and no string matching."""
+    """"Who is in the CEO's line" — every level, and no string matching."""
     graph = world.graph
-    rowan = graph.get(object_id("Employee", "rowan@customer.example"))
-    assert rowan.props["title"] == "Managing Partner"
+    ceo = graph.get(object_id("Employee", demo_world.CEO))
+    assert ceo.props["title"] == "Chief Executive Officer"
 
     def line(person, depth=1):
         found = []
@@ -65,22 +58,22 @@ def test_the_org_chart_is_a_traversal(world):
             found.extend(line(report, depth + 1))
         return found
 
-    chart = line(rowan)
-    assert len(chart) == len(EMPLOYEES) - 1  # everyone but the partner
+    chart = line(ceo)
+    assert len(chart) == len(EMPLOYEES) - 1  # everyone but the CEO
     assert max(depth for depth, _ in chart) == 3
-    assert (1, "Dana Whitfield") in chart
-    assert (3, "Kim Reyes") in chart
+    assert (1, "Raymond Fitzgerald") in chart
+    assert (3, "Connie Alberts") in chart
 
 
 def test_teams_nest_and_have_leads(world):
     graph = world.graph
-    delivery = graph.get(object_id("Team", "delivery"))
-    parents = [o.label for _, o in graph.neighbors(delivery.id, "subteam_of", "out")]
-    subteams = [o.label for _, o in graph.neighbors(delivery.id, "subteam_of", "in")]
-    leads = [o.label for _, o in graph.neighbors(delivery.id, "led_by", "out")]
-    assert parents == ["Firm Leadership"]
-    assert set(subteams) == {"Data Engineering", "Cloud Platform"}
-    assert leads == ["Dana Whitfield"]
+    finance = graph.get(object_id("Team", "finance-administration"))
+    parents = [o.label for _, o in graph.neighbors(finance.id, "subteam_of", "out")]
+    subteams = [o.label for _, o in graph.neighbors(finance.id, "subteam_of", "in")]
+    leads = [o.label for _, o in graph.neighbors(finance.id, "led_by", "out")]
+    assert parents == ["Executive"]
+    assert set(subteams) == {"Information Technology"}
+    assert leads == ["Raymond Fitzgerald"]
     # Every team has exactly one lead — the cardinality is enforced, so this
     # is a check on the data rather than on the model.
     for team in TEAMS:
@@ -91,15 +84,17 @@ def test_teams_nest_and_have_leads(world):
 def test_who_can_do_this_is_answerable(world):
     """The Capability competency question, with the proficiency on the link."""
     graph = world.graph
-    dbt = graph.get(object_id("Capability", "dbt"))
-    assert "dbt projects" in dbt.props["description"]
+    payables = graph.get(object_id("Capability", "accounts-payable"))
+    assert "Three-way matching" in payables.props["description"]
     holders = {
         person.label: link.props["proficiency"]
-        for link, person in graph.neighbors(dbt.id, "has_capability", "in")
+        for link, person in graph.neighbors(payables.id, "has_capability", "in")
     }
-    assert holders == {"Priya Raghavan": "expert", "Kim Reyes": "practising"}
+    assert holders == {
+        "Raymond Fitzgerald": "expert", "Connie Alberts": "expert",
+    }
     # Evidence travels with the holding, not with the person or the skill.
-    for link, _ in graph.neighbors(dbt.id, "has_capability", "in"):
+    for link, _ in graph.neighbors(payables.id, "has_capability", "in"):
         assert link.props["evidenced_by"]
         assert link.method == "human"
 
@@ -115,21 +110,21 @@ def test_every_assignment_landed(world):
 def test_a_skill_is_asserted_by_people_not_observed_by_a_system(world):
     """Two origins in one Collection, and the claims say which is which."""
     graph = world.graph
-    capability = graph.get(object_id("Capability", "dbt"))
+    capability = graph.get(object_id("Capability", "accounts-payable"))
     assert {c.source for c in capability.claims} == {"human:people-ops"}
-    person = graph.get(object_id("Employee", "kim@customer.example"))
+    person = graph.get(object_id("Employee", "john.smith@naviant.com"))
     assert any(c.source == "hris:hris-workforce" for c in person.claims)
 
 
 def test_the_hris_outranks_the_flow_that_minted_the_employee(world):
-    """Kim's email is claimed twice — by the flow that first saw her submit,
-    and by the HRIS. Both are retained; `hris` outranks `flow`, so the system
-    of record for people wins without anything being overwritten."""
-    person = world.graph.get(object_id("Employee", "kim@customer.example"))
+    """The AE's email is claimed twice — by the flow that first saw him
+    submit, and by the HRIS. Both are retained; `hris` outranks `flow`, so the
+    system of record for people wins without anything being overwritten."""
+    person = world.graph.get(object_id("Employee", "john.smith@naviant.com"))
     sources = [c.source for c in person.claims if c.field == "email"]
     assert "flow:expense-reimbursement" in sources
     assert "hris:hris-workforce" in sources
-    assert person.props["email"] == "kim@customer.example"
+    assert person.props["email"] == "john.smith@naviant.com"
     # Same value from both, so it is history rather than disagreement.
     assert "email" not in person.conflicts()
 
@@ -179,9 +174,9 @@ def test_an_unresolved_reference_escalates_as_one_aggregate(world):
             "source": "hris-workforce",
             "employees": [{
                 "external_id": "WD-9999",
-                "email": "ghost@customer.example",
+                "email": "ghost@naviant.com",
                 "name": "Ghost Contractor",
-                "manager_email": "nobody@customer.example",
+                "manager_email": "nobody@naviant.com",
                 "team_slug": "no-such-team",
             }],
         }),

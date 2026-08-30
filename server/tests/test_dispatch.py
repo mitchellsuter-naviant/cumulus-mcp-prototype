@@ -31,7 +31,7 @@ from app.sync import SyncRequest
 from app.tasks import InMemoryTaskDirectory, Task, TaskService
 from tests import world as test_world
 
-TOMAS = next(p for p in personas.CUSTOMER_USERS if p.email.startswith("ap@"))
+CLERK = personas.get("customer-user:ap")
 
 
 @pytest.fixture()
@@ -129,13 +129,13 @@ def test_a_flow_emitted_event_leaves_the_run(world):
                      "tax_id": "94-2711883"}],
     }), actor="system:test")
     record = world.payables.submit(
-        "ap@customer.example", filename="mer.pdf",
+        "connie.alberts@naviant.com", filename="mer.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 "
              "total=190.00",
     )
     world.payables.resume_for_task(
-        world.tasks.decide(record.task_id, "approved", TOMAS.email),
-        principal_for(TOMAS),
+        world.tasks.decide(record.task_id, "approved", CLERK.email),
+        principal_for(CLERK),
     )
 
     posted = [e for e in world.dispatcher.events.list() if e.name == "InvoicePosted"]
@@ -198,7 +198,7 @@ def test_every_sync_feed_starts_through_the_dispatcher(world):
                                "po_number": "PO-1"}],
         "teams": [{"external_id": "T-1", "slug": "finance-ops",
                    "name": "Finance Ops"}],
-        "calendars": [{"external_id": "C-1", "address": "ops@customer.example",
+        "calendars": [{"external_id": "C-1", "address": "ops@naviant.com",
                        "name": "Ops"}],
     }), actor="system:test")
 

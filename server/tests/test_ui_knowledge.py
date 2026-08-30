@@ -28,7 +28,6 @@ from fastapi import HTTPException
 import app.deps as deps
 from app import data_collections, personas, ui_api
 from app.auth import Principal
-from app.calendars import seed_calendars_if_empty
 from app.estate import (
     HRIS_WORKFORCE,
     EstateConnector,
@@ -36,13 +35,11 @@ from app.estate import (
     InMemoryConnectorStateStore,
 )
 from app.ontology import ONTOLOGY
-from app.payables import seed_payables_if_empty
-from app.reimbursements import seed_reimbursements_if_empty
 from app.runs import RunRecord, StepRecord
 from app.ui_api import UNGOVERNED, get_ui_principal
 from app.usage import READ, InMemoryAssetUsageStore
-from app.workforce import seed_workforce_if_empty
 from tests import estate_fixtures as fx
+from tests import demo_world
 from tests import world as test_world
 
 ONTOLOGY_ROUTE = "/api/ui/v1/ontology"
@@ -81,10 +78,10 @@ def _as(persona_id: str) -> dict[str, str]:
 def seeded():
     """A world where every flow that reaches the graph has actually run."""
     world = test_world.build()
-    seed_payables_if_empty(world.payables, sync=world.sync)
-    seed_workforce_if_empty(world.sync, world.graph)
-    seed_calendars_if_empty(world.sync, world.graph)
-    seed_reimbursements_if_empty(world.expenses)
+    demo_world.seed_payables(world.payables, sync=world.sync)
+    demo_world.seed_workforce(world.sync, world.graph)
+    demo_world.seed_calendars(world.sync, world.graph)
+    demo_world.seed_expenses(world.expenses)
     return world
 
 
@@ -381,15 +378,21 @@ def test_the_sources_route_puts_health_and_contract_on_one_row(client):
     # the run and not the flow.
     assert sum(1 for r in rows.values() if r["flow_id"] == "vendor-sync") == 3
 
-    # Every feed Cumulus itself emits now lands under a declared contract. The
-    # registry used to carry a fictional `hris-workday` Mapping beside the real
-    # `hris-workforce` one — two contracts for one subject, one of them
-    # describing a system that does not exist — and the seed kept delivering
-    # under the fictional id after it was removed. Both halves are reconciled,
-    # so an undeclared row here would now be a finding about *us*. The screen's
-    # ability to report one is staged on purpose below.
+    # Three feeds arrive under no declared contract, and the screen says so
+    # for each. They are the AP *test fixture*'s deliveries: the map lost
+    # `procurement-coupa`, `legacy-ap-extract` and `wms-receiving` when the
+    # mock world died, because the estate runs none of those systems. This
+    # is the reading the row is for — a feed nobody wrote a contract for is
+    # reported, never dropped — and here it is a true statement about a
+    # fixture rather than a finding about the deployment.
     undeclared = {s for s, r in rows.items() if r["contract"] is None}
-    assert undeclared == set()
+    assert undeclared == {
+        "procurement-coupa", "legacy-ap-extract", "wms-receiving",
+    }
+    assert all(rows[s]["records_landed"] > 0 for s in undeclared)
+    # The receiving flow keeps its Tier-2 definition even with no Mapping:
+    # the machinery is real, the system behind it is the honest gap.
+    assert rows["wms-receiving"]["flow_id"] == "receiving-sync"
     assert rows["hris-workforce"]["records_landed"] > 0
     assert body["problems"] == []
 
@@ -433,7 +436,9 @@ def test_a_feed_with_no_mapping_is_reported_rather_than_dropped(client, monkeypa
     rows = {r["source"]: r for r in client.get(SOURCES_ROUTE).json()["sources"]}
     assert rows["erp-vendors"]["contract"] is None
     assert rows["erp-vendors"]["records_landed"] > 0
-    assert rows["procurement-coupa"]["contract"] is not None
+    # And the feeds beside it keep theirs: one missing contract is one row's
+    # finding, not the screen giving up on the join.
+    assert rows["hris-workforce"]["contract"] is not None
 
 
 def test_a_pushed_feed_carries_no_pull_state(client):
@@ -798,7 +803,7 @@ def test_sync_now_refuses_a_persona_that_reads_only_its_own_work(estate_client):
     from a route that assumed platform reach."""
     refused = estate_client.post(
         f"{SOURCES_ROUTE}/{HRIS_WORKFORCE}/sync-now",
-        headers=_as("customer-user:kim"),
+        headers=_as("customer-user:ae"),
     )
     assert refused.status_code == 403
     assert "reads only its own" in refused.json()["detail"]

@@ -27,6 +27,17 @@ provenance, or human judgment. The commerce feeds reify because a vendor name
 is fuzzy and a steward rules on the match; the HRIS feed binds because a work
 email is exact and nobody adjudicates it. The validation refuses a bind
 mapping that names a ``lands_as`` type, so the distinction cannot blur.
+
+**Every Mapping here describes a system the customer actually runs.** Three
+once did not — `procurement-coupa`, `legacy-ap-extract` and `wms-receiving`
+were contracts for systems invented to give a seeded demo world something to
+arrive from — and they retired with that world. `receiving-sync` keeps its
+Flow, its wire shape and its Tier-2 definition, because the goods-received leg
+of a three-way match is real machinery that evals exercise; what it does not
+keep is a Mapping, because this estate has no receiving system to declare a
+contract with. The Sources screen renders that gap as a feed under no declared
+contract, which is the finding it exists to make — and the same reading it
+gives any feed that turns up unannounced.
 """
 
 from __future__ import annotations
@@ -123,53 +134,6 @@ MAPPINGS: tuple[Mapping, ...] = (
             "name — stated because it is why a vendor here can reach a "
             "steward that an ERP with tax ids would have resolved outright."
         ),
-    ),
-    Mapping(
-        id="procurement-coupa",
-        source="procurement-coupa",
-        system="Procurement (Coupa)",
-        summary=(
-            "The procurement system's supplier records. Second voice on the "
-            "same vendors — where it disagrees with the ERP, both claims are "
-            "kept and precedence resolves."
-        ),
-        transport="push",
-        payload="VendorRecord",
-        strategy="reify",
-        lands_as="SourceRecord",
-        resolves_to=("Vendor",),
-        identity=(
-            IdentityBinding(column="name", object_type="Vendor",
-                            key="normalized legal name"),
-        ),
-        precedence_source="procurement",
-        match_policy="knowledge:entity-resolution-policy",
-        collection="source-landing",
-        escalation="per-row task",
-    ),
-    Mapping(
-        id="legacy-ap-extract",
-        source="legacy-ap-extract",
-        system="Legacy AP system (one-time extract)",
-        summary=(
-            "A flat extract from the retiring AP system. Dirty on purpose — "
-            "misspellings and defunct vendors are what the steward queue is "
-            "for."
-        ),
-        transport="file-drop",
-        payload="VendorRecord",
-        strategy="reify",
-        lands_as="SourceRecord",
-        resolves_to=("Vendor",),
-        identity=(
-            IdentityBinding(column="name", object_type="Vendor",
-                            key="normalized legal name"),
-        ),
-        precedence_source="erp",
-        match_policy="knowledge:entity-resolution-policy",
-        freshness="one-time",
-        collection="source-landing",
-        escalation="per-row task",
     ),
     Mapping(
         id="erp-purchase-orders",
@@ -314,31 +278,10 @@ MAPPINGS: tuple[Mapping, ...] = (
             "`parentDepartmentId` and `headEmployeeId` as a department's slug "
             "and a work email, because no column on the wire carries either "
             "by id. Capabilities are deliberately absent: a skill is asserted "
-            "by people, not observed by a system, so the catalogue and its "
-            "assignments carry `human:people-ops` authority instead."
+            "by people, not observed by a system, so nothing this contract "
+            "carries may write one — the `Capability` type stands declared "
+            "and unwritten until somebody asserts against it."
         ),
-    ),
-    Mapping(
-        id="wms-receiving",
-        source="wms-receiving",
-        system="Warehouse management (receiving)",
-        summary=(
-            "Receiving reports — the goods-actually-arrived leg of the "
-            "three-way match, keyed to the PO they book in against."
-        ),
-        transport="push",
-        payload="ReceivingRecord",
-        strategy="reify",
-        lands_as="ReceivingReport",
-        resolves_to=("PurchaseOrder",),
-        identity=(
-            IdentityBinding(column="po_number", object_type="PurchaseOrder",
-                            key="po number"),
-        ),
-        precedence_source="erp",
-        match_policy="knowledge:entity-resolution-policy",
-        collection="source-landing",
-        escalation="windowed aggregate",
     ),
     Mapping(
         id="crm-book",

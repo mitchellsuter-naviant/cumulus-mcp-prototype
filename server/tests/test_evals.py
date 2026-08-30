@@ -149,7 +149,7 @@ def test_a_milestone_sees_only_what_had_been_written(service, world):
     from app.reimbursements import SubmittedDocument
 
     request = world.expenses.submit(
-        "pat@customer.example",
+        "felicia.marks@naviant.com",
         documents=[SubmittedDocument(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
@@ -166,7 +166,7 @@ def test_steps_upto_reports_a_step_the_run_never_reached(service, world):
     from app.reimbursements import SubmittedDocument
 
     request = world.expenses.submit(
-        "sam@customer.example",
+        "nathan.pryce@naviant.com",
         documents=[SubmittedDocument(hint="total=612.00 category=lodging")],
         commentary="Conference block rate for the finance summit.",
     )
@@ -187,9 +187,9 @@ def test_a_case_declaring_an_unreachable_milestone_fails_legibly(service):
     )
     case = EvalCase(
         id="held", spec_id="probe", name="over the limit, nobody decided",
-        fixture_id=register(service, "probe/sam", "sam@customer.example"),
+        fixture_id=register(service, "probe/sam", "nathan.pryce@naviant.com"),
         trigger={
-            "employee": "sam@customer.example",
+            "employee": "nathan.pryce@naviant.com",
             "hint": "total=612.00 category=lodging",
         },
         expectations=[MilestoneExpectation(
@@ -235,7 +235,7 @@ def test_trajectory_is_scoped_to_the_milestone(service):
         id="known-vendor", spec_id="probe", name="known vendor",
         fixture_id=fixture.id,
         trigger={
-            "submitted_by": "ap@customer.example",
+            "submitted_by": "connie.alberts@naviant.com",
             "hint": "vendor=acme-industrial nopo invoice=A-1 lines=PPE-GLV:1 total=80.00",
         },
         decisions=[ScriptedDecision(verdict="approved")],
@@ -435,9 +435,9 @@ def test_a_milestone_with_no_expectations_is_never_vacuous(service):
     )
     case = EvalCase(
         id="empty", spec_id="probe", name="asserts nothing at all",
-        fixture_id=register(service, "probe/sam", "sam@customer.example"),
+        fixture_id=register(service, "probe/sam", "nathan.pryce@naviant.com"),
         trigger={
-            "employee": "sam@customer.example",
+            "employee": "nathan.pryce@naviant.com",
             "hint": "total=612.00 category=lodging",
         },
         expectations=[MilestoneExpectation(milestone="committed")],
@@ -457,9 +457,9 @@ def test_a_terminal_milestone_refuses_a_run_that_did_not_finish(service):
     )
     case = EvalCase(
         id="held", spec_id="probe", name="still at the gate",
-        fixture_id=register(service, "probe/sam", "sam@customer.example"),
+        fixture_id=register(service, "probe/sam", "nathan.pryce@naviant.com"),
         trigger={
-            "employee": "sam@customer.example",
+            "employee": "nathan.pryce@naviant.com",
             "hint": "total=612.00 category=lodging",
         },
         expectations=[MilestoneExpectation(
@@ -488,9 +488,9 @@ def test_a_milestone_copied_onto_another_flow_names_what_that_flow_ran(service):
     )
     case = EvalCase(
         id="copied", spec_id="probe", name="an AP anchor on an expense flow",
-        fixture_id=register(service, "probe/sam", "sam@customer.example"),
+        fixture_id=register(service, "probe/sam", "nathan.pryce@naviant.com"),
         trigger={
-            "employee": "sam@customer.example",
+            "employee": "nathan.pryce@naviant.com",
             "commentary": "Client gift wine for the Acme close.",
             "hint": "total=96.40 category=alcohol vendor=vintners-cellar",
         },
@@ -546,9 +546,9 @@ def test_a_wrong_expected_value_fails_with_both_values(service):
     )
     case = EvalCase(
         id="wrong", spec_id="probe", name="deliberately wrong",
-        fixture_id=register(service, "probe/pat", "pat@customer.example"),
+        fixture_id=register(service, "probe/pat", "felicia.marks@naviant.com"),
         trigger={
-            "employee": "pat@customer.example",
+            "employee": "felicia.marks@naviant.com",
             "commentary": "Team lunch after the Acme review.",
             "hint": "total=64.20 category=meals",
         },
@@ -574,9 +574,9 @@ def test_an_ambiguous_empty_key_is_refused_rather_than_guessed(service):
     )
     case = EvalCase(
         id="ambiguous", spec_id="probe", name="two lines, no key",
-        fixture_id=register(service, "probe/kim", "kim@customer.example"),
+        fixture_id=register(service, "probe/kim", "john.smith@naviant.com"),
         trigger={
-            "employee": "kim@customer.example",
+            "employee": "john.smith@naviant.com",
             "commentary": "Two nights at the Acme onsite.",
             "hint": "compound total=140.00 category=lodging",
         },
@@ -605,9 +605,9 @@ def test_unlisted_fields_can_be_required(service):
     )
     case = EvalCase(
         id="drift", spec_id="probe", name="spec behind the flow",
-        fixture_id=register(service, "probe/pat", "pat@customer.example"),
+        fixture_id=register(service, "probe/pat", "felicia.marks@naviant.com"),
         trigger={
-            "employee": "pat@customer.example",
+            "employee": "felicia.marks@naviant.com",
             "commentary": "Team lunch after the Acme review.",
             "hint": "total=64.20 category=meals",
         },
@@ -754,11 +754,11 @@ def test_the_catalog_elides_the_payload_and_the_fixture_serves_it(client, world)
 
 def test_previewing_a_fixture_shows_what_it_asserts(client, world):
     body = client.get(
-        "/api/v1/evals/fixtures/expense/pat-on-the-roster/preview"
+        "/api/v1/evals/fixtures/expense/felicia-on-the-roster/preview"
     ).json()
     assert body["error"] == ""
     assert body["by_type"] == {"Employee": 1}
-    assert body["world"]["id"] == "expense/pat-on-the-roster"
+    assert body["world"]["id"] == "expense/felicia-on-the-roster"
 
 
 def test_flow_id_narrows_the_catalog(client, world):
@@ -876,9 +876,9 @@ def probe():
     store = _EditableSpecStore(spec, [])
     service = EvalService(store)
     store.case_list = [
-        _probe_case(service, "probe-a", "pat@customer.example", 64.20),
-        _probe_case(service, "probe-b", "kim@customer.example", 128.50),
-        _probe_case(service, "probe-c", "lee@customer.example", 42.75),
+        _probe_case(service, "probe-a", "felicia.marks@naviant.com", 64.20),
+        _probe_case(service, "probe-b", "john.smith@naviant.com", 128.50),
+        _probe_case(service, "probe-c", "lee.harmon@naviant.com", 42.75),
     ]
     return service, store
 
@@ -899,7 +899,7 @@ def test_a_result_pins_the_measurement_it_made(probe):
     assert again.measured == first.measured
 
     store.case_list.append(
-        _probe_case(service, "probe-d", "nadia@customer.example", 19.99)
+        _probe_case(service, "probe-d", "raymond.fitzgerald@naviant.com", 19.99)
     )
     wider = service.run("probe")
     assert wider.measured != first.measured

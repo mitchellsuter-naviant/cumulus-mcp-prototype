@@ -58,15 +58,27 @@ def test_bind_must_not_reify_by_the_back_door():
     assert any("bind" in p for p in validate_mappings((bad,)))
 
 
-def test_every_feed_that_delivers_has_a_mapping():
-    """The seed world's deliveries all arrive under declared sources — a feed
-    with no contract would be exactly the smear this module retired."""
+def test_every_mapping_describes_a_system_the_estate_actually_runs():
+    """The registry is a claim about the customer's estate, so a contract for
+    a system nobody operates is a lie the Sources screen would repeat.
+
+    `procurement-coupa`, `legacy-ap-extract` and `wms-receiving` were exactly
+    that — invented systems declared so a seeded demo world had somewhere to
+    arrive from — and they retired with the seed. `receiving-sync` keeps its
+    Flow and its Tier-2 definition; what it has no more of is a Mapping,
+    because this estate has no receiving system. That gap is stated, not
+    papered over: a delivery under `wms-receiving` still lands, and the screen
+    reports it as arriving under no declared contract.
+    """
     declared = {m.source for m in MAPPINGS}
     for source in (
-        "erp-vendors", "procurement-coupa", "legacy-ap-extract",
-        "erp-purchase-orders", "wms-receiving",
+        "erp-vendors", "erp-purchase-orders", "erp-sales", "crm-book",
+        "hris-workforce", "office-calendar",
     ):
         assert source in declared
+    assert declared.isdisjoint(
+        {"procurement-coupa", "legacy-ap-extract", "wms-receiving"}
+    )
 
 
 def test_a_feed_name_resolves_to_an_authority_the_ontology_ranks():
@@ -112,7 +124,7 @@ def test_registry_is_readable_and_read_only_over_http(client):
     body = client.get("/api/v1/mappings").json()
     assert body["problems"] == []
     ids = {m["id"] for m in body["mappings"]}
-    assert "erp-vendors" in ids and "wms-receiving" in ids
+    assert "erp-vendors" in ids and "hris-workforce" in ids
     one = client.get("/api/v1/mappings/erp-purchase-orders").json()
     # Both halves of the contract are in the payload: the binding and the
     # escalation shape a batch feed carries.

@@ -24,8 +24,11 @@ from app.graph import Claim, object_id
 from app.sync import SyncRequest
 from tests import world as test_world
 
-TOMAS = next(p for p in personas.CUSTOMER_USERS if p.email.startswith("ap@"))
-KIM = next(p for p in personas.CUSTOMER_USERS if p.email.startswith("kim@"))
+CLERK = personas.get("customer-user:ap")
+#: The Controller owns both master-data desks: vendor stewardship is a
+#: finance accountability, not an IT one.
+STEWARD = personas.get("customer-user:controller")
+NO_QUEUES = personas.get("customer-user:ae")
 
 
 @pytest.fixture()
@@ -51,7 +54,7 @@ def _vendors(world):
 def _gated_invoice(world):
     """An invoice with no PO on it: the posting rule holds it for a clerk."""
     return world.payables.submit(
-        "ap@customer.example", filename="mer.pdf",
+        "connie.alberts@naviant.com", filename="mer.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 "
              "total=190.00",
     )
@@ -89,8 +92,8 @@ def test_a_decision_write_is_refused_when_the_principal_may_not_make_it(world):
     record = _gated_invoice(world)
     assert record.state == "pending"
 
-    decided = world.tasks.decide(record.task_id, "approved", KIM.email)
-    world.payables.resume_for_task(decided, principal_for(KIM))
+    decided = world.tasks.decide(record.task_id, "approved", NO_QUEUES.email)
+    world.payables.resume_for_task(decided, principal_for(NO_QUEUES))
 
     run = world.engine.get(record.run_id)
     assert run.status == "failed" and "post-invoice" in run.error
@@ -99,12 +102,12 @@ def test_a_decision_write_is_refused_when_the_principal_may_not_make_it(world):
     [entry] = _entries(world, action="post-invoice")
     assert entry.outcome == "refused"
     assert "ap-clerk" in entry.refusal
-    assert entry.principal_uid == KIM.uid
+    assert entry.principal_uid == NO_QUEUES.uid
 
 
 def test_an_undeclared_action_never_reaches_the_graph(world):
     with pytest.raises(Refused):
-        world.gateway.action("delete-everything", principal_for(TOMAS))
+        world.gateway.action("delete-everything", principal_for(CLERK))
     assert world.gateway.ledger.list() == []
 
 
@@ -132,8 +135,8 @@ def test_a_tbox_invalid_write_is_refused_rather_than_landed(world):
 def test_a_decision_write_appends_exactly_one_ledger_entry(world):
     _vendors(world)
     record = _gated_invoice(world)
-    decided = world.tasks.decide(record.task_id, "approved", TOMAS.email)
-    resumed = world.payables.resume_for_task(decided, principal_for(TOMAS))
+    decided = world.tasks.decide(record.task_id, "approved", CLERK.email)
+    resumed = world.payables.resume_for_task(decided, principal_for(CLERK))
     assert resumed.state == "posted"
 
     [entry] = _entries(world, action="post-invoice", run_id=record.run_id)
@@ -151,13 +154,13 @@ def test_a_decision_write_appends_exactly_one_ledger_entry(world):
 def test_an_impersonated_write_names_both_principals(world):
     _vendors(world)
     record = _gated_invoice(world)
-    decided = world.tasks.decide(record.task_id, "approved", TOMAS.email)
+    decided = world.tasks.decide(record.task_id, "approved", CLERK.email)
     world.payables.resume_for_task(
-        decided, principal_for(TOMAS, by=personas.ENGINEER.uid)
+        decided, principal_for(CLERK, by=personas.ENGINEER.uid)
     )
 
     [entry] = _entries(world, action="post-invoice")
-    assert entry.principal_uid == TOMAS.uid
+    assert entry.principal_uid == CLERK.uid
     assert entry.impersonated_by == personas.ENGINEER.uid
 
 
@@ -167,8 +170,8 @@ def test_the_three_regimes_are_distinguishable(world):
     _vendors(world)
     record = _gated_invoice(world)
     world.payables.resume_for_task(
-        world.tasks.decide(record.task_id, "approved", TOMAS.email),
-        principal_for(TOMAS),
+        world.tasks.decide(record.task_id, "approved", CLERK.email),
+        principal_for(CLERK),
     )
 
     by_regime: dict[str, set[str]] = {}
@@ -189,13 +192,13 @@ def test_a_steward_decision_is_ledgered_as_a_decision(world):
         "vendors": [{"external_id": "L-77", "name": "Acme Industial Inc"}],
     }), actor="system:test")
     task = next(t for t in world.tasks.list(kind="match_review"))
-    decided = world.tasks.decide(task.id, "approved", personas.CUSTOMER_ADMIN.email)
+    decided = world.tasks.decide(task.id, "approved", STEWARD.email)
 
-    world.sync.apply_match_decision(decided, principal_for(personas.CUSTOMER_ADMIN))
+    world.sync.apply_match_decision(decided, principal_for(STEWARD))
     [entry] = _entries(world, action="link-source-record")
     assert entry.regime == "decision" and entry.outcome == "committed"
-    assert entry.principal_uid == personas.CUSTOMER_ADMIN.uid
-    assert entry.decided_by == personas.CUSTOMER_ADMIN.email
+    assert entry.principal_uid == STEWARD.uid
+    assert entry.decided_by == STEWARD.email
     assert entry.run_id == ""  # a batch feed does not suspend for one row
 
 
@@ -207,10 +210,10 @@ def test_a_steward_without_the_queue_is_refused(world):
     }), actor="system:test")
     before = len(world.graph.find("Vendor"))
     task = next(t for t in world.tasks.list(kind="match_review"))
-    decided = world.tasks.decide(task.id, "approved", TOMAS.email)
+    decided = world.tasks.decide(task.id, "approved", CLERK.email)
 
     with pytest.raises(Refused):
-        world.sync.apply_match_decision(decided, principal_for(TOMAS))
+        world.sync.apply_match_decision(decided, principal_for(CLERK))
     assert len(world.graph.find("Vendor")) == before
     assert _entries(world, action="link-source-record")[0].outcome == "refused"
 
@@ -230,15 +233,15 @@ def test_a_task_decision_lands_a_ledgered_commit_naming_the_human(client, world)
     response = client.post(
         f"/api/v1/tasks/{record.task_id}/decide",
         json={"verdict": "approved", "note": "Small first invoice, no PO."},
-        headers={"X-Cumulus-Persona": TOMAS.id},
+        headers={"X-Cumulus-Persona": CLERK.id},
     )
     assert response.status_code == 200
     assert world.payables.get(record.id).state == "posted"
 
     [entry] = _entries(world, action="post-invoice")
     assert entry.outcome == "committed"
-    assert entry.principal_uid == TOMAS.uid
-    assert entry.decided_by == TOMAS.uid
+    assert entry.principal_uid == CLERK.uid
+    assert entry.decided_by == CLERK.uid
     # Local dev signs in as the engineer, so this decision was made under a
     # persona switch — and the ledger keeps both parties.
     assert entry.impersonated_by == personas.ENGINEER.uid
@@ -253,8 +256,8 @@ def test_the_ledger_route_scopes_reads_and_lists_the_closed_action_set(
     _vendors(world)
     record = _gated_invoice(world)
     world.payables.resume_for_task(
-        world.tasks.decide(record.task_id, "approved", TOMAS.email),
-        principal_for(TOMAS),
+        world.tasks.decide(record.task_id, "approved", CLERK.email),
+        principal_for(CLERK),
     )
 
     everything = client.get("/api/v1/ledger").json()
@@ -266,7 +269,7 @@ def test_the_ledger_route_scopes_reads_and_lists_the_closed_action_set(
     )
     # Kim reads only her own work, and none of this was hers.
     assert client.get(
-        "/api/v1/ledger", headers={"X-Cumulus-Persona": KIM.id}
+        "/api/v1/ledger", headers={"X-Cumulus-Persona": NO_QUEUES.id}
     ).json() == []
 
     actions = client.get("/api/v1/ledger/actions").json()
@@ -288,7 +291,7 @@ def test_an_expense_the_flow_approved_is_committed_by_the_flow(world):
     lie, and the expensive kind: an auto-approval that reads as a judgment.
     """
     request = world.expenses.submit(
-        "kim@customer.example",
+        "john.smith@naviant.com",
         documents=[{"filename": "taxi.jpg", "hint": "vendor=City Cab total=24.50"}],
     )
     assert request.state == "approved"

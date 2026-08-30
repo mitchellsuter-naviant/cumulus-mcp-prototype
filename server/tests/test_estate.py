@@ -32,6 +32,7 @@ from app.estate import (
 from app.graph import object_id
 from app.sync import SyncRequest
 from tests import estate_fixtures as fx
+from tests import demo_world
 from tests import world as test_world
 
 PROJECT = "cumulus-demo-mitchell-suter"
@@ -442,19 +443,30 @@ def test_a_repull_of_the_same_window_changes_nothing(client, world):
     assert world.graph.stats() == before
 
 
-def test_the_untouched_mock_world_is_still_there(client, world):
-    """The estate lands *beside* the seeded world, not over it."""
-    from app.payables import seed_payables_if_empty
-    from app.workforce import seed_workforce_if_empty
+def test_the_pull_merges_with_a_world_already_standing(client, world):
+    """The estate lands *beside* an existing world, and on top of it where
+    they are the same people.
 
-    seed_payables_if_empty(world.payables, sync=world.sync)
-    seed_workforce_if_empty(world.sync, world.graph)
-    seeded = world.graph.stats()["by_type"]["Employee"]
+    The fixture org chart is real Naviant employees at their real work
+    addresses, so the HRIS pull finds most of them already there and keyed the
+    same way. That is the whole point of a natural key: the same human
+    delivered twice is one Employee with claims from both, never two rows.
+    """
+    demo_world.seed_payables(world.payables, sync=world.sync)
+    demo_world.seed_workforce(world.sync, world.graph)
+    before = world.graph.stats()["by_type"]["Employee"]
+    fixture_emails = {p["email"] for p in demo_world.EMPLOYEES}
 
     build(deliver=door(client)).pull(HRIS_WORKFORCE)
     after = world.graph.stats()["by_type"]["Employee"]
-    assert after == seeded + 8
-    assert world.graph.get(object_id("Employee", "rowan@customer.example"))
+    assert after >= before  # nobody was displaced
+
+    overlap = fixture_emails & {row["workEmail"] for row in fx.EMPLOYEES}
+    assert overlap, "the fixture and the estate name some of the same people"
+    for email in overlap:
+        person = world.graph.get(object_id("Employee", email))
+        sources = {c.source for c in person.claims}
+        assert "hris:hris-workforce" in sources
     assert world.graph.check_invariants() == []
 
 

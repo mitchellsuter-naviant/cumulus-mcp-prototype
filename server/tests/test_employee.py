@@ -10,21 +10,16 @@ import pytest
 import app.deps as deps
 from app import personas
 from app.config import settings
-from app.employee import (
-    EmployeeService,
-    InMemoryEmployeeDirectory,
-    seed_employee_if_empty,
-)
-from app.tasks import seed_tasks_if_empty
-from app.workforce import seed_workforce_if_empty
+from app.employee import EmployeeService, InMemoryEmployeeDirectory
+from tests import demo_world
 from tests import world as test_world
 
 
 @pytest.fixture()
 def client(_client):
     world = test_world.fresh()
-    seed_workforce_if_empty(world.sync, world.graph)
-    seed_tasks_if_empty(world.tasks)
+    demo_world.seed_workforce(world.sync, world.graph)
+    demo_world.seed_tasks(world.tasks)
     deps._employee_service = EmployeeService(
         InMemoryEmployeeDirectory(),
         world.knowledge,
@@ -32,12 +27,18 @@ def client(_client):
         world.graph,
         answer_backend=None,
     )
-    seed_employee_if_empty(deps._employee_service)
+    demo_world.seed_pto(deps._employee_service)
     return _client
 
 
 def _as(persona_id: str) -> dict[str, str]:
     return {"X-Cumulus-Persona": persona_id}
+
+
+#: Whose hub these run in. The default persona is the Naviant engineer, who is
+#: deliberately not on the customer's org chart, so a personal surface has to
+#: be asked for as somebody who is.
+ME = _as("customer-user:ae")
 
 
 def test_the_profile_is_the_person_the_org_chart_knows(client):
@@ -46,13 +47,13 @@ def test_the_profile_is_the_person_the_org_chart_knows(client):
     The hub used to mint a blank profile the first time anybody read it, so it
     showed a synthesized person with a balance nobody had accrued.
     """
-    me = client.get("/api/v1/employee/me").json()
-    assert me["email"] == personas.DEFAULT_PERSONA.email
-    assert me["name"] == "Mitchell Suter"
-    assert me["title"] == "Director, Platform & Operations"
-    assert me["team"] == "Firm Leadership"
-    assert me["manager"] == "Rowan Ellis"
-    assert me["location"] == "Boston, MA"
+    me = client.get("/api/v1/employee/me", headers=ME).json()
+    assert me["email"] == "john.smith@naviant.com"
+    assert me["name"] == "John Smith"
+    assert me["title"] == "Account Executive"
+    assert me["team"] == "Sales"
+    assert me["manager"] == "Marcus Reyes"
+    assert me["location"] == "Madison, WI"
     assert me["in_workforce"] is True
 
     # The hub's own state is still the hub's, and still stored.
@@ -63,19 +64,26 @@ def test_the_profile_is_the_person_the_org_chart_knows(client):
 
 
 def test_the_persona_decides_whose_hub_it_is(client):
-    me = client.get("/api/v1/employee/me", headers=_as("customer-user:kim")).json()
-    assert me["email"] == "kim@customer.example"
-    assert me["name"] == "Kim Reyes"
-    assert me["title"] == "Senior Data Engineer"
-    assert me["team"] == "Data Engineering"
-    assert me["manager"] == "Priya Raghavan"
+    me = client.get(
+        "/api/v1/employee/me", headers=_as("customer-user:controller")
+    ).json()
+    assert me["email"] == "raymond.fitzgerald@naviant.com"
+    assert me["name"] == "Raymond Fitzgerald"
+    assert me["title"] == "Controller"
+    assert me["team"] == "Finance & Administration"
+    assert me["manager"] == "Diane Vogel"
 
 
-def test_a_principal_outside_the_workforce_is_told_so(client):
-    """Naviant Support is not the customer's employee. The hub renders and
-    says that, rather than inventing a colleague to fill the screen."""
-    me = client.get("/api/v1/employee/me", headers=_as("naviant-support")).json()
-    assert me["email"] == personas.SUPPORT.email
+@pytest.mark.parametrize(
+    "persona", (personas.SUPPORT, personas.ENGINEER), ids=lambda p: p.id
+)
+def test_a_principal_outside_the_workforce_is_told_so(client, persona):
+    """Neither Naviant persona is the customer's employee — not the support
+    engineer diagnosing a ticket, and not the engineer operating the
+    deployment. The hub renders and says so, rather than inventing a colleague
+    to fill the screen."""
+    me = client.get("/api/v1/employee/me", headers=_as(persona.id)).json()
+    assert me["email"] == persona.email
     assert me["in_workforce"] is False
     assert "not in the workforce" in me["workforce_note"]
     assert me["name"] == "" and me["benefits"] == []
@@ -87,12 +95,13 @@ def test_short_pto_auto_approves_within_governed_window(client):
         "/api/v1/employee/pto",
         json={"start_date": "2026-09-14", "end_date": "2026-09-16", "days": 2,
               "note": "long weekend"},
+        headers=ME,
     )
     assert resp.status_code == 201
     request = resp.json()
     assert request["state"] == "approved"
     assert "auto-approval window" in request["reason"]
-    me = client.get("/api/v1/employee/me").json()
+    me = client.get("/api/v1/employee/me", headers=ME).json()
     assert me["pto_balance_days"] == 15.5  # deducted immediately
 
 
@@ -100,6 +109,7 @@ def test_long_pto_routes_to_hr_and_decision_resumes(client):
     request = client.post(
         "/api/v1/employee/pto",
         json={"start_date": "2026-11-02", "end_date": "2026-11-10", "days": 6},
+        headers=ME,
     ).json()
     assert request["state"] == "pending" and request["task_id"]
     task = client.get(f"/api/v1/tasks/{request['task_id']}").json()
@@ -110,10 +120,10 @@ def test_long_pto_routes_to_hr_and_decision_resumes(client):
         f"/api/v1/tasks/{task['id']}/decide",
         json={"verdict": "approved", "note": "Coverage confirmed."},
     )
-    mine = client.get("/api/v1/employee/pto").json()
+    mine = client.get("/api/v1/employee/pto", headers=ME).json()
     decided = next(r for r in mine if r["id"] == request["id"])
     assert decided["state"] == "approved"
-    me = client.get("/api/v1/employee/me").json()
+    me = client.get("/api/v1/employee/me", headers=ME).json()
     assert me["pto_balance_days"] == 11.5  # deducted on approval, not request
 
 
@@ -121,21 +131,23 @@ def test_pto_over_balance_is_declined(client):
     request = client.post(
         "/api/v1/employee/pto",
         json={"start_date": "2026-12-01", "end_date": "2026-12-31", "days": 25},
+        headers=ME,
     ).json()
     assert request["state"] == "denied"
     assert "balance" in request["reason"]
 
 
-def test_seeded_pending_request_pairs_with_seeded_task(client):
-    """And belongs to the default persona, so it is visible in their hub."""
-    mine = client.get("/api/v1/employee/pto").json()
+def test_a_pending_request_pairs_with_the_task_that_holds_it(client):
+    """And belongs to whoever asked, so it is visible in their hub and in
+    nobody else's."""
+    mine = client.get("/api/v1/employee/pto", headers=ME).json()
     seeded = next(r for r in mine if r["id"] == "pto_seed_01")
     assert seeded["state"] == "pending"
     assert seeded["task_id"] == "task_pto_seed_01"
-    assert seeded["email"] == personas.DEFAULT_PERSONA.email
+    assert seeded["email"] == "john.smith@naviant.com"
     assert client.get("/api/v1/tasks/task_pto_seed_01").json()["queue"] == "hr"
     assert client.get(
-        "/api/v1/employee/pto", headers=_as("customer-user:kim")
+        "/api/v1/employee/pto", headers=_as("customer-user:controller")
     ).json() == []
 
 
@@ -143,6 +155,7 @@ def test_hr_chat_grounds_on_facts_and_cites_policy(client):
     reply = client.post(
         "/api/v1/employee/hr-chat",
         json={"message": "How much PTO do I have and how do I take time off?"},
+        headers=ME,
     ).json()
     assert "17.5" in reply["reply"]
     assert any(c["id"] == "pto-policy" for c in reply["citations"])
@@ -151,7 +164,8 @@ def test_hr_chat_grounds_on_facts_and_cites_policy(client):
 
 def test_hr_chat_answers_benefits(client):
     reply = client.post(
-        "/api/v1/employee/hr-chat", json={"message": "What is the 401k match?"}
+        "/api/v1/employee/hr-chat", json={"message": "What is the 401k match?"},
+        headers=ME,
     ).json()
     assert "4%" in reply["reply"]
 

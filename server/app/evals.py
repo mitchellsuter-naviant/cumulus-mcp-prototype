@@ -377,7 +377,7 @@ class ScriptedDecision(BaseModel):
     """
 
     verdict: Literal["approved", "rejected", "corrected"]
-    decided_by: str = "eval@customer.example"
+    decided_by: str = "eval@naviant.com"
     note: str = ""
     payload: dict = Field(default_factory=dict)
 

@@ -21,13 +21,10 @@ from app.estate import (
 )
 from app.flow_projection import SCAN_LIMIT, project_flow, project_flows
 from app.graph import parse_ref
-from app.payables import seed_payables_if_empty
-from app.reimbursements import seed_reimbursements_if_empty
 from app.runs import InMemoryRunStore, RunEngine, RunRecord, StepRecord
 from app.tasks import InMemoryTaskDirectory, TaskService
-from app.calendars import seed_calendars_if_empty
-from app.workforce import seed_workforce_if_empty
 from tests import estate_fixtures as fx
+from tests import demo_world
 from tests import world as test_world
 
 
@@ -249,10 +246,10 @@ def seeded():
     module's whole claim is about flows that have actually touched the graph.
     """
     world = test_world.build()
-    seed_payables_if_empty(world.payables, sync=world.sync)
-    seed_workforce_if_empty(world.sync, world.graph)
-    seed_calendars_if_empty(world.sync, world.graph)
-    seed_reimbursements_if_empty(world.expenses)
+    demo_world.seed_payables(world.payables, sync=world.sync)
+    demo_world.seed_workforce(world.sync, world.graph)
+    demo_world.seed_calendars(world.sync, world.graph)
+    demo_world.seed_expenses(world.expenses)
     for build, rows in (
         (_build_crm_book, {"accounts": fx.ACCOUNTS, "contacts": fx.CONTACTS,
                            "opportunities": fx.OPPORTUNITIES}),

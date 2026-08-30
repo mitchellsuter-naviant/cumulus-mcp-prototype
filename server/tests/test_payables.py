@@ -23,13 +23,9 @@ from pydantic import ValidationError
 from app.graph import object_id
 from app.matching import MatchLine, MatchTolerances, match_invoice
 from app.models import AssetUpdate
-from app.payables import (
-    InvoiceScenario,
-    ScenarioLine,
-    _seed_invoices,
-    seed_payables_if_empty,
-)
+from app.payables import InvoiceScenario, ScenarioLine
 from app.sync import SyncRequest
+from tests import demo_world
 from tests import world as test_world
 
 
@@ -113,7 +109,7 @@ def _shipped_hints() -> list[str]:
     from app.eval_specs import AP_CASES
 
     return (
-        [case.hint for case in _seed_invoices()]
+        [case.hint for case in demo_world.seed_invoices()]
         + [c.trigger["hint"] for c in AP_CASES if c.trigger.get("hint")]
     )
 
@@ -207,7 +203,7 @@ def test_each_twist_reaches_the_branch_it_advertises(world, twist):
         **{twist: True},
     )
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf", hint=scenario.to_hint()
+        "connie.alberts@naviant.com", filename="acme.pdf", hint=scenario.to_hint()
     )
     if twist == "price_variance":
         assert record.match_verdict == "variance"
@@ -228,7 +224,7 @@ def test_each_twist_reaches_the_branch_it_advertises(world, twist):
         # extractor's, and exactly the division this flow exists to show.
         assert record.vendor_tax_id
         plain = world.payables.submit(
-            "ap@customer.example", filename="acme.pdf",
+            "connie.alberts@naviant.com", filename="acme.pdf",
             hint=scenario.model_copy(update={"tax_id": False}).to_hint(),
         )
         assert not plain.vendor_tax_id
@@ -252,7 +248,7 @@ def test_editing_the_posting_limit_changes_the_flow(world):
         content=content.replace("Auto-post limit: $2,500.00", "Auto-post limit: $500.00")
     ))
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-1 lines=STL-0250:2,FAS-M12:3",
     )
     assert record.state == "pending"
@@ -298,7 +294,7 @@ def test_an_ambiguous_name_waits_for_a_steward_and_asserts_nothing(world):
     assert task.queue == "vendor-stewardship" and task.status == "open"
 
     decided = world.tasks.decide(
-        task.id, "approved", "steward@customer.example",
+        task.id, "approved", "raymond.fitzgerald@naviant.com",
         note="Same company, misspelled in the legacy extract.",
     )
     result = world.sync.apply_match_decision(decided)
@@ -314,7 +310,7 @@ def test_an_ambiguous_name_waits_for_a_steward_and_asserts_nothing(world):
 def test_the_invoice_path_resolves_against_the_master(world):
     _vendors(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial nopo invoice=ACME-9 lines=PPE-GLV:1 total=80.00",
     )
     assert record.vendor_resolution == "linked"
@@ -328,7 +324,7 @@ def test_the_invoice_path_resolves_against_the_master(world):
 def test_an_unknown_vendor_is_minted_onboarding(world):
     _vendors(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="new.pdf",
+        "connie.alberts@naviant.com", filename="new.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:1 total=80.00",
     )
     assert record.vendor_resolution == "new"
@@ -346,7 +342,7 @@ def test_one_model_call_reads_the_document(world):
     _orders(world)
     _receipts(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-2 lines=STL-0250:2,FAS-M12:3",
     )
     assert record.state == "posted"
@@ -379,7 +375,7 @@ def test_the_extraction_prompt_is_an_asset_the_modelcall_names(world):
     _orders(world)
     _receipts(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-9 lines=STL-0250:2",
     )
     run = world.engine.get(record.run_id)
@@ -401,7 +397,7 @@ def test_a_corpus_without_the_prompt_still_extracts():
     assert prompt.source_ref == "knowledge:invoice-extraction-prompt"
 
     record = world.payables.submit(
-        "ap@customer.example", filename="mer.pdf",
+        "connie.alberts@naviant.com", filename="mer.pdf",
         hint="newvendor po=PO-9001 invoice=MER-7 total=480.00",
     )
     run = world.engine.get(record.run_id)
@@ -414,7 +410,7 @@ def test_a_corpus_without_the_prompt_still_extracts():
 def test_an_unknown_vendor_is_minted_onboarding_and_graduates_on_posting(world):
     _vendors(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="mer.pdf",
+        "connie.alberts@naviant.com", filename="mer.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 total=190.00",
     )
     # No PO on the document, so the posting rule holds it for a clerk.
@@ -425,7 +421,7 @@ def test_an_unknown_vendor_is_minted_onboarding_and_graduates_on_posting(world):
     assert task.kind == "decision" and task.queue == "ap-clerk"
 
     decided = world.tasks.decide(
-        task.id, "approved", "dana@customer.example",
+        task.id, "approved", "dana.prentiss@naviant.com",
         note="First invoice from this vendor, no PO expected at this size.",
     )
     resumed = world.payables.resume_for_task(decided)
@@ -437,15 +433,15 @@ def test_an_unknown_vendor_is_minted_onboarding_and_graduates_on_posting(world):
 def test_the_next_invoice_links_to_the_same_vendor(world):
     _vendors(world)
     first = world.payables.submit(
-        "ap@customer.example", filename="mer1.pdf",
+        "connie.alberts@naviant.com", filename="mer1.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 total=190.00",
     )
     world.payables.resume_for_task(
-        world.tasks.decide(first.task_id, "approved", "dana@customer.example")
+        world.tasks.decide(first.task_id, "approved", "dana.prentiss@naviant.com")
     )
 
     second = world.payables.submit(
-        "ap@customer.example", filename="mer2.pdf",
+        "connie.alberts@naviant.com", filename="mer2.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-2 lines=PPE-GLV:1 total=112.00",
     )
     assert second.vendor_id == first.vendor_id
@@ -459,11 +455,11 @@ def test_the_next_invoice_links_to_the_same_vendor(world):
 def test_a_rejected_review_denies_and_commits_nothing(world):
     _vendors(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="mer.pdf",
+        "connie.alberts@naviant.com", filename="mer.pdf",
         hint="newvendor=meridian-supply nopo invoice=MER-1 lines=PPE-GLV:2 total=190.00",
     )
     decided = world.tasks.decide(
-        record.task_id, "rejected", "dana@customer.example",
+        record.task_id, "rejected", "dana.prentiss@naviant.com",
         note="Not our invoice — wrong company entirely.",
     )
     resumed = world.payables.resume_for_task(decided)
@@ -480,7 +476,7 @@ def test_a_clean_invoice_matches_its_po_and_receipt(world):
     _orders(world)
     _receipts(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-3 lines=STL-0250:2,FAS-M12:3",
     )
     assert record.match_verdict == "matched"
@@ -501,7 +497,7 @@ def test_a_price_variance_holds_the_invoice_and_a_correction_releases_it(world):
     _orders(world)
     _receipts(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-4 "
              "lines=STL-0250:2,FAS-M12:3 pricebump",
     )
@@ -510,7 +506,7 @@ def test_a_price_variance_holds_the_invoice_and_a_correction_releases_it(world):
     assert "off the PO's" in record.verdict_reason
 
     decided = world.tasks.decide(
-        record.task_id, "corrected", "dana@customer.example",
+        record.task_id, "corrected", "dana.prentiss@naviant.com",
         note="Vendor billed the old list price.",
         payload={"lines": [{"ordinal": 1, "unit_price_usd": 486.00}]},
     )
@@ -527,7 +523,7 @@ def test_billing_more_than_was_received_is_a_quantity_variance(world):
     _orders(world)
     _receipts(world, short=1.0)
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-5 lines=STL-0250:2,FAS-M12:3",
     )
     assert record.match_verdict == "variance"
@@ -539,7 +535,7 @@ def test_billing_more_than_was_received_is_a_quantity_variance(world):
 def test_an_invoice_with_no_purchase_order_is_unmatched_not_broken(world):
     _vendors(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial nopo invoice=ACME-6 lines=PPE-GLV:1 total=80.00",
     )
     assert record.match_verdict == "unmatched"
@@ -590,7 +586,7 @@ def test_goods_not_booked_in_block_rather_than_vary():
 def test_the_screen_says_so_when_there_is_no_history(world):
     _vendors(world)
     record = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial nopo invoice=ACME-7 lines=PPE-GLV:1 total=80.00",
     )
     assert record.anomaly_findings == []
@@ -603,7 +599,7 @@ def test_an_outlier_is_measured_against_this_vendor(world):
     _receipts(world)
     for number in ("ACME-A", "ACME-B", "ACME-C"):
         world.payables.submit(
-            "ap@customer.example", filename="acme.pdf",
+            "connie.alberts@naviant.com", filename="acme.pdf",
             hint=f"vendor=acme-industrial po=PO-7741 invoice={number} "
                  "lines=STL-0250:2,FAS-M12:3",
         )
@@ -614,7 +610,7 @@ def test_an_outlier_is_measured_against_this_vendor(world):
     assert profile.invoices == 3 and profile.median_usd > 0
 
     big = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-BIG "
              "lines=STL-0375:12 total=9800.00",
     )
@@ -628,13 +624,13 @@ def test_a_duplicate_total_inside_the_window_is_flagged(world):
     _orders(world)
     _receipts(world)
     first = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-D1 "
              "lines=STL-0250:2,FAS-M12:3",
     )
     world.anomaly.rebuild()
     second = world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint=f"vendor=acme-industrial po=PO-7741 invoice=ACME-D2 "
              f"lines=STL-0250:2,FAS-M12:3 total={first.total_usd:.2f}",
     )
@@ -648,7 +644,7 @@ def test_profiles_are_derived_and_rebuildable(world):
     _orders(world)
     _receipts(world)
     world.payables.submit(
-        "ap@customer.example", filename="acme.pdf",
+        "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-E lines=STL-0250:2,FAS-M12:3",
     )
     world.anomaly.rebuild()
@@ -667,9 +663,9 @@ def test_profiles_are_derived_and_rebuildable(world):
 
 
 def test_seed_builds_a_matchable_world(world):
-    seeded = seed_payables_if_empty(world.payables, sync=world.sync)
+    seeded = demo_world.seed_payables(world.payables, sync=world.sync)
     assert seeded > 0
-    assert seed_payables_if_empty(world.payables, sync=world.sync) == 0
+    assert demo_world.seed_payables(world.payables, sync=world.sync) == 0
 
     rows = world.payables.list()
     assert len(rows) == seeded
@@ -696,7 +692,7 @@ def test_a_redelivery_changes_nothing(world):
 
 
 def test_api_exposes_the_table_the_match_and_the_vendors(client, world):
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     rows = client.get("/api/v1/payables").json()
     assert rows and any(r["match_pairings"] for r in rows)
     stats = client.get("/api/v1/payables/stats").json()
@@ -737,11 +733,11 @@ AP_VISIBLE = {
     # and raised nothing. A clerk shown only the invoices that went wrong has
     # no baseline to judge the exceptions against.
     "customer-user:ap": 7,
-    "customer-user:nadia": 7,
+    "customer-user:controller": 7,
     # Owns no queue and entered no invoice.
-    "customer-user:kim": 0,
+    "customer-user:ae": 0,
     # Approves expenses, which says nothing about invoices.
-    "customer-user:rowan": 0,
+    "customer-user:ceo": 0,
 }
 
 
@@ -749,7 +745,7 @@ AP_VISIBLE = {
 def test_the_ap_table_shows_the_work_you_are_accountable_for(
     client, world, persona, expected
 ):
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     rows = client.get(
         "/api/v1/payables", headers={"X-Cumulus-Persona": persona}
     ).json()
@@ -761,7 +757,7 @@ def test_the_ap_strip_counts_the_table_under_it(client, world, persona, expected
     """A strip computed over a different slice than its table is a screen
     arguing with itself — the bug already caught once on the task badge, where
     the per-queue breakdown was filtered and the headline was not."""
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     headers = {"X-Cumulus-Persona": persona}
     rows = client.get("/api/v1/payables", headers=headers).json()
     stats = client.get("/api/v1/payables/stats", headers=headers).json()
@@ -774,10 +770,10 @@ def test_the_ap_strip_counts_the_table_under_it(client, world, persona, expected
 def test_a_total_is_a_read_of_every_row_it_counts(client, world):
     """The money, not just the count. An org-wide figure handed to somebody who
     may see none of the rows leaks all of them in aggregate."""
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     everyone = client.get("/api/v1/payables/stats").json()
     kim = client.get(
-        "/api/v1/payables/stats", headers={"X-Cumulus-Persona": "customer-user:kim"}
+        "/api/v1/payables/stats", headers={"X-Cumulus-Persona": "customer-user:ae"}
     ).json()
     tomas = client.get(
         "/api/v1/payables/stats", headers={"X-Cumulus-Persona": "customer-user:ap"}
@@ -794,7 +790,7 @@ def test_a_total_is_a_read_of_every_row_it_counts(client, world):
 def test_an_invoice_outside_your_slice_is_missing_not_forbidden(client, world):
     """404 rather than 403: a 403 confirms the id exists, which is the one bit
     an unauthorized caller should not get back."""
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     record_id = "run_ap_seed03"  # raised an ap-clerk task, still pending
     assert client.get(
         f"/api/v1/payables/{record_id}",
@@ -802,7 +798,7 @@ def test_an_invoice_outside_your_slice_is_missing_not_forbidden(client, world):
     ).status_code == 200
     refused = client.get(
         f"/api/v1/payables/{record_id}",
-        headers={"X-Cumulus-Persona": "customer-user:kim"},
+        headers={"X-Cumulus-Persona": "customer-user:ae"},
     )
     assert refused.status_code == 404
 
@@ -837,7 +833,7 @@ def test_every_composer_control_is_a_row_from_the_graph(client, world):
     `lines=STL-0250:2,FAS-M12:3` appear, and nobody composing an invoice has to
     know that spelling exists.
     """
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     composer = client.get(UI_PAYABLES).json()["composer"]
 
     acme = next(v for v in composer["vendors"] if "Acme" in v["label"])
@@ -865,7 +861,7 @@ def test_every_composer_control_is_a_row_from_the_graph(client, world):
 
 
 def test_a_composed_submission_sends_the_string_it_showed(client, world):
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     outcome = client.post(UI_SUBMISSIONS, json=_composed()).json()
     assert outcome["hint"] == (
         "vendor=acme-industrial po=PO-7741 invoice=ACME-INV-9001 "
@@ -884,7 +880,7 @@ def test_the_outcome_marks_the_clause_the_rule_cited(client, world):
     `_posting_check` already wrote; deciding here would be a second copy of the
     rule, and the two would eventually disagree.
     """
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     outcome = client.post(UI_SUBMISSIONS, json=_composed(
         invoice_number="ACME-INV-9002",
         lines=[{"sku": "STL-0375", "quantity": 12}],
@@ -904,7 +900,7 @@ def test_may_decide_answers_require_queue_before_the_403(client, world):
     a queue binding rather than a rung on the write ladder — so the screen has
     to say which queue, not merely "not allowed".
     """
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     body = _composed(invoice_number="ACME-INV-9003", total_usd=9800.0)
 
     tomas = client.post(
@@ -917,7 +913,7 @@ def test_may_decide_answers_require_queue_before_the_403(client, world):
 
     body["scenario"]["invoice_number"] = "ACME-INV-9004"
     kim = client.post(
-        UI_SUBMISSIONS, json=body, headers={"X-Cumulus-Persona": "customer-user:kim"}
+        UI_SUBMISSIONS, json=body, headers={"X-Cumulus-Persona": "customer-user:ae"}
     ).json()["gate"]
     assert not kim["may_decide"]
     assert kim["why_not"] == "this is in ap-clerk; you are bound to no queue"
@@ -931,7 +927,7 @@ def test_an_upload_carries_no_hints_and_a_key_gets_no_door(client, world):
     than dressing up. And the console door refuses a minted key outright: a
     machine has no screens.
     """
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     outcome = client.post(UI_SUBMISSIONS, json={"filename": "a-scan.pdf"}).json()
     assert outcome["hint"] == "" and outcome["invoice"]["id"]
     assert client.post(UI_SUBMISSIONS, json={}).status_code == 400
@@ -941,7 +937,7 @@ def test_an_upload_carries_no_hints_and_a_key_gets_no_door(client, world):
 def test_the_screen_and_its_strip_count_the_same_slice(client, world):
     """One route, so the strip cannot be computed over a different read than
     the table under it — the failure the two-call version made possible."""
-    seed_payables_if_empty(world.payables, sync=world.sync)
+    demo_world.seed_payables(world.payables, sync=world.sync)
     for persona, expected in sorted(AP_VISIBLE.items()):
         screen = client.get(
             UI_PAYABLES, headers={"X-Cumulus-Persona": persona}

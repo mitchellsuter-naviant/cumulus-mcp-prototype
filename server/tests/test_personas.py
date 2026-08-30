@@ -2,8 +2,9 @@
 
 The doctrine's Role confers two things at once — a rung on the write ladder
 and a set of queue-bindings — so both halves are exercised here, together with
-the invariant that makes the roster worth having: a persona that claims a
-person can actually find them in the graph.
+the invariant that makes the roster worth having: every persona meant to be
+one of the customer's people can actually be found in the customer's graph,
+and the two that are not say so.
 """
 
 import pytest
@@ -12,9 +13,8 @@ from fastapi import HTTPException
 from app import auth, personas, ui_api
 from app.auth import Principal
 from app.config import settings
-from app.calendars import seed_calendars_if_empty
 from app.ui_api import get_ui_principal
-from app.workforce import seed_workforce_if_empty
+from tests import demo_world
 from tests import world as test_world
 
 #: The personas whose authority is above `user` on the write ladder. Written
@@ -26,8 +26,8 @@ MAY_WRITE = {"naviant-engineer", "customer-admin"}
 @pytest.fixture()
 def world():
     w = test_world.fresh()
-    seed_workforce_if_empty(w.sync, w.graph)
-    seed_calendars_if_empty(w.sync, w.graph)
+    demo_world.seed_workforce(w.sync, w.graph)
+    demo_world.seed_calendars(w.sync, w.graph)
     return w
 
 
@@ -67,11 +67,11 @@ def test_switching_persona_rewrites_the_whole_principal(client):
     """Impersonation is not a hint travelling beside the principal. Uid, email,
     authority, scope and queues are all Kim's; only `impersonated_by` remembers
     who actually asked."""
-    kim = personas.get("customer-user:kim")
+    kim = personas.get("customer-user:ae")
     body = client.get("/api/ui/v1/session", headers=_as(kim.id)).json()
     assert body["uid"] == kim.uid
-    assert body["email"] == "kim@customer.example"
-    assert body["person"] == "Kim Reyes"
+    assert body["email"] == "john.smith@naviant.com"
+    assert body["person"] == "John Smith"
     assert body["authority"] == "user"
     assert body["scope"] == "own"
     assert body["queues"] == []
@@ -118,10 +118,11 @@ def test_the_authority_ladder_decides_who_may_write(client, persona):
 
 
 def test_queue_bindings_separate_two_people_on_the_same_rung():
-    """Tomas and Kim are both `user`, and only one of them may work AP. The
-    ladder cannot tell them apart, which is the whole reason queues exist."""
+    """The AP specialist and the account executive are both `user`, and only
+    one of them may work AP. The ladder cannot tell them apart, which is the
+    whole reason queues exist."""
     tomas = auth.principal_for(personas.get("customer-user:ap"))
-    kim = auth.principal_for(personas.get("customer-user:kim"))
+    kim = auth.principal_for(personas.get("customer-user:ae"))
     assert tomas.role == kim.role == "user"
 
     assert auth.require_queue(tomas, "ap-clerk") is tomas
@@ -141,35 +142,48 @@ def test_the_engineer_owns_every_queue():
 # ---- the person behind the persona ------------------------------------------
 
 
-_WITH_A_PERSON = tuple(p for p in personas.ALL_PERSONAS if p.person)
+#: Everybody on the customer's side of the roster. Each is a real Naviant
+#: employee at the work address the estate's HRIS holds, so a persona test and
+#: a live session resolve the same human.
+_CUSTOMER = (personas.CUSTOMER_ADMIN,) + personas.CUSTOMER_USERS
 
 
-@pytest.mark.parametrize("persona", _WITH_A_PERSON, ids=_ids(_WITH_A_PERSON))
-def test_a_persona_that_claims_a_person_is_really_in_the_graph(client, persona):
+@pytest.mark.parametrize("persona", _CUSTOMER, ids=_ids(_CUSTOMER))
+def test_every_customer_persona_is_really_in_the_graph(client, persona):
     """A persona with no `Employee` behind it opens onto an empty hub and an
     empty calendar, which teaches nothing about the screen under test."""
     body = client.get("/api/ui/v1/session", headers=_as(persona.id)).json()
     assert body["person"] == persona.person
+    assert body["email"].endswith("@naviant.com")
     assert body["in_workforce"] is True
 
 
-def test_naviant_support_is_honestly_absent_from_the_org_chart(client):
-    """Support staff are not the customer's employees, and the console says so
-    rather than inventing a record."""
-    body = client.get("/api/ui/v1/session", headers=_as(personas.SUPPORT.id)).json()
-    assert body["person"] == ""
+@pytest.mark.parametrize(
+    "persona", (personas.SUPPORT, personas.ENGINEER), ids=_ids(
+        (personas.SUPPORT, personas.ENGINEER)
+    )
+)
+def test_the_naviant_personas_are_honestly_absent_from_the_org_chart(
+    client, persona
+):
+    """Neither of them is one of the customer's employees — not the support
+    engineer diagnosing a ticket, and not the engineer who operates the
+    deployment. The console says so rather than inventing a record, which is
+    also the state a real deployed operator sees on every personal surface.
+    """
+    body = client.get("/api/ui/v1/session", headers=_as(persona.id)).json()
     assert body["in_workforce"] is False
-    assert body["scope"] == "platform"  # it still reads everything
+    assert body["scope"] == "platform"  # both still read everything
 
 
 def test_a_persona_sees_its_own_personal_surfaces(client):
     """Nadia is a real employee, so `/calendar/me` is her week — no demo
     persona substituted underneath, and so no note saying one was."""
     body = client.get(
-        "/api/v1/calendar/me", headers=_as("customer-user:nadia")
+        "/api/v1/calendar/me", headers=_as("customer-user:controller")
     ).json()
-    assert body["email"] == "nadia@customer.example"
-    assert body["name"] == "Nadia Farrell"
+    assert body["email"] == "raymond.fitzgerald@naviant.com"
+    assert body["name"] == "Raymond Fitzgerald"
     assert body["persona_note"] == ""
 
 
@@ -213,7 +227,7 @@ def test_an_own_scoped_persona_cannot_read_the_graph_around_it(client):
     colleague's rows with their amounts in one call. Whatever the rule is, it
     has to hold across the surface — so this walks the whole of it.
     """
-    kim = {"X-Cumulus-Persona": "customer-user:kim"}
+    kim = {"X-Cumulus-Persona": "customer-user:ae"}
     for path in (
         "/api/v1/graph/objects?type=ExpenseRequest",
         "/api/v1/graph/objects",
@@ -221,7 +235,7 @@ def test_an_own_scoped_persona_cannot_read_the_graph_around_it(client):
         "/api/v1/graph/instances",
         "/api/v1/graph/search?q=expense",
         "/api/v1/graph/stats",
-        "/api/v1/graph/employees/rowan@customer.example/expenses",
+        "/api/v1/graph/employees/diane.vogel@naviant.com/expenses",
     ):
         assert client.get(path, headers=kim).status_code == 403, path
 

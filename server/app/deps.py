@@ -25,31 +25,15 @@ from .teams import TeamService, build_team_directory
 from .usage import AssetUsageStore, build_asset_usage_store
 from .users import UserDirectory, build_user_directory
 from .flows import FlowService, build_flow_service, seed_flows_if_empty
-from .workforce import seed_workforce_if_empty, sync_workforce_additions
-from .calendars import (
-    CalendarService,
-    build_calendar_service,
-    seed_calendars_if_empty,
-    sync_calendar_additions,
-)
-from .tasks import TaskService, build_task_service, seed_tasks_if_empty
+from .calendars import CalendarService, build_calendar_service
+from .tasks import TaskService, build_task_service
 from .reimbursements import (
     ReimbursementService,
     build_receipt_reader,
     build_reimbursement_service,
-    seed_reimbursements_if_empty,
 )
-from .employee import (
-    EmployeeService,
-    build_employee_service,
-    seed_employee_if_empty,
-)
-from .payables import (
-    PayableService,
-    build_invoice_reader,
-    build_payable_service,
-    seed_payables_if_empty,
-)
+from .employee import EmployeeService, build_employee_service
+from .payables import PayableService, build_invoice_reader, build_payable_service
 
 log = logging.getLogger("cumulus.deps")
 
@@ -226,7 +210,6 @@ def get_task_service() -> TaskService:
         )
         with _lock:
             if _task_service is None:
-                seed_tasks_if_empty(service)
                 _task_service = service
     return _task_service
 
@@ -396,23 +379,18 @@ def get_estate_connector() -> EstateConnector:
 
 
 def get_calendar_service() -> CalendarService:
-    """The mirrored schedules, and the seed that lands them.
+    """The mirrored schedules, read out of the graph.
 
-    Ordering, not decoration: the calendar seed hangs its calendars off
-    Employees, and the workforce lands as part of the payables seed, so that
-    has to have run first. A calendar with no owner would be a mirror of
-    nobody.
+    Nothing is constructed but a reader: calendars arrive from the
+    `office-calendar` feed, so before that feed has pulled there is no
+    schedule to show and the service says so. There used to be a seed here,
+    and an ordering dependency on the workforce seed to hang it off.
     """
     global _calendar_service
     if _calendar_service is None:
-        graph = get_graph_service()
-        sync = get_sync_service()
-        get_payable_service()  # seeds the workforce the calendars hang off
-        service = build_calendar_service(graph)
+        service = build_calendar_service(get_graph_service())
         with _lock:
             if _calendar_service is None:
-                seed_calendars_if_empty(sync, graph)
-                sync_calendar_additions(sync, graph)
                 _calendar_service = service
     return _calendar_service
 
@@ -497,7 +475,6 @@ def get_reimbursement_service() -> ReimbursementService:
         )
         with _lock:
             if _reimbursement_service is None:
-                seed_reimbursements_if_empty(service)
                 _reimbursement_service = service
     return _reimbursement_service
 
@@ -508,7 +485,6 @@ def get_payable_service() -> PayableService:
         # Dependencies resolved before the lock: `_lock` is not reentrant.
         knowledge = get_service()
         tasks = get_task_service()
-        sync = get_sync_service()
         get_anomaly_service()
         try:
             reader = build_invoice_reader(
@@ -539,18 +515,6 @@ def get_payable_service() -> PayableService:
         )
         with _lock:
             if _payable_service is None:
-                # The sync service seeds the vendor master, the purchase orders
-                # and the receiving reports the invoices match against, so it
-                # has to exist before the AP seed runs.
-                seed_payables_if_empty(service, sync=sync)
-                # The org chart rides the same sync service, and the expense
-                # seed has already minted the employees it attaches to.
-                seed_workforce_if_empty(sync, get_graph_service())
-                # And the people added to the roster since this store was
-                # first seeded — including the console's operator, who has to
-                # resolve to somebody or every personal surface falls back to
-                # a demo persona.
-                sync_workforce_additions(sync, get_graph_service())
                 _payable_service = service
     return _payable_service
 
@@ -562,9 +526,6 @@ def get_employee_service() -> EmployeeService:
         knowledge = get_service()
         tasks = get_task_service()
         teams = get_team_service()
-        # The hub resolves "me" against the org chart, which rides in with the
-        # payables seed — same ordering the calendar depends on.
-        get_payable_service()
         if _answer_backend is _MISSING:
             backend = _build_answer_backend()
             with _lock:
@@ -582,7 +543,6 @@ def get_employee_service() -> EmployeeService:
         )
         with _lock:
             if _employee_service is None:
-                seed_employee_if_empty(service)
                 _employee_service = service
     return _employee_service
 
