@@ -134,6 +134,33 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         read_by=("hr-agent",),
     ),
     DataCollection(
+        id="correspondence",
+        name="Correspondence",
+        summary=(
+            "Mailboxes and the messages in them, mirrored from the mail "
+            "provider — headers, addressing, and an opening preview of the "
+            "body. The cap is the governance, not an implementation shortcut: "
+            "a commitment is usually made in mail before any system is told "
+            "about it, so the graph needs to know a conversation happened and "
+            "who was in it, and it emphatically does not need to become a "
+            "second copy of the customer's inbox. Not authoritative and never "
+            "will be — the provider is the system of record, and nothing here "
+            "sends."
+        ),
+        role="data", kind="entities", origin="synced",
+        container="graph_objects", custody="copy", authoritative=False,
+        retention="P1Y",
+        retention_note=(
+            "the same horizon as calendars, and for the same reason: this is "
+            "a working record read to explain something recent. A preview is "
+            "not evidence worth keeping for seven years, and pretending "
+            "otherwise would be storing the customer's mail under a "
+            "compliance justification it cannot support"
+        ),
+        object_types=("Mailbox", "MailMessage"),
+        written_by=("mail-sync",),
+    ),
+    DataCollection(
         id="vendor-master",
         name="Vendor master",
         summary=(
@@ -150,6 +177,64 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         read_by=("accounts-payable",),
     ),
     DataCollection(
+        id="company-master",
+        name="Company master",
+        summary=(
+            "The counterparty book: one concept of company, with every source "
+            "system's row attached as a reversible identity Link, and the "
+            "people we deal with at each. The sell side's answer to the "
+            "vendor master, and governed identically because it fails "
+            "identically — a counterparty that exists four times is four "
+            "partial answers to every question anybody asks about them. "
+            "Contacts live here rather than in a book of their own: a person "
+            "at a customer is master data about that counterparty, with the "
+            "same retention, the same custody and the same authority behind "
+            "it, and splitting them would put one relationship under two "
+            "policies."
+        ),
+        role="data", kind="entities", origin="synced",
+        container="graph_objects", authoritative=True, retention="indefinite",
+        retention_note=(
+            "a dormant company is retained while any order, invoice or "
+            "message still references it — the record of who we dealt with "
+            "outlives the dealing"
+        ),
+        object_types=("Company", "Person"),
+        # Declared ahead of their writers: crm-sync reifies accounts and
+        # contacts, sales-sync reifies ERP customers onto the same companies.
+        written_by=("crm-sync", "sales-sync"),
+        # mail-sync reads it rather than writing it, which is the whole point
+        # of the split: a message resolves its correspondents against the book
+        # and counts the ones it cannot place, instead of minting a company
+        # out of every sending domain.
+        read_by=("mail-sync",),
+    ),
+    DataCollection(
+        id="sales-records",
+        name="Sales records",
+        summary=(
+            "The commercial cycle on the sell side: what we are pursuing, "
+            "what has been ordered, and the catalogue both are written "
+            "against. One Collection rather than three because it is one "
+            "lifecycle — an opportunity becomes an order or it does not, and "
+            "the interesting question is almost always about the seam between "
+            "them. Mirrored, not owned: the ERP and the CRM are the books of "
+            "record, and a stage or a total corrected here would be corrected "
+            "in the wrong place."
+        ),
+        role="data", kind="entities", origin="synced",
+        container="graph_objects", custody="copy", authoritative=False,
+        retention="P7Y",
+        retention_note=(
+            "set by the orders, which are financial records on the same "
+            "seven-year footing as AP; the pipeline rows ride the horizon "
+            "because retention is a property of the set and the set is drawn "
+            "around the whole cycle, not around one row's shelf life"
+        ),
+        object_types=("Opportunity", "SalesOrder", "SalesOrderLine", "Item"),
+        written_by=("crm-sync", "sales-sync"),
+    ),
+    DataCollection(
         id="source-landing",
         name="Source landing",
         summary=(
@@ -162,7 +247,15 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         container="graph_objects", authoritative=False, retention="P1Y",
         retention_note="raw rows age out once re-resolution is no longer plausible",
         object_types=("SourceRecord",),
-        written_by=("vendor-sync", "purchase-order-sync", "receiving-sync"),
+        # Every feed that reifies lands here, including the four declared
+        # ahead of their writers: crm-sync and sales-sync land the rows behind
+        # a Company or a Person, and employment-event-sync lands the HRIS
+        # ledger as-is rather than promoting it to a type — an event that only
+        # ever gets read back as history has not earned one.
+        written_by=(
+            "vendor-sync", "purchase-order-sync", "receiving-sync",
+            "crm-sync", "sales-sync", "employment-event-sync",
+        ),
     ),
     DataCollection(
         id="expense-records",
@@ -212,6 +305,37 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         authoritative=True,
         object_types=("Document",),
         written_by=("expense-reimbursement", "accounts-payable"),
+    ),
+    DataCollection(
+        id="document-library",
+        name="Document library",
+        summary=(
+            "The customer's own document system, mirrored as knowledge about "
+            "where things are filed rather than as a copy of what is in them. "
+            "The tree lands as Folder objects; the files themselves stay put "
+            "and land as Document rows stamped with this Collection's id and "
+            "a `storage_ref` pointing back at the original. That split is the "
+            "governance: a folder path is metadata a person put there on "
+            "purpose — and is where their retention rules were hung — while "
+            "the bytes are the customer's, in the system they already trust "
+            "with them. Copying a document library to make it queryable is "
+            "how a map turns into a second system of record nobody asked for."
+        ),
+        role="data", kind="documents", origin="synced",
+        container="graph_objects", custody="reference", authoritative=False,
+        retention="indefinite",
+        retention_note=(
+            "there is nothing here to purge but pointers; the horizon on the "
+            "documents themselves belongs to the system that holds them, and "
+            "a reference that outlives its target reads as a broken link "
+            "rather than as retained content"
+        ),
+        # Only the tree. `Document` is governed by `audit-documents` as a
+        # type — the partition allows exactly one home per type — and a
+        # DMS-sourced row is placed here per instance by its `collection_id`,
+        # which is what that field is for.
+        object_types=("Folder",),
+        written_by=("dms-sync",),
     ),
     # Run journals are deliberately NOT a Collection. The doctrine is explicit
     # that machinery/operational state — "flow run journals, the trigger

@@ -69,6 +69,38 @@ def test_every_feed_that_delivers_has_a_mapping():
         assert source in declared
 
 
+def test_a_feed_name_resolves_to_an_authority_the_ontology_ranks():
+    """Precedence is declared over authorities, not over feed names, so this
+    function is the whole join between the two. A bucket the ontology does not
+    rank would sort last by accident rather than by decision.
+
+    The office branch sits below the calendar branch deliberately: one
+    provider serves both surfaces, so `office-calendar` and `office-mail`
+    share a prefix while only the mail half is a hint. Matching on the suite
+    name first would demote the calendar — the one thing that actually knows
+    what is on somebody's Friday.
+    """
+    from app.ontology import ONTOLOGY
+    from app.sync import _authority
+
+    assert _authority("crm-book") == "crm"
+    assert _authority("erp-sales") == "erp"
+    assert _authority("office-mail") == "office"
+    assert _authority("office-calendar") == "calendar"
+    assert _authority("hris-employment-events") == "hris"
+    # The existing feeds keep the standing they had.
+    for source, expected in (
+        ("erp-vendors", "erp"), ("erp-purchasing", "erp"),
+        ("hris-workday", "hris"), ("calendar-m365", "calendar"),
+        ("procurement-coupa", "procurement"), ("wms-receiving", "procurement"),
+    ):
+        assert _authority(source) == expected, source
+
+    ranked = set(ONTOLOGY.precedence)
+    for m in MAPPINGS:
+        assert _authority(m.source) in ranked, m.source
+
+
 def test_export_is_a_schema_export_and_says_where_it_lives():
     fields = mappings_asset_fields()
     assert fields["kind"] == "schema-export"

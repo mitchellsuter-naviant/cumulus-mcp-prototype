@@ -232,6 +232,37 @@ def test_ontology_endpoint_reports_declaration_and_reality(client, world):
     assert body["precedence"][0] == "human"
 
 
+def test_the_export_renders_types_declared_before_their_writers(client, world):
+    """The whole model still exports, including the nine types no flow writes
+    yet — which is the state the ontology overlay draws as outlines.
+
+    An empty count here is a promise nothing has kept, and it has to be
+    legible as that rather than absent from a document claiming to be the
+    whole model.
+    """
+    from app.ontology import ONTOLOGY, ontology_markdown
+
+    body = client.get("/api/v1/graph/ontology").json()
+    by_name = {o["name"]: o for o in body["objects"]}
+    assert len(by_name) == len(ONTOLOGY.objects)
+    for awaiting in (
+        "Company", "Person", "Opportunity", "SalesOrder", "SalesOrderLine",
+        "Item", "Mailbox", "MailMessage", "Folder",
+    ):
+        assert by_name[awaiting]["instances"] == 0, awaiting
+    assert by_name["Company"]["competency_questions"]
+    assert body["precedence"] == list(ONTOLOGY.precedence)
+
+    # And the governed-knowledge document the customer keeps renders every one
+    # of them, links included.
+    markdown = ontology_markdown()
+    for object_type in ONTOLOGY.objects:
+        assert f"`{object_type.name}`" in markdown, object_type.name
+    for link in ONTOLOGY.links:
+        assert f"--{link.name}-->" in markdown, link.name
+    assert "`office`" in markdown and "`crm`" in markdown
+
+
 def test_the_analytical_question_is_a_traversal(client, world):
     from app.reimbursements import SubmittedDocument
 
@@ -697,10 +728,22 @@ def test_part_ness_is_derived_never_declared():
     # provider gives every attendee's copy its own id, so the event is
     # identified through the calendar and dies with it.
     assert ONTOLOGY.owner_of("CalendarEvent") == "Calendar"
+    # A mailbox owns its messages on exactly the calendar's argument: the
+    # provider gives every recipient's copy of a thread its own id, so the
+    # message is identified through the mailbox and dies with it. An order
+    # owns its lines the way a PO does.
+    assert ONTOLOGY.owner_of("MailMessage") == "Mailbox"
+    assert ONTOLOGY.owner_of("SalesOrderLine") == "SalesOrder"
+    # Item and Folder are roots, not parts, and the distinction is load-
+    # bearing: a folder outlives everything filed in it, and a catalogue item
+    # outlives every line that sold it.
+    assert ONTOLOGY.owner_of("Item") is None
+    assert ONTOLOGY.owner_of("Folder") is None
     assert [o.name for o in ONTOLOGY.roots()] == [
         "Employee", "Team", "Capability", "Calendar", "ExpenseRequest",
-        "Document", "Vendor", "SourceRecord", "Invoice", "PurchaseOrder",
-        "ReceivingReport",
+        "Document", "Folder", "Vendor", "Company", "Person", "SourceRecord",
+        "Invoice", "PurchaseOrder", "ReceivingReport", "Opportunity",
+        "SalesOrder", "Item", "Mailbox",
     ]
 
 
@@ -708,6 +751,126 @@ def test_the_declared_ontology_conforms():
     from app.ontology import validate_ontology
 
     assert validate_ontology() == []
+
+
+def test_precedence_is_an_ordered_argument_not_a_set():
+    """Pinned, because the order *is* the decision and every claim in the
+    graph resolves through it.
+
+    Two systems of record first (each authoritative over its own subject, so
+    they never actually compete), then the CRM below the ERP — where both
+    describe one commercial fact the business is bound by the ERP's — then the
+    two provider mirrors, with `office` last among the systems because a title
+    read off a mail directory is a hint and must lose to anything that knows.
+    """
+    from app.ontology import ONTOLOGY
+
+    assert ONTOLOGY.precedence == (
+        "human", "erp", "hris", "crm", "calendar", "office", "procurement",
+        "flow", "model",
+    )
+    assert ONTOLOGY.precedence.index("erp") < ONTOLOGY.precedence.index("crm")
+    assert ONTOLOGY.precedence.index("calendar") < ONTOLOGY.precedence.index("office")
+    # A Flow's own inference stays below every system that observed something.
+    assert ONTOLOGY.precedence[-2:] == ("flow", "model")
+
+
+def test_a_link_name_declared_twice_is_refused():
+    """The trap this rule exists to keep anyone from laying.
+
+    A link type is addressed by name — `link_type()` returns one declaration
+    and `_validate_link` checks every edge against it — so a second
+    declaration sharing a name is not a wider link. Its edges are validated
+    against the first declaration's endpoints and refused as
+    `wrong-endpoint-type`, at write time, with nothing pointing at the cause.
+    Hence the qualified names in the counterparty block.
+    """
+    from app.ontology import LinkType, ObjectType, Ontology, validate_ontology
+
+    bad = Ontology(
+        objects=(
+            ObjectType(name="A", label="A", summary="", natural_key="k",
+                       tags=("x",), competency_questions=("q {label}?",)),
+            ObjectType(name="B", label="B", summary="", natural_key="k",
+                       tags=("x",), competency_questions=("q {label}?",)),
+            ObjectType(name="C", label="C", summary="", natural_key="k",
+                       tags=("x",), competency_questions=("q {label}?",)),
+        ),
+        links=(
+            LinkType("points_at", "A", "C", "many-to-one", ""),
+            LinkType("points_at", "B", "C", "many-to-one", ""),
+        ),
+        precedence=("human",),
+    )
+    assert any("declared twice" in p for p in validate_ontology(bad))
+
+    # And the real declaration keeps them unique, which is what lets the three
+    # identity links and the two mail-sender links coexist.
+    from app.ontology import ONTOLOGY
+
+    names = [link.name for link in ONTOLOGY.links]
+    assert len(names) == len(set(names))
+    identity = {
+        link.name: link.from_type
+        for link in ONTOLOGY.links if link.identity
+    }
+    assert identity == {
+        "identified_as": "Vendor",
+        "company_identified_as": "Company",
+        "person_identified_as": "Person",
+    }
+
+
+def test_the_counterparty_book_is_reachable_by_traversal():
+    """Every competency question the new roots declare has to be a walk.
+
+    Declared ahead of their writers, so the instance counts are zero — but the
+    *paths* must exist now, because a root admitted on a question its links
+    cannot answer is exactly the growth the admission test is meant to refuse.
+    """
+    from app.ontology import ONTOLOGY
+
+    def edge(name: str) -> tuple[str, str]:
+        link = ONTOLOGY.link_type(name)
+        assert link is not None, name
+        return link.from_type, link.to_type
+
+    # "Which systems hold a record for {label}?" and "What have we sold them?"
+    assert edge("company_identified_as") == ("Company", "SourceRecord")
+    assert edge("sold_to") == ("SalesOrder", "Company")
+    # "Who at {label} do we actually deal with?"
+    assert edge("works_at") == ("Person", "Company")
+    # "Which correspondence has {label} been part of?" — both sides of a
+    # thread, because inside and outside the company are different answers.
+    assert edge("sent_by") == ("MailMessage", "Person")
+    assert edge("sent_by_employee") == ("MailMessage", "Employee")
+    assert edge("addressed_to") == ("MailMessage", "Person")
+    # "Which orders have carried {label}, and at what price each time?"
+    assert edge("sells") == ("SalesOrderLine", "Item")
+    assert edge("has_so_line") == ("SalesOrder", "SalesOrderLine")
+    # "What is filed under {label} — directly, and all the way down?"
+    assert edge("subfolder_of") == ("Folder", "Folder")
+    assert edge("filed_under") == ("Document", "Folder")
+
+    # A recipient list is many; a sender, a parent folder and a customer are
+    # one, and a second would be a resolution bug rather than a fact.
+    assert ONTOLOGY.link_type("addressed_to").cardinality == "many-to-many"
+    for one in ("sent_by", "sold_to", "works_at", "subfolder_of", "filed_under"):
+        assert ONTOLOGY.link_type(one).cardinality == "many-to-one", one
+
+
+def test_a_referenced_document_says_where_the_original_lives():
+    """The field that keeps `reference` custody honest. Without it a document
+    the map never fetched is a filename with nothing behind it, and it reads
+    identically to one whose bytes we hold."""
+    from app.ontology import ONTOLOGY
+
+    document = ONTOLOGY.object_type("Document")
+    assert "storage_ref" in {f.name for f in document.fields}
+    # One type for both, deliberately: what differs is custody, and custody is
+    # a property of the Collection a row belongs to.
+    assert "collection_id" in {f.name for f in document.fields}
+    assert "source + external id" in document.natural_key
 
 
 def test_composition_rules_are_refused_at_declaration():

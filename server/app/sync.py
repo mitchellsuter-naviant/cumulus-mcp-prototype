@@ -1490,6 +1490,8 @@ def _authority(source: str) -> str:  # noqa: D401
     lowered = source.lower()
     if "erp" in lowered or "netsuite" in lowered or "sap" in lowered:
         return "erp"
+    if "crm" in lowered or "salesforce" in lowered or "hubspot" in lowered:
+        return "crm"
     if "procure" in lowered or "coupa" in lowered or "ariba" in lowered:
         return "procurement"
     if "wms" in lowered or "receiv" in lowered:
@@ -1504,6 +1506,13 @@ def _authority(source: str) -> str:  # noqa: D401
         or "gcal" in lowered
     ):
         return "calendar"
+    # Below the calendar branch on purpose. One provider serves both surfaces,
+    # so `office-calendar` and `office-mail` share a prefix while only the mail
+    # half is a hint — matching on the suite name first would quietly demote
+    # the calendar, which is the one thing that actually knows what is on
+    # somebody's Friday.
+    if "office" in lowered or "mail" in lowered:
+        return "office"
     return "flow"
 
 

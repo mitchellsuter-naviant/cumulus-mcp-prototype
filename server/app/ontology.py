@@ -382,9 +382,21 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         label="Document",
         summary=(
             "One artifact as submitted: bytes, pages, and the regions an "
-            "extraction read. Evidence, never a fact in itself."
+            "extraction read. Evidence, never a fact in itself. The same type "
+            "serves a receipt a person uploaded and a file that has sat in the "
+            "customer's document system for six years — deliberately, because "
+            "a second `DmsFile` type would split every 'what evidences this' "
+            "question in two and force each reader to ask it twice. What "
+            "differs between them is custody, and custody is a property of the "
+            "Collection a row belongs to, which is why `collection_id` is a "
+            "field and the duplicate type is not."
         ),
-        natural_key="content hash",
+        natural_key=(
+            "content hash; or source + external id for an original that is "
+            "referenced in place rather than copied — a file we never fetched "
+            "the bytes of has no hash to be keyed by, and inventing one would "
+            "make it look read"
+        ),
         fields=(
             FieldSpec("filename", "string"),
             FieldSpec("media_type", "string"),
@@ -394,11 +406,53 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("collection_id", "string",
                       "the Collection whose retention governs the bytes"),
             FieldSpec("retention_until", "date", "stamped when the bytes landed"),
+            FieldSpec("storage_ref", "string",
+                      "where the original lives, for a row held under "
+                      "`reference` custody: a resolvable address in the "
+                      "system of record, fetched on demand and never copied. "
+                      "Empty for anything the map holds the bytes of. This is "
+                      "the field that keeps a reference honest — without it a "
+                      "referenced document is a filename with nothing behind "
+                      "it"),
         ),
         collection="audit-documents",
         tags=("expenses", "payables", "evidence"),
         competency_questions=(
             "Which lines and invoices were read out of {label}?",
+        ),
+    ),
+    ObjectType(
+        name="Folder",
+        label="Folder",
+        summary=(
+            "One node of a document system's filing tree. It is here because "
+            "where a customer filed something is itself knowledge: the same "
+            "PDF under `Contracts/Northwind/Executed` and under "
+            "`Scratch/inbox` means two different things, and a flat document "
+            "list throws that away along with every retention rule a "
+            "department hung off a folder. Modelled as a type rather than a "
+            "path string on Document for the ordinary reason — a path is a "
+            "spelling, and renaming a folder would silently orphan every row "
+            "that had memorized the old one."
+        ),
+        natural_key="source + folder path from the tree's root",
+        fields=(
+            FieldSpec("name", "string", "the folder's own name, not its path"),
+            FieldSpec("path", "string",
+                      "the full path, denormalized from subfolder_of for "
+                      "cheap reads and for showing a person where they are"),
+            FieldSpec("external_id", "string", "the document system's id"),
+            FieldSpec("source", "string", "which document system this tree is"),
+            FieldSpec("depth", "number", "0 at the root"),
+        ),
+        # The document system owns the tree; we mirror it. A steward who wants
+        # a folder moved should move it there.
+        authoritative=False,
+        collection="document-library",
+        tags=("documents", "evidence", "filing"),
+        competency_questions=(
+            "What is filed under {label} — directly, and all the way down?",
+            "Which folder does {label} itself sit in?",
         ),
     ),
     ObjectType(
@@ -427,6 +481,95 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         competency_questions=(
             "How much has {label} invoiced us, and is that usual for them?",
             "Which systems have a record for {label}?",
+        ),
+    ),
+    ObjectType(
+        name="Company",
+        label="Company",
+        summary=(
+            "One counterparty, as the business means it: the organization a "
+            "CRM account, an ERP customer and a mail domain are each keeping "
+            "their own row about. None of those rows is the company — they "
+            "are three claims about one, in three spellings. Without this "
+            "type, 'what is our whole relationship with Northwind' has no "
+            "subject to hang off, only three answers that cannot be added "
+            "together. Deliberately not merged into Vendor: buying from "
+            "somebody and selling to them are different roles with different "
+            "authorities behind them, and a firm that is both should read as "
+            "two roles a link joins, not one row that has quietly lost track "
+            "of which is which."
+        ),
+        natural_key=(
+            "normalized legal name — the same normalization Vendor uses, so "
+            "the two books collapse spellings identically and a proposed "
+            "Company↔Vendor match is comparing like with like"
+        ),
+        fields=(
+            FieldSpec("name", "string"),
+            FieldSpec("slug", "string"),
+            FieldSpec("industry", "string",
+                      "the CRM's claim, and usually an unopposed one — no "
+                      "other system holds an opinion about it"),
+            FieldSpec("website", "string"),
+            FieldSpec("phone", "string"),
+            FieldSpec("email", "string"),
+            FieldSpec("payment_terms", "string",
+                      "a commercial fact, so the ERP outranks the CRM here — "
+                      "both claims are kept and precedence picks"),
+            FieldSpec("status", "enum", "prospect | active | inactive"),
+            FieldSpec("aliases", "string",
+                      "other names this company has arrived under"),
+        ),
+        authoritative=True,
+        collection="company-master",
+        tags=("commerce", "counterparties", "mdm"),
+        competency_questions=(
+            "Which systems hold a record for {label}?",
+            "What have we sold {label}, and what is still open?",
+            "Who at {label} do we actually deal with?",
+        ),
+    ),
+    ObjectType(
+        name="Person",
+        label="Person",
+        summary=(
+            "A human outside the enterprise: a contact in the CRM, a name on "
+            "a mail thread, the person who signs for a delivery. Deliberately "
+            "not Employee. Employment is a fact the HRIS is authoritative "
+            "about, and widening Employee to cover everyone we have ever "
+            "emailed would put the org chart and the address book in one bag "
+            "— 'who reports to whom' stops being answerable the moment half "
+            "the rows are people who do not work here. Two rows for the same "
+            "human should resolve to one Person; two humans who share nothing "
+            "but a common name must not, which is why the key is an address "
+            "and not a spelling."
+        ),
+        natural_key=(
+            "lowercased email. Where a source carries none, source + external "
+            "id — a record with no address mints its own Person rather than "
+            "guessing, so two same-named strangers stay two people and the "
+            "merge, if there is one, is proposed later with evidence a human "
+            "can read"
+        ),
+        fields=(
+            FieldSpec("email", "string"),
+            FieldSpec("name", "string"),
+            FieldSpec("first_name", "string"),
+            FieldSpec("last_name", "string"),
+            FieldSpec("title", "string",
+                      "their job title at their own employer — a label, and "
+                      "not a role we grant anything on"),
+            FieldSpec("phone", "string"),
+            FieldSpec("company_name", "string",
+                      "denormalized from works_at, for cheap reads"),
+        ),
+        authoritative=True,
+        collection="company-master",
+        tags=("people", "commerce", "counterparties", "mdm"),
+        competency_questions=(
+            "Which company does {label} work at, and what have we sold them?",
+            "Which correspondence has {label} been part of?",
+            "Which source rows resolve to {label}?",
         ),
     ),
     ObjectType(
@@ -588,6 +731,212 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         authoritative=True,
         collection="ap-records",
     ),
+    ObjectType(
+        name="Opportunity",
+        label="Opportunity",
+        summary=(
+            "A deal being pursued: intent, before anything has been ordered. "
+            "It earns its own type rather than a stage field on Company "
+            "because one company can be pursued several times at once and "
+            "each pursuit has its own answer — a single stage on the "
+            "counterparty would have to pick one and lose the rest. It is "
+            "also the only place the gap in deal-to-order can be seen: the "
+            "window between a deal closing won and a sales order existing is "
+            "a fact about two rows disagreeing, and there is no such window "
+            "if they are the same row."
+        ),
+        natural_key="source + opportunity id at the CRM that issued it",
+        fields=(
+            FieldSpec("external_id", "string"),
+            FieldSpec("name", "string"),
+            FieldSpec("stage", "enum",
+                      "prospecting | qualification | proposal | negotiation | "
+                      "closed-won | closed-lost"),
+            FieldSpec("amount_usd", "money", "what the CRM expects it to be worth"),
+            FieldSpec("close_date", "date",
+                      "expected while the deal is open, actual once it closed"),
+            FieldSpec("owner_email", "string",
+                      "the rep carrying it — an observation awaiting "
+                      "promotion, not a Link: it becomes one the moment it "
+                      "resolves to an Employee rather than a string the CRM "
+                      "typed"),
+            FieldSpec("company_name", "string",
+                      "denormalized from pursued_with, for cheap reads"),
+        ),
+        # The CRM is the book of record for a pipeline; we mirror it, and a
+        # correction to a stage belongs there, not here.
+        authoritative=False,
+        collection="sales-records",
+        tags=("commerce", "pipeline"),
+        competency_questions=(
+            "Who is {label} being pursued with, and who else is talking to them?",
+            "Did {label} close won, and did an order ever follow it?",
+        ),
+    ),
+    ObjectType(
+        name="SalesOrder",
+        label="Sales order",
+        summary=(
+            "A commitment to sell, synced from the ERP — the mirror image of "
+            "PurchaseOrder, and a type for the same reason: what was ordered, "
+            "at what price, and whether it has been released are facts about "
+            "the order and not about the customer who placed it. It is also "
+            "the first thing Cumulus is meant to write back to, and an Action "
+            "needs a subject with an identity: 'release the order' has to "
+            "name an object, not a row in somebody else's table."
+        ),
+        natural_key="order number as the ERP issued it",
+        fields=(
+            FieldSpec("order_number", "string"),
+            FieldSpec("external_id", "string", "the ERP's internal record id"),
+            FieldSpec("ordered_date", "date"),
+            FieldSpec("status", "enum",
+                      "pending-approval | approved | fulfilled | billed | "
+                      "closed | cancelled"),
+            FieldSpec("total_usd", "money"),
+            FieldSpec("currency", "string"),
+            FieldSpec("memo", "string"),
+            FieldSpec("company_name", "string",
+                      "denormalized from sold_to, for cheap reads"),
+        ),
+        authoritative=False,
+        collection="sales-records",
+        tags=("commerce", "orders"),
+        competency_questions=(
+            "Who did we sell {label} to, and what is on it?",
+            "Which catalogue items does {label} commit us to deliver?",
+        ),
+    ),
+    ObjectType(
+        name="SalesOrderLine",
+        label="Sales order line",
+        summary=(
+            "One sold line: what was committed to, how much of it, at what "
+            "price. A part of its order in the strict sense — its ordinal "
+            "only means anything inside one order, and it dies with it."
+        ),
+        natural_key="sales order id + ordinal",
+        fields=(
+            FieldSpec("description", "string"),
+            FieldSpec("sku", "string"),
+            FieldSpec("quantity", "number"),
+            FieldSpec("unit_price_usd", "money",
+                      "what this line actually charged, which is not "
+                      "necessarily what the catalogue lists"),
+            FieldSpec("amount_usd", "money"),
+            FieldSpec("order_number", "string", "denormalized from the parent"),
+        ),
+        collection="sales-records",
+    ),
+    ObjectType(
+        name="Item",
+        label="Item",
+        summary=(
+            "A thing the business sells or buys, as the catalogue defines it. "
+            "Lines on both sides of the house carry a SKU, and until that SKU "
+            "is an entity 'what did we sell most of' is a count over "
+            "spellings and 'is this the same part we bought' cannot be asked "
+            "at all. Deliberately thin: a catalogue entry, not an inventory "
+            "position. How many are on a shelf is a fact about a warehouse "
+            "and a moment, and putting it here would make the type wrong the "
+            "instant it was written."
+        ),
+        natural_key="SKU",
+        fields=(
+            FieldSpec("sku", "string"),
+            FieldSpec("name", "string"),
+            FieldSpec("item_type", "enum",
+                      "inventory | non-inventory | service | assembly"),
+            FieldSpec("base_price_usd", "money",
+                      "the list price; what a line actually charged lives on "
+                      "the line"),
+            FieldSpec("external_id", "string",
+                      "the source's internal id for the item — what order "
+                      "lines reference, which is deliberately not the SKU, "
+                      "and the reason a line needs resolving rather than "
+                      "reading"),
+        ),
+        authoritative=False,
+        collection="sales-records",
+        tags=("commerce", "catalogue"),
+        competency_questions=(
+            "Which orders have carried {label}, and at what price each time?",
+            "Where has {label} sold below its list price?",
+        ),
+    ),
+    ObjectType(
+        name="Mailbox",
+        label="Mailbox",
+        summary=(
+            "One correspondent's mail, as the provider keeps it. A governed "
+            "mirror on exactly the terms Calendar is one — the provider is "
+            "the system of record and we hold a copy a steward may not "
+            "overwrite — because correspondence is where a commitment is "
+            "usually made before any system is told about it. What is "
+            "deliberately not here is a mail store: bodies stop at a preview, "
+            "attachments are not modelled, and nothing in Cumulus sends. This "
+            "is evidence that a conversation happened and who was in it, not "
+            "a second inbox."
+        ),
+        natural_key="mailbox address at the provider",
+        fields=(
+            FieldSpec("address", "string"),
+            FieldSpec("display_name", "string", "what the provider shows"),
+            FieldSpec("provider", "string", "microsoft-365 | google | …"),
+            FieldSpec("external_id", "string"),
+            FieldSpec("job_title", "string",
+                      "as the directory behind the mailbox states it — a "
+                      "claim the HRIS outranks where the two disagree"),
+            FieldSpec("department", "string"),
+            FieldSpec("timezone", "string"),
+            FieldSpec("synced_at", "date", "when the mirror last landed"),
+        ),
+        authoritative=False,
+        collection="correspondence",
+        tags=("people", "correspondence", "evidence"),
+        competency_questions=(
+            "What has landed in {label} lately, and who sent it?",
+            "Who does {label} correspond with outside the company?",
+        ),
+    ),
+    ObjectType(
+        name="MailMessage",
+        label="Mail message",
+        summary=(
+            "One message as it sits in one mailbox — a **part** of that "
+            "mailbox, for the same reason a calendar event is part of a "
+            "calendar: a thread delivered to four people is four rows with "
+            "four provider ids, four read states and four filing decisions. "
+            "The shared conversation is not the row; it is what the rows "
+            "agree on, and `conversation_id` is where that agreement is "
+            "recorded. Custody stops at `body_preview` on purpose — enough "
+            "for a person to recognize the message, far short of holding the "
+            "customer's mail."
+        ),
+        natural_key="mailbox address + provider message id",
+        fields=(
+            FieldSpec("external_id", "string", "the provider's id for this copy"),
+            FieldSpec("subject", "string"),
+            FieldSpec("folder", "string", "where the provider filed it"),
+            FieldSpec("from_email", "string",
+                      "denormalized from sent_by, and the fallback when the "
+                      "sender resolves to nobody we know"),
+            FieldSpec("from_name", "string"),
+            FieldSpec("to_emails", "string", "recipients, as addressed"),
+            FieldSpec("cc_emails", "string"),
+            FieldSpec("body_preview", "string",
+                      "the opening of the body and nothing more — the custody "
+                      "line, stated as a field so it is visible rather than "
+                      "assumed"),
+            FieldSpec("importance", "enum", "low | normal | high"),
+            FieldSpec("conversation_id", "string",
+                      "the provider's thread id — what the copies of one "
+                      "exchange agree on"),
+            FieldSpec("received_at", "date"),
+            FieldSpec("sent_at", "date"),
+        ),
+        collection="correspondence",
+    ),
 )
 
 LINK_TYPES: tuple[LinkType, ...] = (
@@ -663,6 +1012,82 @@ LINK_TYPES: tuple[LinkType, ...] = (
              nature="composition"),
     LinkType("matches_invoice_line", "MatchSet", "InvoiceLine", "one-to-many",
              "one pairing in the match, with its variance in the link props"),
+    # ---- the counterparty book, and what hangs off it ---------------------
+    #
+    # Declared ahead of their writers, like the org-chart links above: the crm,
+    # sales, mail and dms sync flows are the named triggers. Until those land
+    # these read "0 in the graph", which is the honest state of a promise
+    # nothing has kept yet, and the ontology overlay draws them as outlines.
+    #
+    # A note on the qualified names below (`company_identified_as`,
+    # `sent_by_employee`). A link type is addressed by name — `link_type(name)`
+    # returns one declaration, and `GraphService._validate_link` checks every
+    # edge against it — so two declarations sharing a name would mean the
+    # second one's edges were validated against the first one's endpoints and
+    # refused. Where the same relationship holds between different types, each
+    # gets its own name, qualified by the endpoint that varies. The cost is a
+    # longer name; the alternative is widening one declaration's endpoints
+    # until it stops constraining anything, which is how a cardinality check
+    # quietly becomes decoration.
+    LinkType("works_at", "Person", "Company", "many-to-one",
+             "the company this person is at. One at a time, deliberately: a "
+             "contact who has moved gets a new edge and the old one is "
+             "withdrawn, so 'who did we know at Northwind in March' stays "
+             "answerable instead of being overwritten"),
+    LinkType("company_identified_as", "Company", "SourceRecord", "one-to-many",
+             "an external system's row for this company — the CRM's account, "
+             "the ERP's customer, reversible and carrying the confidence and "
+             "method that produced it. This is the edge the whole identity "
+             "story is told through: four systems, four ids, one company, and "
+             "a steward who can take any one of them back",
+             nature="identity"),
+    LinkType("person_identified_as", "Person", "SourceRecord", "one-to-many",
+             "an external system's row for this human. Kept separate from the "
+             "company's so a wrong merge can be withdrawn at the person "
+             "without disturbing the organization they were filed under",
+             nature="identity"),
+    LinkType("pursued_with", "Opportunity", "Company", "many-to-one",
+             "the company a deal is being pursued with — one, and a second "
+             "would mean the CRM had reparented the deal rather than that two "
+             "companies were being sold the same thing"),
+    LinkType("sold_to", "SalesOrder", "Company", "many-to-one",
+             "the customer an order was raised for. The mirror of "
+             "`ordered_from`, and the edge that makes 'what is open with this "
+             "counterparty' a traversal rather than a name search"),
+    LinkType("has_so_line", "SalesOrder", "SalesOrderLine", "one-to-many",
+             "the order's sold lines", nature="composition"),
+    LinkType("sells", "SalesOrderLine", "Item", "many-to-one",
+             "the catalogue item this line commits us to. A Link and not the "
+             "line's `sku` string, because the question Item exists to answer "
+             "— where has this sold, and for how much — is a traversal, and a "
+             "string that has to be matched by spelling on every read is not "
+             "one"),
+    LinkType("subfolder_of", "Folder", "Folder", "many-to-one",
+             "the parent folder — what makes the filing system a tree rather "
+             "than a list of paths that only look nested"),
+    LinkType("filed_under", "Document", "Folder", "many-to-one",
+             "the folder a document is filed in. Where a customer put "
+             "something is evidence about what they think it is, and it is "
+             "also where their retention rules were hung — both are lost the "
+             "moment a document is only a row in a flat list"),
+    LinkType("has_message", "Mailbox", "MailMessage", "one-to-many",
+             "the messages in the mailbox", nature="composition"),
+    LinkType("sent_by", "MailMessage", "Person", "many-to-one",
+             "the outside human who sent this message, where the sender's "
+             "address resolved to one we know. A sender we cannot place is "
+             "counted and left as `from_email` — minting a Person per unknown "
+             "address would fill the counterparty book with newsletters"),
+    LinkType("sent_by_employee", "MailMessage", "Employee", "many-to-one",
+             "the same relationship when the sender is one of ours. Two "
+             "declarations rather than one loose edge, because 'did this "
+             "commitment come from inside or outside the company' is the "
+             "first question anybody asks of a thread"),
+    LinkType("addressed_to", "MailMessage", "Person", "many-to-many",
+             "an outside human this message was addressed to; whether they "
+             "were on To or Cc lives on the link, because it is a fact about "
+             "the addressing and not about either end"),
+    LinkType("addressed_to_employee", "MailMessage", "Employee", "many-to-many",
+             "an internal recipient, on the same terms"),
 )
 
 # Ordered highest-authority first. A human correction outranks every system;
@@ -675,8 +1100,26 @@ LINK_TYPES: tuple[LinkType, ...] = (
 # same argument and ranks just below: the provider is the only thing that
 # knows what is on somebody's Friday, but where it restates a fact the HRIS
 # owns — a display name, an office — the HRIS wins.
+#
+# `crm` enters below the two books of record and above the mirrors. It ranks
+# under `erp` on purpose: where both describe the same commercial fact —
+# payment terms, an order total — the ERP is what the business is actually
+# bound by, and the CRM is what somebody typed while selling. On relationship
+# facts the CRM usually speaks unopposed anyway (nothing else holds an opinion
+# about an industry or a website), so the ordering costs it nothing it should
+# have won. `office` ranks last among the systems, just above a Flow's own
+# guess: a job title read off a mail directory or a company name read off a
+# sending domain is a hint worth keeping and worth losing to anything that
+# actually knows. Ranking mail higher would let a signature block quietly
+# outrank the HRIS.
+#
+# Both claims are always retained, so this order is a read-time decision: the
+# CRM/ERP disagreement the demo turns on is visible *because* neither claim was
+# discarded, and reordering this tuple re-resolves history rather than
+# rewriting it.
 PRECEDENCE: tuple[str, ...] = (
-    "human", "erp", "hris", "calendar", "procurement", "flow", "model",
+    "human", "erp", "hris", "crm", "calendar", "office", "procurement",
+    "flow", "model",
 )
 
 ONTOLOGY = Ontology(objects=OBJECT_TYPES, links=LINK_TYPES, precedence=PRECEDENCE)
@@ -700,6 +1143,23 @@ def validate_ontology(ontology: Ontology = ONTOLOGY) -> list[str]:
                 problems.append(
                     f"{where}: field `{f.name}` refs unknown type `{target}`"
                 )
+    # A link type is addressed by name and nothing else: `link_type()` returns
+    # the first declaration matching, and every endpoint and cardinality check
+    # in `GraphService` is made against whatever comes back. A second
+    # declaration under the same name is therefore not a wider link — it is a
+    # link whose edges are all validated against somebody else's endpoints and
+    # refused. Caught here, at declaration time, because the failure otherwise
+    # surfaces as an unexplainable `wrong-endpoint-type` on the first write.
+    seen_links: set[str] = set()
+    for link in ontology.links:
+        if link.name in seen_links:
+            problems.append(
+                f"link `{link.name}`: declared twice — a link type is looked "
+                "up by name, so the second declaration's edges would be "
+                "checked against the first's endpoints. Qualify the name by "
+                "the endpoint that varies"
+            )
+        seen_links.add(link.name)
     for link in ontology.links:
         where = f"link `{link.name}`"
         if link.from_type not in names:
