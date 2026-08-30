@@ -567,12 +567,18 @@ def test_the_estate_card_reports_discovery_and_per_feed_activation(
     assert estate["pulse_enabled"] is True
     assert estate["pulse_intensity"] == "low"
     assert estate["discovery_error"] == ""
-    # Every count on the card is answered by rows in the list under it.
-    assert estate["feeds_registered"] == 1
-    assert estate["feeds_active"] == 1
+    # Every count on the card is answered by rows in the list under it. The
+    # expectation is read off the FEEDS registry rather than pinned, so a
+    # sibling stage adding a feed moves both sides of this equation at once.
+    from app.estate import FEEDS
+
+    expected = {f.feed for f in FEEDS if f.app in estate["apps"]}
+    assert estate["feeds_registered"] == len(FEEDS)
+    assert estate["feeds_active"] == len(expected)
     pulled = [r for r in body["sources"] if r["pull"] is not None]
-    assert [r["source"] for r in pulled] == [HRIS_WORKFORCE]
-    assert sum(1 for r in pulled if r["pull"]["active"]) == 1
+    assert {r["source"] for r in pulled} == {f.feed for f in FEEDS}
+    assert {r["source"] for r in pulled if r["pull"]["active"]} == expected
+    assert HRIS_WORKFORCE in expected
 
 
 def test_a_registered_feed_that_has_never_pulled_still_gets_a_row(
