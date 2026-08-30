@@ -51,6 +51,14 @@ gets real. Naviant's own back office is the customer (the dogfood story).
     credentials need reauth (`gcloud auth login` and `gcloud auth
     application-default login` on the host). First live run must verify;
     `gemini-3.7-flash` is the verified fallback. `gemini-3-flash` 404s.
+13. **The estate gains a PSA app** (`psa`) — the project-management tool
+    Naviant's Delivery org runs its implementation projects in. Designed
+    into the namespace docs first (A1), built as a new demo app in Wave 2
+    (A4), synced as a sixth source once live. Naming hazard, stated once:
+    `psa` (projects) vs `pas` (the insurance policy system) is a
+    one-transposition collision; they never co-occur in a namespace.
+14. **Subagents run Opus 5** (`model: opus` on every Agent spawn), not
+    Fable.
 
 ## The estate (facts)
 
@@ -87,7 +95,16 @@ gets real. Naviant's own back office is the customer (the dogfood story).
   multiple mailboxes) are in scope.
 - **A3 · Simulation scale + controls.** `sim_naviant.py` cadences for a
   130-person firm; `SIM_DAY_MINUTES` becomes a per-namespace pulse setting
-  editable from the admin console beside enabled/apps/intensity.
+  editable from the admin console beside enabled/apps/intensity. The
+  `project_delivery` process joins the sim once A4 exists (spawned by
+  deal_to_order wins).
+- **A4 · The PSA app.** A new demo app per the ecosystem's "New demo app"
+  checklist (Flutter app, `functions/psa.py`, hosting site + target,
+  authorized domain, firebase-options script, `namespaces.json` apps list):
+  projects, phases, tasks, assignments, time entries — the entity/route
+  sketch comes from the A1 design's "Gaps for build time". Deliberate
+  drift: its own customer spellings, display-name assignees, time entries
+  overlapping HRIS time with no shared id.
 
 ## Track B — the read plane (this repo)
 
@@ -157,8 +174,11 @@ gets real. Naviant's own back office is the customer (the dogfood story).
     Wave 0  (done)      baseline commit · model switch · this plan
     Wave 1  (now)       A1 design docs ▸ B1 connector + first feed (HRIS
                         workforce against the current 16-person seed) ▸ C1
-    Wave 2              A2/A3 estate at scale ▸ B2 all five sources ▸ B3
-                        ontology growth ▸ B4 world replacement + personas
+    Wave 2              A2/A3 estate at scale ▸ A4 PSA app ▸ B2 all live
+                        sources ▸ B3 ontology growth ▸ B4 world
+                        replacement + personas (the PSA feed joins B2 as a
+                        sixth source when A4 lands — the connector is
+                        shaped for N apps, never a hardcoded five)
     Wave 3              B5 identity resolution ▸ C2/C3/C4
     Wave 4              S2a/S2b/S2c ▸ the end-to-end demo script
 
@@ -189,6 +209,7 @@ with the Claude co-author line; container git needs
 
 Critics report; the orchestrator adjudicates. Builders never widen scope
 silently — a brief that contradicts the data gets flagged, not obeyed.
+Every subagent is spawned with `model: opus` (Opus 5) — decision 14.
 
 ## Carried debt (folded from the deprecated workplan)
 
@@ -225,3 +246,7 @@ silently — a brief that contradicts the data gets flagged, not obeyed.
   blocked on host gcloud reauth. A1 namespace redesign agent launched.
   Estate probed live: pulse on, 15 sales orders (10 sim-generated),
   designed drift records confirmed absent.
+- **2026-08-30 (later)** — Decisions 13/14 recorded: the PSA app joins the
+  estate (A4), subagents run Opus 5. Both in-flight Wave-1 agents briefed
+  mid-run (A1 designs the PSA in; the architect shapes the connector for N
+  apps).
