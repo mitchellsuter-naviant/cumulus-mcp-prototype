@@ -132,6 +132,11 @@ TRIGGERS: dict[str, Trigger] = {t.id: t for t in (
             starts="crm-sync", wakes="window"),
     Trigger(id="sales-records-delivered", event="SalesRecordsDelivered",
             starts="sales-sync", wakes="window"),
+    Trigger(id="employment-events-delivered",
+            event="EmploymentEventsDelivered",
+            starts="employment-event-sync", wakes="window"),
+    Trigger(id="documents-delivered", event="DocumentsDelivered",
+            starts="dms-sync", wakes="window"),
 )}
 
 #: The trigger index. The doctrine keeps it in a fast key-value store for O(1)

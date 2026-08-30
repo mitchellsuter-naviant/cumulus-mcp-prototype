@@ -55,7 +55,10 @@ from .sync import (
     AccountRecord,
     ContactRecord,
     CustomerRecord,
+    DmsDocumentRecord,
     EmployeeRecord,
+    EmploymentEventRecord,
+    FolderRecord,
     ItemRecord,
     OpportunityRecord,
     PurchaseOrderLineRecord,
@@ -80,6 +83,8 @@ CRM_BOOK = "crm-book"
 ERP_SALES = "erp-sales"
 ERP_VENDORS = "erp-vendors"
 ERP_PURCHASE_ORDERS = "erp-purchase-orders"
+HRIS_EMPLOYMENT_EVENTS = "hris-employment-events"
+DMS_LIBRARY = "dms-library"
 
 #: Records per delivery. The estate does not page, so this is the only bound on
 #: how large one POST gets; a chunk is cut on an `updatedAt` boundary, never
@@ -198,9 +203,26 @@ def build_connector_state_store(
 # The feed registry
 # ---------------------------------------------------------------------------
 
-#: Resolve one referenced record to the row the estate holds for it:
-#: `(resource, external_id) -> record`, empty when the estate has no such row.
-Deref = Callable[[str, str], dict]
+class EstateAccess(Protocol):
+    """What a `build` may ask the estate for beyond the rows it was handed.
+
+    Called as `access(resource, id)` it resolves one referenced record to the
+    row the estate holds for it, empty when there is no such row — the
+    sanctioned dereference. `access.url(...)` builds an address *in* the estate
+    without fetching anything, which is what a reference-custody feed needs: a
+    `storage_ref` is the customer's own content URL, and only the connector
+    knows the project and namespace it is spelled with. Both are mechanical.
+    Neither reads a byte more than the mapping declares.
+    """
+
+    def __call__(self, resource: str, record_id: str) -> dict: ...
+
+    def url(self, resource: str, record_id: str, suffix: str = "") -> str: ...
+
+
+#: The historical name for the callable half, kept because it is what the
+#: FeedSpec docstring and every existing build signature call it.
+Deref = EstateAccess
 
 
 @dataclass(frozen=True)
@@ -273,12 +295,25 @@ def _build_hris_workforce(
 ) -> SyncRequest:
     """HRIS departments/jobs/employees → the existing TeamRecord/EmployeeRecord.
 
-    Renames, and three id→key lookups that read the page first: `jobId` for the
-    title, `departmentId` for the team slug, `managerId` and `headEmployeeId`
-    for a work email. Nothing here decides anything — a department becomes a
-    Team because the Mapping says departments are Teams, and a worker whose
-    email another row already holds is delivered as it arrived. The duplicate
-    is real HRIS drift and resolving it is B5's job, not a connector's.
+    Renames, plus id→key lookups that read the pulled page first. Two of them
+    still fall back to a GET when the page does not answer — `jobId` for a
+    title, and `parentDepartmentId`/`headEmployeeId`, because no column on
+    `TeamRecord` carries a department's parent or lead by id, so the key is the
+    only thing that can travel.
+
+    **The manager and department dereferences are gone**, and that is the point
+    of the columns that replaced them. `managerId` and `departmentId` now ride
+    on the row as themselves, so a delta of one promoted employee no longer
+    costs a round trip to re-read a work email the flow can look up against a
+    person it already holds. The page is still read first — a full pull answers
+    both without leaving — and where it does not, the raw id is delivered and
+    the flow resolves it. A connector that fetched a key it had already been
+    given was doing the flow's job badly and its own job twice.
+
+    Nothing here decides anything: a department becomes a Team because the
+    Mapping says departments are Teams, and a worker whose email another row
+    already holds is delivered as it arrived. The duplicate is real HRIS drift
+    and resolving it is B5's job, not a connector's.
     """
     departments = {d["id"]: d for d in rows.get("departments", [])}
     jobs = {j["id"]: j for j in rows.get("jobs", [])}
@@ -298,6 +333,14 @@ def _build_hris_workforce(
 
     def email_of(worker_id: str) -> str:
         return _text(off_page(workers, "employees", worker_id), "workEmail")
+
+    def on_page_slug(dept_id: str) -> str:
+        """The department's slug, but only if the pull already carried it."""
+        return team_slug(_text(departments.get(dept_id) or {}, "name"))
+
+    def on_page_email(worker_id: str) -> str:
+        """The worker's email, but only if the pull already carried them."""
+        return _text(workers.get(worker_id) or {}, "workEmail")
 
     teams = [
         TeamRecord(
@@ -328,8 +371,16 @@ def _build_hris_workforce(
             title=_text(off_page(jobs, "jobs", _text(e, "jobId")), "title"),
             location=_text(e, "workLocation"),
             start_date=_text(e, "hireDate"),
-            manager_email=email_of(_text(e, "managerId")),
-            team_slug=slug_of(_text(e, "departmentId")),
+            manager_email=on_page_email(_text(e, "managerId")),
+            team_slug=on_page_slug(_text(e, "departmentId")),
+            manager_external_id=_text(e, "managerId"),
+            department_external_id=_text(e, "departmentId"),
+            # `workerStatus`, not `status`: the estate spells it its own way
+            # and this is the rename the wire shape exists for. A worker the
+            # HRIS calls Terminated arrives saying so instead of arriving
+            # indistinguishable from everyone still here.
+            status=_text(e, "workerStatus"),
+            employment_type=_text(e, "employmentType"),
         ))
 
     return SyncRequest(source=HRIS_WORKFORCE, teams=teams, employees=people)
@@ -503,6 +554,93 @@ def _build_erp_purchase_orders(
     return SyncRequest(source=ERP_PURCHASE_ORDERS, purchase_orders=orders)
 
 
+def _build_hris_employment_events(
+    rows: dict[str, list[dict]], deref: Deref
+) -> SyncRequest:
+    """HRIS employmentEvents → the ledger shape, carried whole.
+
+    The only build here that does not rename anything down to a chosen set of
+    columns, because the row *is* the payload. A promotion carries what the
+    job, department, manager and salary became and what each of them was; a
+    connector that picked four of those seventeen columns would have decided
+    which thirteen a later reader is allowed to ask about. Four are named on
+    the shape for addressing — an id to land under, a person to reference, a
+    type and a date to read without parsing — and the whole row travels beside
+    them.
+    """
+    return SyncRequest(
+        source=HRIS_EMPLOYMENT_EVENTS,
+        employment_events=[
+            EmploymentEventRecord(
+                external_id=_text(row, "id"),
+                employee_external_id=_text(row, "employeeId"),
+                event_type=_text(row, "eventType"),
+                effective_date=_text(row, "effectiveDate"),
+                payload=dict(row),
+            )
+            for row in rows.get("employmentEvents", [])
+        ],
+    )
+
+
+def _build_dms_library(
+    rows: dict[str, list[dict]], deref: Deref
+) -> SyncRequest:
+    """DMS folders/documents → the filing tree and pointers into it.
+
+    No dereference and, more to the point, **no content fetch**. The estate
+    serves the bytes at `/documents/<id>/content` and this build deliberately
+    only ever writes that address down: `storage_ref` is built from the ids the
+    list route already gave us, pinned to the revision it said was current.
+    That is the `reference` custody the Mapping declares, spelled out in the
+    one place it could quietly have been broken.
+
+    The parent pointer travels as the source's own id rather than as a path,
+    because a path is something the tree decides and the tree is the flow's to
+    walk.
+    """
+    return SyncRequest(
+        source=DMS_LIBRARY,
+        folders=[
+            FolderRecord(
+                external_id=_text(f, "id"),
+                name=_text(f, "name"),
+                parent_external_id=_text(f, "parentId"),
+            )
+            for f in rows.get("folders", [])
+        ],
+        documents=[
+            DmsDocumentRecord(
+                external_id=_text(d, "id"),
+                name=_text(d, "name"),
+                folder_external_id=_text(d, "folderId"),
+                content_type=_text(d, "contentType"),
+                size=int(_number(d, "size")),
+                latest_version=int(_number(d, "latestVersion")),
+                storage_ref=_storage_ref(deref, d),
+            )
+            for d in rows.get("documents", [])
+        ],
+    )
+
+
+def _storage_ref(deref: Deref, row: dict) -> str:
+    """The customer-resolvable address of one file's current revision.
+
+    Version-pinned on purpose. `/content` without a version answers with
+    whatever is latest *at read time*, so a reference recorded today would
+    quietly change meaning when somebody uploads a revision — and a Document
+    row that claims `latest_version: 2` while its pointer resolves to v4 is
+    worse than either fact alone.
+    """
+    record_id = _text(row, "id")
+    if not record_id:
+        return ""
+    version = int(_number(row, "latestVersion"))
+    suffix = f"/content?version={version}" if version else "/content"
+    return deref.url("documents", record_id, suffix)
+
+
 #: The closed table of feeds, and the extension point every later app lands in
 #: — same idiom as `dispatch.TRIGGERS` and `gateway.ACTIONS`. A sixth app is
 #: one FeedSpec, one Mapping, and (if it needs one) one flow; the connector
@@ -544,6 +682,25 @@ FEEDS: tuple[FeedSpec, ...] = (
         app="erp",
         resources=("purchaseOrders",),
         build=_build_erp_purchase_orders,
+    ),
+    FeedSpec(
+        feed=HRIS_EMPLOYMENT_EVENTS,
+        app="hris",
+        # Its own feed and not a fourth resource on `hris-workforce`: the
+        # ledger only grows, so its cursor moves on a different clock from the
+        # worker list's, and a workforce pull that failed must not hold back
+        # rows that were already safe to keep.
+        resources=("employmentEvents",),
+        build=_build_hris_employment_events,
+    ),
+    FeedSpec(
+        feed=DMS_LIBRARY,
+        app="dms",
+        # Folders before documents, for the reason teams precede employees: a
+        # file names the folder it is filed in, and the flow can only place it
+        # once that folder has landed.
+        resources=("folders", "documents"),
+        build=_build_dms_library,
     ),
 )
 
@@ -847,7 +1004,7 @@ class EstateConnector:
             )
         return rows
 
-    def _deref(self, app: str) -> Deref:
+    def _deref(self, app: str) -> EstateAccess:
         """One GET for a referenced record the pulled page does not hold.
 
         Memoized for the whole pull, not per chunk: a hundred people reporting
@@ -857,23 +1014,41 @@ class EstateConnector:
         flow already counts those on the aggregate instead of failing the batch.
         """
         seen: dict[tuple[str, str], dict] = {}
+        connector = self
 
-        def fetch(resource: str, record_id: str) -> dict:
-            if (resource, record_id) in seen:
-                return seen[(resource, record_id)]
-            try:
-                found = self._get(self.record_url(app, resource, record_id))
-            except EstateError as exc:
-                log.info(
-                    "Dereference missed",
-                    extra={"resource": resource, "id": record_id,
-                           "error": str(exc)},
+        class _Access:
+            def __call__(self, resource: str, record_id: str) -> dict:
+                if (resource, record_id) in seen:
+                    return seen[(resource, record_id)]
+                try:
+                    found = connector._get(
+                        connector.record_url(app, resource, record_id)
+                    )
+                except EstateError as exc:
+                    log.info(
+                        "Dereference missed",
+                        extra={"resource": resource, "id": record_id,
+                               "error": str(exc)},
+                    )
+                    found = {}
+                seen[(resource, record_id)] = (
+                    found if isinstance(found, dict) else {}
                 )
-                found = {}
-            seen[(resource, record_id)] = found if isinstance(found, dict) else {}
-            return seen[(resource, record_id)]
+                return seen[(resource, record_id)]
 
-        return fetch
+            def url(
+                self, resource: str, record_id: str, suffix: str = ""
+            ) -> str:
+                """An address in the estate, built and not called.
+
+                The one thing a build cannot work out for itself: the project
+                and namespace a URL is spelled with are the connector's
+                machinery config, deliberately below the portability line, so a
+                Mapping never names them and a `build` never sees them.
+                """
+                return connector.record_url(app, resource, record_id) + suffix
+
+        return _Access()
 
     def _deliver_chunk(
         self, spec: FeedSpec, chunk: dict[str, list[dict]], ordinal: int,

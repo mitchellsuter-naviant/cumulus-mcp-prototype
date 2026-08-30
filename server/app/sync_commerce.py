@@ -62,6 +62,7 @@ from .sync import (
     SalesOrderRecord,
     SyncService,
     _authority,
+    _slug,
 )
 from .tasks import Task, TaskEvidence, TaskProposal, TaskService
 
@@ -83,17 +84,6 @@ def register(service: SyncService) -> None:
 # ---------------------------------------------------------------------------
 # Shared vocabulary
 # ---------------------------------------------------------------------------
-
-
-def _slug(value: str) -> str:
-    """A source's display vocabulary as the ontology's declared one.
-
-    `Closed Won` is the CRM's word for `closed-won`; the enum on the type is
-    what every query and every eval is written against. Mechanical, and
-    deliberately *not* in the connector: which vocabulary a source's strings
-    belong to is a mapping decision, and mapping decisions live in flows.
-    """
-    return "-".join((value or "").strip().lower().split())
 
 
 def _item_type(value: str) -> str:

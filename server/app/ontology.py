@@ -201,6 +201,23 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("title", "string", "job title — a label, not a role"),
             FieldSpec("location", "string"),
             FieldSpec("start_date", "date"),
+            FieldSpec("external_id", "string",
+                      "the HRIS's own worker id. Kept as a claim rather than "
+                      "left in the connector because it is how one row's "
+                      "reference to another — a `managerId` — finds a person "
+                      "whose work email this delta never carried; without it "
+                      "the connector has to spend a GET restating what the "
+                      "row already said"),
+            FieldSpec("status", "enum",
+                      "the HRIS's own worker status — Active, Terminated, "
+                      "On Leave. Claimed rather than inferred from a "
+                      "termination date, and claimed rather than dropped: a "
+                      "person who has left is still an Employee with expenses "
+                      "and an org history, and a roster that quietly showed "
+                      "them as current would be wrong in the one direction "
+                      "that matters"),
+            FieldSpec("employment_type", "enum",
+                      "Full-time, Part-time, Contractor — the HRIS's word"),
         ),
         authoritative=True,
         collection="workforce",
@@ -225,6 +242,11 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("slug", "string"),
             FieldSpec("name", "string"),
             FieldSpec("mission", "string", "one line on what the team is for"),
+            FieldSpec("external_id", "string",
+                      "the HRIS's own department id, for the same reason "
+                      "Employee carries one: a worker row names its "
+                      "department by id, and the slug it keys on is derived "
+                      "from a name the delta may not have carried"),
         ),
         authoritative=True,
         collection="workforce",
@@ -414,6 +436,13 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
                       "the field that keeps a reference honest — without it a "
                       "referenced document is a filename with nothing behind "
                       "it"),
+            FieldSpec("latest_version", "number",
+                      "which revision the `storage_ref` points at, as the "
+                      "source counted it. A reference is only as honest as "
+                      "its version: a pointer at v2 of a document now on v4 "
+                      "is not a broken link — it resolves, and answers with "
+                      "content nobody has read since. Empty for a row we hold "
+                      "the bytes of, which has no revisions but its own"),
         ),
         collection="audit-documents",
         tags=("expenses", "payables", "evidence"),
@@ -652,7 +681,9 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("ordered_date", "date"),
             FieldSpec("total_usd", "money"),
             FieldSpec("currency", "string"),
-            FieldSpec("status", "enum", "open | closed | cancelled"),
+            FieldSpec("status", "enum",
+                      "the source's own word, slugged: open | pending-receipt "
+                      "| partially-received | closed | cancelled"),
         ),
         collection="ap-records",
         tags=("payables",),
@@ -1121,12 +1152,24 @@ LINK_TYPES: tuple[LinkType, ...] = (
 # actually knows. Ranking mail higher would let a signature block quietly
 # outrank the HRIS.
 #
+# `dms` sits between `office` and `procurement` and is the narrowest authority
+# in the list, deliberately. A document system knows exactly one kind of fact
+# first-hand — where a file is filed, what it is called, which revision is
+# current — and it is unopposed on all of them. Everything else it appears to
+# say is a *filename*: `Northwind Traders proposal 2026-06-04.pdf` names a
+# counterparty and a date, and reading either off it is inference, not
+# observation. So it ranks below the mirrors that at least observed something
+# and above `procurement`'s second-hand supplier records, and the ordering
+# almost never has to be exercised — which is the point. Without a bucket of
+# its own the DMS would fall through `_authority` to `flow`, and a filing
+# system's own tree would have been recorded as something Cumulus guessed.
+#
 # Both claims are always retained, so this order is a read-time decision: the
 # CRM/ERP disagreement the demo turns on is visible *because* neither claim was
 # discarded, and reordering this tuple re-resolves history rather than
 # rewriting it.
 PRECEDENCE: tuple[str, ...] = (
-    "human", "erp", "hris", "crm", "calendar", "office", "procurement",
+    "human", "erp", "hris", "crm", "calendar", "office", "dms", "procurement",
     "flow", "model",
 )
 

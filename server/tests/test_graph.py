@@ -760,17 +760,26 @@ def test_precedence_is_an_ordered_argument_not_a_set():
     Two systems of record first (each authoritative over its own subject, so
     they never actually compete), then the CRM below the ERP — where both
     describe one commercial fact the business is bound by the ERP's — then the
-    two provider mirrors, with `office` last among the systems because a title
-    read off a mail directory is a hint and must lose to anything that knows.
+    provider mirrors, with `office` below them because a title read off a mail
+    directory is a hint and must lose to anything that knows.
+
+    `dms` sits below `office` and above `procurement`, and its argument is
+    narrowness rather than trust: a document system knows where a file is
+    filed and what revision is current, is unopposed on both, and everything
+    else it appears to say is a filename. The ordering barely has to be
+    exercised — which is the point. What it is really for is that the bucket
+    exists at all: without it a DMS falls through `_authority` to `flow`, and
+    the customer's own filing tree gets recorded as something we inferred.
     """
     from app.ontology import ONTOLOGY
 
     assert ONTOLOGY.precedence == (
-        "human", "erp", "hris", "crm", "calendar", "office", "procurement",
-        "flow", "model",
+        "human", "erp", "hris", "crm", "calendar", "office", "dms",
+        "procurement", "flow", "model",
     )
     assert ONTOLOGY.precedence.index("erp") < ONTOLOGY.precedence.index("crm")
     assert ONTOLOGY.precedence.index("calendar") < ONTOLOGY.precedence.index("office")
+    assert ONTOLOGY.precedence.index("office") < ONTOLOGY.precedence.index("dms")
     # A Flow's own inference stays below every system that observed something.
     assert ONTOLOGY.precedence[-2:] == ("flow", "model")
 

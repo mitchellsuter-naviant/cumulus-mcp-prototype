@@ -1482,6 +1482,188 @@ def _seed_definitions() -> list[FlowDefinition]:
                          config={"event": "SalesRecordsSynced"}),
             ],
         ),
+        # The last four. Every feed that writes the graph now has a
+        # declarative export to audit, which is the carried debt the workplan
+        # opened with — "five flows write the graph with no map" — closed.
+        # The step ids below are the ones the runs actually journal, not a
+        # tidied-up spelling of them: an export that renamed a step would be
+        # a map of a flow nobody runs.
+        FlowDefinition(
+            id="workforce-sync",
+            name="Workforce sync",
+            description=(
+                "Lands the HRIS's departments and workers and wires the org "
+                "chart from the bind columns each row carries. Nothing is "
+                "reified and nothing reaches a steward: a work email is an "
+                "exact key, so there is no match to adjudicate. What can fail "
+                "is a reference — a manager or a department this delta did "
+                "not carry — and the flow resolves those against the ids "
+                "already claimed on the people and teams it holds before "
+                "counting one unresolved. A worker the HRIS calls Terminated "
+                "lands saying so."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "hris", "people", "org-chart"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(120),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="WorkforceDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "WorkforceDelivered"}, next=["a1"]),
+                FlowStep(id="a1", type="action", name="apply-teams",
+                         summary="guarded write of each department as a Team, keyed by slug and carrying the HRIS's own id",
+                         config={"target": "workforce", "gateway": "action-gateway"},
+                         next=["a2"]),
+                FlowStep(id="a2", type="action", name="apply-employees",
+                         summary="guarded write of each worker, keyed by work email — with the HRIS's worker status and employment type claimed only where the source stated them",
+                         config={"target": "workforce", "gateway": "action-gateway"},
+                         next=["a3"]),
+                FlowStep(id="a3", type="action", name="wire-org-chart",
+                         summary="guarded write of the membership, reporting, nesting and lead edges; a reference resolves by key first and by the source's own id second, and what neither answers is counted rather than minted",
+                         config={"target": "workforce", "gateway": "action-gateway"},
+                         next=["e1", "e2"],
+                         branch_labels=["synced", "references unresolved"]),
+                FlowStep(id="e1", type="event", name="WorkforceSynced",
+                         summary="emitted on commit",
+                         config={"event": "WorkforceSynced"}),
+                FlowStep(id="e2", type="event",
+                         name="WorkforceReferencesUnresolved",
+                         summary="emitted alongside e1 when the delivery named people or teams the graph does not hold — one aggregate per delivery, never a gate per row",
+                         config={"event": "WorkforceReferencesUnresolved"}),
+            ],
+        ),
+        FlowDefinition(
+            id="receiving-sync",
+            name="Receiving sync",
+            description=(
+                "Lands receiving reports and writes each one with its lines, "
+                "booked against the purchase order it names. The "
+                "goods-actually-arrived leg of the three-way match, which "
+                "reads these rows out of the graph rather than re-fetching "
+                "them. A report whose PO is not in the graph yet still "
+                "lands — it is counted, and the match finds it when the order "
+                "arrives."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "receiving", "three-way-match"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(120),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger",
+                         name="ReceivingReportsDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "ReceivingReportsDelivered"},
+                         next=["s1"]),
+                FlowStep(id="s1", type="sync", name="land-records",
+                         summary="the reports as delivered, kept before anything is derived from them",
+                         config={"target": "source-landing", "gateway": "action-gateway"},
+                         next=["a1"]),
+                FlowStep(id="a1", type="action",
+                         name="apply-receiving-reports",
+                         summary="guarded write of each report, its lines and the edge to the PO it books in against",
+                         config={"target": "source-landing", "gateway": "action-gateway"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="ReceivingReportsSynced",
+                         summary="emitted on commit",
+                         config={"event": "ReceivingReportsSynced"}),
+            ],
+        ),
+        FlowDefinition(
+            id="employment-event-sync",
+            name="Employment ledger sync",
+            description=(
+                "Mirrors the HRIS's append-only employment ledger and stops "
+                "there. Landing is the whole flow — no resolve step and no "
+                "apply step, because these rows describe changes to people "
+                "the workforce feed already lands, and asserting them a "
+                "second time would put two writers on one set of claims. Each "
+                "row carries what a job, department, manager or salary became "
+                "*and* what it was; no type holds a before/after pair, so the "
+                "row is kept whole for the flows that will ask about history."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "hris", "ledger", "history"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(1),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger",
+                         name="EmploymentEventsDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "EmploymentEventsDelivered"},
+                         next=["s1"]),
+                FlowStep(id="s1", type="sync", name="land-records",
+                         summary="every ledger row kept exactly as delivered, previous values included; a byte-identical redelivery is suppressed by payload hash",
+                         config={"target": "source-landing", "gateway": "action-gateway"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="EmploymentEventsLanded",
+                         summary="emitted on commit — `Landed` and not `Synced`, because nothing downstream was asserted",
+                         config={"event": "EmploymentEventsLanded"}),
+            ],
+        ),
+        FlowDefinition(
+            id="dms-sync",
+            name="Document library sync",
+            description=(
+                "Mirrors the customer's filing tree as knowledge about where "
+                "things are, never as a copy of what is in them. Folders "
+                "become objects keyed by their path from the root; each file "
+                "becomes a Document row stamped with the document library's "
+                "Collection and a version-pinned pointer back to the "
+                "original. The bytes are never fetched — that is the "
+                "Collection's declared reference custody, and it is why a row "
+                "here has no content hash: a hash is what a file somebody "
+                "read has."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "dms", "documents", "evidence", "filing"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(1),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="DocumentsDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "DocumentsDelivered"}, next=["a1"]),
+                FlowStep(id="a1", type="action", name="apply-folders",
+                         summary="walks the parent pointers into full paths — through the batch first, then the tree already in the graph — and guards a write per folder plus the nesting edge; a folder neither answers for is counted, not filed at the root",
+                         config={"target": "document-library", "gateway": "action-gateway"},
+                         next=["a2"]),
+                FlowStep(id="a2", type="action", name="apply-documents",
+                         summary="guarded write of each file as a reference: filename, media type, size, the Collection that governs it and the version-pinned `storage_ref` — then the edge to the folder the customer filed it in",
+                         config={"target": "document-library", "gateway": "action-gateway",
+                                 "custody": "reference"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="DocumentsSynced",
+                         summary="emitted on commit",
+                         config={"event": "DocumentsSynced"}),
+            ],
+        ),
     ]
 
 
