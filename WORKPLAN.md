@@ -284,6 +284,30 @@ Every subagent is spawned with `model: opus` (Opus 5) — decision 14.
   allow it; purge/reseed/pulse wait behind the deploy, then the capstone
   full-estate sync. Ontology decisions queued: Mailbox→Employee owner
   link; Office `showAs` dropped fact.
+- **2026-08-30 (Wave 3 lands — B4, B5, A3)** — B4 (`025f18f`): the mock
+  world is gone (server −1,585 lines); personas are real Naviant people
+  verified against the live HRIS (Nathan Pryce admin, Raymond Fitzgerald
+  controller w/ 4 queues, Connie Alberts AP, Karen Boothe HR, Diane Vogel
+  CEO, John Smith AE); empty-world honesty tested across 26 surfaces × 8
+  personas; a latent tz bug in calendars fixed. B5 (`c2408c5`): the
+  identity-sweep windowed flow — 6 live proposals incl. the roster's HARD
+  case (Kessler↔Prairie Records at 0.95 on domain+phone, name sim 0.18),
+  zero bait pairs, governed thresholds in the policy asset, mutation proof
+  permanent; answer-key eval 4 cases/40 assertions green. Merged at
+  `93aa122`: 823 passed / 1 skipped. A3 (ecosystem): payroll at 130-person
+  scale measured (1,255 Firestore round trips in one step vs the 60s
+  pulse_tick default — a wedged-namespace failure mode), fixed as three
+  steps + timeout_sec=300; cadences retuned (5/10/5 live instances);
+  simDayMinutes now a per-namespace admin-console setting; 100-tick walk
+  clean; DEPLOYED live. Post-merge: the misrouted-connector guard
+  (process marks on deliveries; the door refuses a foreign mark on a
+  process-local world) after two silent cross-server deliveries. Local
+  stack restarted on the merged tree: 1,366 objects / 1,645 links, people
+  links restored, 4 identity proposals + 2 steward Tasks live. Known:
+  masuter@naviant.com not in the estate HRIS (operator persona reads
+  not-in-workforce; Track A call). Ecosystem admin app Dart SDK too old in
+  this container (^3.13 needed, 3.9.2 installed) — simDayMinutes UI built
+  but unexecuted; hosting deploy of the admin app waits on an SDK bump.
 - **2026-08-30 (the estate goes live at scale)** — Ecosystem functions
   deployed; naviant purged and reseeded at 130-person scale (HRIS needed
   `timeout_sec=540` and the direct function URL — Hosting caps rewrites at
