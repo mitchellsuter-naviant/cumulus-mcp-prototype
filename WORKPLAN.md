@@ -284,6 +284,22 @@ Every subagent is spawned with `model: opus` (Opus 5) — decision 14.
   allow it; purge/reseed/pulse wait behind the deploy, then the capstone
   full-estate sync. Ontology decisions queued: Mailbox→Employee owner
   link; Office `showAs` dropped fact.
+- **2026-08-30 (the estate goes live at scale)** — Ecosystem functions
+  deployed; naviant purged and reseeded at 130-person scale (HRIS needed
+  `timeout_sec=540` and the direct function URL — Hosting caps rewrites at
+  ~60s; a pulse tick also snuck a payRun into the purge window before its
+  config reset, hence purge ×3). Live seed: HRIS 135 workers/797 time
+  entries/128 trainings, CRM 36/73/60, ERP 17/14/19/38/30, Office 34
+  mailboxes/126 messages, DMS 145 folders/62 docs. Pulse re-enabled at
+  low. **Capstone passed**: a cold Cumulus server pulled all nine feeds —
+  graph now 1,766 objects / 3,468 links (135 Employees, 40 Companies with
+  13 ERP customers linked not duplicated, 73 Persons, 60 Opportunities,
+  38 SalesOrders, 126 MailMessages, 145 Folders), invariants clean,
+  Northwind one Company with both name claims retained and
+  `conflict_fields:["name"]`. Local run: uvicorn :8080 with
+  ESTATE_PROJECT/ESTATE_NAMESPACE/ESTATE_PULL_INTERVAL_SECONDS=900;
+  console :3000 with DEV_AUTH=true. Critic wave applied at `8233c92`;
+  751 passed / 1 skipped.
 - **2026-08-30 (later)** — Decisions 13/14 recorded: the PSA app joins the
   estate (A4), subagents run Opus 5. Both in-flight Wave-1 agents briefed
   mid-run (A1 designs the PSA in; the architect shapes the connector for N
