@@ -138,7 +138,10 @@ def test_the_delivery_is_what_the_provider_would_push():
     """Built without a graph: the seed is a payload, not a fixture reaching
     into storage."""
     delivery = build_delivery(today=date(2026, 8, 28))
-    assert delivery["source"] == "calendar-m365"
+    # Under the declared contract of the system that really serves the
+    # estate's calendars — the seed used to speak under a Mapping for a
+    # Microsoft 365 tenant nobody operates.
+    assert delivery["source"] == "office-calendar"
     assert len(delivery["calendars"]) == len(EMPLOYEES)
     # Wall-clock local, not a UTC instant: a recurring 9am stays 9am.
     assert all(
@@ -171,7 +174,7 @@ def test_the_api_serves_my_week(client, world):
 
 def test_the_feed_appears_in_the_sources_lens(world):
     kinds = {(s.source, s.kind) for s in world.sync.sources()}
-    assert ("calendar-m365", "calendars") in kinds
+    assert ("office-calendar", "calendars") in kinds
 
 
 # ---- the operator: a person who arrives after the store was seeded ----------

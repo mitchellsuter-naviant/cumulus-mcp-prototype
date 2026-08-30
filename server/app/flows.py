@@ -1260,9 +1260,11 @@ def _seed_definitions() -> list[FlowDefinition]:
         # -- the sync fleet -------------------------------------------------
         #
         # Five feeds used to write the graph with no declarative export to
-        # audit — a flow you can watch run and cannot read. These four are the
-        # first of them to get one, and every step id below was read off a
-        # real journal rather than designed: an export that draws a step the
+        # audit — a flow you can watch run and cannot read. Six of them have
+        # one now; `receiving-sync` and `workforce-sync` are the two still
+        # owed, and the fleet list says so rather than inventing a map for
+        # them. Every step id below was read off a real journal rather than
+        # designed: an export that draws a step the
         # engine does not run is the exact divergence the transparency bar
         # exists to catch, and a map of a batch feed is only worth having if
         # it is the map of what happened.
@@ -1480,6 +1482,105 @@ def _seed_definitions() -> list[FlowDefinition]:
                 FlowStep(id="e1", type="event", name="SalesRecordsSynced",
                          summary="emitted on commit",
                          config={"event": "SalesRecordsSynced"}),
+            ],
+        ),
+        # The two office feeds. Neither has an `x1`/`s1`/`z1`, and the absence
+        # is the contract rather than an omission: a calendar address, a
+        # provider event id and a provider message id are all exact, so there
+        # is no policy to read, no landing record worth keeping, and nothing
+        # for a steward to adjudicate. What both flows do instead is bind
+        # by address in their last action step — and the interesting number
+        # each one reports is what did *not* bind.
+        FlowDefinition(
+            id="calendar-sync",
+            name="Calendar sync",
+            description=(
+                "Mirrors the office suite's calendars, one row per calendar "
+                "per event — which is what the provider actually stores: a "
+                "meeting with four attendees is four blocks with four ids, "
+                "four reminders and four responses, and collapsing them would "
+                "invent a shared object no provider has. What the copies agree "
+                "on is expressed as links to the same people. An attendee the "
+                "workforce does not contain is counted, never minted: an "
+                "invitation is not evidence of employment."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "calendars", "office", "mirror"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(60),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="CalendarsDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "CalendarsDelivered"}, next=["a1"]),
+                FlowStep(id="a1", type="action", name="apply-calendars",
+                         summary="guarded write of each calendar and the `has_calendar` edge to the employee whose it is — times stay wall-clock local in the calendar's own zone, because a recurring 9am has to survive a daylight-saving change",
+                         config={"target": "calendars", "gateway": "action-gateway"},
+                         next=["a2"]),
+                FlowStep(id="a2", type="action", name="apply-events",
+                         summary="guarded write of each block as a part of the calendar that holds it; an event whose calendar this graph does not hold is dropped and counted rather than being given an owner it does not have",
+                         config={"target": "calendars", "gateway": "action-gateway"},
+                         next=["a3"]),
+                FlowStep(id="a3", type="action", name="wire-attendance",
+                         summary="guarded write of the organizer and attendee edges, by work email — a client sponsor or an external recruiter resolves to nobody and is reported on the aggregate",
+                         config={"target": "calendars", "gateway": "action-gateway"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="CalendarsSynced",
+                         summary="emitted on commit",
+                         config={"event": "CalendarsSynced"}),
+            ],
+        ),
+        FlowDefinition(
+            id="mail-sync",
+            name="Mail sync",
+            description=(
+                "Mirrors mailboxes and the messages in them as evidence that a "
+                "conversation happened and who was in it — headers, addressing "
+                "and an opening preview, and deliberately not a mail store. "
+                "Bodies never reach the wire and the preview is capped again "
+                "on the way in, so a provider that called a whole body a "
+                "preview cannot smuggle one past. Correspondents bind by "
+                "address against the people already in the graph, inside the "
+                "company and out; an address belonging to nobody is counted "
+                "and left on the message, because a counterparty book that "
+                "grew a Person per unrecognized sender would fill with robots."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "mail", "office", "correspondence", "evidence"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(2),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="MailDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "MailDelivered"}, next=["a1"]),
+                FlowStep(id="a1", type="action", name="apply-mailboxes",
+                         summary="guarded write of each mailbox, keyed by address — the directory's job title and department land as `office` claims, which the HRIS outranks wherever the two disagree",
+                         config={"target": "correspondence", "gateway": "action-gateway"},
+                         next=["a2"]),
+                FlowStep(id="a2", type="action", name="apply-messages",
+                         summary="guarded write of each message as a part of the mailbox that holds it, truncated to the governed preview length; a message whose mailbox this graph does not hold is dropped and counted",
+                         config={"target": "correspondence", "gateway": "action-gateway",
+                                 "custody": "headers, addressing and body_preview only"},
+                         next=["a3"]),
+                FlowStep(id="a3", type="action", name="wire-correspondents",
+                         summary="guarded write of the sender and recipient edges, by address — separately typed for employees and outside people, because whether a commitment came from inside or outside the company is the first question anybody asks of a thread",
+                         config={"target": "correspondence", "gateway": "action-gateway"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="MailSynced",
+                         summary="emitted on commit", config={"event": "MailSynced"}),
             ],
         ),
     ]

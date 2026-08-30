@@ -53,10 +53,14 @@ from pydantic import BaseModel, Field
 from .models import utcnow
 from .sync import (
     AccountRecord,
+    CalendarEventRecord,
+    CalendarRecord,
     ContactRecord,
     CustomerRecord,
     EmployeeRecord,
     ItemRecord,
+    MailboxRecord,
+    MailMessageRecord,
     OpportunityRecord,
     PurchaseOrderLineRecord,
     PurchaseOrderRecord,
@@ -80,6 +84,15 @@ CRM_BOOK = "crm-book"
 ERP_SALES = "erp-sales"
 ERP_VENDORS = "erp-vendors"
 ERP_PURCHASE_ORDERS = "erp-purchase-orders"
+OFFICE_CALENDAR = "office-calendar"
+OFFICE_MAIL = "office-mail"
+
+#: The suite behind the estate's Office app, named once. Not an inference: the
+#: app serves Microsoft 365's own shapes — opaque `AAMkA…` message ids,
+#: `toRecipients`, `showAs`, `Sent Items` — and which system a feed comes from
+#: is precisely the kind of fact a FeedSpec is the right place to declare. The
+#: mirror types carry it so a reader can see whose copy they are looking at.
+OFFICE_PROVIDER = "microsoft-365"
 
 #: Records per delivery. The estate does not page, so this is the only bound on
 #: how large one POST gets; a chunk is cut on an `updatedAt` boundary, never
@@ -503,6 +516,130 @@ def _build_erp_purchase_orders(
     return SyncRequest(source=ERP_PURCHASE_ORDERS, purchase_orders=orders)
 
 
+def _mailbox_addresses(rows: dict[str, list[dict]], deref: Deref):
+    """`mailboxId` → the mailbox address, the way both office feeds need it.
+
+    The estate references a mailbox by its internal uuid while both office wire
+    shapes key on the address, so this is the same declared-key dereference the
+    purchase-order feed makes for `vendorId` — the pulled page first, one GET
+    for anything it does not hold, memoized for the whole pull. Shared by the
+    two feeds because a mailbox is a mailbox: two copies of this lookup that
+    drifted would put the calendar and the mail of one person under two
+    different keys, which is the one mistake that would make the mirror useless.
+    """
+    mailboxes = {m["id"]: m for m in rows.get("mailboxes", [])}
+
+    def address_of(mailbox_id: str) -> str:
+        if not mailbox_id:
+            return ""
+        if mailbox_id not in mailboxes:
+            mailboxes[mailbox_id] = deref("mailboxes", mailbox_id)
+        return _text(mailboxes[mailbox_id], "address")
+
+    return address_of
+
+
+def _build_office_calendar(
+    rows: dict[str, list[dict]], deref: Deref
+) -> SyncRequest:
+    """Office mailboxes/events → the existing Calendar wire shapes.
+
+    A rename onto a contract that already existed, which is why there is no new
+    flow here: `calendar-sync` was written against a provider mirror and the
+    estate's Office app *is* one. Two things it does not carry, stated rather
+    than filled in. It has no required/optional split on attendees, so
+    `optional_emails` stays empty and every guest lands required — a claim about
+    the addressing we do not have, left absent instead of guessed. And it has no
+    event *kind*: `showAs` is availability (`Busy`, `Out of Office`), which is a
+    different fact, so `kind` keeps the wire shape's default rather than having
+    availability quietly promoted into it. Mapping one onto the other would be
+    an invention, and inventions in a connector are invisible.
+    """
+    address_of = _mailbox_addresses(rows, deref)
+    calendars = [
+        CalendarRecord(
+            external_id=_text(m, "id"),
+            address=_text(m, "address"),
+            name=_text(m, "displayName"),
+            provider=OFFICE_PROVIDER,
+            timezone=_text(m, "timeZone"),
+            # The app models a mailbox as one person's, so its address is both
+            # the calendar's own and its owner's work email. A shared mailbox
+            # would need a directory this app does not serve — and would land
+            # with an owner nobody can resolve, which the flow already counts.
+            owner_email=_text(m, "address"),
+        )
+        for m in rows.get("mailboxes", [])
+    ]
+    events = [
+        CalendarEventRecord(
+            external_id=_text(e, "id"),
+            calendar_address=address_of(_text(e, "mailboxId")),
+            title=_text(e, "subject"),
+            starts_at=_text(e, "start"),
+            ends_at=_text(e, "end"),
+            all_day=bool(e.get("isAllDay")),
+            location=_text(e, "location"),
+            status="cancelled" if e.get("isCancelled") else "confirmed",
+            organizer_email=_text(e, "organizer"),
+            attendee_emails=[str(a) for a in (e.get("attendees") or [])],
+            notes=_text(e, "body"),
+        )
+        for e in rows.get("events", [])
+    ]
+    return SyncRequest(
+        source=OFFICE_CALENDAR, calendars=calendars, calendar_events=events,
+    )
+
+
+def _build_office_mail(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest:
+    """Office mailboxes/messages → the mail mirror. `bodyPreview`, never `body`.
+
+    The estate serves the whole message body on every row and this function
+    reads the preview beside it and drops the body on the floor. That is the
+    custody line held at the earliest possible point: a field that is never put
+    on the wire cannot be landed by mistake, cannot be logged by an
+    intermediary, and cannot be quietly relied on by a flow written later. The
+    flow caps the preview again — see `sync_office.PREVIEW_CHARS` — because
+    this is a boundary worth defending twice.
+    """
+    address_of = _mailbox_addresses(rows, deref)
+    return SyncRequest(
+        source=OFFICE_MAIL,
+        mailboxes=[
+            MailboxRecord(
+                external_id=_text(m, "id"),
+                address=_text(m, "address"),
+                display_name=_text(m, "displayName"),
+                provider=OFFICE_PROVIDER,
+                job_title=_text(m, "jobTitle"),
+                department=_text(m, "department"),
+                timezone=_text(m, "timeZone"),
+            )
+            for m in rows.get("mailboxes", [])
+        ],
+        mail_messages=[
+            MailMessageRecord(
+                external_id=_text(m, "id"),
+                mailbox_address=address_of(_text(m, "mailboxId")),
+                subject=_text(m, "subject"),
+                folder=_text(m, "folder"),
+                from_email=_text(m, "from"),
+                from_name=_text(m, "fromName"),
+                to_emails=[str(a) for a in (m.get("toRecipients") or [])],
+                cc_emails=[str(a) for a in (m.get("ccRecipients") or [])],
+                # `bodyPreview`, and deliberately not `body`.
+                body_preview=_text(m, "bodyPreview"),
+                importance=_text(m, "importance"),
+                conversation_id=_text(m, "conversationId"),
+                received_at=_text(m, "receivedDateTime"),
+                sent_at=_text(m, "sentDateTime"),
+            )
+            for m in rows.get("messages", [])
+        ],
+    )
+
+
 #: The closed table of feeds, and the extension point every later app lands in
 #: — same idiom as `dispatch.TRIGGERS` and `gateway.ACTIONS`. A sixth app is
 #: one FeedSpec, one Mapping, and (if it needs one) one flow; the connector
@@ -544,6 +681,25 @@ FEEDS: tuple[FeedSpec, ...] = (
         app="erp",
         resources=("purchaseOrders",),
         build=_build_erp_purchase_orders,
+    ),
+    FeedSpec(
+        feed=OFFICE_CALENDAR,
+        app="office",
+        # Mailboxes first, for the reason teams precede employees: an event is
+        # a part of a calendar and cannot land before the calendar does.
+        resources=("mailboxes", "events"),
+        build=_build_office_calendar,
+    ),
+    FeedSpec(
+        feed=OFFICE_MAIL,
+        app="office",
+        # The same mailboxes, pulled again under their own cursor. Two feeds
+        # over one resource rather than one feed over three, because the two
+        # halves of an office suite are different contracts — different
+        # authority, different custody, different flow — and a shared cursor
+        # would make a quiet calendar hold back the mail.
+        resources=("mailboxes", "messages"),
+        build=_build_office_mail,
     ),
 )
 

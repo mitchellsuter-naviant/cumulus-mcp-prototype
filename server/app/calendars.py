@@ -36,7 +36,13 @@ from .workforce import OPERATOR_EMAIL
 
 log = logging.getLogger("cumulus.calendars")
 
-CALENDAR_SOURCE = "calendar-m365"
+#: The feed this mock delivery arrives under — the same declared contract the
+#: estate's own office calendars pull through (`mappings.py`, `office-calendar`).
+#: There used to be a `calendar-m365` Mapping here describing a system nobody
+#: runs; the seed now speaks under the contract of the system that actually
+#: serves calendars, so the seeded world and the pulled one are governed by one
+#: map rather than two. The seed itself retires at B4.
+CALENDAR_SOURCE = "office-calendar"
 PROVIDER = "microsoft-365"
 
 # Whose calendar the console shows when the signed-in principal is not in the

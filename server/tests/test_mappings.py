@@ -91,7 +91,7 @@ def test_a_feed_name_resolves_to_an_authority_the_ontology_ranks():
     # The existing feeds keep the standing they had.
     for source, expected in (
         ("erp-vendors", "erp"), ("erp-purchase-orders", "erp"),
-        ("hris-workday", "hris"), ("calendar-m365", "calendar"),
+        ("hris-workday", "hris"),
         ("procurement-coupa", "procurement"), ("wms-receiving", "procurement"),
     ):
         assert _authority(source) == expected, source

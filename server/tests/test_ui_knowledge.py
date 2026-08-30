@@ -51,14 +51,15 @@ LIBRARY_ROUTE = "/api/ui/v1/library"
 ROUTES = (ONTOLOGY_ROUTE, SOURCES_ROUTE, LIBRARY_ROUTE)
 
 #: The flows that reach the graph. Written out rather than derived from the
-#: engine, so the test states the expected answer: seven of them are inbound
-#: syncs, three of those still have no FlowDefinition, and a selector built
-#: from the flow registry would offer six and lose the rest.
+#: engine, so the test states the expected answer: eight of them are inbound
+#: syncs, two of those still have no FlowDefinition, and a selector built
+#: from the flow registry would offer eight and lose the rest.
 GRAPH_FLOWS = {
     "accounts-payable",
     "calendar-sync",
     "crm-sync",
     "expense-reimbursement",
+    "mail-sync",
     "purchase-order-sync",
     "receiving-sync",
     "sales-sync",
@@ -284,12 +285,12 @@ def test_the_ontology_route_draws_the_whole_model_in_one_call(client):
 
 
 def test_the_selector_offers_every_flow_that_writes_the_graph(client):
-    """Not the definitions in the flow registry. Three of the nine are inbound
+    """Not the definitions in the flow registry. Two of the ten are inbound
     syncs with no FlowDefinition at all, and a picker built from the registry
     would leave part of the graph unattributable."""
     body = client.get(ONTOLOGY_ROUTE).json()
     assert {f["id"] for f in body["flows"]} == GRAPH_FLOWS
-    # Named, including the three the registry cannot name.
+    # Named, including the two the registry cannot name.
     assert all(f["label"] and f["label"] != f["id"] for f in body["flows"])
 
 

@@ -242,17 +242,17 @@ MAPPINGS: tuple[Mapping, ...] = (
         ),
     ),
     Mapping(
-        id="calendar-m365",
-        source="calendar-m365",
-        system="Microsoft 365 calendars",
+        id="office-calendar",
+        source="office-calendar",
+        system="Office suite calendars (the estate's mail and calendar system)",
         summary=(
-            "Every employee's schedule, mirrored per calendar. A **bind** "
-            "contract like the HRIS: a calendar address and a provider event "
-            "id are exact, and attendees are named by work email, so nothing "
-            "is reified and nothing needs a steward. Attendees the workforce "
-            "does not contain — a client sponsor, an external recruiter — are "
-            "counted as unresolved rather than minted: an invitation is not "
-            "evidence of employment."
+            "Every mailbox's schedule, mirrored per calendar and pulled on a "
+            "delta. A **bind** contract like the HRIS: a calendar address and "
+            "a provider event id are exact, and attendees are named by work "
+            "email, so nothing is reified and nothing needs a steward. "
+            "Attendees the workforce does not contain — a client sponsor, an "
+            "external recruiter — are counted as unresolved rather than "
+            "minted: an invitation is not evidence of employment."
         ),
         transport="pull",
         payload="CalendarRecord + CalendarEventRecord",
@@ -271,7 +271,7 @@ MAPPINGS: tuple[Mapping, ...] = (
                             key="work email"),
         ),
         precedence_source="calendar",
-        freshness="every 15 minutes, delta by watermark",
+        freshness="pull, delta by updatedAt watermark per resource",
         custody="copy",
         collection="calendars",
         escalation="windowed aggregate",
@@ -279,7 +279,16 @@ MAPPINGS: tuple[Mapping, ...] = (
             "Times land as wall-clock local in the calendar's own zone, not "
             "as UTC instants: a recurring 9am has to stay 9am across a "
             "daylight-saving change, and normalizing it away would move "
-            "every recurring meeting twice a year."
+            "every recurring meeting twice a year. One declared-key "
+            "dereference, named because the connector is otherwise mechanical: "
+            "an event names its mailbox by internal id and this contract keys "
+            "a calendar by address, so the mailbox row is read for `address` "
+            "and memoized for the whole pull. The source models a mailbox as "
+            "one person's, so that address is also the owner's work email. Two "
+            "facts it does not carry are left absent rather than inferred: it "
+            "has no required/optional split on attendees, and its `showAs` is "
+            "availability rather than an event kind, so `kind` keeps the wire "
+            "shape's default instead of having availability promoted into it."
         ),
     ),
     Mapping(
@@ -436,6 +445,67 @@ MAPPINGS: tuple[Mapping, ...] = (
             "neither answers is counted, never minted: inventing a catalogue "
             "entry out of an id would put a SKU-less Item in the book that "
             "the next real one could never merge with."
+        ),
+    ),
+    Mapping(
+        id="office-mail",
+        source="office-mail",
+        system="Office suite mail (the estate's mail and calendar system)",
+        summary=(
+            "Mail as evidence that a conversation happened and who was in it "
+            "— not a mail store. A **bind** contract on the same terms as the "
+            "calendar beside it: a mailbox address and a provider message id "
+            "are exact, so nothing is reified and no steward is asked. What "
+            "makes this feed worth having is that a commitment is usually "
+            "made in a thread before any system has a row for it; what keeps "
+            "it defensible is that custody stops at an opening preview."
+        ),
+        transport="pull",
+        payload="MailboxRecord + MailMessageRecord",
+        strategy="bind",
+        resolves_to=("Mailbox", "MailMessage", "Person", "Employee"),
+        identity=(
+            IdentityBinding(column="address", object_type="Mailbox",
+                            key="mailbox address"),
+            IdentityBinding(column="mailbox_address", object_type="Mailbox",
+                            key="mailbox address"),
+            IdentityBinding(column="from_email", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="from_email", object_type="Person",
+                            key="lowercased email"),
+            IdentityBinding(column="to_emails", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="to_emails", object_type="Person",
+                            key="lowercased email"),
+            IdentityBinding(column="cc_emails", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="cc_emails", object_type="Person",
+                            key="lowercased email"),
+        ),
+        # Deliberately the lowest-ranked system authority. A job title read off
+        # a mail directory is a hint the HRIS outranks, and a fact asserted in
+        # a thread is a fact somebody typed.
+        precedence_source="office",
+        freshness="pull, delta by updatedAt watermark per resource",
+        custody="copy",
+        collection="correspondence",
+        escalation="windowed aggregate",
+        notes=(
+            "**Custody stops at `body_preview`, capped at 240 characters "
+            "(`sync_office.PREVIEW_CHARS`).** The source serves the whole body "
+            "on every row; the connector never puts it on the wire — the shape "
+            "has no `body` field — and the flow truncates the preview again on "
+            "the way in, so a provider that called a whole body a preview "
+            "cannot smuggle one through. An address that belongs to nobody in "
+            "the graph is counted and left on the row as `from_email`, never "
+            "minted: a counterparty book that grew a Person per unrecognized "
+            "sender would fill with no-reply robots. That is also where the "
+            "estate's vendor drift sits — `GSF Logistics` writing from "
+            "`billing@granitefreight.example.com` — as `from_name` evidence on "
+            "a landed message, for a later flow with a steward and a threshold "
+            "to propose, rather than a batch feed to guess. One declared-key "
+            "dereference, the same one the calendar makes: a message names its "
+            "mailbox by internal id and this contract keys by address."
         ),
     ),
 )

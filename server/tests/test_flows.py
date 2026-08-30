@@ -38,12 +38,13 @@ from tests import world as test_world
 SYNC_FLOWS = {
     "vendor-sync", "purchase-order-sync", "receiving-sync",
     "workforce-sync", "calendar-sync", "crm-sync", "sales-sync",
+    "mail-sync",
 }
 #: The feeds that still write the graph with no declarative export to audit.
-#: Four of the seven have one now; these three are the carried debt that is
+#: Six of the eight have one now; these two are the carried debt that is
 #: left, and this set is meant to shrink to nothing rather than to be
 #: maintained.
-UNDECLARED_FEEDS = {"receiving-sync", "workforce-sync", "calendar-sync"}
+UNDECLARED_FEEDS = {"receiving-sync", "workforce-sync"}
 
 
 @pytest.fixture()
@@ -145,8 +146,8 @@ def probe_flow(client, owner, flow_id: str) -> None:
 
 def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
     """The list used to be the registry, so it showed two flows in a system
-    that runs nine. Seven inbound sync feeds write the graph; four of them
-    have a `FlowDefinition` now and three still do not, and every one of them
+    that runs ten. Eight inbound sync feeds write the graph; six of them
+    have a `FlowDefinition` now and two still do not, and every one of them
     is on this list either way — a definition-less row is honest, hiding the
     row is not."""
     submit_expenses(world, 2)
@@ -154,7 +155,7 @@ def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
     by_id = {r["id"]: r for r in rows}
     assert SYNC_FLOWS < set(by_id)
     assert {"expense-reimbursement", "accounts-payable"} < set(by_id)
-    assert len(rows) == 9
+    assert len(rows) == 10
 
     # A definition-less row says so, rather than borrowing a lifecycle state
     # it has no definition to hold.
@@ -182,6 +183,7 @@ def test_list_filters(client):
     assert {r["id"] for r in active} == {
         "expense-reimbursement", "accounts-payable",
         "vendor-sync", "purchase-order-sync", "crm-sync", "sales-sync",
+        "calendar-sync", "mail-sync",
     }
     undeclared = client.get("/api/v1/flows", params={"status": "undeclared"}).json()
     assert {r["id"] for r in undeclared} == UNDECLARED_FEEDS
@@ -361,9 +363,9 @@ def test_the_fleet_run_count_is_the_real_run_count(client, world):
         for row in client.get("/api/v1/flows").json()
     ]
     assert stats["runs"] == sum(u["runs"] for u in per_flow)
-    assert stats["flows"] == 9
-    assert stats["definitions"] == 6
-    assert stats["without_definition"] == 3
+    assert stats["flows"] == 10
+    assert stats["definitions"] == 8
+    assert stats["without_definition"] == len(UNDECLARED_FEEDS) == 2
 
 
 def test_a_flow_with_no_runs_reports_zero_rather_than_a_series(client):

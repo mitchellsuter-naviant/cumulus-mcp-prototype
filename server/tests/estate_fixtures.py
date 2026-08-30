@@ -563,6 +563,429 @@ PURCHASE_ORDERS: list[dict] = [
      "updatedAt": "2026-08-30T13:12:04.620976+00:00"},
 ]
 
+#: Five of the twelve live mailboxes. Four here and one deliberately off-page
+#: below, because both office feeds reference a mailbox by internal id while
+#: both wire shapes key on the address — so a message or an event whose mailbox
+#: the delta did not carry is the dereference case, and it is also the case
+#: where a *message* legitimately arrives with nowhere to hang.
+MAILBOXES: list[dict] = [
+    {'id': '54c4b697-b69c-447f-927d-79556e886ebd',
+     'address': 'john.smith@naviant.com',
+     'displayName': 'John Smith',
+     'jobTitle': 'Account Executive',
+     'department': 'Sales',
+     'timeZone': 'America/Chicago',
+     'createdAt': '2026-08-16T22:16:17.817795+00:00',
+     'updatedAt': '2026-08-16T22:16:17.817795+00:00'},
+    {'id': '4fcef8aa-dc97-4455-be44-ed149399b5cd',
+     'address': 'raymond.fitzgerald@naviant.com',
+     'displayName': 'Raymond Fitzgerald',
+     'jobTitle': 'Controller',
+     'department': 'Finance & Administration',
+     'timeZone': 'America/Chicago',
+     'createdAt': '2026-08-16T23:07:40.879264+00:00',
+     'updatedAt': '2026-08-16T23:07:40.879264+00:00'},
+    {'id': '52a02a75-105a-4af1-9154-6340013c9c7f',
+     'address': 'gregory.lindholm@naviant.com',
+     'displayName': 'Gregory Lindholm',
+     'jobTitle': 'Director of Professional Services',
+     'department': 'Professional Services',
+     'timeZone': 'America/Chicago',
+     'createdAt': '2026-08-16T23:07:40.764168+00:00',
+     'updatedAt': '2026-08-16T23:07:40.764168+00:00'},
+    {'id': '5ae3d6e7-c8d1-4d1d-81a7-254b03bc58f0',
+     'address': 'marcus.reyes@naviant.com',
+     'displayName': 'Marcus Reyes',
+     'jobTitle': 'VP of Sales',
+     'department': 'Sales',
+     'timeZone': 'America/Chicago',
+     'createdAt': '2026-08-19T03:57:05.725218+00:00',
+     'updatedAt': '2026-08-19T03:57:05.725218+00:00'},
+]
+
+#: Reachable by id, absent from every list — Karen Boothe, who is also the
+#: off-page HRIS worker above. One person missing from two deltas at once is
+#: what a delta window actually looks like.
+MAILBOX_OFF_PAGE: dict = {
+    'id': '9825e255-3b3f-4a96-888f-09463fc8cad2',
+    'address': 'karen.boothe@naviant.com',
+    'displayName': 'Karen Boothe',
+    'jobTitle': 'HR Generalist',
+    'department': 'Human Resources',
+    'timeZone': 'America/Chicago',
+    'createdAt': '2026-08-17T09:12:04.365926+00:00',
+    'updatedAt': '2026-08-17T09:12:04.365926+00:00',
+}
+
+#: Nine of the live 163 messages, chosen for what they cover rather than for
+#: tidiness. Every row carries its **whole `body`** alongside `bodyPreview`,
+#: exactly as the estate serves it — which is the only way a test can prove the
+#: body never lands. Between them: a sender who is an Employee, one who is a
+#: known Person, one nobody has ever heard of, and the same thread sitting in
+#: two mailboxes under two ids and one `conversationId`.
+#:
+#: `billing@granitefreight.example.com` signing itself `GSF Logistics` is the
+#: estate's real vendor drift. It arrives here as evidence and stays evidence:
+#: `mail-sync` counts it and B5 is the flow that gets to have an opinion.
+MAIL_MESSAGES: list[dict] = [
+    {'id': 'AAMkA1TkazWITQry_6hnLp5qjTw',
+     'mailboxId': '52a02a75-105a-4af1-9154-6340013c9c7f',
+     'subject': 'Welcome to Naviant — your first week',
+     'folder': 'Inbox',
+     'from': 'karen.boothe@naviant.com',
+     'fromName': 'Karen Boothe',
+     'toRecipients': ['bethany.kruse@naviant.com',
+                      'gregory.lindholm@naviant.com'],
+     'ccRecipients': [],
+     'body': 'Bethany,\n'
+             '\n'
+             'Welcome to Naviant. You start 2026-09-17 as Implementation '
+             'Consultant, reporting to Gregory Lindholm. Your address here is '
+             'bethany.kruse@naviant.com and your laptop will be on your desk '
+             'when you arrive.\n'
+             '\n'
+             'The first weeks look like this: sign offer letter and i-9, '
+             'provision laptop and accounts, complete tax withholding forms, '
+             'manager welcome 1:1. Gregory will put a standing 1:1 on your '
+             'calendar, and benefits enrolment opens inside your first thirty '
+             'days.\n'
+             '\n'
+             'Anything you need before then, just ask.\n'
+             '\n'
+             'Karen',
+     'importance': 'Normal',
+     'isRead': False,
+     'hasAttachments': False,
+     'conversationId': 'AAQkC_0JeLdseT2-X6CXXuohfnA',
+     'receivedDateTime': '2026-08-24T00:42:08.692166+00:00',
+     'sentDateTime': '2026-08-24T00:42:08.692166+00:00',
+     'bodyPreview': 'Bethany, Welcome to Naviant. You start 2026-09-17 as '
+                    'Implementation Consultant, reporting to Gregory Lindholm. '
+                    'Your address here is bethany…',
+     'createdAt': '2026-08-24T00:42:09.034479+00:00',
+     'updatedAt': '2026-08-24T00:42:09.034479+00:00'},
+    {'id': 'AAMkAxD2Z36czThyRixDYIchVMQ',
+     'mailboxId': '54c4b697-b69c-447f-927d-79556e886ebd',
+     'subject': 'Northwind — Returns Dock Capture decision',
+     'folder': 'Inbox',
+     'from': 'tom.berg@northwindtraders.example.com',
+     'fromName': 'Tom Berg',
+     'toRecipients': ['john.smith@naviant.com'],
+     'ccRecipients': [],
+     'body': 'John,\n'
+             '\n'
+             'Thank you for the work on Northwind — Returns Dock Capture. We '
+             'have decided to stay with our incumbent for this phase. The '
+             "proposal was thorough and I'd like to keep talking about next "
+             'year.\n'
+             '\n'
+             'Tom',
+     'importance': 'Normal',
+     'isRead': False,
+     'hasAttachments': False,
+     'conversationId': 'AAQkCFqOLee3IT4-MU1tUbyl__g',
+     'receivedDateTime': '2026-08-26T08:27:10.902871+00:00',
+     'sentDateTime': None,
+     'bodyPreview': 'John, Thank you for the work on Northwind — Returns Dock '
+                    'Capture. We have decided to stay with our incumbent for '
+                    'this phase. The proposal w…',
+     'createdAt': '2026-08-26T08:27:10.902876+00:00',
+     'updatedAt': '2026-08-26T08:27:10.902876+00:00'},
+    {'id': 'AAMkASU6akN-lQ0a9H_6Bq2jHng',
+     'mailboxId': '9825e255-3b3f-4a96-888f-09463fc8cad2',
+     'subject': 'Welcome to Naviant — your first week',
+     'folder': 'Sent Items',
+     'from': 'karen.boothe@naviant.com',
+     'fromName': 'Karen Boothe',
+     'toRecipients': ['corey.landsman@naviant.com',
+                      'gregory.lindholm@naviant.com'],
+     'ccRecipients': [],
+     'body': 'Corey,\n'
+             '\n'
+             'Welcome to Naviant. You start 2026-09-22 as Implementation '
+             'Consultant, reporting to Gregory Lindholm. Your address here is '
+             'corey.landsman@naviant.com and your laptop will be on your desk '
+             'when you arrive.\n'
+             '\n'
+             'The first weeks look like this: sign offer letter and i-9, '
+             'provision laptop and accounts, complete tax withholding forms, '
+             'manager welcome 1:1. Gregory will put a standing 1:1 on your '
+             'calendar, and benefits enrolment opens inside your first thirty '
+             'days.\n'
+             '\n'
+             'Anything you need before then, just ask.\n'
+             '\n'
+             'Karen',
+     'importance': 'Normal',
+     'isRead': True,
+     'hasAttachments': False,
+     'conversationId': 'AAQkCii943nrMQoa3CkoTmw3vPw',
+     'receivedDateTime': None,
+     'sentDateTime': '2026-08-29T22:27:05.245508+00:00',
+     'bodyPreview': 'Corey, Welcome to Naviant. You start 2026-09-22 as '
+                    'Implementation Consultant, reporting to Gregory Lindholm. '
+                    'Your address here is corey.lan…',
+     'createdAt': '2026-08-29T22:27:04.958381+00:00',
+     'updatedAt': '2026-08-29T22:27:05.245508+00:00'},
+    {'id': 'AAMkAqYAuv8dESS-p_OjT3T9QGQ',
+     'mailboxId': '4fcef8aa-dc97-4455-be44-ed149399b5cd',
+     'subject': 'Invoice reminder — PO6012',
+     'folder': 'Inbox',
+     'from': 'billing@granitefreight.example.com',
+     'fromName': 'GSF Logistics',
+     'toRecipients': ['raymond.fitzgerald@naviant.com'],
+     'ccRecipients': [],
+     'body': 'This is a courtesy reminder that the balance on our invoice for '
+             'purchase order PO6012, $2,560.00, is due on Net 15 terms. If '
+             'payment has already been released, please disregard.',
+     'importance': 'Normal',
+     'isRead': False,
+     'hasAttachments': False,
+     'conversationId': 'AAQkCneWLJzqcSQedcIRA0kxong',
+     'receivedDateTime': '2026-08-29T23:57:04.355808+00:00',
+     'sentDateTime': None,
+     'bodyPreview': 'This is a courtesy reminder that the balance on our invoice '
+                    'for purchase order PO6012, $2,560.00, is due on Net 15 '
+                    'terms. If payment has al…',
+     'createdAt': '2026-08-29T23:57:04.355823+00:00',
+     'updatedAt': '2026-08-29T23:57:04.355823+00:00'},
+    {'id': 'AAMkA7Pf7ZuYTRKa-aISbmbAemA',
+     'mailboxId': '54c4b697-b69c-447f-927d-79556e886ebd',
+     'subject': 'Summit Health — Records Digitization Phase 2',
+     'folder': 'Sent Items',
+     'from': 'john.smith@naviant.com',
+     'fromName': 'John Smith',
+     'toRecipients': ['priya.raman@summithealth.example.com'],
+     'ccRecipients': ['evan.walsh@summithealth.example.com'],
+     'body': 'Priya,\n'
+             '\n'
+             'Good talking today. To recap what we scoped: bureau day rate for '
+             'the basement records plus two production units on site. That is '
+             'the Records Digitization Phase 2 work we walked through, and the '
+             'digitization schedule is the piece still open.\n'
+             '\n'
+             "I'll have numbers to you by Friday.\n"
+             '\n'
+             'John',
+     'importance': 'Normal',
+     'isRead': True,
+     'hasAttachments': False,
+     'conversationId': 'AAQkC4Hgn3031T4Wjwm6HW6Hf3Q',
+     'receivedDateTime': None,
+     'sentDateTime': '2026-08-30T10:27:06.782790+00:00',
+     'bodyPreview': 'Priya, Good talking today. To recap what we scoped: bureau '
+                    'day rate for the basement records plus two production units '
+                    'on site. That is the…',
+     'createdAt': '2026-08-30T10:27:06.473503+00:00',
+     'updatedAt': '2026-08-30T10:27:06.782790+00:00'},
+    {'id': 'AAMkAdiv48e4_TGWA7VijoLQLSA',
+     'mailboxId': '52a02a75-105a-4af1-9154-6340013c9c7f',
+     'subject': 'Restock — Lakeshore Paper and Packaging',
+     'folder': 'Sent Items',
+     'from': 'gregory.lindholm@naviant.com',
+     'fromName': 'Gregory Lindholm',
+     'toRecipients': ['raymond.fitzgerald@naviant.com'],
+     'ccRecipients': ['curtis.boyd@naviant.com'],
+     'body': 'Raymond,\n'
+             '\n'
+             'The shipping supplies for the Northwind crates are short. Can we '
+             'cut a PO to Lakeshore Paper and Packaging this week? Lead time has '
+             "been running about two weeks, so I'd rather not wait on it.\n"
+             '\n'
+             "I'll have Curtis check the shipment in when it lands.\n"
+             '\n'
+             'Gregory',
+     'importance': 'Normal',
+     'isRead': True,
+     'hasAttachments': False,
+     'conversationId': 'AAQkC0EauXR_HQTSwEkVNiIihNw',
+     'receivedDateTime': None,
+     'sentDateTime': '2026-08-30T11:27:10.429389+00:00',
+     'bodyPreview': 'Raymond, The shipping supplies for the Northwind crates are '
+                    'short. Can we cut a PO to Lakeshore Paper and Packaging '
+                    'this week? Lead time ha…',
+     'createdAt': '2026-08-30T11:27:10.079555+00:00',
+     'updatedAt': '2026-08-30T11:27:10.429389+00:00'},
+    {'id': 'AAMkA6CKvgQBDSF6MMHPEBmcnwQ',
+     'mailboxId': '4fcef8aa-dc97-4455-be44-ed149399b5cd',
+     'subject': 'Restock — Lakeshore Paper and Packaging',
+     'folder': 'Inbox',
+     'from': 'gregory.lindholm@naviant.com',
+     'fromName': 'Gregory Lindholm',
+     'toRecipients': ['raymond.fitzgerald@naviant.com'],
+     'ccRecipients': ['curtis.boyd@naviant.com'],
+     'body': 'Raymond,\n'
+             '\n'
+             'The shipping supplies for the Northwind crates are short. Can we '
+             'cut a PO to Lakeshore Paper and Packaging this week? Lead time has '
+             "been running about two weeks, so I'd rather not wait on it.\n"
+             '\n'
+             "I'll have Curtis check the shipment in when it lands.\n"
+             '\n'
+             'Gregory',
+     'importance': 'Normal',
+     'isRead': False,
+     'hasAttachments': False,
+     'conversationId': 'AAQkC0EauXR_HQTSwEkVNiIihNw',
+     'receivedDateTime': '2026-08-30T11:27:10.429389+00:00',
+     'sentDateTime': '2026-08-30T11:27:10.429389+00:00',
+     'bodyPreview': 'Raymond, The shipping supplies for the Northwind crates are '
+                    'short. Can we cut a PO to Lakeshore Paper and Packaging '
+                    'this week? Lead time ha…',
+     'createdAt': '2026-08-30T11:27:10.668843+00:00',
+     'updatedAt': '2026-08-30T11:27:10.668843+00:00'},
+    {'id': 'AAMkAdliML1ppRHiNgR5Cq76BVg',
+     'mailboxId': '4fcef8aa-dc97-4455-be44-ed149399b5cd',
+     'subject': 'PO6013 — Crating stock — fourth quarter',
+     'folder': 'Sent Items',
+     'from': 'raymond.fitzgerald@naviant.com',
+     'fromName': 'Raymond Fitzgerald',
+     'toRecipients': ['orders@lakeshorepaper.example.com'],
+     'ccRecipients': ['curtis.boyd@naviant.com'],
+     'body': 'Good morning,\n'
+             '\n'
+             'PO6013 attached — confirm the ship date and the freight terms. The '
+             'order is crating stock — fourth quarter, $3,360.00 on Net 30 '
+             'terms.\n'
+             '\n'
+             'Deliveries go to the bureau floor entrance; Curtis Boyd signs for '
+             'them.\n'
+             '\n'
+             'Raymond Fitzgerald | Controller | Naviant',
+     'importance': 'Normal',
+     'isRead': True,
+     'hasAttachments': True,
+     'conversationId': 'AAQkC6hrsnMKETumavHpEtdsyvQ',
+     'receivedDateTime': None,
+     'sentDateTime': '2026-08-30T16:42:09.107888+00:00',
+     'bodyPreview': 'Good morning, PO6013 attached — confirm the ship date and '
+                    'the freight terms. The order is crating stock — fourth '
+                    'quarter, $3,360.00 on Net …',
+     'createdAt': '2026-08-30T16:42:08.844088+00:00',
+     'updatedAt': '2026-08-30T16:42:09.107888+00:00'},
+    {'id': 'AAMkAjdMx-40_Tkm2mEGON2lpYw',
+     'mailboxId': '54c4b697-b69c-447f-927d-79556e886ebd',
+     'subject': 'RE: Summit Health — Records Digitization Phase 2',
+     'folder': 'Inbox',
+     'from': 'priya.raman@summithealth.example.com',
+     'fromName': 'Priya Raman',
+     'toRecipients': ['john.smith@naviant.com'],
+     'ccRecipients': [],
+     'body': 'John,\n'
+             '\n'
+             'Two things on Summit — Records Digitization Phase 2. The timeline '
+             'has us installing during our busiest month, and finance is asking '
+             "whether the capture licences can move to next year's budget. What "
+             'does that do to the number?\n'
+             '\n'
+             'Priya',
+     'importance': 'Normal',
+     'isRead': False,
+     'hasAttachments': False,
+     'conversationId': 'AAQkCCf3No3zURxSziW7yLNUpLQ',
+     'receivedDateTime': '2026-08-30T16:57:09.129520+00:00',
+     'sentDateTime': None,
+     'bodyPreview': 'John, Two things on Summit — Records Digitization Phase 2. '
+                    'The timeline has us installing during our busiest month, '
+                    'and finance is asking w…',
+     'createdAt': '2026-08-30T16:57:09.129526+00:00',
+     'updatedAt': '2026-08-30T16:57:09.129526+00:00'},
+]
+
+#: Six of the live 116 calendar events, on three of the mailboxes above: two
+#: with external attendees, one all-day trip the provider marks `Out of Office`
+#: (availability, which is why it does not become an event `kind`), and two
+#: copies of one interview loop sitting on one calendar under two ids.
+OFFICE_EVENTS: list[dict] = [
+    {'id': 'AAQkACFb1CmUCQaekMF3pfRrULg',
+     'mailboxId': '54c4b697-b69c-447f-927d-79556e886ebd',
+     'subject': 'Sales pipeline stand-up',
+     'start': '2026-08-16T14:00:00+00:00',
+     'end': '2026-08-16T14:30:00+00:00',
+     'isAllDay': False,
+     'location': 'Teams',
+     'organizer': 'john.smith@naviant.com',
+     'attendees': ['tom.berg@northwindtraders.example.com'],
+     'body': 'Weekly review of open opportunities.',
+     'showAs': 'Busy',
+     'isCancelled': False,
+     'createdAt': '2026-08-16T22:16:19.028001+00:00',
+     'updatedAt': '2026-08-16T22:16:19.028001+00:00'},
+    {'id': 'AAQkAcD_d8X_gRsCVkPyXNY5eQQ',
+     'mailboxId': '54c4b697-b69c-447f-927d-79556e886ebd',
+     'subject': 'Northwind — restock pricing review',
+     'start': '2026-08-16T18:00:00+00:00',
+     'end': '2026-08-16T19:00:00+00:00',
+     'isAllDay': False,
+     'location': 'Teams',
+     'organizer': 'john.smith@naviant.com',
+     'attendees': ['maria.delgado@northwindtraders.example.com',
+                   'tom.berg@northwindtraders.example.com'],
+     'body': 'Walk through the revised scanner quantities.',
+     'showAs': 'Busy',
+     'isCancelled': False,
+     'createdAt': '2026-08-16T22:16:19.088171+00:00',
+     'updatedAt': '2026-08-16T22:16:19.088171+00:00'},
+    {'id': 'AAQkAh6WKsEo_RE-rGXsWQmZf4g',
+     'mailboxId': '54c4b697-b69c-447f-927d-79556e886ebd',
+     'subject': 'Blue Harbor site visit — Seattle',
+     'start': '2026-08-19T05:00:00+00:00',
+     'end': '2026-08-20T05:00:00+00:00',
+     'isAllDay': True,
+     'location': 'Seattle, WA',
+     'organizer': 'john.smith@naviant.com',
+     'attendees': [],
+     'body': None,
+     'showAs': 'Out of Office',
+     'isCancelled': False,
+     'createdAt': '2026-08-16T22:16:19.298839+00:00',
+     'updatedAt': '2026-08-16T22:16:19.298839+00:00'},
+    {'id': 'AAQkAKONKmriJRMGv0frOTl75CQ',
+     'mailboxId': '52a02a75-105a-4af1-9154-6340013c9c7f',
+     'subject': 'Interview — Andre Mbeki (Implementation Consultant)',
+     'start': '2026-08-31T15:00:00+00:00',
+     'end': '2026-08-31T16:00:00+00:00',
+     'isAllDay': False,
+     'location': 'Conference room B',
+     'organizer': 'gregory.lindholm@naviant.com',
+     'attendees': ['karen.boothe@naviant.com', 'gregory.lindholm@naviant.com'],
+     'body': 'Implementation Consultant loop. Bureau volume is up; '
+             'implementation backlog is at six weeks.',
+     'showAs': 'Busy',
+     'isCancelled': False,
+     'createdAt': '2026-08-17T09:12:04.504964+00:00',
+     'updatedAt': '2026-08-17T09:12:04.504964+00:00'},
+    {'id': 'AAQkAN6W-4OTPR1imgzMUeq4mFQ',
+     'mailboxId': '52a02a75-105a-4af1-9154-6340013c9c7f',
+     'subject': 'Interview — Andre Mbeki (Implementation Consultant)',
+     'start': '2026-09-01T19:00:00+00:00',
+     'end': '2026-09-01T20:00:00+00:00',
+     'isAllDay': False,
+     'location': 'Teams',
+     'organizer': 'gregory.lindholm@naviant.com',
+     'attendees': ['karen.boothe@naviant.com', 'gregory.lindholm@naviant.com'],
+     'body': 'Implementation Consultant loop. Bureau volume is up; '
+             'implementation backlog is at six weeks.',
+     'showAs': 'Busy',
+     'isCancelled': False,
+     'createdAt': '2026-08-17T09:12:04.625169+00:00',
+     'updatedAt': '2026-08-17T09:12:04.625169+00:00'},
+    {'id': 'AAQkAQU0i-ebVRpG_dGol1KjVkQ',
+     'mailboxId': '5ae3d6e7-c8d1-4d1d-81a7-254b03bc58f0',
+     'subject': 'Interview — Renata Cordova (Account Executive)',
+     'start': '2026-09-01T15:00:00+00:00',
+     'end': '2026-09-01T16:00:00+00:00',
+     'isAllDay': False,
+     'location': 'Conference room B',
+     'organizer': 'marcus.reyes@naviant.com',
+     'attendees': ['karen.boothe@naviant.com', 'marcus.reyes@naviant.com'],
+     'body': 'Account Executive loop. Backfill for the Wisconsin territory.',
+     'showAs': 'Busy',
+     'isCancelled': False,
+     'createdAt': '2026-08-19T03:57:06.004445+00:00',
+     'updatedAt': '2026-08-19T03:57:06.004445+00:00'},
+]
+
 #: What a list route answers under, by app and resource.
 RESOURCES: dict[tuple[str, str], list[dict]] = {
     ("hris", "departments"): DEPARTMENTS,
@@ -576,12 +999,16 @@ RESOURCES: dict[tuple[str, str], list[dict]] = {
     ("erp", "salesOrders"): SALES_ORDERS,
     ("erp", "vendors"): VENDORS,
     ("erp", "purchaseOrders"): PURCHASE_ORDERS,
+    ("office", "mailboxes"): MAILBOXES,
+    ("office", "messages"): MAIL_MESSAGES,
+    ("office", "events"): OFFICE_EVENTS,
 }
 
 #: Records reachable by id but absent from every list — the dereference cases.
 OFF_PAGE: dict[tuple[str, str], dict] = {
     ("hris", "jobs"): JOB_OFF_PAGE,
     ("hris", "employees"): WORKER_OFF_PAGE,
+    ("office", "mailboxes"): MAILBOX_OFF_PAGE,
 }
 
 

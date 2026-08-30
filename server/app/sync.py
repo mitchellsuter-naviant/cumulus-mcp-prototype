@@ -73,6 +73,7 @@ WORKFORCE_FLOW_ID = "workforce-sync"
 CALENDAR_FLOW_ID = "calendar-sync"
 CRM_FLOW_ID = "crm-sync"
 SALES_FLOW_ID = "sales-sync"
+MAIL_FLOW_ID = "mail-sync"
 STEWARD_QUEUE = "vendor-stewardship"
 #: Counterparties and the humans in them are not the AP steward's work: an
 #: ambiguous Company is a master-data question, and the person who answers it
@@ -93,10 +94,11 @@ WORKFORCE_EVENT = "WorkforceDelivered"
 CALENDAR_EVENT = "CalendarsDelivered"
 CRM_EVENT = "CrmBookDelivered"
 SALES_EVENT = "SalesRecordsDelivered"
+MAIL_EVENT = "MailDelivered"
 
 SyncKind = Literal[
     "vendors", "purchase-orders", "receiving-reports", "workforce",
-    "calendars", "crm-book", "sales-records",
+    "calendars", "crm-book", "sales-records", "mail",
 ]
 
 #: Every sync flow, and the kind its runs report under in the Sources lens.
@@ -112,6 +114,7 @@ FEED_FLOWS: dict[str, SyncKind] = {
     CALENDAR_FLOW_ID: "calendars",
     CRM_FLOW_ID: "crm-book",
     SALES_FLOW_ID: "sales-records",
+    MAIL_FLOW_ID: "mail",
 }
 
 
@@ -342,6 +345,56 @@ class SalesOrderRecord(BaseModel):
     lines: list[SalesOrderLineRecord] = Field(default_factory=list)
 
 
+class MailboxRecord(BaseModel):
+    """One correspondent's mailbox, as the provider holds it.
+
+    The directory fields ride along because the provider carries them, not
+    because they are authoritative: a job title read off a mail directory is a
+    claim the HRIS outranks, and the precedence order is what says so.
+    """
+
+    external_id: str
+    address: str
+    display_name: str = ""
+    provider: str = ""
+    job_title: str = ""
+    department: str = ""
+    timezone: str = ""
+
+
+class MailMessageRecord(BaseModel):
+    """One message as it sits in one mailbox — headers, addressing, a preview.
+
+    **There is no `body` field, and that absence is the design.** A thread
+    delivered to four people is four of these, and the graph's reason for
+    holding any of them is to know that a conversation happened and who was in
+    it. Carrying the body would make Cumulus a second copy of the customer's
+    inbox under a governance story it cannot support, so custody stops at the
+    opening line — capped again on the way in by `sync_office.PREVIEW_CHARS`,
+    because a provider that stuffed a whole body into a field named `preview`
+    must not be able to smuggle one past the wire shape.
+
+    `mailbox_address` is a bind column, and the message's own key embeds it:
+    a provider message id is only unique inside the mailbox that holds it.
+    """
+
+    external_id: str
+    mailbox_address: str
+    subject: str = ""
+    folder: str = ""
+    # Bind columns: correspondents by address, resolved on the way in against
+    # people we already know and counted — never minted — when they are not.
+    from_email: str = ""
+    from_name: str = ""
+    to_emails: list[str] = Field(default_factory=list)
+    cc_emails: list[str] = Field(default_factory=list)
+    body_preview: str = ""
+    importance: str = ""
+    conversation_id: str = ""
+    received_at: str = ""
+    sent_at: str = ""
+
+
 class SyncRequest(BaseModel):
     """One delivery from one source system.
 
@@ -376,6 +429,11 @@ class SyncRequest(BaseModel):
     customers: list[CustomerRecord] = Field(default_factory=list)
     items: list[ItemRecord] = Field(default_factory=list)
     sales_orders: list[SalesOrderRecord] = Field(default_factory=list)
+    # Mail travels the way calendars do, and for the same reason: a message is
+    # a part of the mailbox that holds it, so a delivery that split the two
+    # would orphan every message whose mailbox had not moved that window.
+    mailboxes: list[MailboxRecord] = Field(default_factory=list)
+    mail_messages: list[MailMessageRecord] = Field(default_factory=list)
 
 
 class SourceStatus(BaseModel):
@@ -513,9 +571,10 @@ class SyncService:
             # — and they register here so `SyncService` stays the one place
             # that knows which flows exist. Deferred because they import this
             # module for its wire shapes.
-            from . import sync_commerce
+            from . import sync_commerce, sync_office
 
             sync_commerce.register(self)
+            sync_office.register(self)
 
     def _act(self, ctx: RunContext, action_id: str, step_id: str) -> PendingAction:
         """A sync write, committed by the Flow that is running.
@@ -561,10 +620,14 @@ class SyncService:
             plan.append((CRM_EVENT, []))
         if request.customers or request.items or request.sales_orders:
             plan.append((SALES_EVENT, []))
+        if request.mailboxes or request.mail_messages:
+            plan.append((MAIL_EVENT, []))
         # The multi-shape feeds carry their records in named lists rather than
         # one `records` column, so they are exempt from the emptiness check
         # and build their own inputs below.
-        multi_shape = (WORKFORCE_EVENT, CALENDAR_EVENT, CRM_EVENT, SALES_EVENT)
+        multi_shape = (
+            WORKFORCE_EVENT, CALENDAR_EVENT, CRM_EVENT, SALES_EVENT, MAIL_EVENT,
+        )
         for event, records in plan:
             if event not in multi_shape and not records:
                 continue
@@ -607,6 +670,15 @@ class SyncService:
                     "items": [i.model_dump() for i in request.items],
                     "sales_orders": [
                         o.model_dump() for o in request.sales_orders
+                    ],
+                }
+            elif event == MAIL_EVENT:
+                inputs = {
+                    "source": request.source,
+                    "watermark": request.watermark,
+                    "mailboxes": [m.model_dump() for m in request.mailboxes],
+                    "messages": [
+                        m.model_dump() for m in request.mail_messages
                     ],
                 }
             run_id = None

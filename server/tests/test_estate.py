@@ -458,7 +458,7 @@ def test_every_feed_in_the_registry_declares_a_contract():
     declared = {m.source for m in MAPPINGS}
     assert {f.feed for f in FEEDS} == {
         HRIS_WORKFORCE, "crm-book", "erp-sales", "erp-vendors",
-        "erp-purchase-orders",
+        "erp-purchase-orders", "office-calendar", "office-mail",
     }
     for spec in FEEDS:
         assert spec.feed in declared, spec.feed
