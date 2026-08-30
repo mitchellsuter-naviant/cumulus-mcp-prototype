@@ -248,6 +248,22 @@ Every subagent is spawned with `model: opus` (Opus 5) — decision 14.
   blocked on host gcloud reauth. A1 namespace redesign agent launched.
   Estate probed live: pulse on, 15 sales orders (10 sim-generated),
   designed drift records confirmed absent.
+- **2026-08-30 (Wave 1 lands)** — A1 committed (`7a55e03`, ecosystem): 130
+  people, 4 buckets over the 7 immovable departments + Marketing/Bureau/IT,
+  35 named cast + generation spec, PSA designed in with `project_delivery`,
+  drift 60/30/10 over 30 matched entities, gaps re-derived (ATS is
+  salaried-only; HRIS phone formula collides past index 16). B1 committed
+  (`2e49db7`): estate connector live-smoked — 25 workers pulled, 22
+  Employees landed (3 real duplicate-email pairs in the live HRIS collapse
+  under the natural key — B5 substrate), watermarks strict->, replay
+  idempotent. B3 merged (`da4fec8`): 26 types / 38 links, 4 new
+  collections, precedence `human,erp,hris,crm,calendar,office,procurement,
+  flow,model`; §4's same-name sibling links were a validator trap — landed
+  as `company_identified_as`/`person_identified_as`/`subfolder_of`/
+  `sent_by_employee`/`addressed_to_employee` + a uniqueness rule. Combined
+  gates: 657 passed / 1 skipped, analyze clean, 54 Dart tests. Known:
+  Agent worktrees may branch from the initial commit — builders must
+  verify their base. `_authority` has no `dms` bucket (3c confirms).
 - **2026-08-30 (later)** — Decisions 13/14 recorded: the PSA app joins the
   estate (A4), subagents run Opus 5. Both in-flight Wave-1 agents briefed
   mid-run (A1 designs the PSA in; the architect shapes the connector for N
