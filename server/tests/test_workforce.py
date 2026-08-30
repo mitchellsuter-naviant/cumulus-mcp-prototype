@@ -147,16 +147,27 @@ def test_the_feed_shows_up_as_a_source(world):
 
 
 def test_the_hris_mapping_binds_rather_than_reifies():
-    """An exact key needs no landing record: the first bind contract."""
+    """An exact key needs no landing record.
+
+    One HRIS contract, not two. The registry used to carry a fictional
+    `hris-workday` row beside this one describing the same subject; the seeded
+    delivery below still arrives under that source id and now shows on the
+    Sources screen as a feed under no contract — which is true, and is what
+    B4 deletes when the seed goes.
+    """
     from app.mappings import MAPPINGS
 
-    hris = next(m for m in MAPPINGS if m.id == "hris-workday")
+    hris = next(m for m in MAPPINGS if m.id == "hris-workforce")
     assert hris.strategy == "bind"
     assert hris.lands_as == ""
     assert hris.precedence_source == "hris"
     bound = {(b.column, b.object_type) for b in hris.identity}
     assert ("manager_email", "Employee") in bound
     assert ("team_slug", "Team") in bound
+    # Both references bind twice — by the derived key and by the source's own
+    # id — which is what let the connector stop fetching them.
+    assert ("manager_external_id", "Employee") in bound
+    assert ("department_external_id", "Team") in bound
 
 
 def test_an_unresolved_reference_escalates_as_one_aggregate(world):

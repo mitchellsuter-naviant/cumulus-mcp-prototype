@@ -459,6 +459,7 @@ def test_every_feed_in_the_registry_declares_a_contract():
     assert {f.feed for f in FEEDS} == {
         HRIS_WORKFORCE, "crm-book", "erp-sales", "erp-vendors",
         "erp-purchase-orders", "office-calendar", "office-mail",
+        "hris-employment-events", "dms-library",
     }
     for spec in FEEDS:
         assert spec.feed in declared, spec.feed
@@ -476,8 +477,12 @@ def test_the_mapping_declares_the_pull_contract():
     assert mapping.strategy == "bind" and mapping.lands_as == ""
     assert mapping.precedence_source == "hris"
     assert "watermark" in mapping.freshness
-    # Risk decision 2: every dereference the FeedSpec makes is declared here.
-    assert "managerId" in mapping.notes
+    # Risk decision 2: every dereference the FeedSpec makes is declared here —
+    # and so is the retirement of the two it used to make, because a contract
+    # that still claimed a round trip nobody takes is as wrong as one that
+    # hid one.
+    assert "jobId" in mapping.notes and "parentDepartmentId" in mapping.notes
+    assert "retired the dereference" in mapping.notes
     assert validate_mappings() == []
 
 

@@ -986,6 +986,231 @@ OFFICE_EVENTS: list[dict] = [
      'updatedAt': '2026-08-19T03:57:06.004445+00:00'},
 ]
 
+
+def _event(**over) -> dict:
+    """One HRIS ledger row, with every column the estate actually sends.
+
+    The `previous*` half is the reason this feed lands whole: a promotion says
+    what the job, department, manager and salary *became* and what each of them
+    *was*, and a hire carries nulls in all four because there was no before.
+    """
+    row = {
+        "id": "", "employeeId": "", "eventType": "", "effectiveDate": "",
+        "jobId": None, "departmentId": None, "managerId": None,
+        "payType": "Salary", "annualSalary": None, "hourlyRate": None,
+        "previousJobId": None, "previousDepartmentId": None,
+        "previousManagerId": None, "previousAnnualSalary": None,
+        "previousHourlyRate": None, "reason": None, "note": None,
+        "createdAt": "", "updatedAt": "",
+    }
+    row.update(over)
+    return row
+
+
+#: The append-only employment ledger — one row of each kind the estate emits.
+#: EVT-1019 is Alan Whitcomb's termination, the row behind the `Terminated`
+#: worker status on EMP-1016; EVT-1017 is the promotion whose before/after pair
+#: no ontology type holds, which is the whole argument for landing these whole.
+EMPLOYMENT_EVENTS: list[dict] = [
+    _event(id="EVT-1016", employeeId="EMP-1016", eventType="Hire",
+           effectiveDate="2020-11-15", jobId="JOB-1003",
+           departmentId="DEPT-1002", managerId="EMP-1002",
+           annualSalary=108000, note="New hire",
+           createdAt="2026-08-16T22:16:24.190459+00:00",
+           updatedAt="2026-08-16T22:16:24.190459+00:00"),
+    _event(id="EVT-1017", employeeId="EMP-1014", eventType="Promotion",
+           effectiveDate="2026-01-28", jobId="JOB-1010",
+           departmentId="DEPT-1005", managerId="EMP-1004",
+           annualSalary=152000.0, previousJobId="JOB-1011",
+           previousDepartmentId="DEPT-1005", previousManagerId="EMP-1004",
+           previousAnnualSalary=128000,
+           note="Promoted after the capture-platform rebuild.",
+           createdAt="2026-08-16T22:16:24.514674+00:00",
+           updatedAt="2026-08-16T22:16:24.514674+00:00"),
+    _event(id="EVT-1018", employeeId="EMP-1010", eventType="Transfer",
+           effectiveDate="2026-04-18", jobId="JOB-1006",
+           departmentId="DEPT-1004", managerId="EMP-1003",
+           annualSalary=96000, previousJobId="JOB-1006",
+           previousDepartmentId="DEPT-1003", previousManagerId="EMP-1003",
+           previousAnnualSalary=96000,
+           note="Moved to support the scanning bureau accounts.",
+           createdAt="2026-08-16T22:16:24.689869+00:00",
+           updatedAt="2026-08-16T22:16:24.689869+00:00"),
+    _event(id="EVT-1019", employeeId="EMP-1016", eventType="Termination",
+           effectiveDate="2026-07-02", jobId="JOB-1003",
+           departmentId="DEPT-1002", managerId="EMP-1002",
+           annualSalary=108000, previousJobId="JOB-1003",
+           previousDepartmentId="DEPT-1002", previousManagerId="EMP-1002",
+           previousAnnualSalary=108000,
+           reason="Resignation — accepted an outside offer",
+           createdAt="2026-08-16T22:16:24.856952+00:00",
+           updatedAt="2026-08-16T22:16:24.856952+00:00"),
+    _event(id="EVT-1020", employeeId="EMP-1006",
+           eventType="Leave of Absence", effectiveDate="2026-07-27",
+           jobId="JOB-1013", departmentId="DEPT-1007", managerId="EMP-1001",
+           annualSalary=92000, previousJobId="JOB-1013",
+           previousDepartmentId="DEPT-1007", previousManagerId="EMP-1001",
+           previousAnnualSalary=92000, reason="Parental",
+           createdAt="2026-08-16T22:16:24.971065+00:00",
+           updatedAt="2026-08-16T22:16:24.971065+00:00"),
+    _event(id="EVT-1033", employeeId="EMP-1025", eventType="Hire",
+           effectiveDate="2026-09-22", jobId="JOB-1006",
+           departmentId="DEPT-1003", managerId="EMP-1003",
+           annualSalary=94000.0, note="New hire",
+           createdAt="2026-08-29T19:42:05.567533+00:00",
+           updatedAt="2026-08-29T19:42:05.567533+00:00"),
+]
+
+#: The DMS tree. Three of these — `Folder1`, `Folder2`, `Folder1/Folder3` —
+#: are somebody's real hand-made scratch folders from before the namespace was
+#: seeded, and they carry `updatedAt: null`, which is the shape a delta filter
+#: has to survive rather than a tidy-up to be made in the fixture.
+FOLDERS: list[dict] = [
+    {"id": "a0374b47504b", "name": "Folder1", "parentId": None,
+     "createdAt": "2026-08-15T16:14:16.400759+00:00", "updatedAt": None},
+    {"id": "d9d516051550", "name": "Folder2", "parentId": None,
+     "createdAt": "2026-08-15T16:15:13.958828+00:00", "updatedAt": None},
+    {"id": "d2970492a735", "name": "Folder3", "parentId": "a0374b47504b",
+     "createdAt": "2026-08-15T16:15:20.660191+00:00", "updatedAt": None},
+    {"id": "da7a1f768eb8", "name": "Customers", "parentId": None,
+     "createdAt": "2026-08-17T01:27:04.245169+00:00",
+     "updatedAt": "2026-08-17T01:27:04.245169+00:00"},
+    {"id": "b6a714547ead", "name": "Northwind Traders",
+     "parentId": "da7a1f768eb8",
+     "createdAt": "2026-08-17T01:27:04.483358+00:00",
+     "updatedAt": "2026-08-17T01:27:04.483358+00:00"},
+    {"id": "e3463e01a5d7", "name": "Proposals", "parentId": "b6a714547ead",
+     "createdAt": "2026-08-17T01:27:04.646644+00:00",
+     "updatedAt": "2026-08-17T01:27:04.646644+00:00"},
+    {"id": "e27859fd2fdf", "name": "Orders", "parentId": "b6a714547ead",
+     "createdAt": "2026-08-18T00:57:04.480021+00:00",
+     "updatedAt": "2026-08-18T00:57:04.480021+00:00"},
+    {"id": "15824c62699b", "name": "Accounts Payable", "parentId": None,
+     "createdAt": "2026-08-17T11:57:04.340211+00:00",
+     "updatedAt": "2026-08-17T11:57:04.340211+00:00"},
+    {"id": "65fccd01e8e8", "name": "GSF", "parentId": "15824c62699b",
+     "createdAt": "2026-08-18T23:42:04.804815+00:00",
+     "updatedAt": "2026-08-18T23:42:04.804815+00:00"},
+    {"id": "32bde0f261fc", "name": "2026", "parentId": "65fccd01e8e8",
+     "createdAt": "2026-08-18T23:42:05.029508+00:00",
+     "updatedAt": "2026-08-18T23:42:05.029508+00:00"},
+    {"id": "9327d395a7dd", "name": "Employee Files", "parentId": None,
+     "createdAt": "2026-08-17T16:27:06.893050+00:00",
+     "updatedAt": "2026-08-17T16:27:06.893050+00:00"},
+    {"id": "26c73f300e72", "name": "Andre Mbeki", "parentId": "9327d395a7dd",
+     "createdAt": "2026-08-17T16:27:07.075648+00:00",
+     "updatedAt": "2026-08-17T16:27:07.075648+00:00"},
+]
+
+#: The files in that tree. `versions` travels because the estate sends it; the
+#: connector reads `latestVersion` off the row and writes down an address, and
+#: nothing here has ever been opened. The two `GSF invoice 2026-09-12.pdf` rows
+#: share a filename and differ by id — the sim filed the same invoice twice,
+#: which is exactly the kind of thing a document mirror must not merge away.
+DMS_DOCUMENTS: list[dict] = [
+    {"id": "16f6fd42de84", "name": "Cumulus Overview copy.pdf",
+     "folderId": "d2970492a735", "contentType": "application/octet-stream",
+     "size": 30142410, "latestVersion": 1,
+     "createdAt": "2026-08-15T16:15:46.632252+00:00",
+     "updatedAt": "2026-08-15T16:15:46.632252+00:00",
+     "versions": [{"version": 1, "filename": "Cumulus Overview copy.pdf",
+                   "contentType": "application/octet-stream",
+                   "size": 30142410,
+                   "uploadedAt": "2026-08-15T16:15:46.632099+00:00"}]},
+    {"id": "cb0e2fe64899", "name": "HR_Separation.pdf",
+     "folderId": "a0374b47504b", "contentType": "application/octet-stream",
+     "size": 153549, "latestVersion": 1,
+     "createdAt": "2026-08-15T16:14:23.422928+00:00",
+     "updatedAt": "2026-08-15T16:14:23.422928+00:00",
+     "versions": [{"version": 1, "filename": "HR_Separation.pdf",
+                   "contentType": "application/octet-stream",
+                   "size": 153549,
+                   "uploadedAt": "2026-08-15T16:14:23.422843+00:00"}]},
+    {"id": "c87a1fac055d",
+     "name": "Northwind Traders proposal 2026-08-19.pdf",
+     "folderId": "e3463e01a5d7", "contentType": "text/plain",
+     "size": 320, "latestVersion": 2,
+     "createdAt": "2026-08-17T01:27:04.967008+00:00",
+     "updatedAt": "2026-08-17T08:12:14.556058+00:00",
+     "versions": [
+         {"version": 1,
+          "filename": "Northwind Traders proposal 2026-08-19.txt",
+          "contentType": "text/plain", "size": 358,
+          "uploadedAt": "2026-08-17T01:27:04.966994+00:00"},
+         {"version": 2,
+          "filename": "Northwind Traders proposal 2026-08-19.txt",
+          "contentType": "text/plain", "size": 320,
+          "uploadedAt": "2026-08-17T08:12:14.556047+00:00"}]},
+    {"id": "243c8eda7dba",
+     "name": "Northwind Traders signed order acknowledgement 2026-09-19.pdf",
+     "folderId": "e27859fd2fdf", "contentType": "text/plain",
+     "size": 270, "latestVersion": 1,
+     "createdAt": "2026-08-18T00:57:04.807823+00:00",
+     "updatedAt": "2026-08-18T00:57:04.807823+00:00",
+     "versions": [
+         {"version": 1,
+          "filename":
+              "Northwind Traders signed order acknowledgement 2026-09-19.txt",
+          "contentType": "text/plain", "size": 270,
+          "uploadedAt": "2026-08-18T00:57:04.807810+00:00"}]},
+    {"id": "82e6b9be140a", "name": "Andre Mbeki offer letter 2026-09-05.pdf",
+     "folderId": "26c73f300e72", "contentType": "text/plain",
+     "size": 195, "latestVersion": 2,
+     "createdAt": "2026-08-17T16:27:07.424570+00:00",
+     "updatedAt": "2026-08-18T02:42:04.503705+00:00",
+     "versions": [
+         {"version": 1,
+          "filename": "Andre Mbeki offer letter 2026-09-05.txt",
+          "contentType": "text/plain", "size": 400,
+          "uploadedAt": "2026-08-17T16:27:07.424562+00:00"},
+         {"version": 2,
+          "filename": "Andre Mbeki offer letter 2026-09-05.txt",
+          "contentType": "text/plain", "size": 195,
+          "uploadedAt": "2026-08-18T02:42:04.503694+00:00"}]},
+    {"id": "2f3c3799a309",
+     "name": "Andre Mbeki resignation letter 2027-01-12.pdf",
+     "folderId": "26c73f300e72", "contentType": "text/plain",
+     "size": 238, "latestVersion": 1,
+     "createdAt": "2026-08-20T00:42:04.709263+00:00",
+     "updatedAt": "2026-08-20T00:42:04.709263+00:00",
+     "versions": [
+         {"version": 1,
+          "filename": "Andre Mbeki resignation letter 2027-01-12.txt",
+          "contentType": "text/plain", "size": 238,
+          "uploadedAt": "2026-08-20T00:42:04.709253+00:00"}]},
+    {"id": "8467902a9c82", "name": "GSF invoice 2026-09-02.pdf",
+     "folderId": "32bde0f261fc", "contentType": "text/plain",
+     "size": 195, "latestVersion": 2,
+     "createdAt": "2026-08-18T23:42:05.482789+00:00",
+     "updatedAt": "2026-08-19T01:12:05.355569+00:00",
+     "versions": [
+         {"version": 1, "filename": "GSF invoice 2026-09-02.txt",
+          "contentType": "text/plain", "size": 225,
+          "uploadedAt": "2026-08-18T23:42:05.482774+00:00"},
+         {"version": 2, "filename": "GSF invoice 2026-09-02.txt",
+          "contentType": "text/plain", "size": 195,
+          "uploadedAt": "2026-08-19T01:12:05.355558+00:00"}]},
+    {"id": "1c22882f31cd", "name": "GSF invoice 2026-09-12.pdf",
+     "folderId": "32bde0f261fc", "contentType": "text/plain",
+     "size": 213, "latestVersion": 1,
+     "createdAt": "2026-08-28T16:57:07.979947+00:00",
+     "updatedAt": "2026-08-28T16:57:07.979947+00:00",
+     "versions": [
+         {"version": 1, "filename": "GSF invoice 2026-09-12.txt",
+          "contentType": "text/plain", "size": 213,
+          "uploadedAt": "2026-08-28T16:57:07.979932+00:00"}]},
+    {"id": "4f8ad735aac3", "name": "GSF invoice 2026-09-12.pdf",
+     "folderId": "32bde0f261fc", "contentType": "text/plain",
+     "size": 213, "latestVersion": 1,
+     "createdAt": "2026-08-29T20:27:11.617867+00:00",
+     "updatedAt": "2026-08-29T20:27:11.617867+00:00",
+     "versions": [
+         {"version": 1, "filename": "GSF invoice 2026-09-12.txt",
+          "contentType": "text/plain", "size": 213,
+          "uploadedAt": "2026-08-29T20:27:11.617856+00:00"}]},
+]
+
+
 #: What a list route answers under, by app and resource.
 RESOURCES: dict[tuple[str, str], list[dict]] = {
     ("hris", "departments"): DEPARTMENTS,
@@ -1002,6 +1227,9 @@ RESOURCES: dict[tuple[str, str], list[dict]] = {
     ("office", "mailboxes"): MAILBOXES,
     ("office", "messages"): MAIL_MESSAGES,
     ("office", "events"): OFFICE_EVENTS,
+    ("hris", "employmentEvents"): EMPLOYMENT_EVENTS,
+    ("dms", "folders"): FOLDERS,
+    ("dms", "documents"): DMS_DOCUMENTS,
 }
 
 #: Records reachable by id but absent from every list — the dereference cases.

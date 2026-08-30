@@ -12,10 +12,12 @@ the run count, a flow with no runs reports zeroes rather than a distribution,
 and a $0.00 spend tile can say whether it means "nothing ran" or "nobody
 recorded what it cost".
 
-The fleet is nine flows and six definitions. Three inbound sync feeds still
-have no `FlowDefinition` and run anyway, which is why the registry cannot be
-the list of what exists — and is why the count above will keep moving as the
-remaining feeds get their exports.
+The fleet is eleven flows and ten definitions. One inbound feed —
+`calendar-sync` — is the last one with no declarative export, down from the
+five the workplan opened with. The registry still cannot be the list of what
+exists, and the tests below read the fleet off the engine either way: a
+definition is a *map*, a run is the territory, and the day the two disagree is
+the day this module has to be able to say so.
 """
 
 from datetime import timedelta
@@ -34,17 +36,18 @@ from app.reimbursements import SubmittedDocument
 from app.runs import RunRecord
 from tests import world as test_world
 
-# The nine flows that run: two authored definitions and seven inbound feeds.
+# The eleven flows that run: two authored definitions and nine inbound feeds.
 SYNC_FLOWS = {
     "vendor-sync", "purchase-order-sync", "receiving-sync",
     "workforce-sync", "calendar-sync", "crm-sync", "sales-sync",
     "mail-sync",
+    "employment-event-sync", "dms-sync",
 }
-#: The feeds that still write the graph with no declarative export to audit.
-#: Six of the eight have one now; these two are the carried debt that is
-#: left, and this set is meant to shrink to nothing rather than to be
-#: maintained.
-UNDECLARED_FEEDS = {"receiving-sync", "workforce-sync"}
+#: Every feed now carries its Tier-2 declarative export — the carried debt
+#: reached zero, so the UNDECLARED_FEEDS set that tracked it is gone.
+DECLARED_FLOWS = SYNC_FLOWS | {
+    "expense-reimbursement", "accounts-payable",
+}
 
 
 @pytest.fixture()
@@ -146,23 +149,27 @@ def probe_flow(client, owner, flow_id: str) -> None:
 
 def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
     """The list used to be the registry, so it showed two flows in a system
-    that runs ten. Eight inbound sync feeds write the graph; six of them
-    have a `FlowDefinition` now and two still do not, and every one of them
-    is on this list either way — a definition-less row is honest, hiding the
-    row is not."""
+    that runs twelve. Ten inbound sync feeds write the graph and all of them
+    now have a `FlowDefinition` — but the list is still read off the engine,
+    because the two agreeing today is a fact about today. A body registered
+    with no map still has to appear, so one is registered here to prove the
+    list is not quietly back to being the registry."""
     submit_expenses(world, 2)
+    priced_runs(world, "probe-unmapped", 1)
     rows = client.get("/api/v1/flows").json()
     by_id = {r["id"]: r for r in rows}
     assert SYNC_FLOWS < set(by_id)
     assert {"expense-reimbursement", "accounts-payable"} < set(by_id)
-    assert len(rows) == 10
+    assert len(rows) == 13  # twelve declared flows, plus the unmapped probe
 
     # A definition-less row says so, rather than borrowing a lifecycle state
     # it has no definition to hold.
-    feed = by_id["receiving-sync"]
-    assert feed["has_definition"] is False
-    assert feed["status"] == "undeclared"
-    assert feed["version"] == 0
+    probe = by_id["probe-unmapped"]
+    assert probe["has_definition"] is False
+    assert probe["status"] == "undeclared"
+    assert probe["version"] == 0
+    # And the feed that used to be this test's example now has a map.
+    assert by_id["receiving-sync"]["has_definition"] is True
     assert by_id["expense-reimbursement"]["has_definition"] is True
 
     # One kind of authored logic: nothing in the payload types a flow.
@@ -177,16 +184,13 @@ def test_list_filters(client):
     assert {r["id"] for r in hits} == {"expense-reimbursement"}
     invoices = client.get("/api/v1/flows", params={"q": "invoice"}).json()
     assert {r["id"] for r in invoices} == {"accounts-payable"}
-    # Filtering by a definition's lifecycle state excludes the feeds, which
-    # have no definition to be in a state.
+    # Filtering by a definition's lifecycle state excludes what has no
+    # definition to be in a state — an empty answer now, and the filter must
+    # say so rather than 404 or fall back to everything.
     active = client.get("/api/v1/flows", params={"status": "active"}).json()
-    assert {r["id"] for r in active} == {
-        "expense-reimbursement", "accounts-payable",
-        "vendor-sync", "purchase-order-sync", "crm-sync", "sales-sync",
-        "calendar-sync", "mail-sync",
-    }
+    assert {r["id"] for r in active} == DECLARED_FLOWS
     undeclared = client.get("/api/v1/flows", params={"status": "undeclared"}).json()
-    assert {r["id"] for r in undeclared} == UNDECLARED_FEEDS
+    assert undeclared == []
     team = client.get("/api/v1/flows", params={"team": "finance-ops"}).json()
     assert {r["id"] for r in team} == {"expense-reimbursement", "accounts-payable"}
     none = client.get("/api/v1/flows", params={"team": "no-such-team"}).json()
@@ -194,18 +198,24 @@ def test_list_filters(client):
 
 
 def test_a_definition_less_flow_can_still_be_opened(client, world):
-    """A row the fleet list shows must open. The feed has runs and no map,
-    and saying that is better than a 404 or an invented definition."""
-    submit_expenses(world, 1)
-    detail = client.get("/api/v1/flows/receiving-sync").json()
+    """A row the fleet list shows must open. The flow has runs and no map,
+    and saying that is better than a 404 or an invented definition.
+
+    The example used to be `receiving-sync`, which has an export now. That the
+    case no longer occurs in the shipped fleet is the point of the last four
+    definitions; that the *behaviour* still has to hold is why this registers
+    its own unmapped body rather than being deleted along with the debt.
+    """
+    priced_runs(world, "probe-unmapped", 1)
+    detail = client.get("/api/v1/flows/probe-unmapped").json()
     assert detail["has_definition"] is False
     assert detail["steps"] == []
     assert detail["status"] == "undeclared"
-    usage = client.get("/api/v1/flows/receiving-sync/usage").json()
+    usage = client.get("/api/v1/flows/probe-unmapped/usage").json()
     assert usage["has_definition"] is False
     # Editing and versioning still need a definition — there is nothing there
     # to version, and inventing one would be the same lie in a new place.
-    assert client.get("/api/v1/flows/receiving-sync/versions").status_code == 404
+    assert client.get("/api/v1/flows/probe-unmapped/versions").status_code == 404
     assert client.get("/api/v1/flows/no-such-flow").status_code == 404
 
 
@@ -363,9 +373,10 @@ def test_the_fleet_run_count_is_the_real_run_count(client, world):
         for row in client.get("/api/v1/flows").json()
     ]
     assert stats["runs"] == sum(u["runs"] for u in per_flow)
-    assert stats["flows"] == 10
-    assert stats["definitions"] == 8
-    assert stats["without_definition"] == len(UNDECLARED_FEEDS) == 2
+    assert stats["flows"] == 12
+    assert stats["definitions"] == 12
+    # The carried debt reached zero: every flow that runs carries its export.
+    assert stats["without_definition"] == 0
 
 
 def test_a_flow_with_no_runs_reports_zero_rather_than_a_series(client):
@@ -760,9 +771,9 @@ def test_downgrade_is_withheld_while_the_flow_is_failing(client, world, owner):
 
 
 def test_a_flow_with_no_definition_says_so_rather_than_recommending(client, world, owner):
-    priced_runs(world, "receiving-sync", 3)
+    priced_runs(world, "probe-unmapped", 3)
     recs = client.get(
-        "/api/v1/flows/receiving-sync/recommendations", headers=owner
+        "/api/v1/flows/probe-unmapped/recommendations", headers=owner
     ).json()
     assert recs[0]["kind"] == "evidence"
     assert "no declarative export" in recs[0]["detail"]

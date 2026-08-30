@@ -569,3 +569,63 @@ def test_the_exports_draw_the_steps_the_engine_actually_ran(booked, world, clien
             continue
         journaled = [s.step_id for s in runs[0].steps]
         assert journaled == exported, flow_id
+
+
+# ---------------------------------------------------------------------------
+# The purchasing feed's vocabulary
+# ---------------------------------------------------------------------------
+
+
+class _ErpAccess:
+    """The ERP handle over the recorded rows — the PO feed's declared
+    dereference, with the network taken out."""
+
+    def __call__(self, resource: str, record_id: str) -> dict:
+        for row in fx.RESOURCES.get(("erp", resource), []):
+            if row.get("id") == record_id:
+                return row
+        return {}
+
+    def url(self, resource: str, record_id: str, suffix: str = "") -> str:
+        return (
+            "https://cumulus-demo-mitchell-suter-erp.web.app/api/naviant/v1/"
+            f"{resource}/{record_id}{suffix}"
+        )
+
+
+def test_a_purchase_order_lands_its_status_in_the_declared_vocabulary(world):
+    """The ERP says `Pending Receipt`; the graph holds `pending-receipt`.
+
+    A sales order was already slugged and a purchase order was not, so
+    `status == "closed"` was a question you could only answer per source — and
+    the difference stayed invisible because every seeded fixture happened to
+    say `open`, which slugs to itself. The live estate sends two-word
+    statuses, and the first one to arrive would have landed as its own
+    vocabulary.
+    """
+    from app.estate import _build_erp_purchase_orders, _build_erp_vendors
+    from app.graph import object_id
+    from app.sync import _slug
+
+    access = _ErpAccess()
+    _deliver(world, _build_erp_vendors({"vendors": fx.VENDORS}, access))
+    out = _deliver(
+        world,
+        _build_erp_purchase_orders(
+            {"purchaseOrders": fx.PURCHASE_ORDERS}, access
+        ),
+    )
+    assert out["status"] == "succeeded", out
+
+    statuses = {
+        row["tranId"]: world.graph.get(
+            object_id("PurchaseOrder", row["tranId"])
+        ).props["status"]
+        for row in fx.PURCHASE_ORDERS
+    }
+    assert statuses == {
+        "PO6011": "closed", "PO6012": "closed", "PO6013": "pending-receipt",
+    }
+    # The word the seeded fixtures use survives the slug unchanged, which is
+    # why nothing downstream had to be re-taught a vocabulary.
+    assert _slug("open") == "open"

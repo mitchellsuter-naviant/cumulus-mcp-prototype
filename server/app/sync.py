@@ -74,6 +74,8 @@ CALENDAR_FLOW_ID = "calendar-sync"
 CRM_FLOW_ID = "crm-sync"
 SALES_FLOW_ID = "sales-sync"
 MAIL_FLOW_ID = "mail-sync"
+EMPLOYMENT_EVENT_FLOW_ID = "employment-event-sync"
+DMS_FLOW_ID = "dms-sync"
 STEWARD_QUEUE = "vendor-stewardship"
 #: Counterparties and the humans in them are not the AP steward's work: an
 #: ambiguous Company is a master-data question, and the person who answers it
@@ -95,10 +97,13 @@ CALENDAR_EVENT = "CalendarsDelivered"
 CRM_EVENT = "CrmBookDelivered"
 SALES_EVENT = "SalesRecordsDelivered"
 MAIL_EVENT = "MailDelivered"
+EMPLOYMENT_EVENT_EVENT = "EmploymentEventsDelivered"
+DOCUMENTS_EVENT = "DocumentsDelivered"
 
 SyncKind = Literal[
     "vendors", "purchase-orders", "receiving-reports", "workforce",
-    "calendars", "crm-book", "sales-records", "mail",
+    "calendars", "crm-book", "sales-records", "mail", "employment-events",
+    "documents",
 ]
 
 #: Every sync flow, and the kind its runs report under in the Sources lens.
@@ -115,6 +120,8 @@ FEED_FLOWS: dict[str, SyncKind] = {
     CRM_FLOW_ID: "crm-book",
     SALES_FLOW_ID: "sales-records",
     MAIL_FLOW_ID: "mail",
+    EMPLOYMENT_EVENT_FLOW_ID: "employment-events",
+    DMS_FLOW_ID: "documents",
 }
 
 
@@ -189,6 +196,19 @@ class EmployeeRecord(BaseModel):
     columns — identifiers of other entities carried in the row. Nothing here
     needs a steward to adjudicate a match, which is exactly why the HRIS
     mapping binds rather than reifies: an exact key needs no landing record.
+
+    `manager_external_id` and `department_external_id` are the *same* two
+    references in the source's own vocabulary, and they travel beside the
+    derived ones rather than instead of them. An HRIS names a manager by
+    internal id; the email is a translation, and a translation is only
+    available while the manager's row is on the page. Carrying both means a
+    delta of one promoted employee resolves their manager against a person the
+    graph already holds, where before it cost a round trip to the estate to
+    re-read a key the row had already given us.
+
+    `status` is the one column here whose absence was a *lie* rather than a
+    gap: without it every worker the HRIS holds — including the ones who left
+    — landed indistinguishable from the ones who did not.
     """
 
     external_id: str
@@ -199,6 +219,12 @@ class EmployeeRecord(BaseModel):
     start_date: str = ""
     manager_email: str = ""
     team_slug: str = ""
+    # Additive and default-empty: the door stays backward compatible, and a
+    # source that has none of this keeps landing exactly as it did.
+    manager_external_id: str = ""
+    department_external_id: str = ""
+    status: str = ""
+    employment_type: str = ""
 
 
 class CalendarRecord(BaseModel):
@@ -393,6 +419,64 @@ class MailMessageRecord(BaseModel):
     conversation_id: str = ""
     received_at: str = ""
     sent_at: str = ""
+class EmploymentEventRecord(BaseModel):
+    """One row of the HRIS's append-only employment ledger, carried whole.
+
+    The odd one out on this wire, and deliberately: every other shape here
+    names the columns a flow will read, because a flow is going to derive
+    something from them. This one carries `payload` — the estate's row exactly
+    as it arrived — because the ledger is not a source of entities. It is the
+    *history* of the entities the workforce feed already lands, and history is
+    the one thing you cannot re-derive later if you threw the row away.
+
+    A promotion row says what the job, department, manager and salary became
+    **and** what each of them was. That before/after pair is the whole value
+    and no ontology type holds it, so the flow that receives these lands them
+    and stops. Naming four of the seventeen columns on this shape would have
+    quietly decided which thirteen a later reader is allowed to ask about.
+    """
+
+    external_id: str
+    employee_external_id: str = ""
+    event_type: str = ""
+    effective_date: str = ""
+    #: The source row, verbatim — including the previous-value columns the
+    #: named fields above deliberately do not restate.
+    payload: dict = Field(default_factory=dict)
+
+
+class FolderRecord(BaseModel):
+    """One node of the document system's tree, by its own id.
+
+    `parent_external_id` and not a path: the source keys folders by id and
+    holds the tree as parent pointers, so a path is something the *flow*
+    computes by walking it. A connector that assembled paths would be deciding
+    what a folder's identity is, which is exactly the line it does not cross.
+    """
+
+    external_id: str
+    name: str = ""
+    parent_external_id: str = ""
+
+
+class DmsDocumentRecord(BaseModel):
+    """One file the customer's document system holds — metadata, never bytes.
+
+    `storage_ref` is the whole contract: a resolvable address in the system of
+    record, built from the ids the source gave us and pinned to the revision it
+    said was current. Nothing on this shape was read out of the file. That is
+    not a limitation to be lifted later — it is the custody decision the
+    `document-library` Collection declares, and the reason a DMS mirror does
+    not quietly become a second copy of the customer's documents.
+    """
+
+    external_id: str
+    name: str = ""
+    folder_external_id: str = ""
+    content_type: str = ""
+    size: int = 0
+    latest_version: int = 0
+    storage_ref: str = ""
 
 
 class SyncRequest(BaseModel):
@@ -434,6 +518,14 @@ class SyncRequest(BaseModel):
     # would orphan every message whose mailbox had not moved that window.
     mailboxes: list[MailboxRecord] = Field(default_factory=list)
     mail_messages: list[MailMessageRecord] = Field(default_factory=list)
+    # The HRIS ledger travels alone: it references the workforce feed's people
+    # by the source's own id and derives nothing, so there is no second half
+    # it has to arrive with.
+    employment_events: list[EmploymentEventRecord] = Field(default_factory=list)
+    # Folders and documents travel together for the reason teams and employees
+    # do — a document cannot be filed under a folder that has not landed.
+    folders: list[FolderRecord] = Field(default_factory=list)
+    documents: list[DmsDocumentRecord] = Field(default_factory=list)
 
 
 class SourceStatus(BaseModel):
@@ -571,10 +663,11 @@ class SyncService:
             # — and they register here so `SyncService` stays the one place
             # that knows which flows exist. Deferred because they import this
             # module for its wire shapes.
-            from . import sync_commerce, sync_office
+            from . import sync_commerce, sync_dms, sync_office
 
             sync_commerce.register(self)
             sync_office.register(self)
+            sync_dms.register(self)
 
     def _act(self, ctx: RunContext, action_id: str, step_id: str) -> PendingAction:
         """A sync write, committed by the Flow that is running.
@@ -611,6 +704,9 @@ class SyncService:
             (VENDOR_EVENT, request.vendors),
             (PO_EVENT, request.purchase_orders),
             (RECEIVING_EVENT, request.receiving_reports),
+            # A single-shape feed like the three above it: one list of rows,
+            # landed under `records`, no second resource to arrive with.
+            (EMPLOYMENT_EVENT_EVENT, request.employment_events),
         ]
         if request.teams or request.employees:
             plan.append((WORKFORCE_EVENT, []))
@@ -622,11 +718,14 @@ class SyncService:
             plan.append((SALES_EVENT, []))
         if request.mailboxes or request.mail_messages:
             plan.append((MAIL_EVENT, []))
+        if request.folders or request.documents:
+            plan.append((DOCUMENTS_EVENT, []))
         # The multi-shape feeds carry their records in named lists rather than
         # one `records` column, so they are exempt from the emptiness check
         # and build their own inputs below.
         multi_shape = (
             WORKFORCE_EVENT, CALENDAR_EVENT, CRM_EVENT, SALES_EVENT, MAIL_EVENT,
+            DOCUMENTS_EVENT,
         )
         for event, records in plan:
             if event not in multi_shape and not records:
@@ -680,6 +779,13 @@ class SyncService:
                     "messages": [
                         m.model_dump() for m in request.mail_messages
                     ],
+                }
+            elif event == DOCUMENTS_EVENT:
+                inputs = {
+                    "source": request.source,
+                    "watermark": request.watermark,
+                    "folders": [f.model_dump() for f in request.folders],
+                    "documents": [d.model_dump() for d in request.documents],
                 }
             run_id = None
             if request.idempotency_key:
@@ -1015,7 +1121,13 @@ class SyncService:
                     Claim(field="po_number", value=record.po_number, source=claim_source),
                     Claim(field="ordered_date", value=record.ordered_date, source=claim_source),
                     Claim(field="currency", value=record.currency, source=claim_source),
-                    Claim(field="status", value=record.status, source=claim_source),
+                    # Slugged, like every other status the graph holds. The
+                    # ERP says `Pending Receipt`; the ontology's enum is what
+                    # queries and evals are written against, and one feed
+                    # landing its own spelling meant `status == "open"` was a
+                    # question you could only answer per source.
+                    Claim(field="status", value=_slug(record.status),
+                          source=claim_source),
                     Claim(
                         field="total_usd",
                         value=round(sum(
@@ -1200,14 +1312,21 @@ class SyncService:
         graph = writer if writer is not None else self.graph
         claim_source = f"{_authority(source)}:{source}"
         for record in records:
+            claims = [
+                Claim(field="slug", value=record.slug, source=claim_source),
+                Claim(field="name", value=record.name, source=claim_source),
+                Claim(field="mission", value=record.mission,
+                      source=claim_source),
+            ]
+            if record.external_id:
+                # The source's own id, kept so a worker row naming a
+                # `departmentId` can find this team without the connector
+                # spending a GET to re-read the name the slug came from.
+                claims.append(Claim(field="external_id",
+                                    value=record.external_id,
+                                    source=claim_source))
             graph.upsert(
-                "Team", record.slug,
-                [
-                    Claim(field="slug", value=record.slug, source=claim_source),
-                    Claim(field="name", value=record.name, source=claim_source),
-                    Claim(field="mission", value=record.mission,
-                          source=claim_source),
-                ],
+                "Team", record.slug, claims,
                 label=record.name or record.slug,
                 provenance=f"synced by {run_id}",
             )
@@ -1223,17 +1342,30 @@ class SyncService:
         graph = writer if writer is not None else self.graph
         claim_source = f"{_authority(source)}:{source}"
         for record in records:
+            claims = [
+                Claim(field="email", value=record.email, source=claim_source),
+                Claim(field="name", value=record.name, source=claim_source),
+                Claim(field="title", value=record.title, source=claim_source),
+                Claim(field="location", value=record.location,
+                      source=claim_source),
+                Claim(field="start_date", value=record.start_date,
+                      source=claim_source),
+            ]
+            # Claimed only when the source said something. An empty claim is
+            # not the same fact as a missing one: a feed that predates these
+            # columns would otherwise assert that everyone it delivers has no
+            # status, and `status == ""` would outrank the HRIS that knows.
+            for field, value in (
+                ("external_id", record.external_id),
+                ("status", _slug(record.status)),
+                ("employment_type", _slug(record.employment_type)),
+            ):
+                if value:
+                    claims.append(
+                        Claim(field=field, value=value, source=claim_source)
+                    )
             graph.upsert(
-                "Employee", record.email,
-                [
-                    Claim(field="email", value=record.email, source=claim_source),
-                    Claim(field="name", value=record.name, source=claim_source),
-                    Claim(field="title", value=record.title, source=claim_source),
-                    Claim(field="location", value=record.location,
-                          source=claim_source),
-                    Claim(field="start_date", value=record.start_date,
-                          source=claim_source),
-                ],
+                "Employee", record.email, claims,
                 label=record.name or record.email,
                 provenance=f"synced by {run_id}",
             )
@@ -1251,27 +1383,52 @@ class SyncService:
             "unresolved": 0,
         }
 
-        def employee(email: str):
-            return self.graph.get(object_id("Employee", email)) if email else None
+        def by_external(object_type: str) -> dict[str, Any]:
+            """Everything of one type this source has ever landed, by its id.
 
-        def team(slug: str):
-            return self.graph.get(object_id("Team", slug)) if slug else None
+            One scan rather than a lookup per reference — the org chart names
+            the same handful of managers a hundred times, and `find` walks the
+            store. Built from the graph and not from the batch, which is the
+            point: the manager of the one person in a delta is almost never in
+            that delta, and before these columns existed the only way to place
+            them was for the connector to go back to the estate and ask.
+            """
+            return {
+                str(o.props.get("external_id")): o
+                for o in self.graph.find(object_type)
+                if o.props.get("external_id")
+            }
+
+        people_by_id = by_external("Employee")
+        teams_by_id = by_external("Team")
+
+        def employee(email: str, external_id: str = ""):
+            found = (
+                self.graph.get(object_id("Employee", email)) if email else None
+            )
+            return found or people_by_id.get(external_id)
+
+        def team(slug: str, external_id: str = ""):
+            found = self.graph.get(object_id("Team", slug)) if slug else None
+            return found or teams_by_id.get(external_id)
 
         for record in employees:
             person = employee(record.email)
             if person is None:
                 counts["unresolved"] += 1
                 continue
-            if record.team_slug:
-                unit = team(record.team_slug)
+            if record.team_slug or record.department_external_id:
+                unit = team(record.team_slug, record.department_external_id)
                 if unit is None:
                     counts["unresolved"] += 1
                 else:
                     graph.link("member_of", person.id, unit.id,
                                method="declared", provenance="hris team_slug")
                     counts["member_of"] += 1
-            if record.manager_email:
-                manager = employee(record.manager_email)
+            if record.manager_email or record.manager_external_id:
+                manager = employee(
+                    record.manager_email, record.manager_external_id
+                )
                 if manager is None:
                     counts["unresolved"] += 1
                 else:
@@ -1880,7 +2037,30 @@ def _authority(source: str) -> str:  # noqa: D401
     # somebody's Friday.
     if "office" in lowered or "mail" in lowered:
         return "office"
+    # A bucket of its own rather than the fall-through, because the
+    # fall-through is `flow` — and a document system's own filing tree is the
+    # one thing about it that is *observed*. Letting it land as `flow` would
+    # have recorded the customer's folder structure as something Cumulus
+    # inferred, and a later human correction would have outranked it for the
+    # wrong reason.
+    if "dms" in lowered or "sharepoint" in lowered or "documentum" in lowered:
+        return "dms"
     return "flow"
+
+
+def _slug(value: str) -> str:
+    """A source's display vocabulary as the ontology's declared one.
+
+    `Pending Receipt` is the ERP's word for `pending-receipt`; the enum on the
+    type is what every query and every eval is written against. Mechanical, and
+    deliberately *not* in the connector: which vocabulary a source's strings
+    belong to is a mapping decision, and mapping decisions live in flows.
+
+    It lives here rather than beside its first caller because it stopped being
+    one flow's habit the moment a second flow needed the same guarantee — a
+    sales order slugged and a purchase order not was a difference nobody chose.
+    """
+    return "-".join((value or "").strip().lower().split())
 
 
 def build_sync_service(

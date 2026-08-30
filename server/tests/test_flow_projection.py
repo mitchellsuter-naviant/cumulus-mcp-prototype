@@ -12,7 +12,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.estate import _build_crm_book, _build_erp_sales, _build_office_mail
+from app.estate import (
+    _build_crm_book,
+    _build_dms_library,
+    _build_erp_sales,
+    _build_hris_employment_events,
+    _build_office_mail,
+)
 from app.flow_projection import SCAN_LIMIT, project_flow, project_flows
 from app.graph import parse_ref
 from app.payables import seed_payables_if_empty
@@ -23,6 +29,27 @@ from app.calendars import seed_calendars_if_empty
 from app.workforce import seed_workforce_if_empty
 from tests import estate_fixtures as fx
 from tests import world as test_world
+
+
+class _Access:
+    """The connector's estate handle with the network removed.
+
+    Only `url` is answered — the DMS build needs an address for a
+    `storage_ref` and nothing here dereferences, which is the contract those
+    two feeds declare.
+    """
+
+    def __call__(self, resource: str, record_id: str) -> dict:
+        return {}
+
+    def url(self, resource: str, record_id: str, suffix: str = "") -> str:
+        return (
+            "https://cumulus-demo-mitchell-suter-dms.web.app/api/naviant/v1/"
+            f"{resource}/{record_id}{suffix}"
+        )
+
+
+_access = _Access()
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +260,13 @@ def seeded():
                             "salesOrders": fx.SALES_ORDERS}),
         (_build_office_mail, {"mailboxes": fx.MAILBOXES,
                               "messages": fx.MAIL_MESSAGES}),
+        (_build_hris_employment_events,
+         {"employmentEvents": fx.EMPLOYMENT_EVENTS}),
+        (_build_dms_library,
+         {"folders": fx.FOLDERS, "documents": fx.DMS_DOCUMENTS}),
     ):
         world.sync.deliver(
-            build(rows, lambda resource, record_id: {}), actor="system:test"
+            build(rows, _access), actor="system:test"
         )
     return world
 
@@ -257,13 +288,24 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
         "crm-sync",
         "sales-sync",
         "mail-sync",
+        "employment-event-sync",
+        "dms-sync",
     }
-    # Eight of the ten are inbound syncs, and two of those still have no
-    # FlowDefinition. A projection drawn from the flow registry alone would
-    # report eight and miss the rest.
+    # Ten of the twelve are inbound syncs. They all have FlowDefinitions now,
+    # but the projection is still drawn from the engine and from stored runs:
+    # a definition says what a flow is *meant* to touch, and this module is
+    # about what it did.
     for projection in projections.values():
         assert projection.state == "observed", projection.flow_id
         assert projection.writes, projection.flow_id
+        if projection.flow_id == "employment-event-sync":
+            # The one flow that establishes no link, and the projection is
+            # right to say so: it lands the employment ledger and asserts
+            # nothing about anybody. A projection that quietly excused an
+            # empty `establishes` would stop being able to tell "this flow
+            # draws no edges" from "this flow was never read".
+            assert projection.establishes == []
+            continue
         assert projection.establishes, projection.flow_id
 
 

@@ -51,13 +51,16 @@ LIBRARY_ROUTE = "/api/ui/v1/library"
 ROUTES = (ONTOLOGY_ROUTE, SOURCES_ROUTE, LIBRARY_ROUTE)
 
 #: The flows that reach the graph. Written out rather than derived from the
-#: engine, so the test states the expected answer: eight of them are inbound
-#: syncs, two of those still have no FlowDefinition, and a selector built
-#: from the flow registry would offer eight and lose the rest.
+#: engine, so the test states the expected answer: ten of them are inbound
+#: syncs, every one now carrying a FlowDefinition — stated because a
+#: selector built from the registry alone would have lost the undeclared
+#: ones while they existed.
 GRAPH_FLOWS = {
     "accounts-payable",
     "calendar-sync",
     "crm-sync",
+    "dms-sync",
+    "employment-event-sync",
     "expense-reimbursement",
     "mail-sync",
     "purchase-order-sync",
@@ -285,12 +288,13 @@ def test_the_ontology_route_draws_the_whole_model_in_one_call(client):
 
 
 def test_the_selector_offers_every_flow_that_writes_the_graph(client):
-    """Not the definitions in the flow registry. Two of the ten are inbound
-    syncs with no FlowDefinition at all, and a picker built from the registry
-    would leave part of the graph unattributable."""
+    """Not the definitions in the flow registry. The registry and the engine
+    agree today — every inbound sync carries a FlowDefinition — but the
+    picker is built from runs, so a flow that lost its export would stay
+    attributable."""
     body = client.get(ONTOLOGY_ROUTE).json()
     assert {f["id"] for f in body["flows"]} == GRAPH_FLOWS
-    # Named, including the two the registry cannot name.
+    # Named from the engine, not the registry.
     assert all(f["label"] and f["label"] != f["id"] for f in body["flows"])
 
 
@@ -376,7 +380,16 @@ def test_the_sources_route_puts_health_and_contract_on_one_row(client):
     # Three feeds ride one flow, which is why the artifact join goes through
     # the run and not the flow.
     assert sum(1 for r in rows.values() if r["flow_id"] == "vendor-sync") == 3
-    assert all(r["contract"] is not None for r in rows.values())
+
+    # One row arrives under no contract, and it is the seeded mock HRIS. The
+    # registry used to carry a fictional `hris-workday` Mapping beside the
+    # real `hris-workforce` one — two contracts for one subject, one of them
+    # describing a system that does not exist. Reconciling them to the true
+    # row leaves this delivery visibly undeclared, which is the honest
+    # reading: nothing is behind it, and B4 deletes the seed that emits it.
+    undeclared = {s for s, r in rows.items() if r["contract"] is None}
+    assert undeclared == {"hris-workday"}
+    assert rows["hris-workday"]["records_landed"] > 0
     assert body["problems"] == []
 
 

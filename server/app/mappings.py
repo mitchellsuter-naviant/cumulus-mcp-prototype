@@ -205,43 +205,6 @@ MAPPINGS: tuple[Mapping, ...] = (
         ),
     ),
     Mapping(
-        id="hris-workday",
-        source="hris-workday",
-        system="HRIS (Workday)",
-        summary=(
-            "The firm's people and teams. The first **bind** contract in the "
-            "registry: an HRIS row is keyed by work email and names its "
-            "manager and team by their own keys, so there is nothing for a "
-            "steward to adjudicate and no landing record worth keeping — the "
-            "columns bind straight to entities and the org chart falls out."
-        ),
-        transport="push",
-        payload="EmployeeRecord + TeamRecord",
-        strategy="bind",
-        resolves_to=("Employee", "Team"),
-        identity=(
-            IdentityBinding(column="email", object_type="Employee",
-                            key="work email"),
-            IdentityBinding(column="manager_email", object_type="Employee",
-                            key="work email"),
-            IdentityBinding(column="team_slug", object_type="Team",
-                            key="team slug"),
-            IdentityBinding(column="parent_slug", object_type="Team",
-                            key="team slug"),
-            IdentityBinding(column="lead_email", object_type="Employee",
-                            key="work email"),
-        ),
-        precedence_source="hris",
-        freshness="on push",
-        collection="workforce",
-        escalation="windowed aggregate",
-        notes=(
-            "Capabilities are deliberately not in this feed: a skill is "
-            "asserted by people, not observed by a system, so the catalogue "
-            "and its assignments carry `human:people-ops` authority instead."
-        ),
-    ),
-    Mapping(
         id="office-calendar",
         source="office-calendar",
         system="Office suite calendars (the estate's mail and calendar system)",
@@ -296,13 +259,15 @@ MAPPINGS: tuple[Mapping, ...] = (
         source="hris-workforce",
         system="HRIS (the estate's people system)",
         summary=(
-            "The live estate's departments, jobs and workers, pulled on a "
-            "delta rather than pushed. Same **bind** contract as the HRIS "
-            "feed above and for the same reason — a work email is exact and a "
-            "department slug is a key — but this one is against a real system "
-            "rather than a seed, so its identity drift is real too: the HRIS "
-            "can hold two worker records under one work email, and this feed "
-            "delivers both exactly as it found them."
+            "The estate's departments, jobs and workers — the one HRIS "
+            "contract in this registry, pulled on a delta. A **bind** "
+            "mapping: a work email is exact and a department slug is a key, "
+            "so there is nothing for a steward to adjudicate and no landing "
+            "record worth keeping — the columns bind straight to entities and "
+            "the org chart falls out. It is against a real system, so its "
+            "identity drift is real too: the HRIS can hold two worker records "
+            "under one work email, and this feed delivers both exactly as it "
+            "found them."
         ),
         transport="pull",
         payload="EmployeeRecord + TeamRecord",
@@ -313,8 +278,14 @@ MAPPINGS: tuple[Mapping, ...] = (
                             key="work email"),
             IdentityBinding(column="manager_email", object_type="Employee",
                             key="work email"),
+            IdentityBinding(column="manager_external_id",
+                            object_type="Employee",
+                            key="the HRIS's own worker id"),
             IdentityBinding(column="team_slug", object_type="Team",
                             key="team slug"),
+            IdentityBinding(column="department_external_id",
+                            object_type="Team",
+                            key="the HRIS's own department id"),
             IdentityBinding(column="parent_slug", object_type="Team",
                             key="team slug"),
             IdentityBinding(column="lead_email", object_type="Employee",
@@ -326,13 +297,19 @@ MAPPINGS: tuple[Mapping, ...] = (
         collection="workforce",
         escalation="windowed aggregate",
         notes=(
-            "Declared-key dereferences, named because the connector is "
-            "otherwise mechanical: the source keys by internal id and this "
-            "contract keys by work email and team slug, so `managerId` and "
-            "`headEmployeeId` are read as `workEmail`, `departmentId` and "
-            "`parentDepartmentId` as the department's slug, and `jobId` as "
-            "the job title. The pulled page answers all four wherever it can; "
-            "only a reference the delta does not contain costs one GET."
+            "Two references bind twice on purpose — a manager and a "
+            "department arrive as both the derived key and the source's own "
+            "id — which is what retired the dereference that used to fetch "
+            "them. The connector reads the pulled page and stops; where the "
+            "page does not answer, the raw id travels and the flow resolves "
+            "it against a person or team already in the graph. The "
+            "dereferences that remain, named because the connector is "
+            "otherwise mechanical: `jobId` is read as the job title, and "
+            "`parentDepartmentId` and `headEmployeeId` as a department's slug "
+            "and a work email, because no column on the wire carries either "
+            "by id. Capabilities are deliberately absent: a skill is asserted "
+            "by people, not observed by a system, so the catalogue and its "
+            "assignments carry `human:people-ops` authority instead."
         ),
     ),
     Mapping(
@@ -506,6 +483,90 @@ MAPPINGS: tuple[Mapping, ...] = (
             "to propose, rather than a batch feed to guess. One declared-key "
             "dereference, the same one the calendar makes: a message names its "
             "mailbox by internal id and this contract keys by address."
+        ),
+    ),
+    Mapping(
+        id="hris-employment-events",
+        source="hris-employment-events",
+        system="HRIS employment ledger (the estate's people system)",
+        summary=(
+            "The append-only record of what changed about a worker and when: "
+            "hires, promotions, transfers, leaves, terminations. It "
+            "**reifies** and then stops — the rows land as SourceRecords and "
+            "nothing else is asserted. Not a half-built feed: no type in the "
+            "ontology holds a before/after pair, each ledger row carries both, "
+            "and modelling one to fit would have been modelling the feed "
+            "rather than the business. The workforce feed says who someone is "
+            "now; this one is the only thing that says who they were."
+        ),
+        transport="pull",
+        payload="EmploymentEventRecord",
+        strategy="reify",
+        lands_as="SourceRecord",
+        # Nothing. Stated by its absence, and true: this contract resolves no
+        # entity, which is exactly the claim its landing-only flow makes.
+        resolves_to=(),
+        identity=(),
+        precedence_source="hris",
+        freshness="pull, delta by updatedAt watermark",
+        custody="copy",
+        collection="source-landing",
+        escalation="windowed aggregate",
+        notes=(
+            "The row is landed whole, including the `previous*` columns — "
+            "which is the point, and also why this feed carries salary "
+            "figures that no other contract here does. The ledger only ever "
+            "grows, so its watermark never has to reconsider a row it has "
+            "already seen, and a redelivery is suppressed by payload hash "
+            "like any other."
+        ),
+    ),
+    Mapping(
+        id="dms-library",
+        source="dms-library",
+        system="Document management (the estate's filing system)",
+        summary=(
+            "The customer's filing tree, mirrored as knowledge about *where "
+            "things are* rather than as a copy of what is in them. A **bind** "
+            "contract: a folder id and a document id are exact, so nothing is "
+            "adjudicated and no landing record is kept — folders become Folder "
+            "objects keyed by their path, and each file becomes a Document row "
+            "stamped with the document library's Collection id and a pointer "
+            "back to the original."
+        ),
+        transport="pull",
+        payload="FolderRecord + DmsDocumentRecord",
+        strategy="bind",
+        resolves_to=("Folder", "Document"),
+        identity=(
+            IdentityBinding(column="external_id", object_type="Folder",
+                            key="source + folder path from the tree's root"),
+            IdentityBinding(column="parent_external_id", object_type="Folder",
+                            key="source + folder path from the tree's root"),
+            IdentityBinding(column="folder_external_id", object_type="Folder",
+                            key="source + folder path from the tree's root"),
+            IdentityBinding(column="external_id", object_type="Document",
+                            key="source + external id (referenced in place)"),
+        ),
+        precedence_source="dms",
+        freshness="pull, delta by updatedAt watermark per resource",
+        # The whole contract in one field. The estate serves the bytes at
+        # `/documents/<id>/content`; this feed never calls it.
+        custody="reference",
+        collection="document-library",
+        escalation="windowed aggregate",
+        notes=(
+            "Bytes are never fetched. `storage_ref` is the customer's own "
+            "content URL, built from the ids the list route gave us and "
+            "pinned to the revision it called current — a pointer without a "
+            "version would silently change meaning on the next upload. A "
+            "Document landed here therefore has no `sha256`, deliberately: a "
+            "content hash is what a *read* file has, and minting one from "
+            "metadata would make an unread original indistinguishable from a "
+            "document we hold. No dereference: `parentId` and `folderId` are "
+            "resolved against rows this same feed landed, and a folder whose "
+            "parent neither the delta nor the graph holds is counted on the "
+            "aggregate rather than filed at the root."
         ),
     ),
 )

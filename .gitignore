@@ -224,3 +224,4 @@ deploy/.admin_api_key
 .firebaserc
 deploy/last-deploy.log
 .firebase/
+.claude/worktrees/
