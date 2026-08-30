@@ -264,6 +264,26 @@ Every subagent is spawned with `model: opus` (Opus 5) — decision 14.
   gates: 657 passed / 1 skipped, analyze clean, 54 Dart tests. Known:
   Agent worktrees may branch from the initial commit — builders must
   verify their base. `_authority` has no `dms` bucket (3c confirms).
+- **2026-08-30 (Wave 2 lands — B2 complete)** — 3a (`7f628cd`): commerce
+  feeds live-smoked — 5 Companies minted from CRM, all 4 ERP customers
+  LINKED not duplicated, both claims retained per company, 14/14 PO
+  vendors source-linked; `data-stewardship` queue + `link-company-record`
+  Action. C1 (`b016240`): Sources is a connector-ops surface (estate card,
+  per-feed watermark/sync-now, permission-gated). 3b (`e4be3ff`): mail as
+  evidence — 163 messages, senders 111 employee / 31 person / 21 counted;
+  the 8 unplaced correspondents are the four drift vendors (B5 substrate).
+  3c (`4b87544`): DMS reference-custody, employment ledger as
+  SourceRecords (33 live rows), Terminated workers carry status, `dms`
+  authority added. Merged at `58cae13`: **twelve flows, twelve Tier-2
+  exports, zero undeclared feeds** — 747 passed / 1 skipped, analyze
+  clean, 65 Dart tests. A2 (ecosystem `8f7d78a..ffa07e2`): the 130-person
+  seed, emulator-verified, all answer-key spot checks pass; plus
+  `4b78b77` fixing the PO6002 evidence chain (real ids are
+  SO5000–SO5004 / PO6000–PO6003). **Live rollout blocked**: `firebase
+  deploy` denied by the permission classifier — needs the user to run or
+  allow it; purge/reseed/pulse wait behind the deploy, then the capstone
+  full-estate sync. Ontology decisions queued: Mailbox→Employee owner
+  link; Office `showAs` dropped fact.
 - **2026-08-30 (later)** — Decisions 13/14 recorded: the PSA app joins the
   estate (A4), subagents run Opus 5. Both in-flight Wave-1 agents briefed
   mid-run (A1 designs the PSA in; the architect shapes the connector for N
