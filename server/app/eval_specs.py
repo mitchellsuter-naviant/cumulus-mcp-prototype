@@ -1225,19 +1225,76 @@ _IDENTITY_ERP_VENDORS = {
 }
 
 
+#: The delivery system's client list, and the fifth axis of drift the roster
+#: designs: not a legal name, not a trade name, but whatever a coordinator
+#: typed after a phone call. Five of the thirteen live clients — the ones with
+#: a counterpart in the rows above, so the suite grades a join rather than an
+#: absence.
+#:
+#: Clients only, with no projects and no hours: this fixture grades the
+#: identity sweep, and what the sweep needs from the PSA is its *spellings*.
+#: The delivery book those clients hang off is exercised in
+#: `test_sync_psa.py`, against the same recording.
+#:
+#: What each row is doing here:
+#:
+#: - **`Apex Mfg`** — the third floor of the Apex trap. The abbreviation the
+#:   coordinator typed for the Milwaukee customer *is* the Rockford vendor's
+#:   legal name, and unlike the CRM's `Apex Manufacturing` this row carries no
+#:   phone number, so the area codes that separate the two cannot be compared.
+#:   What it does carry is its contact's address, and that domain is the
+#:   evidence the join is made on and the vendor is refused on.
+#: - **`Kestrel CU`** — the cross-spelling that must be *found*: a name a
+#:   resolver will not join (0.51) on a domain it cannot argue with. Its
+#:   neighbour `Harbor District Credit Union` is the control.
+#: - **`Northwind`** and **`Summit Health`** — the two that never mint. Both
+#:   land in the resolver's review band and wait for a steward, which is the
+#:   other half of what an informal client list does and the reason the book
+#:   does not simply grow a Company per nickname.
+#: - **`Prairie Records`** — the one with no contact address at all. It mints
+#:   on a name and holds nothing else, and it is here because Sauk Prairie
+#:   School District is one word away from it.
+_IDENTITY_PSA = {
+    "source": "psa-book",
+    "watermark": "2026-08-30T00:00:00Z",
+    "psa_clients": [
+        {"external_id": "101", "name": "Apex Mfg",
+         "contact_name": "Susan Kowalski",
+         "contact_email": "susan.kowalski@apexmfg.example.com"},
+        {"external_id": "105", "name": "Kestrel CU",
+         "contact_name": "Angela Marsh",
+         "contact_email": "angela.marsh@kestrelcu.example.com"},
+        {"external_id": "100", "name": "Northwind",
+         "contact_name": "Maria Delgado",
+         "contact_email": "maria.delgado@northwindtraders.example.com"},
+        {"external_id": "103", "name": "Summit Health",
+         "contact_name": "Evan Walsh",
+         "contact_email": "evan.walsh@summithealth.example.com"},
+        # Nobody filled the field in.
+        {"external_id": "112", "name": "Prairie Records",
+         "contact_name": "Vic Malloy"},
+    ],
+}
+
+
 def _identity_world() -> Fixture:
     return Fixture(
         id="identity/naviant-answer-key",
         flow_id="identity-sweep",
         name="The estate's answer key, as its feeds delivered it",
         summary=(
-            "Nine CRM accounts, three contacts, four ERP customers and five "
-            "ERP vendors, recorded from the live estate. Holds every duplicate "
-            "the namespace design plants across two books, both bait pairs, "
-            "and two pairs of merely-similar neighbours — so a suite can fail "
-            "for proposing too little and for proposing too much."
+            "Nine CRM accounts, three contacts, four ERP customers, five ERP "
+            "vendors and five PSA clients, recorded from the live estate. "
+            "Holds every duplicate the namespace design plants across three "
+            "books, both bait pairs — the Apex one three deep, once the "
+            "delivery system's abbreviation is in the world — and two pairs of "
+            "merely-similar neighbours, so a suite can fail for proposing too "
+            "little and for proposing too much."
         ),
-        deliveries=[_IDENTITY_CRM, _IDENTITY_ERP_SALES, _IDENTITY_ERP_VENDORS],
+        deliveries=[
+            _IDENTITY_CRM, _IDENTITY_ERP_SALES, _IDENTITY_ERP_VENDORS,
+            _IDENTITY_PSA,
+        ],
         origin="declared",
         derived_from=DECLARED_IN,
         authored_by="platform-eng",
@@ -1452,11 +1509,13 @@ IDENTITY_CASES = [
             "Summit Healthcare Staffing is a Rockford temp agency, not the "
             "Madison hospital system; Apex Mfg. Services is a Rockford "
             "refurbisher, not the Milwaukee manufacturer whose own abbreviated "
-            "name it happens to be. Different domains, different area codes, "
-            "opposite sides of the ledger. Verona Foods and the two school "
-            "districts are in the same case on purpose: a must-not-link suite "
-            "that a sweep proposing nothing at all would pass is not testing "
-            "anything, so this case fails both ways round."
+            "name it happens to be — nor the delivery system's client `Apex "
+            "Mfg`, which is that abbreviation typed out. Different domains, "
+            "different area codes, opposite sides of the ledger, and in the "
+            "PSA's case nothing comparable at all. Verona Foods and the two "
+            "school districts are in the same case on purpose: a must-not-link "
+            "suite that a sweep proposing nothing at all would pass is not "
+            "testing anything, so this case fails both ways round."
         ),
         fixture_id="identity/naviant-answer-key",
         expectations=[MilestoneExpectation(
@@ -1477,7 +1536,24 @@ IDENTITY_CASES = [
                     link_counts={"company_same_as": 0},
                 ),
                 ExpectedObject(
-                    type="Company", key="Kestrel Credit Union",
+                    type="Company", key="Harbor District Credit Union",
+                    link_counts={"company_same_as": 0},
+                ),
+                # The third floor of the Apex trap, from the side that built
+                # it. The delivery system's abbreviation for the Milwaukee
+                # customer *is* the Rockford vendor's legal name, and unlike
+                # the CRM's spelling this one carries no phone number — so the
+                # area codes that separate the two cannot be compared and the
+                # names agree at 0.78. What refuses it is that neither record
+                # can be reached the way the other can.
+                ExpectedObject(
+                    type="Company", key="Apex Mfg",
+                    link_counts={"company_same_as_vendor": 0},
+                ),
+                # A nickname that holds nothing but a name, one word from a
+                # school district. Minted, and proposed against nothing.
+                ExpectedObject(
+                    type="Company", key="Prairie Records",
                     link_counts={"company_same_as": 0},
                 ),
                 # The discriminator: the sweep is not passing by silence.
@@ -1494,6 +1570,58 @@ IDENTITY_CASES = [
                 "terminal_status": "succeeded",
                 "model_calls_at_most": "0",
                 "read": "knowledge:entity-resolution-policy",
+            },
+        )],
+    ),
+    EvalCase(
+        id="identity/psa-nickname-joins-the-book",
+        spec_id=IDENTITY_SPEC.id,
+        name="A coordinator's shorthand is joined to the company it means",
+        summary=(
+            "The delivery system contributes a fifth axis of drift and the "
+            "weakest names in the estate: `Kestrel CU` scores 0.51 against "
+            "`Kestrel Credit Union` and `Apex Mfg` 0.54 against `Apex "
+            "Manufacturing`, both far below the floor where a resolver would "
+            "assert anything, so both mint their own Company. What joins them "
+            "is the one hard identifier an informal client list carries — the "
+            "domain out of the contact's address — and the proposals come back "
+            "`exact` because a shared domain is a fact rather than a "
+            "resemblance. This is the half of the PSA feed that the bait case "
+            "is the other half of: the same evidence that finds these two has "
+            "to refuse the vendor."
+        ),
+        fixture_id="identity/naviant-answer-key",
+        expectations=[MilestoneExpectation(
+            milestone="proposed",
+            objects=[
+                ExpectedObject(
+                    type="Company", key="Kestrel CU",
+                    link_counts={"company_same_as": 1},
+                    link_props={
+                        "company_same_as.confidence": 0.90,
+                        "company_same_as.status": _IN_REVIEW,
+                        "company_same_as.method": "exact",
+                    },
+                ),
+                # The same pair, read from the other end — a proposal between
+                # two peers is directed by natural key and not by which row is
+                # newer, because which one survives a merge is the steward's
+                # call and encoding a guess about it in the edge would be the
+                # sweep quietly making it. `Apex Manufacturing` sorts before
+                # `Apex Mfg`, so the outbound edge is here.
+                ExpectedObject(
+                    type="Company", key="Apex Manufacturing",
+                    link_counts={"company_same_as": 1},
+                    link_props={
+                        "company_same_as.confidence": 0.90,
+                        "company_same_as.status": _IN_REVIEW,
+                        "company_same_as.method": "exact",
+                    },
+                ),
+            ],
+            trajectory={
+                "terminal_status": "succeeded",
+                "wrote": "link:company_same_as/",
             },
         )],
     ),

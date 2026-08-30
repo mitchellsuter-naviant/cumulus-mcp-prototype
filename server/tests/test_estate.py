@@ -23,6 +23,7 @@ import pytest
 from app.estate import (
     FEEDS,
     HRIS_WORKFORCE,
+    PSA_BOOK,
     EstateConnector,
     EstateError,
     FeedSpec,
@@ -109,26 +110,33 @@ def test_a_namespace_without_the_app_activates_nothing():
         connector.pull(HRIS_WORKFORCE)
 
 
-def test_a_sixth_app_is_one_feedspec_and_no_connector_change():
-    """The psa app, proved before it exists: one row in the registry."""
-    psa = FeedSpec(
-        feed="psa-projects", app="psa", resources=("projects",),
-        build=lambda rows, deref: SyncRequest(source="psa-projects"),
+def test_another_app_is_one_feedspec_and_no_connector_change():
+    """The extension point, proved the way it was proved before `psa` landed.
+
+    That app is real now — it is a row in `FEEDS` and a Mapping like any other,
+    and it arrived by re-recording the discovery payload with nothing in this
+    module changed, which is the claim this test used to make about it in
+    advance. So the case is made again with the next one: a hypothetical
+    applicant-tracking app the namespace does not run.
+    """
+    ats = FeedSpec(
+        feed="ats-requisitions", app="ats", resources=("requisitions",),
+        build=lambda rows, deref: SyncRequest(source="ats-requisitions"),
     )
     payload = {
         "namespaces": [
             {**fx.NAMESPACES["namespaces"][0],
-             "apps": [*fx.NAMESPACES["namespaces"][0]["apps"], "psa"]},
+             "apps": [*fx.NAMESPACES["namespaces"][0]["apps"], "ats"]},
         ],
         "default": "naviant",
     }
-    connector = build(fx.FakeEstate(namespaces=payload), feeds=(*FEEDS, psa))
+    connector = build(fx.FakeEstate(namespaces=payload), feeds=(*FEEDS, ats))
     assert {f.feed for f in connector.active_feeds()} == {
-        *(f.feed for f in FEEDS), "psa-projects",
+        *(f.feed for f in FEEDS), "ats-requisitions",
     }
     # And with the app absent again, the same registry activates everything
     # except the row that named it.
-    assert {f.feed for f in build(feeds=(*FEEDS, psa)).active_feeds()} == {
+    assert {f.feed for f in build(feeds=(*FEEDS, ats)).active_feeds()} == {
         f.feed for f in FEEDS
     }
 
@@ -283,24 +291,14 @@ def test_a_failure_is_recoverable_on_the_next_tick():
 
 
 def test_one_red_feed_does_not_stop_the_others():
-    psa = FeedSpec(
-        feed="psa-projects", app="psa", resources=("projects",),
-        build=lambda rows, deref: SyncRequest(source="psa-projects"),
-    )
-    payload = {
-        "namespaces": [
-            {**fx.NAMESPACES["namespaces"][0],
-             "apps": [*fx.NAMESPACES["namespaces"][0]["apps"], "psa"]},
-        ],
-        "default": "naviant",
-    }
-    connector = build(
-        fx.FakeEstate(namespaces=payload, fails={("psa", "projects")}),
-        feeds=(*FEEDS, psa),
-    )
+    connector = build(fx.FakeEstate(fails={("psa", "clients")}))
     outcomes = {o["feed"]: o for o in connector.pull_all()}
     assert outcomes[HRIS_WORKFORCE]["outcome"] == "delivered"
-    assert outcomes["psa-projects"]["outcome"] == "failed"
+    assert outcomes[PSA_BOOK]["outcome"] == "failed"
+    # All-or-nothing across the family: the four resources that answered
+    # advanced no cursor either, because a project whose client never arrived
+    # is half an edge.
+    assert connector.state(PSA_BOOK).watermarks == {}
 
 
 # -- the mechanical translation ----------------------------------------------

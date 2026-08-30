@@ -25,6 +25,7 @@ from app.eval_specs import (
     _IDENTITY_CRM,
     _IDENTITY_ERP_SALES,
     _IDENTITY_ERP_VENDORS,
+    _IDENTITY_PSA,
 )
 from app.auth import Principal
 from app.gateway import Refused
@@ -71,7 +72,8 @@ def owner(monkeypatch):
 @pytest.fixture()
 def booked(world):
     """The answer key's world, established the way production establishes it."""
-    for delivery in (_IDENTITY_CRM, _IDENTITY_ERP_SALES, _IDENTITY_ERP_VENDORS):
+    for delivery in (_IDENTITY_CRM, _IDENTITY_ERP_SALES, _IDENTITY_ERP_VENDORS,
+                     _IDENTITY_PSA):
         world.sync.deliver(SyncRequest.model_validate(delivery), actor="system:test")
     return world
 
@@ -239,9 +241,16 @@ def test_the_crm_duplicate_account_is_proposed_though_one_row_holds_nothing(book
         # The roster's two designed bait pairs.
         ("Summit Health Partners", "Summit Healthcare Staffing LLC"),
         ("Apex Manufacturing", "Apex Mfg. Services LLC"),
+        # The third floor of the Apex trap: the delivery system's nickname for
+        # the customer is the vendor's legal name, and it arrives from a system
+        # that keeps no phone numbers — so the area codes that separate the
+        # other two cannot be compared at all.
+        ("Apex Mfg", "Apex Mfg. Services LLC"),
         # And the confusability the roster documents as *not* designed pairs.
         ("Sauk Prairie School District", "Sugar River School District"),
         ("Kestrel Credit Union", "Harbor District Credit Union"),
+        ("Kestrel CU", "Harbor District Credit Union"),
+        ("Prairie Records", "Sauk Prairie School District"),
     ],
 )
 def test_pairs_the_answer_key_says_are_two_entities_are_not_proposed(
@@ -300,17 +309,17 @@ def test_a_second_sweep_changes_nothing(booked):
     proposal a steward has already ruled on must not be re-opened by a pass
     that happened to run again."""
     first = booked.sync.sweep_identities(actor="system:test")
-    assert first["proposed"] == 3 and first["standing"] == 0
-    assert first["steward_tasks"] == 3
+    assert first["proposed"] == 5 and first["standing"] == 0
+    assert first["steward_tasks"] == 5
 
     second = booked.sync.sweep_identities(actor="system:test")
     assert second["proposed"] == 0
-    assert second["standing"] == 3
-    assert len(_proposals(booked)) == 3
-    # And no second Task for any of the three pairs.
+    assert second["standing"] == 5
+    assert len(_proposals(booked)) == 5
+    # And no second Task for any of the five pairs.
     assert second["steward_tasks"] == 0
-    assert second["steward_tasks_standing"] == 3
-    assert len([t for t in booked.tasks.list() if t.kind == "merge_review"]) == 3
+    assert second["steward_tasks_standing"] == 5
+    assert len([t for t in booked.tasks.list() if t.kind == "merge_review"]) == 5
 
 
 def test_a_later_sweep_does_not_re_open_a_decided_task(booked):
@@ -370,7 +379,7 @@ def test_every_proposal_gets_a_decision_path_whatever_it_scored(booked):
     """
     out = booked.sync.sweep_identities(actor="system:test")
     tasks = [t for t in booked.tasks.list() if t.kind == "merge_review"]
-    assert out["steward_tasks"] == len(tasks) == out["proposed"] == 3
+    assert out["steward_tasks"] == len(tasks) == out["proposed"] == 5
 
     # Every standing proposal has a Task pointing at its edge, and every Task
     # is open. No proposal in the book is undecidable.
@@ -394,11 +403,12 @@ def test_every_proposal_gets_a_decision_path_whatever_it_scored(booked):
         assert ("ratification" in task.summary) is ratifying
         assert (task.title.startswith("Same party?")) is not ratifying
 
-    # Northwind at 0.79 is the one genuine question in this book; Verona and
-    # the Bergs clear the bar and are raised as ratifications.
+    # Northwind at 0.79 is the one genuine question in this book; Verona, the
+    # Bergs and the two PSA nicknames clear the bar and are raised as
+    # ratifications.
     ask = next(t for t in tasks if t.priority == "normal")
     assert STALE_NORTHWIND in ask.title
-    assert out["steward_ratifications"] == 2
+    assert out["steward_ratifications"] == 4
     assert ask.queue == steward_queue_for_type("Company") == "data-stewardship"
     assert ask.case_ref.startswith("link:company_same_as/")
     assert any("shared-anchor" == e.label for e in ask.evidence)
@@ -446,7 +456,7 @@ def test_rejecting_withdraws_the_proposal_without_erasing_that_it_was_made(booke
     # Withdrawn, not deleted, and the other proposals are untouched — a
     # rejection is a judgment about one pair.
     assert withdrawn.props["status"] == "in_review"
-    assert len(_proposals(booked)) == 2
+    assert len(_proposals(booked)) == 4
 
 
 def test_a_decision_on_a_ruled_proposal_is_refused_not_replayed(booked):
@@ -741,12 +751,13 @@ def test_the_answer_key_runs_green_through_the_eval_route(client, owner, world):
         (c["case_id"], [a for a in c["assertions"] if not a["passed"]], c["error"])
         for c in cases if not c["passed"]
     ]
-    assert body["passed"] == 4
+    assert body["passed"] == 5
     assert {c["case_id"] for c in cases} == {
         "identity/northwind-stale-duplicate",
         "identity/berg-duplicate-contact",
         "identity/cedarline-one-vendor",
         "identity/bait-pairs-are-not-proposed",
+        "identity/psa-nickname-joins-the-book",
     }
     # Every case ran in a world the fixture's own deliveries built, and none
     # of them touched the live graph the rest of this module is using.
@@ -790,5 +801,6 @@ def test_loosening_the_governed_thresholds_fails_the_bait_case(client, owner, wo
     ), detail
     # The must-link cases still pass, which is the half that makes this a
     # proof rather than a coincidence: loosening did not break the finder, it
-    # broke the refusing.
-    assert body["passed"] == 3
+    # broke the refusing — including the PSA case, whose two joins rest on a
+    # shared domain and are untouched by a floor that moved.
+    assert body["passed"] == 4

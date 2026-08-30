@@ -7,7 +7,7 @@ master and seven invoices in `payables.py`, twelve expense runs in
 of it on first boot, which was how the prototype got a populated console
 before it had anything to populate it from.
 
-It has something now. The estate connector pulls nine feeds off a live
+It has something now. The estate connector pulls ten feeds off a live
 simulation of a customer environment, so a server that invents a vendor master
 is a server telling the operator something untrue about their own data. The
 seeds are gone from `app/`; a cold server with no estate configured starts

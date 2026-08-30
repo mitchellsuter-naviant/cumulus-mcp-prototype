@@ -18,6 +18,7 @@ from app.estate import (
     _build_erp_sales,
     _build_hris_employment_events,
     _build_office_mail,
+    _build_psa_book,
 )
 from app.flow_projection import SCAN_LIMIT, project_flow, project_flows
 from app.graph import parse_ref
@@ -261,6 +262,10 @@ def seeded():
          {"employmentEvents": fx.EMPLOYMENT_EVENTS}),
         (_build_dms_library,
          {"folders": fx.FOLDERS, "documents": fx.DMS_DOCUMENTS}),
+        (_build_psa_book,
+         {"clients": fx.PSA_CLIENTS, "projects": fx.PSA_PROJECTS,
+          "phases": fx.PSA_PHASES, "tasks": fx.PSA_TASKS,
+          "timeEntries": fx.PSA_TIME_ENTRIES}),
     ):
         world.sync.deliver(
             build(rows, _access), actor="system:test"
@@ -290,9 +295,10 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
         "mail-sync",
         "employment-event-sync",
         "dms-sync",
+        "psa-sync",
         "identity-sweep",
     }
-    # Ten of the thirteen are inbound syncs. They all have FlowDefinitions now,
+    # Eleven of the fourteen are inbound syncs. They all have FlowDefinitions now,
     # but the projection is still drawn from the engine and from stored runs:
     # a definition says what a flow is *meant* to touch, and this module is
     # about what it did.

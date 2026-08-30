@@ -200,9 +200,10 @@ COLLECTIONS: tuple[DataCollection, ...] = (
             "outlives the dealing"
         ),
         object_types=("Company", "Person"),
-        # Declared ahead of their writers: crm-sync reifies accounts and
-        # contacts, sales-sync reifies ERP customers onto the same companies.
-        written_by=("crm-sync", "sales-sync"),
+        # crm-sync reifies accounts and contacts, sales-sync reifies ERP
+        # customers onto the same companies, and psa-sync reifies the delivery
+        # system's client list — the third voice, and the informal one.
+        written_by=("crm-sync", "sales-sync", "psa-sync"),
         # mail-sync reads it rather than writing it, which is the whole point
         # of the split: a message resolves its correspondents against the book
         # and counts the ones it cannot place, instead of minting a company
@@ -235,6 +236,34 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         written_by=("crm-sync", "sales-sync"),
     ),
     DataCollection(
+        id="delivery-records",
+        name="Delivery records",
+        summary=(
+            "What the delivery organization is actually doing for the "
+            "counterparties the sell side booked: engagements, their phases, "
+            "and the hours that went into each. Its own Collection rather than "
+            "more of `sales-records`, and the reason is the one this module "
+            "opens with — governance hangs off the *set*. This set has a "
+            "different system of record (the PSA, not the ERP or the CRM), a "
+            "different org reading it (Delivery, not Sales), and it is the "
+            "only synced set in the estate that carries per-person labour "
+            "time. Folding it into the sell side would have made that "
+            "Collection's own summary false and put a technician's hours under "
+            "whatever policy governs a sales pipeline."
+        ),
+        role="data", kind="entities", origin="synced",
+        container="graph_objects", custody="copy", authoritative=False,
+        retention="P7Y",
+        retention_note=(
+            "the same seven-year footing as the orders, because the hours here "
+            "are the basis of what was billed against them — a project's "
+            "actuals outliving the invoice they justify by less than the "
+            "invoice does would be the wrong way round"
+        ),
+        object_types=("Project", "ProjectPhase"),
+        written_by=("psa-sync",),
+    ),
+    DataCollection(
         id="source-landing",
         name="Source landing",
         summary=(
@@ -254,7 +283,7 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         # ever gets read back as history has not earned one.
         written_by=(
             "vendor-sync", "purchase-order-sync", "receiving-sync",
-            "crm-sync", "sales-sync", "employment-event-sync",
+            "crm-sync", "sales-sync", "employment-event-sync", "psa-sync",
         ),
     ),
     DataCollection(

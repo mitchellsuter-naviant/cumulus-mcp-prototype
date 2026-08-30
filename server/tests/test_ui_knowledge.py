@@ -48,12 +48,12 @@ LIBRARY_ROUTE = "/api/ui/v1/library"
 ROUTES = (ONTOLOGY_ROUTE, SOURCES_ROUTE, LIBRARY_ROUTE)
 
 #: The flows that reach the graph. Written out rather than derived from the
-#: engine, so the test states the expected answer: ten of them are inbound
+#: engine, so the test states the expected answer: eleven of them are inbound
 #: syncs, every one now carrying a FlowDefinition — stated because a
 #: selector built from the registry alone would have lost the undeclared
 #: ones while they existed. `identity-sweep` is the one that reaches the graph
 #: without any source having pushed anything: it reads the book the other
-#: eleven wrote and proposes edges across it.
+#: twelve wrote and proposes edges across it.
 GRAPH_FLOWS = {
     "accounts-payable",
     "identity-sweep",
@@ -63,6 +63,7 @@ GRAPH_FLOWS = {
     "employment-event-sync",
     "expense-reimbursement",
     "mail-sync",
+    "psa-sync",
     "purchase-order-sync",
     "receiving-sync",
     "sales-sync",
@@ -615,7 +616,7 @@ def test_the_estate_card_reports_discovery_and_per_feed_activation(
     assert estate["project"] == "cumulus-demo-mitchell-suter"
     assert estate["namespace"] == "naviant"
     assert estate["industry"] == "software-reseller"
-    assert estate["apps"] == ["crm", "erp", "office", "hris", "dms"]
+    assert estate["apps"] == ["crm", "erp", "office", "hris", "dms", "psa"]
     assert estate["pulse_enabled"] is True
     assert estate["pulse_intensity"] == "low"
     assert estate["discovery_error"] == ""

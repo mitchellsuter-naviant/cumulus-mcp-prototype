@@ -124,6 +124,16 @@ KIND_BY_TYPE: dict[str, PairKind] = {
 WEIGHTS: dict[tuple[PairKind, str], float] = {
     ("organization", "shared-domain"): 0.55,
     ("organization", "conflicting-domain"): -0.35,
+    #: Two organizations that each published a way to be reached, in different
+    #: currencies, with nothing in common: one is on a domain and has no
+    #: number, the other has a number and no domain. Same weight as a
+    #: conflicting domain because it is the same argument — two firms that
+    #: were the same firm would be expected to agree *somewhere*, and these
+    #: two records agree nowhere while both being perfectly well filled in.
+    #: It is the one thing that separates a Milwaukee manufacturer's nickname
+    #: from a Rockford refurbisher's legal name once the nickname arrives from
+    #: a system that keeps no phone numbers.
+    ("organization", "conflicting-contact"): -0.35,
     ("organization", "shared-phone"): 0.45,
     ("organization", "shared-area-code"): 0.08,
     ("organization", "conflicting-area-code"): -0.20,
@@ -363,6 +373,43 @@ def _phone_signal(left: Party, right: Party, kind: PairKind) -> Signal | None:
     )
 
 
+def _crossed_contact(left: Party, right: Party) -> Signal | None:
+    """Both reachable, neither comparably — the negative `_phone_signal` cannot
+    reach.
+
+    A gap the estate walked straight into once a sixth system arrived. The
+    phone bands only fire when *both* sides carry a number and the domain
+    signals only when both carry a domain, so a pair where one side has a
+    domain and no number and the other a number and no domain is scored on its
+    name alone — and a name is exactly what a bait pair is built out of. `Apex
+    Mfg`, a delivery system's nickname for the Milwaukee customer, reaches this
+    with `apexmfg.example.com` and no switchboard; `Apex Mfg. Services LLC`, a
+    Rockford refurbisher, reaches it with the 815 and no address. Their names
+    agree at 0.78 and every hard fact they hold is in a currency the other one
+    does not use.
+
+    Deliberately narrow: it fires only when each side is missing exactly what
+    the other has. A record that holds *nothing* — the badge-list `Verona
+    Foods`, with no website and no phone — is not evidence of difference, it is
+    an absence, and the name signal is properly load-bearing there. And
+    organizations only: for a person a mail domain is an employer signal rather
+    than a way to reach them, which is why it is folded into `shared-employer`
+    and never scored as reachability.
+    """
+    for one, other in ((left, right), (right, left)):
+        if one.domains and not one.phones and other.phones and not other.domains:
+            return Signal(
+                name="conflicting-contact",
+                weight=WEIGHTS[("organization", "conflicting-contact")],
+                detail=(
+                    f"no contact point in common — one is reachable at "
+                    f"{sorted(one.domains)[0]} with no number, the other on "
+                    f"{sorted(other.phones)[0]} with no address"
+                ),
+            )
+    return None
+
+
 def score_pair(
     left: Party, right: Party, kind: PairKind, thresholds: SweepThresholds
 ) -> tuple[float, list[Signal], str]:
@@ -394,6 +441,10 @@ def score_pair(
                 detail=f"different domains ({sorted(left.domains)[0]} and "
                        f"{sorted(right.domains)[0]})",
             ))
+        else:
+            crossed = _crossed_contact(left, right)
+            if crossed is not None:
+                signals.append(crossed)
     elif left.employer_id and left.employer_id == right.employer_id:
         signals.append(Signal(
             name="shared-employer", weight=WEIGHTS[(kind, "shared-employer")],
