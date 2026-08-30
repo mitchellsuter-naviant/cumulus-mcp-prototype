@@ -198,8 +198,10 @@ MAPPINGS: tuple[Mapping, ...] = (
         collection="source-landing",
         escalation="windowed aggregate",
         notes=(
-            "A batch feed: unresolved vendors escalate as one aggregate Task "
-            "per delivery, never per row. Declared-key dereferences, named "
+            "A batch feed: an unresolved vendor is counted on the run's "
+            "summary and the order lands unlinked — no Task is raised, and "
+            "the count is the aggregate a later window reads. Declared-key "
+            "dereferences, named "
             "because the connector is otherwise mechanical: a PO row carries "
             "`vendorId` and its lines carry an internal `itemId`, while this "
             "contract keys a vendor by legal name and a line by SKU — so the "
