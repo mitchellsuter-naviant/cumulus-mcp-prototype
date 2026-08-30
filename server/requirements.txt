@@ -9,6 +9,9 @@ google-cloud-firestore>=2.16
 # Lift the cap once a fixed release lands.
 google-api-core<2.35
 pydantic>=2.7
+# The estate connector is the one outbound caller in the system: it pulls the
+# customer's systems and POSTs to its own /sources/deliver door.
+httpx>=0.28
 email-validator>=2.0
 firebase-admin>=6.5
 # Cosine scoring over the whole corpus per query; a Python loop over thousands

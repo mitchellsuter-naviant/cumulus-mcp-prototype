@@ -14,6 +14,7 @@ from .documents import DocumentService, build_document_service
 from .evals import EvalService, FixtureStore, build_fixture_store
 from .eval_specs import DeclaredSpecStore, seed_fixtures_if_empty
 from .dispatch import Dispatcher, build_dispatcher
+from .estate import EstateConnector, build_estate_connector
 from .gateway import ActionGateway, build_action_gateway
 from .graph import GraphService, build_graph_service
 from .runs import RunEngine, build_run_engine
@@ -73,6 +74,7 @@ _document_service: DocumentService | None = None
 _run_engine: RunEngine | None = None
 _anomaly_service: AnomalyService | None = None
 _sync_service: SyncService | None = None
+_estate_connector: EstateConnector | None = None
 _calendar_service: CalendarService | None = None
 _eval_service: EvalService | None = None
 _fixture_store: FixtureStore | None = None
@@ -359,6 +361,33 @@ def get_sync_service() -> SyncService:
             if _sync_service is None:
                 _sync_service = service
     return _sync_service
+
+
+def get_estate_connector() -> EstateConnector:
+    """The one cursor per feed, and the one thing here that calls outward.
+
+    Deliberately holds no service: it delivers over HTTP to its own door, so
+    it depends on the deployment's URL rather than on `SyncService`. That is
+    what keeps the Event ordering honest — see the module docstring.
+    """
+    global _estate_connector
+    if _estate_connector is None:
+        connector = build_estate_connector(
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.connector_state_collection,
+            estate_project=settings.estate_project,
+            url_template=settings.estate_url_template,
+            namespace=settings.estate_namespace,
+            deliver_url=settings.connector_deliver_url,
+            api_key=settings.connector_api_key,
+            interval_seconds=settings.estate_pull_interval_seconds,
+            chunk_size=settings.estate_chunk_size,
+        )
+        with _lock:
+            if _estate_connector is None:
+                _estate_connector = connector
+    return _estate_connector
 
 
 def get_calendar_service() -> CalendarService:

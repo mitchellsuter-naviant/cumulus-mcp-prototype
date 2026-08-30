@@ -12,6 +12,7 @@ from . import (
     api_keys_api,
     calendar_api,
     data_api,
+    estate_api,
     evals_api,
     graph_api,
     ledger_api,
@@ -37,6 +38,7 @@ from .deps import (
     get_anomaly_service,
     get_dispatcher,
     get_document_service,
+    get_estate_connector,
     get_graph_service,
     get_identity_service,
     get_run_engine,
@@ -98,6 +100,15 @@ async def lifespan(app: FastAPI):
     # Last of the seeds: calendars hang off the employees the workforce seed
     # (which rides along with payables) has just landed.
     get_calendar_service()
+
+    # Last, and after every seed: the connector delivers through the HTTP door,
+    # so it must not start pulling into a half-built world. The loop is the dev
+    # adapter for the Scheduling port and stays off unless an interval is set —
+    # deployed, a managed scheduler POSTs /api/v1/estate/pull instead.
+    try:
+        get_estate_connector().start_interval_loop()
+    except Exception:
+        log.exception("Estate pull loop did not start")
 
     # Hard cutover to identity-bound credentials: a key minted before
     # identities existed authenticates nothing (auth.py refuses it), so mark
@@ -207,6 +218,7 @@ app.include_router(ledger_api.router)
 app.include_router(mappings_api.router)
 app.include_router(runs_api.router)
 app.include_router(data_api.router)
+app.include_router(estate_api.router)
 app.include_router(evals_api.router)
 app.include_router(worlds_api.router)
 app.include_router(api_keys_api.router)

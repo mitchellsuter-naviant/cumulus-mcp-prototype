@@ -119,6 +119,43 @@ class Settings:
             "PUBLIC_BASE_URL", "http://localhost:8080"
         )
 
+        # ---- The estate connector -------------------------------------------
+        # Machinery-config, not map: which live customer environment this
+        # deployment pulls from. A Mapping never names a project, a URL or a
+        # credential — those stay below the portability line, which is here.
+        # Empty ESTATE_PROJECT means no estate is registered, which is the
+        # default everywhere but a dev box and reads as "nothing to do".
+        self.estate_project: str = os.environ.get("ESTATE_PROJECT", "")
+        self.estate_url_template: str = os.environ.get(
+            "ESTATE_URL_TEMPLATE", "https://{project}-{app}.web.app"
+        )
+        # Empty falls back to whatever the estate's discovery calls default.
+        self.estate_namespace: str = os.environ.get("ESTATE_NAMESPACE", "")
+        # 0 = the in-server loop is off, which is the default and the deployed
+        # setting: Scheduling is a sourced capability, and the deployed form is
+        # a managed scheduler POSTing /api/v1/estate/pull. This is the dev
+        # adapter for that port and nothing else.
+        self.estate_pull_interval_seconds: int = int(
+            os.environ.get("ESTATE_PULL_INTERVAL_SECONDS", "0")
+        )
+        # Records per delivery. The estate does not page, so a delta arrives
+        # whole and this is the only bound on one POST.
+        self.estate_chunk_size: int = int(os.environ.get("ESTATE_CHUNK_SIZE", "500"))
+        # Watermarks and last-pull outcomes. Machinery state, not a Dataset —
+        # deliberately absent from data_collections.COLLECTIONS.
+        self.connector_state_collection: str = os.environ.get(
+            "CONNECTOR_STATE_COLLECTION", "connector_state"
+        )
+        # The HTTP door the connector delivers through. Its own deployment by
+        # default: the connector is a client of its own server, because going
+        # around the door would start runs with no Event behind them.
+        self.connector_deliver_url: str = (
+            os.environ.get("CONNECTOR_DELIVER_URL") or self.public_base_url
+        )
+        # The machine credential /sources/deliver is called with. Empty in dev
+        # (AUTH_BACKEND=none makes everyone an owner).
+        self.connector_api_key: str = os.environ.get("CONNECTOR_API_KEY", "")
+
         # ---- Semantic search ------------------------------------------------
         # "none" (default): lexical BM25 only — no credentials, no network, and
         # what the tests run against. "vertex": Vertex AI embeddings. "hash": a

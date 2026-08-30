@@ -263,6 +263,50 @@ MAPPINGS: tuple[Mapping, ...] = (
         ),
     ),
     Mapping(
+        id="hris-workforce",
+        source="hris-workforce",
+        system="HRIS (the estate's people system)",
+        summary=(
+            "The live estate's departments, jobs and workers, pulled on a "
+            "delta rather than pushed. Same **bind** contract as the HRIS "
+            "feed above and for the same reason — a work email is exact and a "
+            "department slug is a key — but this one is against a real system "
+            "rather than a seed, so its identity drift is real too: the HRIS "
+            "can hold two worker records under one work email, and this feed "
+            "delivers both exactly as it found them."
+        ),
+        transport="pull",
+        payload="EmployeeRecord + TeamRecord",
+        strategy="bind",
+        resolves_to=("Employee", "Team"),
+        identity=(
+            IdentityBinding(column="email", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="manager_email", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="team_slug", object_type="Team",
+                            key="team slug"),
+            IdentityBinding(column="parent_slug", object_type="Team",
+                            key="team slug"),
+            IdentityBinding(column="lead_email", object_type="Employee",
+                            key="work email"),
+        ),
+        precedence_source="hris",
+        freshness="pull, delta by updatedAt watermark per resource",
+        custody="copy",
+        collection="workforce",
+        escalation="windowed aggregate",
+        notes=(
+            "Declared-key dereferences, named because the connector is "
+            "otherwise mechanical: the source keys by internal id and this "
+            "contract keys by work email and team slug, so `managerId` and "
+            "`headEmployeeId` are read as `workEmail`, `departmentId` and "
+            "`parentDepartmentId` as the department's slug, and `jobId` as "
+            "the job title. The pulled page answers all four wherever it can; "
+            "only a reference the delta does not contain costs one GET."
+        ),
+    ),
+    Mapping(
         id="wms-receiving",
         source="wms-receiving",
         system="Warehouse management (receiving)",
