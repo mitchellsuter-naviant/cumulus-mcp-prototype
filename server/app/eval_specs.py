@@ -90,7 +90,7 @@ def _ap_deliveries(short: float = 0.0) -> list[dict]:
     return [
         {"source": "erp-vendors", "watermark": "2026-08-01T00:00:00Z",
          "vendors": [_ACME, _NORTHWIND]},
-        {"source": "erp-purchasing", "purchase_orders": [_PO_7741]},
+        {"source": "erp-purchase-orders", "purchase_orders": [_PO_7741]},
         {"source": "wms-receiving", "receiving_reports": [_receipt(short)]},
     ]
 

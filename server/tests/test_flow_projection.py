@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.estate import _build_crm_book, _build_erp_sales
 from app.flow_projection import SCAN_LIMIT, project_flow, project_flows
 from app.graph import parse_ref
 from app.payables import seed_payables_if_empty
@@ -20,6 +21,7 @@ from app.runs import InMemoryRunStore, RunEngine, RunRecord, StepRecord
 from app.tasks import InMemoryTaskDirectory, TaskService
 from app.calendars import seed_calendars_if_empty
 from app.workforce import seed_workforce_if_empty
+from tests import estate_fixtures as fx
 from tests import world as test_world
 
 
@@ -212,12 +214,27 @@ def seeded():
     Built rather than installed: nothing here goes through the API, so there
     is no reason to swap the shared `deps` singletons out from under the other
     test modules.
+
+    The commerce feeds have no seed helper — nothing fictional stands in for
+    them, by design — so they are driven from the recorded estate shapes, the
+    same rows `test_sync_commerce.py` uses. Without that they would be
+    registered flows with no runs, and this module's whole claim is about
+    flows that have actually touched the graph.
     """
     world = test_world.build()
     seed_payables_if_empty(world.payables, sync=world.sync)
     seed_workforce_if_empty(world.sync, world.graph)
     seed_calendars_if_empty(world.sync, world.graph)
     seed_reimbursements_if_empty(world.expenses)
+    for build, rows in (
+        (_build_crm_book, {"accounts": fx.ACCOUNTS, "contacts": fx.CONTACTS,
+                           "opportunities": fx.OPPORTUNITIES}),
+        (_build_erp_sales, {"customers": fx.CUSTOMERS, "items": fx.ITEMS,
+                            "salesOrders": fx.SALES_ORDERS}),
+    ):
+        world.sync.deliver(
+            build(rows, lambda resource, record_id: {}), actor="system:test"
+        )
     return world
 
 
@@ -225,7 +242,7 @@ def _by_id(world) -> dict:
     return {p.flow_id: p for p in project_flows(world.engine)}
 
 
-def test_all_seven_flows_that_reach_the_graph_are_projected(seeded):
+def test_every_flow_that_reaches_the_graph_is_projected(seeded):
     projections = {p.flow_id: p for p in project_flows(seeded.engine)}
     assert set(projections) == {
         "accounts-payable",
@@ -235,9 +252,12 @@ def test_all_seven_flows_that_reach_the_graph_are_projected(seeded):
         "receiving-sync",
         "workforce-sync",
         "calendar-sync",
+        "crm-sync",
+        "sales-sync",
     }
-    # Five of the seven are inbound syncs with no FlowDefinition. A projection
-    # drawn from the flow registry alone would report two.
+    # Seven of the nine are inbound syncs, and three of those still have no
+    # FlowDefinition. A projection drawn from the flow registry alone would
+    # report six and miss the rest.
     for projection in projections.values():
         assert projection.state == "observed", projection.flow_id
         assert projection.writes, projection.flow_id

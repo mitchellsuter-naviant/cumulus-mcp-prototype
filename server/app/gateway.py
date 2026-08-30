@@ -93,6 +93,14 @@ ACTIONS: dict[str, Action] = {a.id: a for a in (
     Action(id="record-expense", target="expense-records", queue="expense-review"),
     Action(id="link-source-record", target="entity-layer",
            queue="vendor-stewardship"),
+    # The same decision on the other book. A second declaration rather than a
+    # widened queue on the one above, because the queue *is* the governance
+    # here: whoever owns `vendor-stewardship` decides who Cumulus pays, and
+    # whoever owns `data-stewardship` decides who Cumulus thinks it is dealing
+    # with. Letting one Action answer to both would hand the first authority
+    # the second's work with nothing in the table to say it had happened.
+    Action(id="link-company-record", target="entity-layer",
+           queue="data-stewardship"),
     Action(id="confirm-vendor", target="entity-layer", queue="ap-clerk"),
     # observations — a source reported this; audited by lineage, not approval
     Action(id="land-source-records", target="source-landing",

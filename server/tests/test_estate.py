@@ -84,11 +84,16 @@ def client(_client, world):
 def test_discovery_activates_only_the_apps_the_namespace_runs():
     connector = build()
     assert connector.discover()["id"] == "naviant"
-    assert [f.feed for f in connector.active_feeds()] == [HRIS_WORKFORCE]
+    assert {f.feed for f in connector.active_feeds()} == {f.feed for f in FEEDS}
 
 
 def test_a_namespace_without_the_app_activates_nothing():
-    """The filter is the namespace's `apps` list, not the FEEDS table."""
+    """The filter is the namespace's `apps` list, not the FEEDS table.
+
+    A namespace that runs the CRM and the ERP but no HRIS activates the
+    commerce feeds and refuses the workforce one — per feed, off the app it
+    declares, with nothing in the connector knowing which is which.
+    """
     payload = {
         "namespaces": [
             {**fx.NAMESPACES["namespaces"][0],
@@ -97,7 +102,8 @@ def test_a_namespace_without_the_app_activates_nothing():
         "default": "naviant",
     }
     connector = build(fx.FakeEstate(namespaces=payload))
-    assert connector.active_feeds() == []
+    assert HRIS_WORKFORCE not in {f.feed for f in connector.active_feeds()}
+    assert "crm-book" in {f.feed for f in connector.active_feeds()}
     with pytest.raises(EstateError):
         connector.pull(HRIS_WORKFORCE)
 
@@ -117,11 +123,12 @@ def test_a_sixth_app_is_one_feedspec_and_no_connector_change():
     }
     connector = build(fx.FakeEstate(namespaces=payload), feeds=(*FEEDS, psa))
     assert {f.feed for f in connector.active_feeds()} == {
-        HRIS_WORKFORCE, "psa-projects"
+        *(f.feed for f in FEEDS), "psa-projects",
     }
-    # And with the app absent again, the same registry activates only the five.
+    # And with the app absent again, the same registry activates everything
+    # except the row that named it.
     assert {f.feed for f in build(feeds=(*FEEDS, psa)).active_feeds()} == {
-        HRIS_WORKFORCE
+        f.feed for f in FEEDS
     }
 
 
@@ -439,10 +446,26 @@ def test_the_untouched_mock_world_is_still_there(client, world):
 # -- registration and the API -------------------------------------------------
 
 
-def test_the_registry_holds_one_feed_at_stage_one():
-    assert [f.feed for f in FEEDS] == [HRIS_WORKFORCE]
-    assert [f.app for f in FEEDS] == ["hris"]
-    assert FEEDS[0].resources == ("departments", "jobs", "employees")
+def test_every_feed_in_the_registry_declares_a_contract():
+    """The registry and the Mapping table are two halves of one statement.
+
+    A FeedSpec with no Mapping is a feed pulling rows under no declared
+    contract — which the Sources screen would report as a finding, and which is
+    a finding about *us* rather than about the customer's estate.
+    """
+    from app.mappings import MAPPINGS
+
+    declared = {m.source for m in MAPPINGS}
+    assert {f.feed for f in FEEDS} == {
+        HRIS_WORKFORCE, "crm-book", "erp-sales", "erp-vendors",
+        "erp-purchase-orders",
+    }
+    for spec in FEEDS:
+        assert spec.feed in declared, spec.feed
+        assert spec.app in ("crm", "erp", "office", "hris", "dms"), spec.feed
+        assert spec.resources
+    workforce = next(f for f in FEEDS if f.feed == HRIS_WORKFORCE)
+    assert workforce.resources == ("departments", "jobs", "employees")
 
 
 def test_the_mapping_declares_the_pull_contract():

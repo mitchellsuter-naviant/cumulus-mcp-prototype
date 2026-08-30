@@ -1257,6 +1257,231 @@ def _seed_definitions() -> list[FlowDefinition]:
                          summary="emitted on commit", config={"event": "InvoicePosted"}),
             ],
         ),
+        # -- the sync fleet -------------------------------------------------
+        #
+        # Five feeds used to write the graph with no declarative export to
+        # audit — a flow you can watch run and cannot read. These four are the
+        # first of them to get one, and every step id below was read off a
+        # real journal rather than designed: an export that draws a step the
+        # engine does not run is the exact divergence the transparency bar
+        # exists to catch, and a map of a batch feed is only worth having if
+        # it is the map of what happened.
+        #
+        # None of them has a `task` step, and that is the point rather than an
+        # omission: a windowed flow never suspends for one ambiguous row. The
+        # Task is raised *inside* the apply step and the run finishes; the
+        # steward's answer arrives later through `apply_match_decision`, which
+        # carries no run because there is no run left to carry it.
+        #
+        # And none of them declares `roi_minutes_per_run`. A feed's saved time
+        # is not a thing anybody has measured, and a plausible number here
+        # would put invented value straight into the fleet's ROI figure by the
+        # side door — which is the exact failure the run count was rebuilt to
+        # end. Zero is the honest assumption until somebody makes a real one.
+        FlowDefinition(
+            id="vendor-sync",
+            name="Vendor sync",
+            description=(
+                "Lands an ERP vendor delivery exactly as it arrived, scores "
+                "each row against the vendor master under the governed "
+                "resolution thresholds, and then — in a separate step, "
+                "because nothing is asserted while a match is in doubt — "
+                "links, mints, or raises a steward Task per row. A batch feed "
+                "that stopped on row 47 would hold up rows 48 to 200 for no "
+                "reason, so it never stops."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "vendors", "mdm", "identity"],
+            queues=["vendor-stewardship"],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(120),
+            updated_at=_ago(1),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="VendorRecordsDelivered",
+                         summary="one run per delivery, woken by a window rather than a case",
+                         config={"event": "VendorRecordsDelivered"}, next=["x1"]),
+                FlowStep(id="x1", type="transform", name="read-resolution-policy",
+                         summary="gathers the governed auto-link and steward-review thresholds — the resolver never fetches",
+                         config={"source": "knowledge:entity-resolution-policy"},
+                         next=["s1"]),
+                FlowStep(id="s1", type="sync", name="land-records",
+                         summary="every row kept as delivered, so a change to the matching rules can re-resolve without re-fetching; byte-identical redeliveries are suppressed by payload hash",
+                         config={"target": "source-landing", "gateway": "action-gateway"},
+                         next=["z1"]),
+                FlowStep(id="z1", type="resolve", name="resolve-records",
+                         summary="scores each landed row against the vendor master and asserts nothing — linked, new, or a steward's to decide",
+                         config={"entity": "Vendor",
+                                 "source": "knowledge:entity-resolution-policy"},
+                         next=["a1"]),
+                FlowStep(id="a1", type="action", name="apply-resolutions",
+                         summary="guarded write of the identity decisions: claims onto known vendors, newly minted ones, and a `match_review` Task per ambiguous row — the run does not wait for it",
+                         config={"target": "vendor-master", "gateway": "action-gateway",
+                                 "queue": "vendor-stewardship"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="VendorsSynced",
+                         summary="emitted on commit", config={"event": "VendorsSynced"}),
+            ],
+        ),
+        FlowDefinition(
+            id="purchase-order-sync",
+            name="Purchase order sync",
+            description=(
+                "Lands ERP purchase orders and writes each one with its lines, "
+                "binding the order to the Vendor it was cut against. No "
+                "resolve step of its own: the vendor is named by an id the "
+                "vendor feed already resolved, so this flow reads that "
+                "identity rather than deciding it a second time — and an "
+                "order whose vendor is not in the graph yet is counted on the "
+                "aggregate, never guessed at."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "purchasing", "three-way-match"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(120),
+            updated_at=_ago(1),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="PurchaseOrdersDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "PurchaseOrdersDelivered"}, next=["s1"]),
+                FlowStep(id="s1", type="sync", name="land-records",
+                         summary="the orders as delivered, kept before anything is derived from them",
+                         config={"target": "source-landing", "gateway": "action-gateway"},
+                         next=["a1"]),
+                FlowStep(id="a1", type="action", name="apply-purchase-orders",
+                         summary="guarded write of each order, its lines and the `ordered_from` edge — the three-way match reads these legs out of the graph rather than re-fetching them",
+                         config={"target": "source-landing", "gateway": "action-gateway"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="PurchaseOrdersSynced",
+                         summary="emitted on commit",
+                         config={"event": "PurchaseOrdersSynced"}),
+            ],
+        ),
+        FlowDefinition(
+            id="crm-sync",
+            name="CRM book sync",
+            description=(
+                "Lands the CRM's accounts and contacts and resolves them onto "
+                "the counterparty book: an account becomes a Company under "
+                "the same normalization the vendor master uses, a contact "
+                "becomes a Person keyed by email address — and a contact with "
+                "no address mints its own rather than being matched on a "
+                "name, because two people who share a spelling are two "
+                "people. Opportunities bind instead of reifying: a deal id is "
+                "exact, and the only thing worth adjudicating about a deal is "
+                "its stage, which belongs to the CRM."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "crm", "counterparties", "mdm", "identity"],
+            queues=["data-stewardship"],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(2),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="CrmBookDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "CrmBookDelivered"}, next=["x1"]),
+                FlowStep(id="x1", type="transform", name="read-resolution-policy",
+                         summary="gathers the governed auto-link and steward-review thresholds — the same policy the vendor master resolves under, so the two books cannot disagree about what counts as a match",
+                         config={"source": "knowledge:entity-resolution-policy"},
+                         next=["s1"]),
+                FlowStep(id="s1", type="sync", name="land-records",
+                         summary="accounts and contacts land as they arrived, tagged `company` and `person` — the field a steward's decision is later routed on",
+                         config={"target": "source-landing", "gateway": "action-gateway"},
+                         next=["z1"]),
+                FlowStep(id="z1", type="resolve", name="resolve-records",
+                         summary="scores accounts against the counterparty book by name and contacts by address; asserts nothing",
+                         config={"entity": "Company,Person",
+                                 "source": "knowledge:entity-resolution-policy"},
+                         next=["a1"]),
+                FlowStep(id="a1", type="action", name="apply-resolutions",
+                         summary="guarded write of the companies, the people in them, the reversible identity links back to each landed row, and a `match_review` Task per ambiguous company",
+                         config={"target": "company-master", "gateway": "action-gateway",
+                                 "queue": "data-stewardship"},
+                         next=["a2"]),
+                FlowStep(id="a2", type="action", name="apply-opportunities",
+                         summary="guarded write of the pipeline, each deal bound to the company it is being pursued with — a deal naming an account this delta did not carry is counted, never minted",
+                         config={"target": "sales-records", "gateway": "action-gateway"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="CrmBookSynced",
+                         summary="emitted on commit", config={"event": "CrmBookSynced"}),
+            ],
+        ),
+        FlowDefinition(
+            id="sales-sync",
+            name="Sales record sync",
+            description=(
+                "The ERP's sell side, onto the same counterparty book the CRM "
+                "writes into. Customers reify and resolve — this is the "
+                "second voice on the same companies, and where the two "
+                "disagree about a commercial fact both claims are kept and "
+                "the ERP's precedence decides what resolves. The catalogue "
+                "and the orders bind: a SKU and an order number are exact. "
+                "The one thing that needs work is the line, which names its "
+                "item by an internal id the catalogue row is the only "
+                "translation for."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "erp", "orders", "counterparties", "mdm"],
+            queues=["data-stewardship"],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(2),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="SalesRecordsDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "SalesRecordsDelivered"}, next=["x1"]),
+                FlowStep(id="x1", type="transform", name="read-resolution-policy",
+                         summary="gathers the governed thresholds the counterparty match runs under",
+                         config={"source": "knowledge:entity-resolution-policy"},
+                         next=["s1"]),
+                FlowStep(id="s1", type="sync", name="land-records",
+                         summary="the ERP's customer rows as delivered, under their legal spellings",
+                         config={"target": "source-landing", "gateway": "action-gateway"},
+                         next=["z1"]),
+                FlowStep(id="z1", type="resolve", name="resolve-records",
+                         summary="scores each customer against the counterparty book — `Northwind Traders Inc.` against the `Northwind Traders` the CRM already minted",
+                         config={"entity": "Company",
+                                 "source": "knowledge:entity-resolution-policy"},
+                         next=["a1"]),
+                FlowStep(id="a1", type="action", name="apply-resolutions",
+                         summary="guarded write of the ERP's claims onto known companies and its identity links back to each landed row; an ambiguous one raises a Task and asserts nothing",
+                         config={"target": "company-master", "gateway": "action-gateway",
+                                 "queue": "data-stewardship"},
+                         next=["a2"]),
+                FlowStep(id="a2", type="action", name="apply-items",
+                         summary="guarded write of the catalogue, keyed by SKU and carrying the ERP's internal id — the bridge an order line is resolved through",
+                         config={"target": "sales-records", "gateway": "action-gateway"},
+                         next=["a3"]),
+                FlowStep(id="a3", type="action", name="apply-sales-orders",
+                         summary="guarded write of the orders, their lines, the customer edge and the catalogue edge; a line naming an item nobody has seen is counted rather than minting a SKU-less item the real one could never merge with",
+                         config={"target": "sales-records", "gateway": "action-gateway"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="SalesRecordsSynced",
+                         summary="emitted on commit",
+                         config={"event": "SalesRecordsSynced"}),
+            ],
+        ),
     ]
 
 

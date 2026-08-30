@@ -63,7 +63,7 @@ def _vendors(world):
 
 def _orders(world):
     world.sync.deliver(SyncRequest.model_validate({
-        "source": "erp-purchasing",
+        "source": "erp-purchase-orders",
         "purchase_orders": [{
             "external_id": "PO-7741", "po_number": "PO-7741",
             "vendor_external_id": "V-10041", "vendor_name": "Acme Industrial Inc.",
@@ -682,7 +682,7 @@ def test_seed_builds_a_matchable_world(world):
     assert len(world.graph.find("Vendor")) >= 4
     assert world.graph.find("PurchaseOrder") and world.graph.find("ReceivingReport")
     sources = {s.source for s in world.sync.sources()}
-    assert {"erp-vendors", "erp-purchasing", "wms-receiving"} <= sources
+    assert {"erp-vendors", "erp-purchase-orders", "wms-receiving"} <= sources
 
 
 def test_a_redelivery_changes_nothing(world):

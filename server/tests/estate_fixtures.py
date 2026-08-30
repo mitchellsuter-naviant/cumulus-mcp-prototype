@@ -255,11 +255,327 @@ WORKER_OFF_PAGE: dict = _worker(
     updatedAt="2026-08-16T22:16:24.942981+00:00",
 )
 
+# ---------------------------------------------------------------------------
+# CRM — the sales book
+# ---------------------------------------------------------------------------
+#
+# The five accounts as the CRM spells them, which is the fixture's whole point:
+# four of them are the same firms the ERP bills under their legal names
+# (`Northwind Traders` here, `Northwind Traders Inc.` there), and Fairview is
+# the fifth that only the CRM knows. A tidied fixture that spelled them alike
+# would test a resolver against a problem the estate does not have.
+
+ACCOUNTS: list[dict] = [
+    {"id": "0012a330a03e1e8", "name": "Apex Manufacturing",
+     "industry": "Industrial Manufacturing", "phone": "(414) 555-0188",
+     "website": "https://apexmfg.example.com",
+     "createdAt": "2026-08-16T22:16:14.911840+00:00",
+     "updatedAt": "2026-08-16T22:16:14.911840+00:00"},
+    {"id": "001abbf392844aa", "name": "Blue Harbor Logistics",
+     "industry": "Transportation & Logistics", "phone": "(206) 555-0142",
+     "website": "https://blueharbor.example.com",
+     "createdAt": "2026-08-16T22:16:15.093915+00:00",
+     "updatedAt": "2026-08-16T22:16:15.093915+00:00"},
+    {"id": "00183c5049623dd", "name": "Fairview Insurance Group",
+     "industry": "Insurance", "phone": "(920) 555-0163",
+     "website": "https://fairviewinsurance.example.com",
+     "createdAt": "2026-08-16T22:16:15.312091+00:00",
+     "updatedAt": "2026-08-16T22:16:15.312091+00:00"},
+    {"id": "0010e4954cbbedf", "name": "Northwind Traders",
+     "industry": "Wholesale Distribution", "phone": "(312) 555-0134",
+     "website": "https://northwindtraders.example.com",
+     "createdAt": "2026-08-16T22:16:14.776980+00:00",
+     "updatedAt": "2026-08-16T22:16:14.776980+00:00"},
+    {"id": "001a441a7e0ac44", "name": "Summit Health Partners",
+     "industry": "Healthcare", "phone": "(608) 555-0117",
+     "website": "https://summithealth.example.com",
+     "createdAt": "2026-08-16T22:16:15.203631+00:00",
+     "updatedAt": "2026-08-16T22:16:15.203631+00:00"},
+]
+
+#: Nine contacts, every one of them with an address — so the wire shape's
+#: no-address fallback has no recording to come from and is exercised as a
+#: constructed delivery in `test_sync_commerce.py` instead. Said here rather
+#: than invented above, because a fixture that quietly grew a row the estate
+#: never served would stop being a recording.
+CONTACTS: list[dict] = [
+    {"id": "003f3c42a2692f8", "accountId": "001abbf392844aa",
+     "firstName": "Alicia", "lastName": "Grant", "title": "COO",
+     "email": "alicia.grant@blueharbor.example.com", "phone": "(206) 555-0109",
+     "createdAt": "2026-08-16T22:16:15.961894+00:00",
+     "updatedAt": "2026-08-16T22:16:15.961894+00:00"},
+    {"id": "003778e6b53c501", "accountId": "00183c5049623dd",
+     "firstName": "Bill", "lastName": "Trask", "title": "CFO",
+     "email": "bill.trask@fairviewinsurance.example.com",
+     "phone": "(920) 555-0102",
+     "createdAt": "2026-08-16T22:16:16.397207+00:00",
+     "updatedAt": "2026-08-16T22:16:16.397207+00:00"},
+    {"id": "003d38f010882b5", "accountId": "0012a330a03e1e8",
+     "firstName": "Derek", "lastName": "Hsu", "title": "Director of IT",
+     "email": "derek.hsu@apexmfg.example.com", "phone": "(414) 555-0177",
+     "createdAt": "2026-08-16T22:16:15.841629+00:00",
+     "updatedAt": "2026-08-16T22:16:15.841629+00:00"},
+    {"id": "003c23bdfff33be", "accountId": "001a441a7e0ac44",
+     "firstName": "Evan", "lastName": "Walsh", "title": "IT Director",
+     "email": "evan.walsh@summithealth.example.com", "phone": "(608) 555-0128",
+     "createdAt": "2026-08-16T22:16:16.174825+00:00",
+     "updatedAt": "2026-08-16T22:16:16.174825+00:00"},
+    {"id": "00301edf8283f61", "accountId": "00183c5049623dd",
+     "firstName": "Janet", "lastName": "Okafor", "title": "Claims Director",
+     "email": "janet.okafor@fairviewinsurance.example.com",
+     "phone": "(920) 555-0139",
+     "createdAt": "2026-08-16T22:16:16.267423+00:00",
+     "updatedAt": "2026-08-16T22:16:16.267423+00:00"},
+    {"id": "00370f0b603d30b", "accountId": "0010e4954cbbedf",
+     "firstName": "Maria", "lastName": "Delgado", "title": "VP Operations",
+     "email": "maria.delgado@northwindtraders.example.com",
+     "phone": "(312) 555-0135",
+     "createdAt": "2026-08-16T22:16:15.441052+00:00",
+     "updatedAt": "2026-08-16T22:16:15.441052+00:00"},
+    {"id": "003fb5317d7564e", "accountId": "001a441a7e0ac44",
+     "firstName": "Priya", "lastName": "Raman",
+     "title": "Chief Medical Officer",
+     "email": "priya.raman@summithealth.example.com", "phone": "(608) 555-0150",
+     "createdAt": "2026-08-16T22:16:16.051502+00:00",
+     "updatedAt": "2026-08-16T22:16:16.051502+00:00"},
+    {"id": "00378e33631b8ca", "accountId": "0012a330a03e1e8",
+     "firstName": "Susan", "lastName": "Kowalski", "title": "Plant Manager",
+     "email": "susan.kowalski@apexmfg.example.com", "phone": "(414) 555-0121",
+     "createdAt": "2026-08-16T22:16:15.745926+00:00",
+     "updatedAt": "2026-08-16T22:16:15.745926+00:00"},
+    {"id": "003090b92282986", "accountId": "0010e4954cbbedf",
+     "firstName": "Tom", "lastName": "Berg", "title": "Purchasing Manager",
+     "email": "tom.berg@northwindtraders.example.com", "phone": "(312) 555-0181",
+     "createdAt": "2026-08-16T22:16:15.566882+00:00",
+     "updatedAt": "2026-08-16T22:16:15.566882+00:00"},
+]
+
+#: Eight of the twenty-five live deals — one per (account, stage) pair, so the
+#: whole declared stage vocabulary is represented without carrying the pulse's
+#: churn. Note `Closed Won` and `Closed Lost`: title case on the wire, which is
+#: the flow's job to slug, not the connector's.
+OPPORTUNITIES: list[dict] = [
+    {"id": "0066efd6fda119d", "accountId": "0010e4954cbbedf",
+     "name": "Northwind — Annual Restock Program", "stage": "Negotiation",
+     "amount": 180000, "closeDate": "2026-09-30",
+     "createdAt": "2026-08-16T22:16:16.576376+00:00",
+     "updatedAt": "2026-08-16T22:16:16.576376+00:00"},
+    {"id": "006574ab2ec7ad9", "accountId": "0010e4954cbbedf",
+     "name": "Northwind — Warehouse Scanning Pilot", "stage": "Qualification",
+     "amount": 45000, "closeDate": "2026-11-15",
+     "createdAt": "2026-08-16T22:16:16.664099+00:00",
+     "updatedAt": "2026-08-16T22:16:16.664099+00:00"},
+    {"id": "006b8a5548735d2", "accountId": "0012a330a03e1e8",
+     "name": "Apex — Plant Floor Automation Phase 1", "stage": "Proposal",
+     "amount": 420000, "closeDate": "2026-10-31",
+     "createdAt": "2026-08-16T22:16:16.745899+00:00",
+     "updatedAt": "2026-08-16T22:16:16.745899+00:00"},
+    {"id": "00622eb2dc4cc9d", "accountId": "001abbf392844aa",
+     "name": "Blue Harbor — Fleet Telematics Rollout", "stage": "Prospecting",
+     "amount": 95000, "closeDate": "2026-12-01",
+     "createdAt": "2026-08-16T22:16:16.813024+00:00",
+     "updatedAt": "2026-08-16T22:16:16.813024+00:00"},
+    {"id": "0067d4d05e966d5", "accountId": "001a441a7e0ac44",
+     "name": "Summit — Patient Portal Migration", "stage": "Closed Won",
+     "amount": 310000, "closeDate": "2026-07-15",
+     "createdAt": "2026-08-16T22:16:16.901825+00:00",
+     "updatedAt": "2026-08-16T22:16:16.901825+00:00"},
+    {"id": "006acdf9f3b98cb", "accountId": "001a441a7e0ac44",
+     "name": "Summit — Records Digitization", "stage": "Proposal",
+     "amount": 120000, "closeDate": "2026-10-15",
+     "createdAt": "2026-08-16T22:16:16.976893+00:00",
+     "updatedAt": "2026-08-16T22:16:16.976893+00:00"},
+    {"id": "006aa148670b4d1", "accountId": "00183c5049623dd",
+     "name": "Fairview — Claims Intake Modernization", "stage": "Closed Lost",
+     "amount": 250000, "closeDate": "2026-06-30",
+     "createdAt": "2026-08-16T22:16:17.041474+00:00",
+     "updatedAt": "2026-08-16T22:16:17.041474+00:00"},
+    {"id": "00623810b4b2a86", "accountId": "0010e4954cbbedf",
+     "name": "Northwind — Annual Restock Program Phase 2", "stage": "Closed Won",
+     "amount": 129000.0, "closeDate": "2026-09-06",
+     "createdAt": "2026-08-16T23:07:39.523796+00:00",
+     "updatedAt": "2026-08-17T13:57:15.434553+00:00"},
+]
+
+# ---------------------------------------------------------------------------
+# ERP — customers, catalogue, orders, and the buy side
+# ---------------------------------------------------------------------------
+
+#: Four customers, spelled the way a contract spells them. `Summit Health
+#: Partners` is the one that matches its CRM account verbatim; the other three
+#: carry the legal suffix that `normalize_key` is supposed to collapse.
+CUSTOMERS: list[dict] = [
+    {"id": "1001", "companyName": "Apex Manufacturing Co.",
+     "email": "accounts.payable@apexmfg.example.com",
+     "phone": "(414) 555-0188", "terms": "Net 60",
+     "createdAt": "2026-08-15T18:18:55.497843+00:00",
+     "updatedAt": "2026-08-15T18:18:55.497843+00:00"},
+    {"id": "1002", "companyName": "Blue Harbor Logistics LLC",
+     "email": "billing@blueharbor.example.com",
+     "phone": "(206) 555-0142", "terms": "Net 30",
+     "createdAt": "2026-08-15T18:18:55.631849+00:00",
+     "updatedAt": "2026-08-15T18:18:55.631849+00:00"},
+    {"id": "1000", "companyName": "Northwind Traders Inc.",
+     "email": "ap@northwindtraders.example.com",
+     "phone": "(312) 555-0134", "terms": "Net 30",
+     "createdAt": "2026-08-15T18:18:55.348380+00:00",
+     "updatedAt": "2026-08-15T18:18:55.348380+00:00"},
+    {"id": "1003", "companyName": "Summit Health Partners",
+     "email": "ap@summithealth.example.com",
+     "phone": "(608) 555-0117", "terms": "Net 45",
+     "createdAt": "2026-08-15T18:18:55.768274+00:00",
+     "updatedAt": "2026-08-15T18:18:55.768274+00:00"},
+]
+
+#: The catalogue. `itemId` is the SKU and `id` is the record — the transposition
+#: an order line depends on, and the reason items travel with orders.
+ITEMS: list[dict] = [
+    {"id": "3000", "itemId": "SCN-4200", "displayName": "Production Scanner 4200",
+     "itemType": "Inventory Item", "basePrice": 4750, "quantityOnHand": 18,
+     "createdAt": "2026-08-15T18:18:56.609696+00:00",
+     "updatedAt": "2026-08-15T18:18:56.609696+00:00"},
+    {"id": "3001", "itemId": "SCN-2100", "displayName": "Desktop Scanner 2100",
+     "itemType": "Inventory Item", "basePrice": 1250, "quantityOnHand": 46,
+     "createdAt": "2026-08-15T18:18:56.741930+00:00",
+     "updatedAt": "2026-08-15T18:18:56.741930+00:00"},
+    {"id": "3002", "itemId": "KIT-ROLLER", "displayName": "Scanner Roller Kit",
+     "itemType": "Inventory Item", "basePrice": 189, "quantityOnHand": 220,
+     "createdAt": "2026-08-15T18:18:56.878954+00:00",
+     "updatedAt": "2026-08-15T18:18:56.878954+00:00"},
+    {"id": "3003", "itemId": "LIC-CAPTURE",
+     "displayName": "Capture Software License (annual)",
+     "itemType": "Non-Inventory Item", "basePrice": 2400, "quantityOnHand": 0,
+     "createdAt": "2026-08-15T18:18:56.995868+00:00",
+     "updatedAt": "2026-08-15T18:18:56.995868+00:00"},
+    {"id": "3004", "itemId": "SVC-INSTALL", "displayName": "On-site Installation",
+     "itemType": "Service", "basePrice": 1800, "quantityOnHand": 0,
+     "createdAt": "2026-08-15T18:18:57.062848+00:00",
+     "updatedAt": "2026-08-15T18:18:57.062848+00:00"},
+    {"id": "3005", "itemId": "SVC-SCANDAY",
+     "displayName": "Scanning Bureau Day Rate",
+     "itemType": "Service", "basePrice": 950, "quantityOnHand": 0,
+     "createdAt": "2026-08-15T18:18:57.128185+00:00",
+     "updatedAt": "2026-08-15T18:18:57.128185+00:00"},
+]
+
+#: The five seeded orders, verbatim — every customer and, between them, the
+#: estate's whole status vocabulary. The ten orders the pulse has generated
+#: since are all `Billed` and would have made the fixture look like a system
+#: with one state. The line's `itemId` is the item's *record* id (`"3000"`),
+#: never its SKU, and SO5003 prices SCN-2100 at 1150 against a list price of
+#: 1250 — a line charging something other than the catalogue, which is exactly
+#: why `unit_price_usd` lives on the line and not on the item.
+SALES_ORDERS: list[dict] = [
+    {"id": "5000", "tranId": "SO5000", "customerId": "1000",
+     "tranDate": "2026-07-08", "status": "Billed", "total": 23136.0,
+     "memo": "Annual restock — warehouse rollout",
+     "lines": [
+         {"itemId": "3001", "quantity": 12, "rate": 1250, "amount": 15000},
+         {"itemId": "3002", "quantity": 24, "rate": 189, "amount": 4536},
+         {"itemId": "3004", "quantity": 2, "rate": 1800, "amount": 3600},
+     ],
+     "createdAt": "2026-08-15T18:18:57.345453+00:00",
+     "updatedAt": "2026-08-15T18:18:57.345453+00:00"},
+    {"id": "5001", "tranId": "SO5001", "customerId": "1000",
+     "tranDate": "2026-08-03", "status": "Pending Fulfillment", "total": 10950.0,
+     "memo": "Scanning pilot hardware",
+     "lines": [
+         {"itemId": "3001", "quantity": 3, "rate": 1250, "amount": 3750},
+         {"itemId": "3003", "quantity": 3, "rate": 2400, "amount": 7200},
+     ],
+     "createdAt": "2026-08-15T18:18:57.533759+00:00",
+     "updatedAt": "2026-08-15T18:18:57.533759+00:00"},
+    {"id": "5002", "tranId": "SO5002", "customerId": "1001",
+     "tranDate": "2026-07-22", "status": "Partially Fulfilled", "total": 50200.0,
+     "memo": "Plant floor phase 1",
+     "lines": [
+         {"itemId": "3000", "quantity": 4, "rate": 4750, "amount": 19000},
+         {"itemId": "3004", "quantity": 4, "rate": 1800, "amount": 7200},
+         {"itemId": "3003", "quantity": 10, "rate": 2400, "amount": 24000},
+     ],
+     "createdAt": "2026-08-15T18:18:57.815976+00:00",
+     "updatedAt": "2026-08-15T18:18:57.815976+00:00"},
+    {"id": "5003", "tranId": "SO5003", "customerId": "1002",
+     "tranDate": "2026-08-11", "status": "Pending Approval", "total": 6900.0,
+     "memo": "Dock scanning refresh",
+     "lines": [
+         {"itemId": "3001", "quantity": 6, "rate": 1150, "amount": 6900},
+     ],
+     "createdAt": "2026-08-15T18:18:57.976625+00:00",
+     "updatedAt": "2026-08-15T18:18:57.976625+00:00"},
+    {"id": "5004", "tranId": "SO5004", "customerId": "1003",
+     "tranDate": "2026-06-29", "status": "Closed", "total": 47500.0,
+     "memo": "Records digitization — phase 1",
+     "lines": [
+         {"itemId": "3005", "quantity": 40, "rate": 950, "amount": 38000},
+         {"itemId": "3000", "quantity": 2, "rate": 4750, "amount": 9500},
+     ],
+     "createdAt": "2026-08-15T18:18:58.203986+00:00",
+     "updatedAt": "2026-08-15T18:18:58.203986+00:00"},
+]
+
+#: The buy side, on the same shape as customers — and with no tax id anywhere,
+#: which is why an ERP vendor can still reach a steward.
+VENDORS: list[dict] = [
+    {"id": "2000", "companyName": "Lakeshore Paper & Packaging",
+     "email": "orders@lakeshorepaper.example.com", "phone": "(920) 555-0121",
+     "terms": "Net 30",
+     "createdAt": "2026-08-15T18:18:55.948548+00:00",
+     "updatedAt": "2026-08-15T18:18:55.948548+00:00"},
+    {"id": "2001", "companyName": "Midwest Component Supply",
+     "email": "sales@midwestcomponent.example.com", "phone": "(414) 555-0155",
+     "terms": "Net 30",
+     "createdAt": "2026-08-15T18:18:56.084368+00:00",
+     "updatedAt": "2026-08-15T18:18:56.084368+00:00"},
+    {"id": "2002", "companyName": "Granite State Freight",
+     "email": "dispatch@granitefreight.example.com", "phone": "(603) 555-0177",
+     "terms": "Net 15",
+     "createdAt": "2026-08-15T18:18:56.252219+00:00",
+     "updatedAt": "2026-08-15T18:18:56.252219+00:00"},
+    {"id": "2003", "companyName": "Cedarline Office Systems",
+     "email": "service@cedarlineoffice.example.com", "phone": "(608) 555-0163",
+     "terms": "Due on receipt",
+     "createdAt": "2026-08-15T18:18:56.429954+00:00",
+     "updatedAt": "2026-08-15T18:18:56.429954+00:00"},
+]
+
+#: Purchase orders name their vendor and their items by internal id only —
+#: no `companyName`, no SKU anywhere on the row. That absence is what the
+#: `erp-purchase-orders` feed's declared dereference exists for.
+PURCHASE_ORDERS: list[dict] = [
+    {"id": "6011", "tranId": "PO6011", "vendorId": "2002",
+     "tranDate": "2026-08-29", "status": "Closed", "total": 1280.0,
+     "memo": "Inbound freight — September",
+     "lines": [{"itemId": "3004", "quantity": 2, "rate": 640, "amount": 1280}],
+     "createdAt": "2026-08-28T01:27:04.784828+00:00",
+     "updatedAt": "2026-08-29T11:12:07.572443+00:00"},
+    {"id": "6012", "tranId": "PO6012", "vendorId": "2002",
+     "tranDate": "2026-08-29", "status": "Closed", "total": 2560.0,
+     "memo": "Inbound freight — September",
+     "lines": [{"itemId": "3004", "quantity": 4, "rate": 640, "amount": 2560}],
+     "createdAt": "2026-08-29T06:27:08.022190+00:00",
+     "updatedAt": "2026-08-30T04:57:14.049912+00:00"},
+    {"id": "6013", "tranId": "PO6013", "vendorId": "2000",
+     "tranDate": "2026-08-31", "status": "Pending Receipt", "total": 3360.0,
+     "memo": "Crating stock — fourth quarter",
+     "lines": [{"itemId": "3002", "quantity": 35, "rate": 96, "amount": 3360}],
+     "createdAt": "2026-08-30T11:57:06.211944+00:00",
+     "updatedAt": "2026-08-30T13:12:04.620976+00:00"},
+]
+
 #: What a list route answers under, by app and resource.
 RESOURCES: dict[tuple[str, str], list[dict]] = {
     ("hris", "departments"): DEPARTMENTS,
     ("hris", "jobs"): JOBS,
     ("hris", "employees"): EMPLOYEES,
+    ("crm", "accounts"): ACCOUNTS,
+    ("crm", "contacts"): CONTACTS,
+    ("crm", "opportunities"): OPPORTUNITIES,
+    ("erp", "customers"): CUSTOMERS,
+    ("erp", "items"): ITEMS,
+    ("erp", "salesOrders"): SALES_ORDERS,
+    ("erp", "vendors"): VENDORS,
+    ("erp", "purchaseOrders"): PURCHASE_ORDERS,
 }
 
 #: Records reachable by id but absent from every list — the dereference cases.

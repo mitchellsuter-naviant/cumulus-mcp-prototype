@@ -64,7 +64,7 @@ def test_every_feed_that_delivers_has_a_mapping():
     declared = {m.source for m in MAPPINGS}
     for source in (
         "erp-vendors", "procurement-coupa", "legacy-ap-extract",
-        "erp-purchasing", "wms-receiving",
+        "erp-purchase-orders", "wms-receiving",
     ):
         assert source in declared
 
@@ -90,7 +90,7 @@ def test_a_feed_name_resolves_to_an_authority_the_ontology_ranks():
     assert _authority("hris-employment-events") == "hris"
     # The existing feeds keep the standing they had.
     for source, expected in (
-        ("erp-vendors", "erp"), ("erp-purchasing", "erp"),
+        ("erp-vendors", "erp"), ("erp-purchase-orders", "erp"),
         ("hris-workday", "hris"), ("calendar-m365", "calendar"),
         ("procurement-coupa", "procurement"), ("wms-receiving", "procurement"),
     ):
@@ -113,7 +113,7 @@ def test_registry_is_readable_and_read_only_over_http(client):
     assert body["problems"] == []
     ids = {m["id"] for m in body["mappings"]}
     assert "erp-vendors" in ids and "wms-receiving" in ids
-    one = client.get("/api/v1/mappings/erp-purchasing").json()
+    one = client.get("/api/v1/mappings/erp-purchase-orders").json()
     # Both halves of the contract are in the payload: the binding and the
     # escalation shape a batch feed carries.
     assert one["strategy"] == "reify"

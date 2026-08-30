@@ -51,7 +51,21 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .models import utcnow
-from .sync import EmployeeRecord, SyncRequest, TeamRecord
+from .sync import (
+    AccountRecord,
+    ContactRecord,
+    CustomerRecord,
+    EmployeeRecord,
+    ItemRecord,
+    OpportunityRecord,
+    PurchaseOrderLineRecord,
+    PurchaseOrderRecord,
+    SalesOrderLineRecord,
+    SalesOrderRecord,
+    SyncRequest,
+    TeamRecord,
+    VendorRecord,
+)
 
 log = logging.getLogger("cumulus.estate")
 
@@ -62,6 +76,10 @@ DISCOVERY_APP = "admin"
 DISCOVERY_PATH = "/admin/namespaces"
 
 HRIS_WORKFORCE = "hris-workforce"
+CRM_BOOK = "crm-book"
+ERP_SALES = "erp-sales"
+ERP_VENDORS = "erp-vendors"
+ERP_PURCHASE_ORDERS = "erp-purchase-orders"
 
 #: Records per delivery. The estate does not page, so this is the only bound on
 #: how large one POST gets; a chunk is cut on an `updatedAt` boundary, never
@@ -224,6 +242,32 @@ def _text(row: dict, field: str) -> str:
     return "" if value is None else str(value)
 
 
+def _number(row: dict, field: str) -> float:
+    """One estate column as a float, and 0.0 for anything that is not one.
+
+    Not a judgment about the missing value — a wire shape declares a number
+    and something has to be put there. What the *absence* means is a question
+    for the flow, which can see the whole row.
+    """
+    try:
+        return float(row.get(field))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _memo(cache: dict[str, dict], deref: Deref, resource: str, record_id: str) -> dict:
+    """One referenced row, fetched at most once per pull.
+
+    A delta of forty orders against four vendors is four GETs, and the same
+    vendor reappearing in the next chunk is none.
+    """
+    if not record_id:
+        return {}
+    if record_id not in cache:
+        cache[record_id] = deref(resource, record_id)
+    return cache[record_id]
+
+
 def _build_hris_workforce(
     rows: dict[str, list[dict]], deref: Deref
 ) -> SyncRequest:
@@ -291,6 +335,174 @@ def _build_hris_workforce(
     return SyncRequest(source=HRIS_WORKFORCE, teams=teams, employees=people)
 
 
+def _build_crm_book(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest:
+    """CRM accounts/contacts/opportunities → the counterparty wire shapes.
+
+    Renames only, and no dereference at all: every reference in this family
+    (`accountId`) is an id the flow resolves against a row this same feed
+    landed, so the connector never leaves the page it pulled. The account
+    spellings arrive exactly as the CRM holds them — `Northwind Traders`,
+    without the legal suffix its ERP record carries — because deciding those
+    are one company is the flow's job and this module's whole discipline is
+    not to have an opinion about it.
+    """
+    return SyncRequest(
+        source=CRM_BOOK,
+        accounts=[
+            AccountRecord(
+                external_id=_text(a, "id"),
+                name=_text(a, "name"),
+                industry=_text(a, "industry"),
+                website=_text(a, "website"),
+                phone=_text(a, "phone"),
+            )
+            for a in rows.get("accounts", [])
+        ],
+        contacts=[
+            ContactRecord(
+                external_id=_text(c, "id"),
+                first_name=_text(c, "firstName"),
+                last_name=_text(c, "lastName"),
+                title=_text(c, "title"),
+                email=_text(c, "email"),
+                phone=_text(c, "phone"),
+                account_external_id=_text(c, "accountId"),
+            )
+            for c in rows.get("contacts", [])
+        ],
+        opportunities=[
+            OpportunityRecord(
+                external_id=_text(o, "id"),
+                name=_text(o, "name"),
+                account_external_id=_text(o, "accountId"),
+                stage=_text(o, "stage"),
+                amount=_number(o, "amount"),
+                close_date=_text(o, "closeDate"),
+            )
+            for o in rows.get("opportunities", [])
+        ],
+    )
+
+
+def _build_erp_sales(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest:
+    """ERP customers/items/salesOrders → the sell-side wire shapes.
+
+    No dereference either, and for a reason worth naming: an order line names
+    its item by the ERP's *internal* id (`"itemId": "3000"`), which is not the
+    SKU the ontology keys on (`SCN-4200`). The item rows travel with the
+    orders precisely so the translation is a fact in the delivery rather than
+    a round trip — `ItemRecord` carries both ids, and the flow reads the
+    bridge off the row.
+    """
+    return SyncRequest(
+        source=ERP_SALES,
+        customers=[
+            CustomerRecord(
+                external_id=_text(c, "id"),
+                name=_text(c, "companyName"),
+                email=_text(c, "email"),
+                phone=_text(c, "phone"),
+                payment_terms=_text(c, "terms"),
+            )
+            for c in rows.get("customers", [])
+        ],
+        items=[
+            ItemRecord(
+                external_id=_text(i, "id"),
+                # The estate's `itemId` is the SKU; its `id` is the record.
+                sku=_text(i, "itemId"),
+                display_name=_text(i, "displayName"),
+                item_type=_text(i, "itemType"),
+                base_price=_number(i, "basePrice"),
+            )
+            for i in rows.get("items", [])
+        ],
+        sales_orders=[
+            SalesOrderRecord(
+                external_id=_text(o, "id"),
+                order_number=_text(o, "tranId"),
+                customer_external_id=_text(o, "customerId"),
+                ordered_date=_text(o, "tranDate"),
+                status=_text(o, "status"),
+                memo=_text(o, "memo"),
+                total=_number(o, "total"),
+                lines=[
+                    SalesOrderLineRecord(
+                        item_external_id=_text(line, "itemId"),
+                        quantity=_number(line, "quantity"),
+                        rate=_number(line, "rate"),
+                        amount=_number(line, "amount"),
+                    )
+                    for line in (o.get("lines") or [])
+                ],
+            )
+            for o in rows.get("salesOrders", [])
+        ],
+    )
+
+
+def _build_erp_vendors(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest:
+    """ERP vendors → the existing `VendorRecord`, onto the existing flow.
+
+    A rename and nothing else. The estate carries no tax id on a vendor, so
+    the field stays empty rather than being filled from something adjacent —
+    a fabricated hard identifier is worse than an absent one, because the
+    resolver treats a tax-id match as decisive.
+    """
+    return SyncRequest(
+        source=ERP_VENDORS,
+        vendors=[
+            VendorRecord(
+                external_id=_text(v, "id"),
+                name=_text(v, "companyName"),
+                payment_terms=_text(v, "terms"),
+            )
+            for v in rows.get("vendors", [])
+        ],
+    )
+
+
+def _build_erp_purchase_orders(
+    rows: dict[str, list[dict]], deref: Deref
+) -> SyncRequest:
+    """ERP purchaseOrders → the existing `PurchaseOrderRecord`.
+
+    The one feed here that dereferences, because the wire shape it has to fill
+    was declared against a system that sends names: a PO row carries only
+    `vendorId`, and `PurchaseOrderRecord.vendor_name` is what the flow matches
+    a Vendor on. Same for a line's internal `itemId`, where the shape wants a
+    SKU and a description. Both are declared keys read off one record each,
+    memoized for the whole pull, and both are named in the Mapping's notes —
+    which is the rule this exception exists under.
+    """
+    vendors: dict[str, dict] = {}
+    items: dict[str, dict] = {}
+    orders: list[PurchaseOrderRecord] = []
+    for record in rows.get("purchaseOrders", []):
+        vendor_id = _text(record, "vendorId")
+        lines: list[PurchaseOrderLineRecord] = []
+        for line in record.get("lines") or []:
+            item = _memo(items, deref, "items", _text(line, "itemId"))
+            lines.append(PurchaseOrderLineRecord(
+                sku=_text(item, "itemId"),
+                description=_text(item, "displayName"),
+                quantity_ordered=_number(line, "quantity"),
+                unit_price_usd=_number(line, "rate"),
+            ))
+        orders.append(PurchaseOrderRecord(
+            external_id=_text(record, "id"),
+            po_number=_text(record, "tranId"),
+            vendor_external_id=vendor_id,
+            vendor_name=_text(
+                _memo(vendors, deref, "vendors", vendor_id), "companyName"
+            ),
+            ordered_date=_text(record, "tranDate"),
+            status=_text(record, "status"),
+            lines=lines,
+        ))
+    return SyncRequest(source=ERP_PURCHASE_ORDERS, purchase_orders=orders)
+
+
 #: The closed table of feeds, and the extension point every later app lands in
 #: — same idiom as `dispatch.TRIGGERS` and `gateway.ACTIONS`. A sixth app is
 #: one FeedSpec, one Mapping, and (if it needs one) one flow; the connector
@@ -303,6 +515,35 @@ FEEDS: tuple[FeedSpec, ...] = (
         # exist before it can wire an employee into one.
         resources=("departments", "jobs", "employees"),
         build=_build_hris_workforce,
+    ),
+    FeedSpec(
+        feed=CRM_BOOK,
+        app="crm",
+        # Accounts first for the same reason teams precede employees: a
+        # contact and a deal both name an account, and the flow can only bind
+        # them once the counterparty they name has landed.
+        resources=("accounts", "contacts", "opportunities"),
+        build=_build_crm_book,
+    ),
+    FeedSpec(
+        feed=ERP_SALES,
+        app="erp",
+        # Items before orders: a line names an item by an internal id, and the
+        # item row is the only thing that translates it to a SKU.
+        resources=("customers", "items", "salesOrders"),
+        build=_build_erp_sales,
+    ),
+    FeedSpec(
+        feed=ERP_VENDORS,
+        app="erp",
+        resources=("vendors",),
+        build=_build_erp_vendors,
+    ),
+    FeedSpec(
+        feed=ERP_PURCHASE_ORDERS,
+        app="erp",
+        resources=("purchaseOrders",),
+        build=_build_erp_purchase_orders,
     ),
 )
 
