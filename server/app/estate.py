@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -112,6 +113,17 @@ DMS_LIBRARY = "dms-library"
 #: how large one POST gets; a chunk is cut on an `updatedAt` boundary, never
 #: mid-timestamp.
 DEFAULT_CHUNK_SIZE = 500
+
+#: This process's self-mark, stamped on every delivery the connector makes.
+#: `CONNECTOR_DELIVER_URL` defaults to `public_base_url`, and on a shared dev
+#: box that URL can belong to a *different* Cumulus process — which then
+#: accepts the delivery, reports success, and leaves the initiating server
+#: with an advanced cursor and no data. It happened twice in one afternoon
+#: before this existed. The door refuses a mismatched mark when its world is
+#: process-local (memory backend); under a shared store, any instance of the
+#: same deployment is the same world and the mark is informational.
+PROCESS_TOKEN = secrets.token_hex(8)
+PROCESS_HEADER = "X-Cumulus-Connector-Process"
 
 
 class EstateError(RuntimeError):
@@ -1294,7 +1306,9 @@ class EstateConnector:
         if not base:
             raise EstateError("no deliver URL configured")
         url = f"{base}/api/v1/sources/deliver"
-        headers = {"X-API-Key": self.api_key} if self.api_key else {}
+        headers = {PROCESS_HEADER: PROCESS_TOKEN}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
         response = httpx.post(
             url, json=payload, headers=headers, timeout=self.timeout
         )

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from . import data_collections, deps
@@ -244,7 +244,11 @@ def list_sources(
 
 @router.post("/sources/deliver", status_code=202)
 def deliver(
-    body: SyncRequest, principal: Principal = Depends(get_principal)
+    body: SyncRequest,
+    principal: Principal = Depends(get_principal),
+    connector_process: str | None = Header(
+        default=None, alias="X-Cumulus-Connector-Process"
+    ),
 ) -> dict:
     """A push from an external system.
 
@@ -254,6 +258,27 @@ def deliver(
     at-least-once transport safe to point at this.
     """
     require_role(principal, "admin")
+    # A delivery stamped by *another* Cumulus process's connector is a
+    # misrouted CONNECTOR_DELIVER_URL, not a feed: accepting it advances the
+    # sender's cursor while its own graph stays empty, and this door reporting
+    # 202 is what made that failure silent. Only refused when this world is
+    # process-local — under a shared store, any instance is the same world.
+    from .config import settings
+    from .estate import PROCESS_TOKEN
+
+    if (
+        connector_process
+        and connector_process != PROCESS_TOKEN
+        and settings.storage_backend == "memory"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This delivery was initiated by a different Cumulus process's "
+                "connector (misrouted CONNECTOR_DELIVER_URL). Refusing rather "
+                "than accepting data the initiating server will never see."
+            ),
+        )
     outcomes = deps.get_sync_service().deliver(body, actor=principal.uid)
     log.info(
         "Source delivery accepted",

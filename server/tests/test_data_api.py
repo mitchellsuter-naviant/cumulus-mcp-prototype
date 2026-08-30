@@ -351,3 +351,45 @@ def test_the_live_graph_comes_back_in_the_same_shape(client, world):
 
 def test_an_unknown_world_is_a_404(client, world):
     assert client.get("/api/v1/worlds/expense/nope").status_code == 404
+
+
+def test_the_door_refuses_another_processs_connector(
+    client, owner, world, monkeypatch
+):
+    """A misrouted CONNECTOR_DELIVER_URL must fail loudly, not succeed silently.
+
+    The connector stamps every delivery with its process mark. A mark from a
+    different process means some other server's pull is delivering into this
+    one — its cursor advances, its graph stays empty, and a 202 here is what
+    made that failure invisible. It happened twice on one shared dev box
+    before this guard existed.
+    """
+    from app.config import settings
+    from app.estate import PROCESS_HEADER, PROCESS_TOKEN
+
+    body = {
+        "source": "erp-vendors",
+        "vendors": [{"external_id": "V-9", "name": "Misroute Metals LLC"}],
+    }
+    foreign = dict(owner)
+    foreign[PROCESS_HEADER] = "deadbeefdeadbeef"
+    refused = client.post("/api/v1/sources/deliver", json=body, headers=foreign)
+    assert refused.status_code == 409
+    assert "different Cumulus process" in refused.json()["detail"]
+
+    # Our own connector's mark, and an unmarked external push, both pass.
+    own = dict(owner)
+    own[PROCESS_HEADER] = PROCESS_TOKEN
+    assert client.post(
+        "/api/v1/sources/deliver", json=body, headers=own
+    ).status_code == 202
+    assert client.post(
+        "/api/v1/sources/deliver", json=body, headers=owner
+    ).status_code == 202
+
+    # Under a shared store, any instance of the deployment is the same world
+    # — the mark is informational and a "foreign" one is another instance.
+    monkeypatch.setattr(settings, "storage_backend", "firestore")
+    assert client.post(
+        "/api/v1/sources/deliver", json=body, headers=foreign
+    ).status_code == 202
