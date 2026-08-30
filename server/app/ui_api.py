@@ -31,12 +31,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from . import data_collections, deps, payables, personas
-from .auth import Principal, get_principal, require_reader
+from .auth import Principal, get_principal, require_reader, require_role
 from .config import settings
 from .deps import get_graph_service
+from .estate import EstateError
 from .flow_projection import ProjectionState, project_flow, project_flows
 from .graph import GraphService, object_id
-from .mappings import MAPPINGS, validate_mappings
+from .mappings import MAPPINGS, Mapping, validate_mappings
 from .ontology import ONTOLOGY
 
 log = logging.getLogger("cumulus.ui.api")
@@ -485,6 +486,45 @@ class SourceArtifact(BaseModel):
     retention_until_iso: str
 
 
+class PullState(BaseModel):
+    """The connector's half of a feed Cumulus *pulls*, read off `ConnectorState`.
+
+    Only a pulled feed has one. A feed that pushes through the door keeps its
+    own cadence and has no cursor here, so `None` on the row is that fact
+    rather than missing data — and the screen draws no Sync now for it.
+
+    The cursor cannot be derived from the runs the way the rest of the row is,
+    which is why it is joined rather than computed: a pull that found nothing
+    starts no run, and a pull that *failed* has no run at all. Both are states
+    an operator needs, and both are invisible to `SyncService.sources()`.
+    """
+
+    #: Whether an estate is registered at all. False makes every field below
+    #: read as "nothing has happened yet" instead of "something is wrong".
+    registered: bool
+    #: Whether discovery says the namespace actually runs this feed's app. A
+    #: registry row for an app the customer does not run is inert, not broken.
+    active: bool
+    estate_app: str
+    namespace: str
+    #: The list routes this feed pulls together, in delivery order.
+    resources: list[str]
+    #: Per resource, because they move independently — an employee change must
+    #: not re-pull the jobs catalogue.
+    watermarks: dict[str, str]
+    last_pull_at: str
+    last_outcome: str  # delivered · unchanged · failed
+    last_error: str
+    #: Only the dev interval loop knows when the next pull is due; under a
+    #: managed scheduler the cadence belongs to the scheduler, and this stays
+    #: empty rather than claiming one nothing here controls.
+    next_pull_at: str
+    sync_now_allowed: bool
+    #: Why not, when not. An access boundary is a sentence the screen prints
+    #: next to a control it does not draw — never a button that 403s.
+    sync_now_refusal: str
+
+
 class SourceRow(BaseModel):
     """One feed: how it is running, what it promised, what it left behind."""
 
@@ -505,15 +545,72 @@ class SourceRow(BaseModel):
     #: `None` when no Mapping claims this feed — rows arriving under no
     #: declared contract, which is exactly the finding this screen is for.
     contract: SourceContract | None
+    #: `None` for a feed that pushes. See `PullState`.
+    pull: PullState | None
     artifacts: list[SourceArtifact]
     artifacts_total: int
 
 
+class EstateCard(BaseModel):
+    """The registered estate, above the feeds it explains.
+
+    Screen-level rather than per-row because registration is one fact for the
+    whole connector: five feeds failing because no estate is registered is one
+    finding, and repeating it five times down a list buries it.
+    """
+
+    registered: bool
+    project: str
+    namespace: str
+    discovery_url: str
+    #: Whether a credential is configured — never which one.
+    authenticated: bool
+    pull_interval_seconds: int
+    #: Set when discovery itself failed. Rendered as its own state, because an
+    #: estate that could not be reached is not an estate that runs no apps.
+    discovery_error: str
+    industry: str
+    #: What discovery says this namespace runs. The feed registry proposes and
+    #: this disposes, so a feed whose app is absent renders as inactive.
+    apps: list[str]
+    processes: list[str]
+    #: `None` when the discovery payload carries no pulse block — an estate
+    #: that reports no simulation is not one whose simulation is stopped.
+    pulse_enabled: bool | None
+    pulse_intensity: str
+    #: Feeds in the connector's registry, and how many of them this namespace
+    #: actually runs. Both counts are answered by rows in the list below.
+    feeds_registered: int
+    feeds_active: int
+
+
 class SourcesScreen(BaseModel):
     sources: list[SourceRow]
+    estate: EstateCard
     #: Mappings naming a type or Collection that does not exist. Same reading
     #: as `conformance`, and withheld from a tenant for the same reason.
     problems: list[str] | None
+
+
+class SyncNowOutcome(BaseModel):
+    """What one pull did, and the row it leaves behind.
+
+    The row travels with the outcome so the screen redraws the feed from the
+    same read that reports the result. A count in a banner disagreeing with
+    the count in the list under it is the failure this shape rules out.
+    """
+
+    source: str
+    outcome: str  # delivered · unchanged · failed
+    #: Records read from the estate, per resource.
+    pulled: dict[str, int]
+    #: Records handed to the door, across every chunk of this pull.
+    delivered: int
+    chunks: int
+    error: str
+    #: The feed's row, re-read after the pull. `None` only if the feed left the
+    #: registry mid-request — the screen keeps the row it has.
+    row: SourceRow | None
 
 
 def _artifacts_by_source(flow_ids: set[str]) -> dict[str, list[SourceArtifact]]:
@@ -549,16 +646,128 @@ def _artifacts_by_source(flow_ids: set[str]) -> dict[str, list[SourceArtifact]]:
     return out
 
 
-@router.get("/sources", response_model=SourcesScreen)
-def sources(
-    principal: Principal = Depends(get_knowledge_principal),
-) -> SourcesScreen:
-    """Every inbound feed, against the contract it lands under.
+def _contract(mapping: Mapping | None) -> SourceContract | None:
+    """The declared half, or `None` — which is itself the screen's finding."""
+    if mapping is None:
+        return None
+    return SourceContract(
+        id=mapping.id, system=mapping.system,
+        transport=mapping.transport, payload=mapping.payload,
+        strategy=mapping.strategy, lands_as=mapping.lands_as,
+        resolves_to=list(mapping.resolves_to),
+        match_policy=mapping.match_policy,
+        precedence_source=mapping.precedence_source,
+        freshness=mapping.freshness, custody=mapping.custody,
+        collection=mapping.collection, escalation=mapping.escalation,
+    )
 
-    Health and contract in one row is the whole argument for the screen: a
-    feed delivering cleanly under a mapping nobody declared is a different
-    problem from one that is failing, and reading them off two lists side by
-    side is how the second kind goes unnoticed.
+
+def _sync_now_refusal(
+    *, active: bool, may_sync: bool, discovery_error: str,
+    namespace: str, app: str,
+) -> str:
+    """The reason there is no Sync now, in the order the operator can act on.
+
+    An unreachable estate is reported as itself rather than collapsing into
+    "the namespace does not run that app" — discovery returning nothing and
+    discovery answering that the app is absent are opposite findings, and only
+    the second one is about the customer's estate.
+    """
+    if discovery_error:
+        return f"The estate could not be reached: {discovery_error}"
+    if not active:
+        return (
+            f"The `{namespace}` namespace does not run the `{app}` app, so "
+            f"this feed has nothing to pull."
+        )
+    if not may_sync:
+        return (
+            "Pulling a feed delivers through the door, which writes. That "
+            "needs admin authority."
+        )
+    return ""
+
+
+def _estate_view(principal: Principal) -> tuple[EstateCard, dict[str, PullState]]:
+    """The estate card, and one `PullState` per feed the connector registers.
+
+    Read through `registration()`, which never raises by design: an estate
+    that is down is a thing this screen has to draw, and a 500 here would take
+    the whole Sources list — including every feed that pushes and is fine —
+    down with the one connector that could not reach a network.
+    """
+    view = deps.get_estate_connector().registration()
+    detail = view.get("namespace_detail") or {}
+    pulse = detail.get("pulse")
+    registered = bool(view.get("registered"))
+    namespace = str(view.get("namespace") or "")
+    discovery_error = str(view.get("discovery_error") or "")
+    # The write ladder, asked once for the screen rather than per row: the
+    # answer cannot differ between two feeds of the same connector.
+    may_sync = principal.outranks_or_is("admin")
+
+    # No estate registered means no feed *is* pulled — the registry still holds
+    # the specs, but none of them names anything reachable. Reporting them as
+    # rows would put a Sync now on a feed with nowhere to pull from, and make
+    # the card's counts describe a list of possibilities rather than of feeds.
+    states: dict[str, PullState] = {}
+    for feed in (view.get("feeds") or ()) if registered else ():
+        state = feed.get("state") or {}
+        app = str(feed.get("app") or "")
+        active = bool(feed.get("active"))
+        states[str(feed.get("feed") or "")] = PullState(
+            registered=True,
+            active=active,
+            estate_app=app,
+            namespace=namespace,
+            resources=[str(r) for r in feed.get("resources") or ()],
+            watermarks={
+                str(k): str(v)
+                for k, v in (state.get("watermarks") or {}).items()
+            },
+            last_pull_at=str(state.get("last_pull_at") or ""),
+            last_outcome=str(state.get("last_outcome") or ""),
+            last_error=str(state.get("last_error") or ""),
+            next_pull_at=str(state.get("next_pull_at") or ""),
+            sync_now_allowed=active and may_sync and not discovery_error,
+            sync_now_refusal=_sync_now_refusal(
+                active=active, may_sync=may_sync,
+                discovery_error=discovery_error,
+                namespace=namespace, app=app,
+            ),
+        )
+
+    card = EstateCard(
+        registered=registered,
+        project=str(view.get("project") or ""),
+        namespace=namespace,
+        discovery_url=str(view.get("discovery_url") or ""),
+        authenticated=bool(view.get("authenticated")),
+        pull_interval_seconds=int(view.get("pull_interval_seconds") or 0),
+        discovery_error=str(view.get("discovery_error") or ""),
+        industry=str(detail.get("industry") or ""),
+        apps=[str(a) for a in detail.get("apps") or ()],
+        processes=[str(p) for p in detail.get("processes") or ()],
+        pulse_enabled=(
+            bool(pulse.get("enabled")) if isinstance(pulse, dict) else None
+        ),
+        pulse_intensity=(
+            str(pulse.get("intensity") or "") if isinstance(pulse, dict) else ""
+        ),
+        feeds_registered=len(states),
+        feeds_active=sum(1 for s in states.values() if s.active),
+    )
+    return card, states
+
+
+def _source_rows(pulls: dict[str, PullState]) -> list[SourceRow]:
+    """Every feed the screen draws: what has delivered, plus what is registered.
+
+    The delivered half is assembled from the sync runs, as it always was. The
+    registered half is the addition a pull connector forces: a feed that has
+    never pulled has no run to be assembled from, and leaving it out would put
+    the Sync now that starts it nowhere, and make the estate card's count of
+    active feeds disagree with the list underneath it.
     """
     statuses = deps.get_sync_service().sources()
     contracts = {m.source: m for m in MAPPINGS}
@@ -566,7 +775,6 @@ def sources(
 
     rows: list[SourceRow] = []
     for status in statuses:
-        mapping = contracts.get(status.source)
         left = artifacts.get(status.source, [])
         rows.append(SourceRow(
             source=status.source, kind=status.kind, flow_id=status.flow_id,
@@ -577,22 +785,102 @@ def sources(
             records_landed=status.records_landed, linked=status.linked,
             created=status.created, awaiting_steward=status.awaiting_steward,
             unchanged=status.unchanged,
-            contract=None if mapping is None else SourceContract(
-                id=mapping.id, system=mapping.system,
-                transport=mapping.transport, payload=mapping.payload,
-                strategy=mapping.strategy, lands_as=mapping.lands_as,
-                resolves_to=list(mapping.resolves_to),
-                match_policy=mapping.match_policy,
-                precedence_source=mapping.precedence_source,
-                freshness=mapping.freshness, custody=mapping.custody,
-                collection=mapping.collection, escalation=mapping.escalation,
-            ),
+            contract=_contract(contracts.get(status.source)),
+            pull=pulls.get(status.source),
             artifacts=left[:ARTIFACT_WINDOW],
             artifacts_total=len(left),
         ))
+
+    delivered = {s.source for s in statuses}
+    for feed, pull in pulls.items():
+        if feed in delivered:
+            continue
+        # No run means no kind and no flow: this row states that nothing has
+        # happened yet rather than naming a flow that has never been asked to.
+        rows.append(SourceRow(
+            source=feed, kind="", flow_id="", last_run_id="",
+            last_run_at_iso="", last_status="", last_error=pull.last_error,
+            watermark="", deliveries=0, records_landed=0, linked=0,
+            created=0, awaiting_steward=0, unchanged=0,
+            contract=_contract(contracts.get(feed)),
+            pull=pull, artifacts=[], artifacts_total=0,
+        ))
+    return sorted(rows, key=lambda r: (r.source, r.kind))
+
+
+@router.get("/sources", response_model=SourcesScreen)
+def sources(
+    principal: Principal = Depends(get_knowledge_principal),
+) -> SourcesScreen:
+    """Every inbound feed, against the contract it lands under.
+
+    Health and contract in one row is the whole argument for the screen: a
+    feed delivering cleanly under a mapping nobody declared is a different
+    problem from one that is failing, and reading them off two lists side by
+    side is how the second kind goes unnoticed. The connector's cursor joins
+    the same row for the same reason — a feed whose last pull failed and a
+    feed nothing has pushed to are two different silences.
+    """
+    estate, pulls = _estate_view(principal)
     return SourcesScreen(
-        sources=rows,
+        sources=_source_rows(pulls),
+        estate=estate,
         problems=validate_mappings() if principal.sees_everything else None,
+    )
+
+
+@router.post("/sources/{source}/sync-now", response_model=SyncNowOutcome)
+def sync_source_now(
+    source: str,
+    principal: Principal = Depends(get_knowledge_principal),
+) -> SyncNowOutcome:
+    """Pull one feed now, and answer with the row the screen redraws.
+
+    Gated on `admin` because that is what `POST /api/v1/estate/feeds/{feed}/
+    sync-now` gates on — this proxies that act, and a console door that let a
+    weaker principal through would be a second, quieter authorization policy.
+    The answer is also given in advance: `PullState.sync_now_allowed` tells the
+    screen not to draw the control, so a persona that may not pull reads a
+    sentence rather than pressing a button that refuses.
+    """
+    require_role(principal, "admin")
+    connector = deps.get_estate_connector()
+    if connector.spec(source) is None:
+        raise HTTPException(
+            status_code=404, detail=f"No such feed: {source}"
+        )
+    if not connector.registered:
+        raise HTTPException(
+            status_code=400,
+            detail="No estate is registered — set ESTATE_PROJECT.",
+        )
+    try:
+        outcome = connector.pull(source)
+    except EstateError as exc:
+        # The failure is upstream, and reporting it as our own 500 would send
+        # an operator to read the wrong logs.
+        log.warning(
+            "Console sync-now failed",
+            extra={"feed": source, "actor": principal.uid, "error": str(exc)},
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    _, pulls = _estate_view(principal)
+    row = next((r for r in _source_rows(pulls) if r.source == source), None)
+    chunks = outcome.get("chunks") or []
+    log.info(
+        "Console sync-now completed",
+        extra={"feed": source, "actor": principal.uid,
+               "outcome": outcome.get("outcome"), "chunks": len(chunks)},
+    )
+    return SyncNowOutcome(
+        source=source,
+        outcome=str(outcome.get("outcome") or ""),
+        pulled={str(k): int(v) for k, v in (outcome.get("pulled") or {}).items()},
+        delivered=sum(int(c.get("records") or 0) for c in chunks),
+        chunks=len(chunks),
+        error=str(outcome.get("error") or ""),
+        row=row,
     )
 
 

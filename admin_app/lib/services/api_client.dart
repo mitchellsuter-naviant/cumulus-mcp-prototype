@@ -41,6 +41,10 @@ const _timeout = Duration(seconds: 20);
 /// would abandon answers that were about to arrive.
 const _askTimeout = Duration(seconds: 90);
 
+/// A pull reads every list route in a feed and delivers through the door
+/// before it answers, so it is bounded by the estate rather than by us.
+const _syncNowTimeout = Duration(seconds: 120);
+
 class ApiException implements Exception {
   final int statusCode;
   final String message;
@@ -1097,6 +1101,26 @@ class ApiClient {
     );
     _check(resp);
     return SourcesScreen.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// Pull one feed now, and get back the row the screen redraws.
+  ///
+  /// Synchronous on purpose: the operator pressed it, so the answer is what
+  /// landed rather than "accepted". A pull reads every list route in the feed
+  /// and delivers through the door, which is legitimately slower than a read —
+  /// timing it out at 20s would abandon a sync that was about to finish.
+  Future<SyncNowOutcome> syncSourceNow(String source) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/ui/v1/sources/$source/sync-now'),
+        headers: await _headers(),
+      ),
+      timeout: _syncNowTimeout,
+    );
+    _check(resp);
+    return SyncNowOutcome.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
   }

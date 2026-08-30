@@ -29,6 +29,12 @@ import app.deps as deps
 from app import data_collections, personas, ui_api
 from app.auth import Principal
 from app.calendars import seed_calendars_if_empty
+from app.estate import (
+    HRIS_WORKFORCE,
+    EstateConnector,
+    EstateError,
+    InMemoryConnectorStateStore,
+)
 from app.ontology import ONTOLOGY
 from app.payables import seed_payables_if_empty
 from app.reimbursements import seed_reimbursements_if_empty
@@ -36,6 +42,7 @@ from app.runs import RunRecord, StepRecord
 from app.ui_api import UNGOVERNED, get_ui_principal
 from app.usage import READ, InMemoryAssetUsageStore
 from app.workforce import seed_workforce_if_empty
+from tests import estate_fixtures as fx
 from tests import world as test_world
 
 ONTOLOGY_ROUTE = "/api/ui/v1/ontology"
@@ -383,6 +390,20 @@ def test_a_feed_with_no_mapping_is_reported_rather_than_dropped(client, monkeypa
     assert rows["procurement-coupa"]["contract"] is not None
 
 
+def test_a_pushed_feed_carries_no_pull_state(client):
+    """`pull is None` is a fact about the feed, not a gap in the payload.
+
+    Every seeded feed pushes through the door on its own cadence. None of them
+    has a cursor here, and a screen that drew a Sync now for them would be
+    offering to pull a system nothing knows how to reach.
+    """
+    body = client.get(SOURCES_ROUTE).json()
+    assert all(r["pull"] is None for r in body["sources"])
+    assert body["estate"]["registered"] is False
+    assert body["estate"]["feeds_registered"] == 0
+    assert body["estate"]["apps"] == []
+
+
 def test_artifacts_are_attributed_to_the_feed_whose_run_left_them(client):
     """Through the run, never the flow.
 
@@ -465,6 +486,321 @@ def test_only_platform_scope_sees_the_conformance_report(client):
         f"{ONTOLOGY_ROUTE}?flow=accounts-payable", headers=_as("customer-admin")
     ).json()["overlay"]
     assert overlaid["state"] == "observed"
+
+
+# ---------------------------------------------------------------------------
+# Sources — the estate connector's half
+# ---------------------------------------------------------------------------
+
+
+def _connector(estate: fx.FakeEstate | None = None, **over):
+    """A connector over the recorded estate, delivering into a list.
+
+    Built here rather than imported from `test_estate.py` so this module's
+    fixtures do not depend on another test module's helpers; the fake is the
+    shared thing, and it is a fixture file for exactly that reason.
+    """
+    estate = estate or fx.FakeEstate()
+    return EstateConnector(
+        InMemoryConnectorStateStore(),
+        project="cumulus-demo-mitchell-suter",
+        namespace=over.pop("namespace", "naviant"),
+        fetch=estate.fetch,
+        deliver=over.pop("deliver", None) or (lambda payload: {"runs": []}),
+        **over,
+    )
+
+
+@pytest.fixture()
+def estate_client(_client, monkeypatch):
+    """A world with no history and a registered estate.
+
+    Fresh rather than `seeded`, because a pull delivers through the real door:
+    landing eight employees into the module's shared world would make every
+    other test in it depend on the order this one ran in.
+    """
+    world = test_world.fresh()
+
+    def door(payload: dict) -> dict:
+        response = _client.post("/api/v1/sources/deliver", json=payload)
+        assert response.status_code == 202, response.text
+        return response.json()
+
+    connector = _connector(deliver=door)
+    monkeypatch.setattr(deps, "_estate_connector", connector)
+    _client.connector = connector  # type: ignore[attr-defined]  — test handle
+    _client.world = world  # type: ignore[attr-defined]
+    return _client
+
+
+def test_the_estate_card_says_so_when_no_estate_is_registered(client):
+    """The default everywhere but a dev box, and it reads as "nothing to do".
+
+    Registration is one fact for the whole connector, so it is answered once
+    at screen level. The feed registry still holds its specs, but none of them
+    names anything reachable — reporting them as rows would offer a Sync now
+    with nowhere to pull from and make the card's counts describe a list of
+    possibilities rather than of feeds.
+    """
+    estate = client.get(SOURCES_ROUTE).json()["estate"]
+    assert estate == {
+        "registered": False, "project": "", "namespace": "",
+        "discovery_url": "", "authenticated": False,
+        "pull_interval_seconds": 0, "discovery_error": "", "industry": "",
+        "apps": [], "processes": [], "pulse_enabled": None,
+        "pulse_intensity": "", "feeds_registered": 0, "feeds_active": 0,
+    }
+
+
+def test_the_estate_card_reports_discovery_and_per_feed_activation(
+    estate_client,
+):
+    body = estate_client.get(SOURCES_ROUTE).json()
+    estate = body["estate"]
+    assert estate["registered"] is True
+    assert estate["project"] == "cumulus-demo-mitchell-suter"
+    assert estate["namespace"] == "naviant"
+    assert estate["industry"] == "software-reseller"
+    assert estate["apps"] == ["crm", "erp", "office", "hris", "dms"]
+    assert estate["pulse_enabled"] is True
+    assert estate["pulse_intensity"] == "low"
+    assert estate["discovery_error"] == ""
+    # Every count on the card is answered by rows in the list under it.
+    assert estate["feeds_registered"] == 1
+    assert estate["feeds_active"] == 1
+    pulled = [r for r in body["sources"] if r["pull"] is not None]
+    assert [r["source"] for r in pulled] == [HRIS_WORKFORCE]
+    assert sum(1 for r in pulled if r["pull"]["active"]) == 1
+
+
+def test_a_registered_feed_that_has_never_pulled_still_gets_a_row(
+    estate_client,
+):
+    """No run to be assembled from, and the operator still has to be able to
+    start it. The row says nothing has happened rather than being absent."""
+    rows = {r["source"]: r for r in estate_client.get(SOURCES_ROUTE).json()["sources"]}
+    row = rows[HRIS_WORKFORCE]
+
+    assert row["deliveries"] == 0 and row["records_landed"] == 0
+    assert row["last_run_at_iso"] == "" and row["flow_id"] == ""
+    assert row["contract"]["transport"] == "pull"
+    assert row["pull"]["last_pull_at"] == ""
+    assert row["pull"]["watermarks"] == {}
+    assert row["pull"]["resources"] == ["departments", "jobs", "employees"]
+    assert row["pull"]["sync_now_allowed"] is True
+    assert row["pull"]["sync_now_refusal"] == ""
+
+
+def test_the_cursor_is_joined_onto_the_row_the_pull_delivered(estate_client):
+    """The half of a feed's state the runs cannot tell you.
+
+    A watermark is not derivable from the runs the way the counts are, and the
+    two facts belong on one row: `records_landed` says what arrived, the
+    cursor says what the next pull will ask for.
+    """
+    estate_client.connector.pull(HRIS_WORKFORCE)
+
+    rows = {r["source"]: r for r in estate_client.get(SOURCES_ROUTE).json()["sources"]}
+    row = rows[HRIS_WORKFORCE]
+    pull = row["pull"]
+
+    assert pull["last_outcome"] == "delivered"
+    assert pull["last_error"] == ""
+    assert pull["last_pull_at"]
+    # Per resource, because they move independently.
+    assert set(pull["watermarks"]) == {"departments", "jobs", "employees"}
+    assert pull["estate_app"] == "hris"
+    # The run-derived half is there too, and counts what the door was handed:
+    # 7 departments and 10 workers, the jobs having been read for titles only.
+    assert row["flow_id"] == "workforce-sync"
+    assert row["deliveries"] == 1
+    assert row["records_landed"] == 17
+    # Fewer Employees than worker rows, and that is the estate's real drift —
+    # two of those emails are held by two worker records each, and the natural
+    # key collapses them. The row counts deliveries, not entities.
+    assert estate_client.world.graph.stats()["by_type"]["Employee"] == 8
+    # The delivered watermark is the cursor the connector will ask with next.
+    assert row["watermark"] == max(pull["watermarks"].values())
+
+
+def test_a_failed_pull_is_on_the_row_even_though_no_run_exists(estate_client):
+    """The state a run-derived list cannot hold. A pull that never reached the
+    door left nothing behind but its own recorded failure, and a screen that
+    read only the runs would show this feed as simply quiet."""
+    estate_client.connector._fetch = fx.FakeEstate(
+        fails={("hris", "employees")}
+    ).fetch
+    with pytest.raises(EstateError):
+        estate_client.connector.pull(HRIS_WORKFORCE)
+
+    rows = {r["source"]: r for r in estate_client.get(SOURCES_ROUTE).json()["sources"]}
+    pull = rows[HRIS_WORKFORCE]["pull"]
+    assert pull["last_outcome"] == "failed"
+    assert "employees" in pull["last_error"]
+    # No cursor advanced, so the next pull re-asks the same window.
+    assert pull["watermarks"] == {}
+    assert rows[HRIS_WORKFORCE]["deliveries"] == 0
+
+
+def test_an_undeclared_pulled_feed_still_reports_both_halves(
+    estate_client, monkeypatch
+):
+    """The screen's oldest finding survives the join: a feed can be pulling
+    cleanly and landing under no declared Mapping at once, and the row has to
+    say both."""
+    monkeypatch.setattr(
+        ui_api, "MAPPINGS",
+        tuple(m for m in ui_api.MAPPINGS if m.source != HRIS_WORKFORCE),
+    )
+    estate_client.connector.pull(HRIS_WORKFORCE)
+
+    rows = {r["source"]: r for r in estate_client.get(SOURCES_ROUTE).json()["sources"]}
+    assert rows[HRIS_WORKFORCE]["contract"] is None
+    assert rows[HRIS_WORKFORCE]["pull"]["last_outcome"] == "delivered"
+    assert rows[HRIS_WORKFORCE]["records_landed"] > 0
+
+
+def test_sync_now_pulls_the_feed_and_answers_with_its_row(estate_client):
+    """One round trip: the outcome and the row it leaves behind.
+
+    The row travels with the result so the screen redraws the feed from the
+    same read that reports it — a count in a banner disagreeing with the count
+    in the list under it is what this shape rules out.
+    """
+    body = estate_client.post(
+        f"{SOURCES_ROUTE}/{HRIS_WORKFORCE}/sync-now"
+    ).json()
+
+    assert body["outcome"] == "delivered"
+    assert body["error"] == ""
+    assert body["pulled"] == {"departments": 7, "jobs": 5, "employees": 10}
+    assert body["chunks"] == 1
+    assert body["delivered"] == 22
+    row = body["row"]
+    assert row["source"] == HRIS_WORKFORCE
+    assert row["records_landed"] > 0
+    assert row["pull"]["last_outcome"] == "delivered"
+    # And the row it answered with is the row the screen would read next.
+    listed = {
+        r["source"]: r
+        for r in estate_client.get(SOURCES_ROUTE).json()["sources"]
+    }
+    assert listed[HRIS_WORKFORCE] == row
+
+
+def test_a_second_sync_now_of_the_same_window_lands_nothing(estate_client):
+    """The state the screen has to be able to say out loud: a pull that found
+    nothing is not a pull that failed."""
+    estate_client.post(f"{SOURCES_ROUTE}/{HRIS_WORKFORCE}/sync-now")
+    again = estate_client.post(
+        f"{SOURCES_ROUTE}/{HRIS_WORKFORCE}/sync-now"
+    ).json()
+
+    assert again["outcome"] == "unchanged"
+    assert again["pulled"] == {"departments": 0, "jobs": 0, "employees": 0}
+    assert again["chunks"] == 0 and again["delivered"] == 0
+    assert again["row"]["pull"]["last_outcome"] == "unchanged"
+
+
+def test_sync_now_reports_an_estate_outage_as_a_bad_gateway(estate_client):
+    """The failure is upstream. Reporting it as our own 500 would send an
+    operator to read the wrong logs."""
+    estate_client.connector._fetch = fx.FakeEstate(
+        fails={("hris", "employees")}
+    ).fetch
+    response = estate_client.post(f"{SOURCES_ROUTE}/{HRIS_WORKFORCE}/sync-now")
+
+    assert response.status_code == 502
+    assert "employees" in response.json()["detail"]
+
+
+def test_sync_now_refuses_a_persona_with_no_write_authority(estate_client):
+    """A pull writes through the door, so it gates exactly where the machine
+    route gates — and the screen is told the answer in advance.
+
+    Support reads every plane and decides nothing, which is the case a console
+    proxy is most likely to get wrong: it can see the feed, so a button drawn
+    from read reach alone would be there and would 403 when pressed.
+    """
+    refused = estate_client.post(
+        f"{SOURCES_ROUTE}/{HRIS_WORKFORCE}/sync-now",
+        headers=_as("naviant-support"),
+    )
+    assert refused.status_code == 403
+    assert "admin" in refused.json()["detail"]
+
+    pull = next(
+        r["pull"]
+        for r in estate_client.get(
+            SOURCES_ROUTE, headers=_as("naviant-support")
+        ).json()["sources"]
+        if r["source"] == HRIS_WORKFORCE
+    )
+    assert pull["sync_now_allowed"] is False
+    assert "admin authority" in pull["sync_now_refusal"]
+
+
+def test_sync_now_refuses_a_persona_that_reads_only_its_own_work(estate_client):
+    """A customer user is refused at the console door it shares with every
+    other Knowledge route — one 403 with a sentence in it, not a stack trace
+    from a route that assumed platform reach."""
+    refused = estate_client.post(
+        f"{SOURCES_ROUTE}/{HRIS_WORKFORCE}/sync-now",
+        headers=_as("customer-user:kim"),
+    )
+    assert refused.status_code == 403
+    assert "reads only its own" in refused.json()["detail"]
+
+
+def test_sync_now_of_a_feed_the_registry_does_not_hold_is_a_404(estate_client):
+    response = estate_client.post(f"{SOURCES_ROUTE}/no-such-feed/sync-now")
+    assert response.status_code == 404
+    assert "no-such-feed" in response.json()["detail"]
+
+
+def test_sync_now_with_no_estate_registered_is_refused_before_the_network(
+    client,
+):
+    response = client.post(f"{SOURCES_ROUTE}/{HRIS_WORKFORCE}/sync-now")
+    assert response.status_code == 400
+    assert "ESTATE_PROJECT" in response.json()["detail"]
+
+
+def test_an_unreachable_estate_is_reported_as_itself(estate_client):
+    """Discovery failing and discovery saying the app is absent are opposite
+    findings, and only the second one is about the customer's estate."""
+    estate_client.connector._discovery = None
+    estate_client.connector._fetch = fx.FakeEstate(
+        namespaces={"namespaces": [], "default": ""}
+    ).fetch
+
+    body = estate_client.get(SOURCES_ROUTE).json()
+    assert body["estate"]["registered"] is True
+    assert "naviant" in body["estate"]["discovery_error"]
+    assert body["estate"]["apps"] == []
+    assert body["estate"]["feeds_active"] == 0
+
+    pull = next(
+        r["pull"] for r in body["sources"] if r["source"] == HRIS_WORKFORCE
+    )
+    assert pull["sync_now_allowed"] is False
+    assert pull["sync_now_refusal"].startswith("The estate could not be reached")
+
+
+def test_the_console_sync_now_gates_where_the_machine_route_gates():
+    """One spelling of the rule. A console door that let a weaker principal
+    through would be a second, quieter authorization policy."""
+    from app import estate_api
+
+    console = inspect.signature(ui_api.sync_source_now)
+    assert console.parameters["principal"].default.dependency is (
+        ui_api.get_knowledge_principal
+    )
+    machine = inspect.getsource(estate_api.sync_now)
+    assert 'require_role(principal, "admin")' in machine
+    assert 'require_role(principal, "admin")' in inspect.getsource(
+        ui_api.sync_source_now
+    )
 
 
 def test_only_platform_scope_sees_the_mapping_registry_problems(client):

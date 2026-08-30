@@ -187,6 +187,181 @@ class SourceArtifact {
 
 /// One inbound feed: how it is running, what it promised, what it left behind.
 ///
+/// The connector's half of a feed Cumulus *pulls* — its cursor, and how the
+/// last pull went.
+///
+/// Null on a feed that pushes through the door on its own cadence: that feed
+/// has no cursor here and no Sync now, and the null is that fact rather than
+/// missing data. The state cannot be derived from the runs the way the rest of
+/// the row is — a pull that found nothing starts no run, and a pull that
+/// failed has no run at all.
+class PullState {
+  /// Whether discovery says the namespace actually runs this feed's app. A
+  /// registry row for an app the customer does not run is inert, not broken.
+  final bool active;
+  final String estateApp;
+  final String namespace;
+
+  /// The list routes this feed pulls together, in delivery order.
+  final List<String> resources;
+
+  /// Per resource, because they move independently — an employee change must
+  /// not re-pull the jobs catalogue.
+  final Map<String, String> watermarks;
+
+  final String lastPullAt;
+  final String lastOutcome;
+  final String lastError;
+
+  /// Only the dev interval loop knows when the next pull is due; under a
+  /// managed scheduler the cadence belongs to the scheduler and this is empty.
+  final String nextPullAt;
+
+  final bool syncNowAllowed;
+
+  /// Why not, when not. An access boundary is a sentence the screen prints
+  /// next to a control it does not draw — never a button that fails.
+  final String syncNowRefusal;
+
+  const PullState({
+    required this.active,
+    required this.estateApp,
+    required this.namespace,
+    required this.resources,
+    required this.watermarks,
+    required this.lastPullAt,
+    required this.lastOutcome,
+    required this.lastError,
+    required this.nextPullAt,
+    required this.syncNowAllowed,
+    required this.syncNowRefusal,
+  });
+
+  bool get everPulled => lastPullAt.isNotEmpty;
+
+  bool get failed => lastOutcome == 'failed' || lastError.isNotEmpty;
+
+  /// The furthest point any of this feed's cursors has reached — what the next
+  /// pull will ask the estate for. The largest, not the first: the resources
+  /// advance independently and the row states one number.
+  String get watermark {
+    if (watermarks.isEmpty) return '';
+    return watermarks.values.reduce((a, b) => a.compareTo(b) >= 0 ? a : b);
+  }
+
+  factory PullState.fromJson(Map<String, dynamic> json) => PullState(
+    active: json['active'] as bool? ?? false,
+    estateApp: json['estate_app'] as String? ?? '',
+    namespace: json['namespace'] as String? ?? '',
+    resources: (json['resources'] as List<dynamic>? ?? const [])
+        .map((e) => '$e')
+        .toList(),
+    watermarks: (json['watermarks'] as Map<String, dynamic>? ?? const {})
+        .map((k, v) => MapEntry(k, '$v')),
+    lastPullAt: json['last_pull_at'] as String? ?? '',
+    lastOutcome: json['last_outcome'] as String? ?? '',
+    lastError: json['last_error'] as String? ?? '',
+    nextPullAt: json['next_pull_at'] as String? ?? '',
+    syncNowAllowed: json['sync_now_allowed'] as bool? ?? false,
+    syncNowRefusal: json['sync_now_refusal'] as String? ?? '',
+  );
+}
+
+/// The registered estate, above the feeds it explains.
+///
+/// Screen-level rather than per-row because registration is one fact for the
+/// whole connector: five feeds idle because no estate is registered is one
+/// finding, and repeating it down a list buries it.
+class EstateCard {
+  final bool registered;
+  final String project;
+  final String namespace;
+  final String discoveryUrl;
+
+  /// Whether a credential is configured — never which one.
+  final bool authenticated;
+
+  final int pullIntervalSeconds;
+
+  /// Set when discovery itself failed. Its own state: an estate that could not
+  /// be reached is not an estate that runs no apps.
+  final String discoveryError;
+
+  final String industry;
+
+  /// What discovery says this namespace runs. The feed registry proposes and
+  /// this disposes, so a feed whose app is absent renders as inactive.
+  final List<String> apps;
+
+  final List<String> processes;
+
+  /// Null when the discovery payload carries no pulse block — an estate that
+  /// reports no simulation is not one whose simulation is stopped.
+  final bool? pulseEnabled;
+
+  final String pulseIntensity;
+
+  /// Feeds in the connector's registry, and how many of them this namespace
+  /// runs. Both counts are answered by rows in the list below.
+  final int feedsRegistered;
+  final int feedsActive;
+
+  const EstateCard({
+    required this.registered,
+    required this.project,
+    required this.namespace,
+    required this.discoveryUrl,
+    required this.authenticated,
+    required this.pullIntervalSeconds,
+    required this.discoveryError,
+    required this.industry,
+    required this.apps,
+    required this.processes,
+    required this.pulseEnabled,
+    required this.pulseIntensity,
+    required this.feedsRegistered,
+    required this.feedsActive,
+  });
+
+  static const none = EstateCard(
+    registered: false,
+    project: '',
+    namespace: '',
+    discoveryUrl: '',
+    authenticated: false,
+    pullIntervalSeconds: 0,
+    discoveryError: '',
+    industry: '',
+    apps: [],
+    processes: [],
+    pulseEnabled: null,
+    pulseIntensity: '',
+    feedsRegistered: 0,
+    feedsActive: 0,
+  );
+
+  factory EstateCard.fromJson(Map<String, dynamic> json) => EstateCard(
+    registered: json['registered'] as bool? ?? false,
+    project: json['project'] as String? ?? '',
+    namespace: json['namespace'] as String? ?? '',
+    discoveryUrl: json['discovery_url'] as String? ?? '',
+    authenticated: json['authenticated'] as bool? ?? false,
+    pullIntervalSeconds: json['pull_interval_seconds'] as int? ?? 0,
+    discoveryError: json['discovery_error'] as String? ?? '',
+    industry: json['industry'] as String? ?? '',
+    apps: (json['apps'] as List<dynamic>? ?? const [])
+        .map((e) => '$e')
+        .toList(),
+    processes: (json['processes'] as List<dynamic>? ?? const [])
+        .map((e) => '$e')
+        .toList(),
+    pulseEnabled: json['pulse_enabled'] as bool?,
+    pulseIntensity: json['pulse_intensity'] as String? ?? '',
+    feedsRegistered: json['feeds_registered'] as int? ?? 0,
+    feedsActive: json['feeds_active'] as int? ?? 0,
+  );
+}
+
 /// Assembled from the sync runs themselves rather than a second bookkeeping
 /// store, so a feed with no run has never delivered and this cannot pretend
 /// otherwise.
@@ -210,6 +385,9 @@ class SourceFeed {
   /// contract, which is exactly the finding the screen is for.
   final SourceContract? contract;
 
+  /// Null for a feed that pushes. See [PullState].
+  final PullState? pull;
+
   final List<SourceArtifact> artifacts;
 
   /// What [artifacts] is a window onto: a feed that dropped a thousand scanned
@@ -232,11 +410,17 @@ class SourceFeed {
     required this.awaitingSteward,
     required this.unchanged,
     required this.contract,
+    required this.pull,
     required this.artifacts,
     required this.artifactsTotal,
   });
 
-  bool get failed => lastStatus == 'failed' || lastError.isNotEmpty;
+  bool get failed =>
+      lastStatus == 'failed' || lastError.isNotEmpty || (pull?.failed ?? false);
+
+  /// True for a registered feed that has never delivered: the row exists so
+  /// the pull that would start it has somewhere to be pressed.
+  bool get neverDelivered => deliveries == 0 && lastRunAtIso.isEmpty;
 
   factory SourceFeed.fromJson(Map<String, dynamic> json) => SourceFeed(
     source: json['source'] as String? ?? '',
@@ -256,6 +440,9 @@ class SourceFeed {
     contract: json['contract'] == null
         ? null
         : SourceContract.fromJson(json['contract'] as Map<String, dynamic>),
+    pull: json['pull'] == null
+        ? null
+        : PullState.fromJson(json['pull'] as Map<String, dynamic>),
     artifacts: (json['artifacts'] as List<dynamic>? ?? const [])
         .map((e) => SourceArtifact.fromJson(e as Map<String, dynamic>))
         .toList(),
@@ -267,20 +454,93 @@ class SourceFeed {
 class SourcesScreen {
   final List<SourceFeed> sources;
 
+  /// The estate the pulled feeds below are pulled from.
+  final EstateCard estate;
+
   /// Mappings naming a type or Collection that does not exist. Null — not
   /// empty — for a tenant-scoped persona: a registry bug is a Naviant bug,
   /// and an alarm a customer can take no action on is worse than no alarm.
   final List<String>? problems;
 
-  const SourcesScreen({required this.sources, required this.problems});
+  const SourcesScreen({
+    required this.sources,
+    required this.estate,
+    required this.problems,
+  });
+
+  /// The same screen with one feed's row replaced.
+  ///
+  /// A sync answers with the row it left behind, so the screen redraws that
+  /// feed from the same read that reported the result rather than re-fetching
+  /// and hoping the two agree.
+  SourcesScreen replacing(SourceFeed feed) => SourcesScreen(
+    sources: [
+      for (final f in sources)
+        f.source == feed.source && f.kind == feed.kind ? feed : f,
+    ],
+    estate: estate,
+    problems: problems,
+  );
 
   factory SourcesScreen.fromJson(Map<String, dynamic> json) => SourcesScreen(
     sources: (json['sources'] as List<dynamic>? ?? const [])
         .map((e) => SourceFeed.fromJson(e as Map<String, dynamic>))
         .toList(),
+    estate: json['estate'] == null
+        ? EstateCard.none
+        : EstateCard.fromJson(json['estate'] as Map<String, dynamic>),
     problems: (json['problems'] as List<dynamic>?)
         ?.map((e) => '$e')
         .toList(),
+  );
+}
+
+/// What one Sync now did, and the row it leaves behind.
+///
+/// The row travels with the outcome so a count in the banner and the count in
+/// the list under it come from one read and cannot disagree.
+class SyncNowOutcome {
+  final String source;
+
+  /// `delivered` · `unchanged` · `failed`.
+  final String outcome;
+
+  /// Records read from the estate, per resource.
+  final Map<String, int> pulled;
+
+  /// Records handed to the door, across every chunk of this pull.
+  final int delivered;
+
+  final int chunks;
+  final String error;
+
+  /// Null only if the feed left the registry mid-request; the screen then
+  /// keeps the row it already has.
+  final SourceFeed? row;
+
+  const SyncNowOutcome({
+    required this.source,
+    required this.outcome,
+    required this.pulled,
+    required this.delivered,
+    required this.chunks,
+    required this.error,
+    required this.row,
+  });
+
+  int get recordsPulled => pulled.values.fold(0, (sum, n) => sum + n);
+
+  factory SyncNowOutcome.fromJson(Map<String, dynamic> json) => SyncNowOutcome(
+    source: json['source'] as String? ?? '',
+    outcome: json['outcome'] as String? ?? '',
+    pulled: (json['pulled'] as Map<String, dynamic>? ?? const {})
+        .map((k, v) => MapEntry(k, (v as num? ?? 0).toInt())),
+    delivered: json['delivered'] as int? ?? 0,
+    chunks: json['chunks'] as int? ?? 0,
+    error: json['error'] as String? ?? '',
+    row: json['row'] == null
+        ? null
+        : SourceFeed.fromJson(json['row'] as Map<String, dynamic>),
   );
 }
 
