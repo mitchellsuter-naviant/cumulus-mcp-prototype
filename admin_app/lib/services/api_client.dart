@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import '../models/api_key.dart';
 import '../models/asset.dart';
 import '../models/calendar.dart';
+import '../models/dashboard.dart';
 import '../models/identity.dart';
 import '../models/platform_user.dart';
 import '../models/team.dart';
@@ -1088,6 +1089,23 @@ class ApiClient {
   }
 
   // ---- the data layer's governance views ----
+
+  /// The current state of the whole system, in one call.
+  ///
+  /// Four questions — what the map holds, whether the outside world is
+  /// arriving, whether judgment is flowing, whether governance is holding —
+  /// composed server-side from the surfaces that already own their numbers.
+  /// One call because fetching them separately would put the join in the
+  /// client, where each panel could show a different instant and disagree
+  /// about a figure they were both reading off the same store.
+  Future<Dashboard> dashboard() async {
+    final resp = await _send(
+      _http.get(_uri('/api/ui/v1/dashboard'), headers: await _headers()),
+      timeout: _askTimeout,
+    );
+    _check(resp);
+    return Dashboard.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
 
   /// Every inbound feed against the contract it lands under, plus the
   /// artifacts its runs left — the whole Sources screen in one call.

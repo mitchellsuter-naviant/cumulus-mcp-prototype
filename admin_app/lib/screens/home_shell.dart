@@ -18,6 +18,7 @@ import '../widgets/ontology/ontology_canvas.dart';
 import '../widgets/payables_view.dart';
 import '../widgets/reimbursements_view.dart';
 import '../widgets/sources_plane.dart';
+import '../widgets/system_state.dart';
 import '../widgets/ui_kit.dart';
 import 'asset_list_screen.dart';
 import 'employee_hub_screen.dart';
@@ -41,10 +42,11 @@ const int _tasksIndex = 2;
 const int _expenseWorkspaceIndex = 3;
 const int _payablesWorkspaceIndex = 4;
 const int _identityWorkspaceIndex = 5;
-const int _knowledgeIndex = 6;
-const int _flowsIndex = 7;
-const int _identitiesIndex = 8;
-const int _employeeHubIndex = 9;
+const int _systemStateIndex = 6;
+const int _knowledgeIndex = 7;
+const int _flowsIndex = 8;
+const int _identitiesIndex = 9;
+const int _employeeHubIndex = 10;
 
 /// The Library's tab index inside the Knowledge layer section. Named because
 /// the palette navigates to it and a bare `1` would not survive a reorder.
@@ -53,6 +55,11 @@ const int _libraryPlane = 1;
 /// Where the section lands. Ontology first because the diagram *is* the model
 /// — the thing an Overview used to describe in cards, shown instead.
 const int _ontologyPlane = 0;
+
+/// The Sources tab inside the Knowledge layer. Named for the same reason the
+/// Library's is: System state hands off to it, and a bare `2` would not
+/// survive a reorder of the tabs.
+const int _sourcesPlane = 2;
 
 /// The rail. `badge` on the Tasks stop is filled in per build from the open
 /// count — the badge moved off the top bar with the queue itself.
@@ -116,12 +123,21 @@ List<RailDestination> _destinations(int openTasks, Session? session) {
           ),
       ],
     ),
+    // The governance group opens on the reading of the whole deployment,
+    // because every other stop in it is one of the surfaces this one counts:
+    // it says which of them is worth opening this morning.
+    if (governs)
+      const RailDestination(
+        icon: Icons.monitor_heart_outlined,
+        label: 'System state',
+        index: _systemStateIndex,
+        startsGroup: true,
+      ),
     if (governs)
       const RailDestination(
         icon: Icons.hub_outlined,
         label: 'Knowledge layer',
         index: _knowledgeIndex,
-        startsGroup: true,
       ),
     const RailDestination(
       icon: Icons.account_tree_outlined,
@@ -287,7 +303,11 @@ class _HomeShellState extends State<HomeShell> {
   }
 
   /// The governance sections, which an own-scoped persona cannot reach.
-  static const _governance = {_knowledgeIndex, _identitiesIndex};
+  static const _governance = {
+    _systemStateIndex,
+    _knowledgeIndex,
+    _identitiesIndex,
+  };
 
   Widget _lazy(int index, Widget Function() build, Session? session) {
     if (!_visited.contains(index)) return const SizedBox.shrink();
@@ -380,6 +400,28 @@ class _HomeShellState extends State<HomeShell> {
               api: _api,
               onQueueChanged: _refreshTaskBadge,
               initialCaseRef: _openProposal,
+            ),
+            session,
+          ),
+          // Every hand-off below is the surface that holds the rows the panel
+          // counted. A tile whose number could not be gone and read would be a
+          // figure this screen owned, which is the one thing it must not be.
+          _lazy(
+            _systemStateIndex,
+            () => SystemStateSection(
+              api: _api,
+              session: session,
+              onOpenOntology: () {
+                _knowledgePlane.value = _ontologyPlane;
+                _show(_knowledgeIndex);
+              },
+              onOpenSources: () {
+                _knowledgePlane.value = _sourcesPlane;
+                _show(_knowledgeIndex);
+              },
+              onOpenTasks: () => _show(_tasksIndex),
+              onOpenIdentity: () => _show(_identityWorkspaceIndex),
+              onOpenFlows: () => _show(_flowsIndex),
             ),
             session,
           ),

@@ -1,0 +1,708 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:cumulus_admin/models/dashboard.dart';
+import 'package:cumulus_admin/widgets/system_state.dart';
+
+/// The tile states that have to be legible, and every one of them is a state
+/// where a plausible-looking number would be a lie.
+///
+/// - A conformance count a tenant may not read is `—` with the reason, never a
+///   reassuring zero.
+/// - A spend figure over calls nobody priced is `—` with the reason, never
+///   `$0.00`.
+/// - A pull that found no delta and a row that arrived byte-identical share the
+///   word *unchanged* and are different facts, so they never share a phrase.
+/// - Fewer entities than records is the natural key working, and the row says
+///   so — unless the book is shared, in which case the comparison means
+///   nothing and the sentence is withheld.
+/// - A desk with work and nobody bound is a finding; a desk with nobody bound
+///   and nothing on it is not.
+/// - A sweep that never ran is stated, never drawn as a sweep that found
+///   nothing.
+void main() {
+  group('MapPanel', () {
+    testWidgets('a tenant reads why conformance is withheld, not a zero',
+        (tester) async {
+      await _pump(tester, MapPanel(map: _map(invariants: null)));
+
+      expect(find.text('—'), findsOneWidget);
+      expect(
+        find.textContaining('withheld — a TBox violation is a Naviant bug'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a clean graph says it conforms', (tester) async {
+      await _pump(tester, MapPanel(map: _map(invariants: 0, kinds: const {})));
+
+      expect(
+        find.text('the graph conforms to its own ontology'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('violations are named by kind, not just counted',
+        (tester) async {
+      await _pump(tester, MapPanel(
+        map: _map(invariants: 3, kinds: const {'orphan': 2, 'weak-key': 1}),
+      ));
+
+      expect(find.text('3'), findsWidgets);
+      expect(find.text('2 orphan · 1 weak-key'), findsOneWidget);
+    });
+
+    testWidgets('an empty map is a book with nothing in it, not a broken one',
+        (tester) async {
+      await _pump(tester, MapPanel(
+        map: const MapState(
+          objects: 0,
+          links: 0,
+          conflicted: 0,
+          collections: [
+            CollectionState(
+              id: 'workforce',
+              label: 'Workforce',
+              role: 'data',
+              origin: 'synced',
+              custody: 'copy',
+              retention: 'indefinite',
+              authoritative: true,
+              types: [
+                TypeState(
+                  name: 'Employee',
+                  label: 'Employee',
+                  instances: 0,
+                  conflicted: 0,
+                ),
+              ],
+              objects: 0,
+              conflicted: 0,
+            ),
+          ],
+          invariants: 0,
+          invariantKinds: {},
+        ),
+      ));
+
+      expect(
+        find.text(
+          'Nothing has landed in the map yet. Every Collection below is '
+          'declared and empty — the shape of the book, without the book.',
+        ),
+        findsOneWidget,
+      );
+      // The Collection is still drawn: the shape of the book is declared.
+      expect(find.text('Workforce'), findsOneWidget);
+      expect(find.text('Employee 0'), findsOneWidget);
+    });
+
+    testWidgets('a Collection carries its governed properties beside its count',
+        (tester) async {
+      await _pump(tester, MapPanel(map: _map()));
+
+      expect(find.text('Employee 135 · Team 9'), findsOneWidget);
+      expect(find.text('authoritative'), findsOneWidget);
+      expect(
+        find.text('custody copy · retained indefinitely'),
+        findsOneWidget,
+      );
+      expect(find.text('2 in conflict'), findsOneWidget);
+    });
+  });
+
+  group('FeedHealthRow', () {
+    testWidgets('a pull that found no delta is not a row that arrived '
+        'unchanged', (tester) async {
+      await _pump(tester, FeedHealthRow(feed: _feed(
+        deliveries: 2,
+        recordsLanded: 17,
+        created: 8,
+        unchangedRows: 4,
+        pulls: true,
+        lastPullOutcome: 'unchanged',
+        lastPullAgeSeconds: 120,
+        watermarkAgeSeconds: 7200,
+        lastStatus: 'succeeded',
+      )));
+
+      // The connector's word: nothing was fetched at all.
+      expect(
+        find.textContaining(
+          'the estate reported no delta, so nothing was fetched',
+        ),
+        findsOneWidget,
+      );
+      // The row counter's word: rows that did arrive, byte-identical.
+      expect(
+        find.textContaining('4 redelivered byte-identical'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('pulled 2m ago'), findsOneWidget);
+      expect(find.textContaining('read up to 2h ago'), findsOneWidget);
+    });
+
+    testWidgets('a bind feed holding fewer entities than rows is explained, '
+        'not left looking like a dropped delivery', (tester) async {
+      await _pump(tester, FeedHealthRow(feed: _feed(
+        deliveries: 1,
+        recordsLanded: 17,
+        lastStatus: 'succeeded',
+        entities: const [
+          EntityCount(type: 'Employee', instances: 8, feeds: 1),
+          EntityCount(type: 'Team', instances: 7, feeds: 1),
+        ],
+      )));
+
+      expect(find.text('the book now holds Employee 8 · Team 7'), findsOneWidget);
+      expect(
+        find.text(
+          'Landed 17 rows against a book holding 15: the natural key collapsed '
+          'the difference — two source rows under one key are one entity, not '
+          'a dropped delivery.',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('minting more rows than the whole book holds is a collapse '
+        'even when the book is shared', (tester) async {
+      // The live finding this rule was written for: fourteen ERP vendor rows,
+      // thirteen Vendors. Two feeds resolve against that book, and it does not
+      // spoil the inference — another feed can only make the book larger.
+      await _pump(tester, FeedHealthRow(feed: _feed(
+        source: 'erp-vendors',
+        deliveries: 1,
+        recordsLanded: 14,
+        created: 14,
+        landsAs: 'SourceRecord',
+        lastStatus: 'succeeded',
+        entities: const [EntityCount(type: 'Vendor', instances: 13, feeds: 2)],
+      )));
+
+      expect(
+        find.text('the book now holds Vendor 13 (2 feeds resolve against it)'),
+        findsOneWidget,
+      );
+      expect(
+        find.text(
+          'Minted 14 rows against a book holding 13: the natural key collapsed '
+          'the difference — two source rows under one key are one entity, not '
+          'a dropped delivery.',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a reify feed claims nothing from its row count alone',
+        (tester) async {
+      // 109 rows landed as SourceRecords first, so they are not comparable to
+      // the counterparty book those rows then resolved against. Nothing is
+      // claimed rather than a plausible sentence about a number that does not
+      // mean what it looks like.
+      await _pump(tester, FeedHealthRow(feed: _feed(
+        source: 'crm-book',
+        deliveries: 1,
+        recordsLanded: 109,
+        created: 36,
+        landsAs: 'SourceRecord',
+        lastStatus: 'succeeded',
+        entities: const [
+          EntityCount(type: 'Company', instances: 40, feeds: 2),
+        ],
+      )));
+
+      expect(
+        find.text('the book now holds Company 40 (2 feeds resolve against it)'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('natural key collapsed'), findsNothing);
+    });
+
+    testWidgets('a feed under no Mapping says so on the row', (tester) async {
+      await _pump(tester, FeedHealthRow(feed: _feed(
+        source: 'wms-receiving',
+        deliveries: 3,
+        recordsLanded: 12,
+        lastStatus: 'succeeded',
+      )));
+
+      expect(find.text('no contract'), findsOneWidget);
+    });
+
+    testWidgets('a registered feed that has never delivered says that, not '
+        'zero of everything', (tester) async {
+      await _pump(tester, FeedHealthRow(feed: _feed(pulls: true)));
+
+      expect(find.text('never delivered'), findsOneWidget);
+      expect(
+        find.text('Nothing delivered yet — no run, and nothing landed.'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('never pulled'), findsOneWidget);
+    });
+
+    testWidgets('a failed pull prints what the estate said, verbatim',
+        (tester) async {
+      const wire = 'GET https://…-hris.web.app/api/naviant/v1/employees → 503';
+      await _pump(tester, FeedHealthRow(feed: _feed(
+        pulls: true,
+        lastPullOutcome: 'failed',
+        lastPullError: wire,
+        lastPullAgeSeconds: 30,
+      )));
+
+      expect(find.text('Last pull failed: $wire'), findsOneWidget);
+    });
+  });
+
+  group('QueueDepthRow', () {
+    testWidgets('a desk with work and nobody bound is a finding',
+        (tester) async {
+      await _pump(tester, const QueueDepthRow(
+        queue: QueueState(
+          queue: 'data-stewardship',
+          open: 4,
+          oldestOpenAtIso: '2026-08-01T00:00:00+00:00',
+          oldestOpenAgeSeconds: 90000,
+          byKind: {'merge_review': 4},
+          bound: [],
+        ),
+        max: 4,
+      ));
+
+      expect(find.text('nobody bound'), findsOneWidget);
+      expect(
+        find.text('oldest waiting 1d · 4 merge_review'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a desk with nobody bound and nothing on it is not an alarm',
+        (tester) async {
+      await _pump(tester, const QueueDepthRow(
+        queue: QueueState(queue: 'knowledge-curation', open: 0, bound: []),
+        max: 4,
+      ));
+
+      expect(find.text('nothing open'), findsOneWidget);
+      expect(find.text('no persona bound'), findsOneWidget);
+      expect(find.text('nobody bound'), findsNothing);
+    });
+
+    testWidgets('a held desk names who holds it', (tester) async {
+      await _pump(tester, const QueueDepthRow(
+        queue: QueueState(
+          queue: 'ap-clerk',
+          open: 2,
+          highPriority: 1,
+          oldestOpenAgeSeconds: 300,
+          byKind: {'decision': 2},
+          bound: ['Connie Alberts', 'Raymond Fitzgerald'],
+        ),
+        max: 4,
+      ));
+
+      expect(
+        find.text('held by Connie Alberts, Raymond Fitzgerald'),
+        findsOneWidget,
+      );
+      expect(find.text('1 high'), findsOneWidget);
+    });
+  });
+
+  group('JudgmentPanel', () {
+    testWidgets('the regimes are drawn with their refusals beside their commits',
+        (tester) async {
+      await _pump(tester, JudgmentPanel(judgment: _judgment()));
+
+      expect(find.text('3 committed'), findsOneWidget);
+      expect(
+        find.text('2 committed · 1 refused at the write'),
+        findsOneWidget,
+      );
+      expect(find.text('observation'), findsOneWidget);
+      expect(find.text('decision'), findsOneWidget);
+      expect(find.text('resolution'), findsOneWidget);
+    });
+
+    testWidgets('an empty ledger window states the three regimes exist anyway',
+        (tester) async {
+      await _pump(tester, JudgmentPanel(
+        judgment: _judgment(
+          ledger: const LedgerWindow(
+            days: 30,
+            scanned: 0,
+            inWindow: 0,
+            byRegime: [
+              RegimeCount(regime: 'observation', committed: 0, refused: 0),
+              RegimeCount(regime: 'decision', committed: 0, refused: 0),
+              RegimeCount(regime: 'resolution', committed: 0, refused: 0),
+            ],
+          ),
+        ),
+      ));
+
+      expect(
+        find.textContaining(
+          'Nothing has been committed through the Action Gateway in the last '
+          '30 days',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a sweep that never ran is said, not drawn as one that found '
+        'nothing', (tester) async {
+      await _pump(tester, JudgmentPanel(
+        judgment: _judgment(
+          identity: const IdentityState(
+            books: [
+              IdentityBook(
+                type: 'Company',
+                label: 'Company',
+                stewardQueue: 'data-stewardship',
+                objects: 0,
+                standing: 0,
+                confirmed: 0,
+                withdrawn: 0,
+                yours: false,
+              ),
+            ],
+          ),
+        ),
+      ));
+
+      expect(
+        find.textContaining('The identity sweep has never run over these books'),
+        findsOneWidget,
+      );
+      expect(
+        find.text(
+          '0 in the book · 0 standing · 0 confirmed · 0 withdrawn',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a standing proposal with no Task is called an anomaly',
+        (tester) async {
+      await _pump(tester, JudgmentPanel(
+        judgment: _judgment(
+          identity: const IdentityState(standing: 3, withoutTask: 1),
+        ),
+      ));
+
+      expect(
+        find.textContaining('carry no Task, so there is nowhere to decide'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('an unowned desk holding work is called out above the list',
+        (tester) async {
+      await _pump(tester, JudgmentPanel(
+        judgment: _judgment(unowned: const ['nobody-is-bound-here']),
+      ));
+
+      expect(
+        find.textContaining(
+          'Work is sitting on nobody-is-bound-here, which no persona is bound '
+          'to.',
+        ),
+        findsOneWidget,
+      );
+    });
+  });
+
+  group('GovernancePanel', () {
+    testWidgets('spend nobody priced is a dash with the reason, never \$0.00',
+        (tester) async {
+      await _pump(tester, GovernancePanel(
+        governance: _governance(
+          spend: const SpendState(
+            days: 30,
+            runs: 40,
+            modelCalls: 12,
+            pricedModelCalls: 0,
+            costUsd: 0,
+            basis: 'unrecorded',
+          ),
+        ),
+      ));
+
+      expect(find.text('—'), findsOneWidget);
+      expect(find.text('\$0.00'), findsNothing);
+      expect(
+        find.textContaining(
+          '12 model call(s) over 30d, none carrying a cost',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a genuinely idle window is zero and says why', (tester) async {
+      await _pump(tester, GovernancePanel(
+        governance: _governance(
+          spend: const SpendState(days: 30, runs: 3, basis: 'no-model-calls'),
+        ),
+      ));
+
+      expect(find.text('\$0.00'), findsOneWidget);
+      expect(
+        find.text(
+          'nothing called a model in 30d, so this is genuinely zero',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('the two gap directions are never merged into one sentence',
+        (tester) async {
+      await _pump(tester, const FlowGapRow(gap: FlowGap(
+        flowId: 'accounts-payable',
+        label: 'Accounts payable',
+        state: 'observed',
+        totalRuns: 6,
+        undeclaredReads: ['PurchaseOrder'],
+        unobservedWrites: ['ReceivingReport'],
+      )));
+
+      expect(
+        find.text(
+          'reads PurchaseOrder — no Collection declares it may',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.text(
+          'declares it writes ReceivingReport — no run ever has',
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('undeclared'), findsOneWidget);
+      expect(find.text('6 run(s)'), findsOneWidget);
+    });
+
+    testWidgets('a flow that never ran wears that rather than "undeclared"',
+        (tester) async {
+      await _pump(tester, const FlowGapRow(gap: FlowGap(
+        flowId: 'psa-sync',
+        label: 'Psa sync',
+        state: 'never_ran',
+        unobservedWrites: ['Project'],
+      )));
+
+      expect(find.text('never ran'), findsOneWidget);
+      expect(find.text('undeclared'), findsNothing);
+    });
+
+    testWidgets('a tenant reads why the registry report is withheld',
+        (tester) async {
+      await _pump(tester, GovernancePanel(
+        governance: _governance(problems: null),
+      ));
+
+      expect(
+        find.textContaining(
+          'Withheld — a Mapping naming a type that does not exist',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('feeds under no contract are named, with a way to go read them',
+        (tester) async {
+      await _pump(tester, GovernancePanel(
+        governance: _governance(
+          withoutContract: const ['legacy-ap-extract', 'wms-receiving'],
+        ),
+      ));
+
+      expect(
+        find.textContaining(
+          'Rows are arriving under no declared Mapping from '
+          'legacy-ap-extract, wms-receiving',
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('See them on Sources'), findsOneWidget);
+    });
+  });
+
+  group('SystemStateNotYours', () {
+    testWidgets('an own-scoped persona is told it is not theirs, not that the '
+        'system is empty', (tester) async {
+      await _pump(tester, const SystemStateNotYours());
+
+      expect(find.text('This is not scoped to you'), findsOneWidget);
+      expect(
+        find.textContaining('so there is nothing here for it rather than '
+            'something withheld'),
+        findsOneWidget,
+      );
+      // No retry on a refusal that can never succeed.
+      expect(find.bySubtype<OutlinedButton>(), findsNothing);
+    });
+  });
+}
+
+Future<void> _pump(WidgetTester tester, Widget child) async {
+  await tester.pumpWidget(MaterialApp(
+    home: Scaffold(
+      body: SingleChildScrollView(child: SizedBox(width: 1200, child: child)),
+    ),
+  ));
+}
+
+MapState _map({int? invariants = 0, Map<String, int>? kinds = const {}}) =>
+    MapState(
+      objects: 1766,
+      links: 3468,
+      conflicted: 2,
+      collections: const [
+        CollectionState(
+          id: 'workforce',
+          label: 'Workforce',
+          role: 'data',
+          origin: 'synced',
+          custody: 'copy',
+          retention: 'indefinite',
+          authoritative: true,
+          types: [
+            TypeState(
+              name: 'Employee',
+              label: 'Employee',
+              instances: 135,
+              conflicted: 2,
+            ),
+            TypeState(name: 'Team', label: 'Team', instances: 9, conflicted: 0),
+          ],
+          objects: 144,
+          conflicted: 2,
+        ),
+      ],
+      invariants: invariants,
+      invariantKinds: invariants == null ? null : kinds,
+    );
+
+FeedState _feed({
+  String source = 'hris-workforce',
+  String kind = '',
+  String contractId = 'hris-workforce',
+  String landsAs = '',
+  int deliveries = 0,
+  int recordsLanded = 0,
+  int created = 0,
+  int linked = 0,
+  int unchangedRows = 0,
+  int awaitingSteward = 0,
+  String lastStatus = '',
+  List<EntityCount> entities = const [],
+  bool pulls = false,
+  String lastPullOutcome = '',
+  String lastPullError = '',
+  int? lastPullAgeSeconds,
+  int? watermarkAgeSeconds,
+}) => FeedState(
+  source: source,
+  kind: kind,
+  contractId: source == 'wms-receiving' ? '' : contractId,
+  landsAs: landsAs,
+  deliveries: deliveries,
+  recordsLanded: recordsLanded,
+  created: created,
+  linked: linked,
+  unchangedRows: unchangedRows,
+  awaitingSteward: awaitingSteward,
+  lastStatus: lastStatus,
+  entities: entities,
+  pulls: pulls,
+  lastPullOutcome: lastPullOutcome,
+  lastPullError: lastPullError,
+  lastPullAgeSeconds: lastPullAgeSeconds,
+  watermarkAgeSeconds: watermarkAgeSeconds,
+);
+
+JudgmentState _judgment({
+  LedgerWindow? ledger,
+  IdentityState? identity,
+  List<String> unowned = const [],
+}) => JudgmentState(
+  openTasks: 6,
+  highPriority: 1,
+  queues: const [
+    QueueState(
+      queue: 'ap-clerk',
+      open: 2,
+      highPriority: 1,
+      byKind: {'decision': 2},
+      oldestOpenAgeSeconds: 600,
+      bound: ['Connie Alberts'],
+    ),
+    QueueState(queue: 'nobody-is-bound-here', open: 4, bound: []),
+  ],
+  unownedWithWork: unowned,
+  ledger: ledger ??
+      const LedgerWindow(
+        days: 30,
+        scanned: 6,
+        inWindow: 6,
+        refused: 1,
+        newestAtIso: '',
+        byRegime: [
+          RegimeCount(regime: 'observation', committed: 3, refused: 0),
+          RegimeCount(regime: 'decision', committed: 2, refused: 1),
+          RegimeCount(regime: 'resolution', committed: 1, refused: 0),
+        ],
+      ),
+  identity: identity ??
+      const IdentityState(
+        standing: 4,
+        awaitingDecision: 4,
+        books: [
+          IdentityBook(
+            type: 'Company',
+            label: 'Company',
+            stewardQueue: 'data-stewardship',
+            objects: 40,
+            standing: 3,
+            confirmed: 1,
+            withdrawn: 0,
+            yours: true,
+          ),
+        ],
+        lastSweep: SweepRun(
+          runId: 'run_sweep_1',
+          atIso: '',
+          status: 'succeeded',
+          compared: 780,
+          considered: 12,
+          proposed: 4,
+          standing: 4,
+          stewardTasks: 4,
+          ratifications: 2,
+        ),
+      ),
+);
+
+GovernanceState _governance({
+  SpendState? spend,
+  List<String>? problems = const [],
+  List<String> withoutContract = const [],
+}) => GovernanceState(
+  flowsTotal: 13,
+  gaps: const [
+    FlowGap(
+      flowId: 'accounts-payable',
+      label: 'Accounts payable',
+      state: 'observed',
+      totalRuns: 6,
+      undeclaredReads: ['PurchaseOrder'],
+      unobservedWrites: ['ReceivingReport'],
+    ),
+  ],
+  feedsWithoutContract: withoutContract,
+  registryProblems: problems,
+  spend: spend ?? const SpendState(days: 30, basis: 'no-model-calls'),
+);

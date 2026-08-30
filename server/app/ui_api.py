@@ -25,20 +25,23 @@ convenience route part of the public contract.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from pydantic import BaseModel
 
-from . import data_collections, deps, payables, personas
+from . import data_collections, deps, flows, payables, personas
 from .auth import Principal, get_principal, require_reader, require_role
 from .config import settings
 from .deps import get_graph_service
 from .estate_api import pull_feed_now
 from .flow_projection import ProjectionState, project_flow, project_flows
+from .gateway import ACTIONS
 from .graph import GraphService, LinkRecord, ObjectRecord, object_id
 from .identity_sweep import IDENTITY_SWEEP_FLOW_ID, SCANS, SCAN_BY_LINK
 from .mappings import MAPPINGS, Mapping, steward_queue_for_type, validate_mappings
+from .models import utcnow
 from .ontology import ONTOLOGY
 from .resolution import read_sweep_thresholds
 
@@ -193,22 +196,23 @@ def session(principal: Principal = Depends(get_ui_principal)) -> Session:
 def get_knowledge_principal(
     principal: Principal = Depends(get_ui_principal),
 ) -> Principal:
-    """The Knowledge layer's read reach: platform or tenant, never own.
+    """The governance surfaces' read reach: platform or tenant, never own.
 
     Built on `get_ui_principal` rather than beside it, so the no-keys rule is
-    inherited in one place and cannot drift into a second spelling.
-
-    Nothing in this section is scoped to one person's work — the ontology, the
-    corpus and the feeds are the shape of the whole map. So an own-scoped
-    persona is refused outright rather than handed an empty diagram, which it
-    would read as "there is nothing here" instead of "this is not yours".
+    inherited in one place and cannot drift into a second spelling. Shared by
+    the Knowledge layer and the system-state screen because it is one argument,
+    not two: neither is scoped to one person's work — the ontology, the corpus,
+    the feeds, the desks and the ledger are the shape of the whole deployment.
+    So an own-scoped persona is refused outright rather than handed an empty
+    diagram, which it would read as "there is nothing here" instead of "this is
+    not yours".
     """
     if not principal.reads_beyond_self:
         raise HTTPException(
             status_code=403,
             detail=(
-                "The Knowledge layer describes the whole map, not one "
-                "person's work. This persona reads only its own."
+                "This describes the whole map, not one person's work. "
+                "This persona reads only its own."
             ),
         )
     return principal
@@ -1433,6 +1437,676 @@ def identity(
         last_sweep=_last_sweep(),
         desks=desks,
         curates=bool(desks),
+    )
+
+
+# ---------------------------------------------------------------------------
+# System state — the whole deployment, read off the surfaces that already hold it
+# ---------------------------------------------------------------------------
+#
+# Four questions in the order an operator asks them: **what does the map hold**,
+# **is the outside world arriving**, **is judgment flowing**, **is governance
+# holding**. Nothing here is a new record. Every figure is composed from a
+# surface that already owns it — the graph's own counts, the Sources rows, the
+# task queue, the ledger, the flow projections — so a number on this screen is
+# always answerable by a list one rail stop away, and the two can never drift
+# apart because there is only one of them.
+#
+# What that rules out is the thing a dashboard is normally for. There is no
+# second bookkeeping table behind this route, no history it keeps of itself, and
+# no figure derived from an assumption: a quantity that cannot be read out of
+# stored state is a quantity this screen does not show. The places where it
+# would like to say more and cannot — spend nobody priced, a conformance report
+# a tenant may not read — say *that* instead, which is the honest shape of the
+# same tile.
+
+
+#: The window every rate on this screen is taken over. One window for the whole
+#: screen rather than one per tile: two panels quoting different windows read as
+#: one panel contradicting another, and the reader has no way to tell.
+DASHBOARD_WINDOW_DAYS = 30
+
+#: Ledger entries read for the window count. The store is newest-first, so this
+#: is a window onto the newest entries and `truncated` says when the window was
+#: too small to hold the days asked for — the `scanned_runs` idiom, applied to
+#: the one list here that grows without bound.
+LEDGER_SCAN = 1000
+
+
+def _age_seconds(iso: str) -> int | None:
+    """How long ago, or `None` when there is no timestamp to subtract.
+
+    `None` rather than a large number, because "never" and "a long time ago"
+    are opposite readings of a feed and only one of them is about staleness.
+    Naive stamps are read as UTC, which is what every writer in this process
+    produces; a stamp that will not parse is reported as absent rather than as
+    a wrong age.
+    """
+    if not iso:
+        return None
+    try:
+        when = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0, int((utcnow() - when).total_seconds()))
+
+
+# ---- 1 · what the map holds ------------------------------------------------
+
+
+class TypeState(BaseModel):
+    """One object type, as the map holds it now."""
+
+    name: str
+    label: str
+    instances: int
+    #: Instances where two sources assert the same field differently. The
+    #: precedence order picks a winner to read, and this is how many rows are
+    #: standing on one — outstanding disagreement, not resolved history.
+    conflicted: int
+
+
+class CollectionState(BaseModel):
+    """A Collection, and what is inside it.
+
+    Grouped by Collection because that is the unit governance hangs off: a
+    retention horizon, a custody decision and an authoritativeness claim are
+    properties of the set, so a count grouped any other way is a count of
+    nothing anybody governs.
+    """
+
+    id: str
+    label: str
+    role: str
+    origin: str
+    custody: str
+    retention: str
+    authoritative: bool
+    types: list[TypeState]
+    objects: int
+    conflicted: int
+
+
+class MapState(BaseModel):
+    objects: int
+    links: int
+    conflicted: int
+    collections: list[CollectionState]
+    #: TBox violations over the whole graph, and their kinds. `None` — never a
+    #: reassuring zero — for a tenant-scoped persona, on the same reading the
+    #: Ontology screen's `conformance` uses: a violation is a Naviant bug, and
+    #: an alarm the reader can take no action on is worse than no alarm.
+    invariants: int | None
+    invariant_kinds: dict[str, int] | None
+
+
+def _map_state(principal: Principal) -> MapState:
+    """The book, by Collection, from one pass over the store.
+
+    `_graph_counts` is the same pass the Ontology screen counts from, so a type
+    reading 135 here reads 135 there. That is the point of borrowing it rather
+    than counting again.
+    """
+    graph = deps.get_graph_service()
+    by_type, conflicted, by_link = _graph_counts(graph)
+
+    members: dict[str, list[TypeState]] = {}
+    for declared in ONTOLOGY.objects:
+        governing = data_collections.for_object_type(declared.name)
+        members.setdefault(
+            governing.id if governing is not None else UNGOVERNED, []
+        ).append(TypeState(
+            name=declared.name, label=declared.label,
+            instances=by_type.get(declared.name, 0),
+            conflicted=conflicted.get(declared.name, 0),
+        ))
+
+    collections: list[CollectionState] = []
+    for collection in data_collections.COLLECTIONS:
+        types = members.get(collection.id)
+        if not types:
+            # A Collection claiming no object type governs a container that is
+            # not the graph — the corpus, the task ledger, the run journals'
+            # neighbours. Counting graph objects for it would be a zero about
+            # the wrong store.
+            continue
+        collections.append(CollectionState(
+            id=collection.id, label=collection.name, role=collection.role,
+            origin=collection.origin, custody=collection.custody,
+            retention=collection.retention,
+            authoritative=collection.authoritative,
+            types=sorted(types, key=lambda t: -t.instances),
+            objects=sum(t.instances for t in types),
+            conflicted=sum(t.conflicted for t in types),
+        ))
+    if UNGOVERNED in members:
+        types = members[UNGOVERNED]
+        log.warning(
+            "Object types governed by no Collection",
+            extra={"types": [t.name for t in types]},
+        )
+        collections.append(CollectionState(
+            id=UNGOVERNED, label="Ungoverned — no Collection claims these",
+            role="", origin="", custody="", retention="",
+            authoritative=False,
+            types=sorted(types, key=lambda t: -t.instances),
+            objects=sum(t.instances for t in types),
+            conflicted=sum(t.conflicted for t in types),
+        ))
+
+    violations = graph.check_invariants() if principal.sees_everything else None
+    kinds: dict[str, int] | None = None
+    if violations is not None:
+        kinds = {}
+        for violation in violations:
+            kinds[violation.kind] = kinds.get(violation.kind, 0) + 1
+    return MapState(
+        objects=sum(by_type.values()),
+        links=sum(by_link.values()),
+        conflicted=sum(conflicted.values()),
+        collections=collections,
+        invariants=None if violations is None else len(violations),
+        invariant_kinds=kinds,
+    )
+
+
+# ---- 2 · is the outside world arriving -------------------------------------
+
+
+class EntityCount(BaseModel):
+    """A type one feed resolves to, and what the book holds of it now.
+
+    Beside `records_landed` and `created` this is the number that explains the
+    screen's most misreadable gap: a feed that minted 14 vendor rows against a
+    book holding 13 has not dropped one. The name is the natural key, two ERP
+    rows carry the same one, and they are one Vendor by construction.
+
+    The comparison survives a shared book, which is why it is worth showing at
+    all: another feed writing the same type can only make `instances` *larger*,
+    so minting more rows than the book holds proves a collapse however many
+    feeds resolve against it.
+    """
+
+    type: str
+    instances: int
+    #: How many Mappings resolve rows against this type. More than one and the
+    #: book is shared, so `instances` is not this feed's output: the mail and
+    #: calendar feeds resolve *against* Employee without ever minting one, and
+    #: the ERP and the CRM both write the counterparty book.
+    feeds: int
+
+
+class FeedState(BaseModel):
+    """One inbound feed's health, composed from the Sources row.
+
+    Two different facts share the word *unchanged* and this shape keeps them
+    apart, because conflating them turns a healthy quiet feed into a broken
+    one and back. `last_pull_outcome == "unchanged"` is the **connector**
+    saying the estate reported no delta since the watermark — nothing was
+    fetched and no run started. `unchanged_rows` counts **rows** that arrived
+    byte-identical to what the map already held, which only happens on a pull
+    that *did* deliver. A feed can have either without the other.
+    """
+
+    source: str
+    kind: str
+    flow_id: str
+    #: `""` when no Mapping claims this feed — rows landing under no declared
+    #: contract, which is the finding, not a missing field.
+    contract_id: str
+    transport: str
+    #: The type a reified row becomes, and `""` for a **bind** mapping — whose
+    #: rows become nothing of their own and go straight to the types in
+    #: `entities`. Carried because that distinction is what makes
+    #: `records_landed` comparable to what the book holds: a feed that lands
+    #: `SourceRecord`s is not short of entities when it holds fewer of them.
+    lands_as: str
+    #: `None` for a feed that pushes; it has no app for discovery to confirm.
+    active: bool | None
+    last_run_at_iso: str
+    last_run_age_seconds: int | None
+    last_status: str
+    last_error: str
+    deliveries: int
+    records_landed: int
+    created: int
+    linked: int
+    unchanged_rows: int
+    awaiting_steward: int
+    entities: list[EntityCount]
+    #: Whether Cumulus pulls this feed. A pushed feed keeps its own cadence and
+    #: has no cursor here, so every pull field below stays empty as a fact
+    #: about the arrangement rather than as missing data.
+    pulls: bool
+    last_pull_at: str
+    last_pull_age_seconds: int | None
+    last_pull_outcome: str
+    last_pull_error: str
+    #: The furthest cursor across the feed's resources — what the next pull
+    #: asks from. Its age is how far back the estate has been read up to, which
+    #: a delivery count cannot tell you.
+    watermark: str
+    watermark_age_seconds: int | None
+
+
+class ArrivalsState(BaseModel):
+    estate: EstateCard
+    feeds: list[FeedState]
+    #: Feeds arriving under no Mapping, named. The same rows as
+    #: `contract_id == ""` above, counted once so the governance panel and this
+    #: one cannot disagree about how many there are.
+    without_contract: list[str]
+    failing: list[str]
+
+
+def _feed_states(rows: list[SourceRow]) -> list[FeedState]:
+    """The Sources rows, with the ages and entity counts a dashboard reads by.
+
+    Assembled from `_source_rows` rather than from a second walk of the runs:
+    there is one answer to "what has this feed delivered", and the Sources
+    screen owns it.
+    """
+    graph = deps.get_graph_service()
+    by_type, _conflicted, _by_link = _graph_counts(graph)
+    fed_by: dict[str, int] = {}
+    for mapping in MAPPINGS:
+        for type_name in mapping.resolves_to:
+            fed_by[type_name] = fed_by.get(type_name, 0) + 1
+
+    out: list[FeedState] = []
+    for row in rows:
+        pull = row.pull
+        watermark = (
+            max(pull.watermarks.values()) if pull and pull.watermarks else ""
+        )
+        contract = row.contract
+        out.append(FeedState(
+            source=row.source, kind=row.kind, flow_id=row.flow_id,
+            contract_id=contract.id if contract else "",
+            transport=contract.transport if contract else "",
+            lands_as=contract.lands_as if contract else "",
+            active=pull.active if pull else None,
+            last_run_at_iso=row.last_run_at_iso,
+            last_run_age_seconds=_age_seconds(row.last_run_at_iso),
+            last_status=row.last_status, last_error=row.last_error,
+            deliveries=row.deliveries, records_landed=row.records_landed,
+            created=row.created, linked=row.linked,
+            unchanged_rows=row.unchanged,
+            awaiting_steward=row.awaiting_steward,
+            entities=[
+                EntityCount(
+                    type=type_name,
+                    instances=by_type.get(type_name, 0),
+                    feeds=fed_by.get(type_name, 0),
+                )
+                for type_name in (contract.resolves_to if contract else ())
+            ],
+            pulls=pull is not None,
+            last_pull_at=pull.last_pull_at if pull else "",
+            last_pull_age_seconds=_age_seconds(pull.last_pull_at if pull else ""),
+            last_pull_outcome=pull.last_outcome if pull else "",
+            last_pull_error=pull.last_error if pull else "",
+            watermark=watermark,
+            watermark_age_seconds=_age_seconds(watermark),
+        ))
+    return out
+
+
+# ---- 3 · is judgment flowing -----------------------------------------------
+
+
+class QueueState(BaseModel):
+    """One desk: what is on it, how long the oldest has waited, and who holds it.
+
+    A queue with work and nobody bound to it is the finding this shape exists
+    for. Tasks route to a queue and never to a person precisely so work
+    survives absence — which also means an unbound queue accumulates silently,
+    and no per-person inbox anywhere would ever show it.
+    """
+
+    queue: str
+    open: int
+    high_priority: int
+    by_kind: dict[str, int]
+    oldest_open_at_iso: str
+    oldest_open_age_seconds: int | None
+    #: Personas bound to this queue, by label. Read off the roster, so a
+    #: rebinding moves the queue and this together.
+    bound: list[str]
+
+
+class RegimeCount(BaseModel):
+    """Writes in the window under one regime, split by how they ended.
+
+    Declared, never inferred: an observation, a decision and a resolution are
+    indistinguishable by their effect on the graph, so the Action carries its
+    regime and this counts what the Actions said. A refusal is counted beside
+    a commit because a write the Gateway stopped is the spine doing its job —
+    reporting only the commits would make a refusing deployment look idle.
+    """
+
+    regime: str
+    committed: int
+    refused: int
+
+
+class LedgerWindow(BaseModel):
+    days: int
+    #: Entries read, newest first, and whether the read hit its limit. A count
+    #: over a window that could not be fully scanned says so rather than
+    #: quietly under-reporting.
+    scanned: int
+    truncated: bool
+    in_window: int
+    by_regime: list[RegimeCount]
+    refused: int
+    newest_at_iso: str
+
+
+class IdentityState(BaseModel):
+    """What the counterparty books are waiting on, taken from the workbench.
+
+    Composed by calling the identity route's own function rather than walking
+    the links again: the workbench is the list this panel's numbers are
+    answerable by, and a second derivation would be a second way to be wrong.
+    """
+
+    standing: int
+    #: Standing proposals with an open Task carrying them — the ones a steward
+    #: can actually answer.
+    awaiting_decision: int
+    #: Standing proposals with no Task at all. Every proposal the sweep writes
+    #: raises one, so this is an anomaly rather than a policy: a proposal
+    #: nobody was paged about and nowhere to decide it.
+    without_task: int
+    confirmed: int
+    withdrawn: int
+    books: list[IdentityBook]
+    last_sweep: SweepRun | None
+
+
+class JudgmentState(BaseModel):
+    open_tasks: int
+    high_priority: int
+    queues: list[QueueState]
+    #: Queues holding open work that no persona is bound to.
+    unowned_with_work: list[str]
+    ledger: LedgerWindow
+    identity: IdentityState
+
+
+def _known_queues(open_tasks: list) -> set[str]:
+    """Every desk that exists, not only the ones with something on them.
+
+    Four declarations name a queue and all four are queues an operator can be
+    asked about: a persona's binding, a guarded Action's desk, a Mapping's
+    escalation target, and a Task that actually landed. A list built from open
+    Tasks alone would make a desk that has gone quiet indistinguishable from a
+    desk that was never declared.
+    """
+    return (
+        {q for p in personas.ALL_PERSONAS for q in p.queues}
+        | {a.queue for a in ACTIONS.values() if a.queue}
+        | {m.steward_queue for m in MAPPINGS if m.steward_queue}
+        | {t.queue for t in open_tasks if t.queue}
+    )
+
+
+def _queue_states() -> list[QueueState]:
+    tasks = deps.get_task_service().list(status="open")
+    bound: dict[str, list[str]] = {}
+    for persona in personas.ALL_PERSONAS:
+        for queue in persona.queues:
+            bound.setdefault(queue, []).append(persona.label)
+
+    states: list[QueueState] = []
+    for queue in sorted(_known_queues(tasks)):
+        mine = [t for t in tasks if t.queue == queue]
+        by_kind: dict[str, int] = {}
+        for task in mine:
+            by_kind[task.kind] = by_kind.get(task.kind, 0) + 1
+        oldest = min(
+            (t.created_at_iso for t in mine if t.created_at_iso), default=""
+        )
+        states.append(QueueState(
+            queue=queue,
+            open=len(mine),
+            high_priority=sum(1 for t in mine if t.priority == "high"),
+            by_kind=by_kind,
+            oldest_open_at_iso=oldest,
+            oldest_open_age_seconds=_age_seconds(oldest),
+            bound=sorted(bound.get(queue, [])),
+        ))
+    return states
+
+
+def _ledger_window(days: int) -> LedgerWindow:
+    """Governed writes in the window, by regime, off the ledger itself.
+
+    Read unscoped because this route is already refused to anyone who reads
+    only their own work — the narrowing `ledger_api` applies per entry exists
+    for a principal that reaches the ledger at all, and there is no such
+    principal here.
+    """
+    entries = deps.get_action_gateway().ledger.list(limit=LEDGER_SCAN)
+    cutoff = (utcnow() - timedelta(days=days)).isoformat()
+    in_window = [e for e in entries if e.at_iso >= cutoff]
+    counts = {
+        regime: {"committed": 0, "refused": 0}
+        for regime in ("observation", "decision", "resolution")
+    }
+    for entry in in_window:
+        bucket = counts.setdefault(
+            entry.regime, {"committed": 0, "refused": 0}
+        )
+        if entry.outcome in bucket:
+            bucket[entry.outcome] += 1
+    return LedgerWindow(
+        days=days,
+        scanned=len(entries),
+        truncated=len(entries) >= LEDGER_SCAN and len(in_window) == len(entries),
+        in_window=len(in_window),
+        by_regime=[
+            RegimeCount(regime=regime, committed=c["committed"], refused=c["refused"])
+            for regime, c in counts.items()
+        ],
+        refused=sum(c["refused"] for c in counts.values()),
+        newest_at_iso=entries[0].at_iso if entries else "",
+    )
+
+
+def _identity_state(principal: Principal) -> IdentityState:
+    """The workbench's own composition, counted. See `IdentityState`.
+
+    Safe to call directly: this route is gated on read reach, and read reach is
+    one of the two ways `may_open_identity` lets a principal in — so anyone who
+    reaches here would have been admitted to the workbench anyway.
+    """
+    screen = identity(principal=principal)
+    return IdentityState(
+        standing=len(screen.standing),
+        awaiting_decision=sum(
+            1 for p in screen.standing if p.gate.task_status == "open"
+        ),
+        without_task=sum(1 for p in screen.standing if not p.gate.task_id),
+        confirmed=sum(1 for p in screen.decided if p.status == "confirmed"),
+        withdrawn=sum(1 for p in screen.decided if p.status == "withdrawn"),
+        books=screen.books,
+        last_sweep=screen.last_sweep,
+    )
+
+
+# ---- 4 · is governance holding ---------------------------------------------
+
+
+class FlowGap(BaseModel):
+    """One flow whose declared footprint and its observed one disagree.
+
+    Both directions are gaps and they are opposite problems. `undeclared_*` is
+    a flow reading or writing something no Collection says it may — governance
+    that is not covering what is happening. `unobserved_*` is a declaration no
+    run has ever exercised — either a stale promise or a path nothing has
+    tested. `state` is carried because a flow that has never run produces the
+    second on every declaration it has, which is not the same finding.
+    """
+
+    flow_id: str
+    label: str
+    state: ProjectionState
+    total_runs: int
+    undeclared_writes: list[str]
+    undeclared_reads: list[str]
+    unobserved_writes: list[str]
+    unobserved_reads: list[str]
+
+
+class SpendState(BaseModel):
+    """What the ModelCalls in the window cost, and whether that is a measurement.
+
+    `basis` is the whole tile. A $0.00 has two readings pointing opposite ways
+    — nothing called a model, or models were called and no call site recorded a
+    price — and only the first is a fact about spending. `unrecorded` states
+    itself rather than letting a confident zero pass as good news.
+    """
+
+    days: int
+    runs: int
+    model_calls: int
+    priced_model_calls: int
+    cost_usd: float
+    tokens: int
+    basis: flows.CostBasis
+
+
+class GovernanceState(BaseModel):
+    flows_total: int
+    gaps: list[FlowGap]
+    #: Named again from the arrivals panel's own list, so the two counts are
+    #: one count.
+    feeds_without_contract: list[str]
+    #: Mappings naming a type or Collection that does not exist. Withheld from
+    #: a tenant on the same reading as `MapState.invariants`.
+    registry_problems: list[str] | None
+    spend: SpendState
+
+
+def _governance_state(
+    principal: Principal, without_contract: list[str], days: int
+) -> GovernanceState:
+    engine = deps.get_run_engine()
+    projections = project_flows(engine)
+    names = {f.id: f.name for f in deps.get_flow_service().list() if f.name}
+    gaps = [
+        FlowGap(
+            flow_id=p.flow_id, label=_flow_label(p.flow_id, names),
+            state=p.state, total_runs=p.total_runs,
+            undeclared_writes=p.undeclared_writes,
+            undeclared_reads=p.undeclared_reads,
+            unobserved_writes=p.unobserved_writes,
+            unobserved_reads=p.unobserved_reads,
+        )
+        for p in projections
+        if p.undeclared_writes or p.undeclared_reads
+        or p.unobserved_writes or p.unobserved_reads
+    ]
+
+    # One rollup over every run in the deployment, through the same aggregation
+    # a single flow's usage chart is drawn from. A second summation here would
+    # be a second definition of what a priced ModelCall is.
+    series = flows.usage_series(engine.store.list(), days)
+    model_calls = sum(d.model_calls for d in series)
+    priced = sum(d.priced_model_calls for d in series)
+    return GovernanceState(
+        flows_total=len(projections),
+        gaps=sorted(gaps, key=lambda g: g.flow_id),
+        feeds_without_contract=without_contract,
+        registry_problems=(
+            validate_mappings() if principal.sees_everything else None
+        ),
+        spend=SpendState(
+            days=days,
+            runs=sum(d.runs for d in series),
+            model_calls=model_calls,
+            priced_model_calls=priced,
+            cost_usd=round(sum(d.cost_usd for d in series), 6),
+            tokens=sum(d.tokens for d in series),
+            basis=flows.cost_basis(model_calls, priced),
+        ),
+    )
+
+
+# ---- the screen ------------------------------------------------------------
+
+
+class Dashboard(BaseModel):
+    """The whole system, as of now.
+
+    `at_iso` is on the payload because every figure below is a reading taken at
+    one instant and none of them is a stored total. A screen that renders a
+    count without saying when it was true invites the reader to treat it as a
+    standing fact.
+    """
+
+    at_iso: str
+    window_days: int
+    map: MapState
+    arrivals: ArrivalsState
+    judgment: JudgmentState
+    governance: GovernanceState
+
+
+@router.get("/dashboard", response_model=Dashboard)
+def dashboard(
+    principal: Principal = Depends(get_knowledge_principal),
+) -> Dashboard:
+    """The current state of the whole system, in one call.
+
+    Gated exactly as the Knowledge layer is, and for the same reason: none of
+    this is scoped to one person's work. It is the shape of the map, the health
+    of every feed, the depth of every desk and the spine's own record — so an
+    own-scoped persona is refused outright rather than handed a screen of zeros
+    it would read as "everything is fine".
+
+    One call because the four questions are one question. Fetching them
+    separately would put the join in the client, where the panels could each
+    show a different instant and disagree about a number they were both
+    reading off the same store.
+    """
+    estate, pulls = _estate_view(principal)
+    rows = _source_rows(pulls)
+    feeds = _feed_states(rows)
+    without_contract = sorted(f.source for f in feeds if not f.contract_id)
+    queues = _queue_states()
+    stats = deps.get_task_service().stats()
+
+    return Dashboard(
+        at_iso=utcnow().isoformat(),
+        window_days=DASHBOARD_WINDOW_DAYS,
+        map=_map_state(principal),
+        arrivals=ArrivalsState(
+            estate=estate,
+            feeds=feeds,
+            without_contract=without_contract,
+            failing=sorted(
+                f.source for f in feeds
+                if f.last_status == "failed" or f.last_pull_outcome == "failed"
+            ),
+        ),
+        judgment=JudgmentState(
+            open_tasks=stats.open,
+            high_priority=stats.high_priority,
+            queues=queues,
+            unowned_with_work=[
+                q.queue for q in queues if q.open > 0 and not q.bound
+            ],
+            ledger=_ledger_window(DASHBOARD_WINDOW_DAYS),
+            identity=_identity_state(principal),
+        ),
+        governance=_governance_state(
+            principal, without_contract, DASHBOARD_WINDOW_DAYS
+        ),
     )
 
 
