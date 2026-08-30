@@ -255,22 +255,21 @@ def test_profiles_refresh_on_demand(client, owner, world):
 
 # ---- authored ABoxes ------------------------------------------------------
 #
-# A good deal of ABox is written by hand in Python — every eval fixture, and
-# the demo seed's feed deliveries. It was only ever observable through its
-# effects. These assert it is now viewable, and that looking is a read.
+# A good deal of ABox is written by hand in Python — every world an eval case
+# runs in, and the demo seed's feed deliveries. It was only ever observable
+# through its effects. These assert it is now viewable, and that looking is a
+# read. `/api/v1/worlds` is the fixture catalog under its older name.
 
 
-def test_the_catalog_lists_the_fragments_declared_in_code(client, world):
+def test_the_catalog_lists_the_worlds_declared_in_code(client, world):
     rows = client.get("/api/v1/worlds").json()
     by_id = {r["id"]: r for r in rows}
-    assert "seed:demo-world" in by_id
-    assert by_id["seed:demo-world"]["kind"] == "seed-world"
-    assert by_id["seed:demo-world"]["declared_in"].endswith("payables.py")
-    fixtures = [r for r in rows if r["kind"] == "eval-fixture"]
-    assert len(fixtures) >= 9
-    # A fragment with neither deliveries nor objects would be nothing to look
-    # at, so it is not listed.
-    assert all(r["deliveries"] or r["direct_objects"] for r in rows)
+    # The demo seed is a fixture like any other — one registry, because it is
+    # the same kind of thing as the world an eval case runs in.
+    assert "seed:demo-world" not in by_id
+    assert by_id["seed/demo-world"]["flow_id"] == ""
+    assert by_id["seed/demo-world"]["derived_from"].endswith("payables.py")
+    assert len([r for r in rows if r["flow_id"]]) >= 6
 
 
 def test_materializing_shows_the_consequence_not_the_payload(client, world):
@@ -280,7 +279,7 @@ def test_materializing_shows_the_consequence_not_the_payload(client, world):
     the sync flow performed and the Task it escalated, neither of which is in
     the delivery payload.
     """
-    body = client.get("/api/v1/worlds/seed:demo-world").json()
+    body = client.get("/api/v1/worlds/seed/demo-world").json()
     assert body["error"] == ""
     assert body["by_type"]["Vendor"] == 4
     assert body["by_type"]["SourceRecord"] == 12
@@ -296,7 +295,7 @@ def test_materializing_shows_the_consequence_not_the_payload(client, world):
 
 
 def test_a_materialized_object_answers_what_a_natural_key_resolves_to(client, world):
-    body = client.get("/api/v1/worlds/seed:demo-world").json()
+    body = client.get("/api/v1/worlds/seed/demo-world").json()
     acme = next(o for o in body["objects"] if o["label"] == "Acme Industrial Inc.")
     assert acme["natural_key"] == "Acme Industrial Inc."
     assert acme["id"].startswith("vendor_")
@@ -311,15 +310,13 @@ def test_a_materialized_object_answers_what_a_natural_key_resolves_to(client, wo
 def test_materializing_touches_nothing_real(client, world):
     before = world.graph.stats()
     before_runs = len(world.engine.list())
-    client.get("/api/v1/worlds/seed:demo-world")
+    client.get("/api/v1/worlds/seed/demo-world")
     assert world.graph.stats() == before
     assert len(world.engine.list()) == before_runs
 
 
 def test_an_expense_fixture_is_thin_and_says_so(client, world):
-    body = client.get(
-        "/api/v1/worlds/eval:expense-in-policy-auto-approves"
-    ).json()
+    body = client.get("/api/v1/worlds/expense/pat-on-the-roster").json()
     # One Employee and no edges — correct, and worth being able to see rather
     # than inferring from a count.
     assert body["by_type"] == {"Employee": 1}
@@ -327,5 +324,27 @@ def test_an_expense_fixture_is_thin_and_says_so(client, world):
     assert body["objects"][0]["claims"][0]["source"] == "fixture"
 
 
+def test_a_world_is_shown_by_what_it_asserts_not_by_its_payload(client, world):
+    """The preview answers the question by running it, so it answers it once.
+
+    The declaration is a call away — `/api/v1/evals/fixtures/{id}` — and the
+    catalog and the preview both leave it out rather than handing back the
+    payload beside the consequence it produced.
+    """
+    listed = client.get("/api/v1/worlds").json()[0]
+    assert "deliveries" not in listed and "objects" not in listed
+    body = client.get("/api/v1/worlds/expense/pat-on-the-roster").json()
+    assert "deliveries" not in body["world"]
+
+
+def test_the_live_graph_comes_back_in_the_same_shape(client, world):
+    """One renderer for the running graph and a declared one."""
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    body = client.get("/api/v1/graph/instances?limit=50").json()
+    assert body["world"]["id"] == "live"
+    assert "deliveries" not in body["world"]
+    assert any(o["type"] == "Vendor" for o in body["objects"])
+
+
 def test_an_unknown_world_is_a_404(client, world):
-    assert client.get("/api/v1/worlds/eval:nope").status_code == 404
+    assert client.get("/api/v1/worlds/expense/nope").status_code == 404

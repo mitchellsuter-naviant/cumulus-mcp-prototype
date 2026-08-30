@@ -416,8 +416,14 @@ class LensChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final fg = selected ? Colors.white : CumulusColors.inkSecondary;
+    // The fill lives on the Container, not the Material, and the Material is
+    // transparent. Carrying it on the Material put the pill's colour on one
+    // layer and its label on another: selecting a chip whose result set came
+    // back empty repainted the text to white and left the fill behind, so the
+    // one chip you needed to read was white on white until some other change
+    // forced a frame. One layer cannot desync from itself.
     return Material(
-      color: selected ? CumulusColors.ink : CumulusColors.surface,
+      color: Colors.transparent,
       borderRadius: BorderRadius.circular(CumulusRadius.pill),
       child: InkWell(
         onTap: onTap,
@@ -426,6 +432,7 @@ class LensChip extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 7),
           decoration: BoxDecoration(
+            color: selected ? CumulusColors.ink : CumulusColors.surface,
             borderRadius: BorderRadius.circular(CumulusRadius.pill),
             border: Border.all(
               color: selected ? CumulusColors.ink : CumulusColors.borderStrong,
@@ -1004,6 +1011,13 @@ String compactCount(int n) => n >= 1000000
     : '$n';
 
 /// `just now` / `12m ago` / `6h ago` / `3d ago` / `4mo ago`.
+/// Run timestamps cross the wire as ISO strings, never parsed dates — the
+/// journal is stored text and stays text until something needs to render it.
+String agoIso(String iso) {
+  final when = DateTime.tryParse(iso);
+  return when == null ? '—' : agoLabel(when);
+}
+
 String agoLabel(DateTime when) {
   final diff = DateTime.now().difference(when);
   if (diff.inMinutes < 1) return 'just now';

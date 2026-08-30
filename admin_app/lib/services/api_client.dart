@@ -15,10 +15,11 @@ import '../models/flow.dart';
 import '../models/data_layer.dart';
 import '../models/eval.dart';
 import '../models/graph.dart';
-import '../models/mapping.dart';
+import '../models/ontology_screen.dart';
 import '../models/payable.dart';
 import '../models/reimbursement.dart';
 import '../models/run.dart';
+import '../models/session.dart';
 import '../models/task.dart';
 import '../models/world.dart';
 import 'auth_service.dart';
@@ -52,6 +53,14 @@ class ApiException implements Exception {
 class ApiClient {
   final http.Client _http = http.Client();
 
+  /// The persona every request acts as, or null to be whoever signed in.
+  ///
+  /// Static because the acting persona belongs to the session, not to a
+  /// connection: the console holds a client per screen that fetches, and a
+  /// switch that moved only one of them would leave half the app answering as
+  /// the persona you just left.
+  static String? persona;
+
   /// Release the underlying connection pool. Call from `State.dispose()`.
   void close() => _http.close();
 
@@ -64,6 +73,7 @@ class ApiClient {
       'Content-Type': 'application/json',
       if (token != null) 'Authorization': 'Bearer $token',
       if (apiKey.isNotEmpty) 'X-API-Key': apiKey,
+      if (persona != null) 'X-Cumulus-Persona': persona!,
     };
   }
 
@@ -82,6 +92,18 @@ class ApiClient {
         'The server did not respond within ${limit.inSeconds}s.',
       );
     }
+  }
+
+  // ---- Session ----
+
+  /// The shell's first call, and the only one that reports on the persona
+  /// itself rather than through it.
+  Future<Session> session() async {
+    final resp = await _send(
+      _http.get(_uri('/api/ui/v1/session'), headers: await _headers()),
+    );
+    _check(resp);
+    return Session.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
   Future<List<AssetSummary>> listAssets({
@@ -111,6 +133,24 @@ class ApiClient {
     );
     _check(resp);
     return Asset.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  /// Dereference a read-set reference — the `knowledge:{id}@rev{n}` strings
+  /// run journals and tasks carry — back into the document it names.
+  ///
+  /// The ref goes into the path verbatim. Its colon and `@` are both legal
+  /// path characters, so they survive [_uri] untouched and the `{ref:path}`
+  /// route receives exactly what the journal recorded. Percent-encoding them
+  /// happens to work as well, but only because Starlette decodes before it
+  /// matches, and a call should not lean on that.
+  Future<RefResolution> resolveRef(String ref) async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/refs/$ref'), headers: await _headers()),
+    );
+    _check(resp);
+    return RefResolution.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
   }
 
   Future<List<SearchHit>> search(
@@ -199,24 +239,63 @@ class ApiClient {
     return AssetUsage.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  /// Usage for every asset, zero-filled.
+  /// The corpus and its traffic, joined — the whole Library screen in one
+  /// call. Zero-filled, because the documents with no traffic are precisely
+  /// what the dead-weight lenses exist to find.
   ///
-  /// One call rather than one per row: it backs the list column, the corpus
-  /// stats and the unused report at once. Assets with no traffic are included
-  /// precisely because their absence is what the dead-weight view looks for.
-  Future<Map<String, AssetUsage>> corpusUsage({int days = 30}) async {
+  /// Returned as the two shapes the screen already holds rather than a third
+  /// model: a [LibraryRow] would be an [AssetSummary] and an [AssetUsage] with
+  /// a new name, and a name is a concept someone has to learn.
+  Future<({List<AssetSummary> assets, Map<String, AssetUsage> usage})>
+  libraryScreen({int days = 30}) async {
     final resp = await _send(
       _http.get(
-        _uri('/api/v1/usage/assets', {'days': '$days'}),
+        _uri('/api/ui/v1/library', {'days': '$days'}),
         headers: await _headers(),
       ),
     );
     _check(resp);
-    return {
-      for (final row in jsonDecode(resp.body) as List<dynamic>)
-        (row as Map<String, dynamic>)['asset_id'] as String:
-            AssetUsage.fromJson(row),
-    };
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    final rows = (body['assets'] as List<dynamic>? ?? const [])
+        .cast<Map<String, dynamic>>();
+    return (
+      assets: [
+        for (final row in rows)
+          AssetSummary(
+            id: row['id'] as String? ?? '',
+            path: row['path'] as String? ?? '',
+            title: row['title'] as String? ?? '',
+            // Not carried by this route: the list renders a taxonomy, and no
+            // row of it has ever asked how the bytes are encoded.
+            contentType: '',
+            authorityLevel: row['authority_level'] as String? ?? '',
+            kind: row['kind'] as String? ?? 'document',
+            origin: row['origin'] as String? ?? 'authored',
+            scope: row['scope'] as String? ?? 'org',
+            owner: row['owner'] as String? ?? '',
+            tags: (row['tags'] as List<dynamic>? ?? const [])
+                .map((e) => '$e')
+                .toList(),
+            status: row['status'] as String? ?? '',
+            revision: row['revision'] as int? ?? 1,
+            updatedAt:
+                DateTime.tryParse(row['updated_at_iso'] as String? ?? '') ??
+                DateTime.fromMillisecondsSinceEpoch(0),
+          ),
+      ],
+      usage: {
+        for (final row in rows)
+          row['id'] as String: AssetUsage(
+            assetId: row['id'] as String? ?? '',
+            reads: row['reads'] as int? ?? 0,
+            citations: row['citations'] as int? ?? 0,
+            impressions: row['impressions'] as int? ?? 0,
+            lastUsedAt: DateTime.tryParse(
+              row['last_used_at_iso'] as String? ?? '',
+            ),
+          ),
+      },
+    );
   }
 
   Future<Asset> createAsset(Asset asset) async {
@@ -403,14 +482,6 @@ class ApiClient {
     return Team.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  /// Refused with 409 while the team still owns assets, so ownership is never
-  /// lost by accident.
-  Future<void> deleteTeam(String slug) async {
-    final resp = await _send(
-      _http.delete(_uri('/api/v1/teams/$slug'), headers: await _headers()),
-    );
-    _check(resp);
-  }
 
   /// Adds a member, or changes the team role of one already on the team. This
   /// grants team authority only — platform roles are changed elsewhere.
@@ -453,11 +524,18 @@ class ApiClient {
 
   // ---- reimbursements ----
 
-  Future<List<Reimbursement>> listReimbursements({String? state}) async {
+  /// `mine: true` narrows to the acting persona's own rows server-side. The
+  /// hub used to fetch every submitter's receipts and discard the rest in the
+  /// browser, which sent a table across the wire to throw most of it away.
+  Future<List<Reimbursement>> listReimbursements({
+    String? state,
+    bool mine = false,
+  }) async {
     final resp = await _send(
       _http.get(
         _uri('/api/v1/reimbursements', {
           if (state != null && state.isNotEmpty) 'state': state,
+          if (mine) 'mine': 'true',
         }),
         headers: await _headers(),
       ),
@@ -551,28 +629,46 @@ class ApiClient {
     return PayableStats.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
+  /// The whole AP workspace in one call: the rows this reader is accountable
+  /// for, the strip's counts over exactly that slice, and the composer —
+  /// the vendor master, its orders and their lines, and the governed values a
+  /// run will read.
+  Future<PayablesScreen> payablesScreen() async {
+    final resp = await _send(
+      _http.get(_uri('/api/ui/v1/payables'), headers: await _headers()),
+    );
+    _check(resp);
+    return PayablesScreen.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
   /// One live run of the accounts-payable flow: extract → resolve the vendor
   /// → three-way match → anomaly screen → post or review.
-  Future<PayableInvoice> submitInvoice({
+  ///
+  /// The *scenario* is posted rather than the hint string it prints, so the
+  /// string the run receives is serialized in one place — the server's
+  /// `InvoiceScenario.to_hint` — and comes back on the outcome as sent.
+  Future<PayableOutcome> submitInvoice({
+    InvoiceScenario? scenario,
     String imageBase64 = '',
     String filename = '',
-    String note = '',
   }) async {
     final resp = await _send(
       _http.post(
-        _uri('/api/v1/payables'),
+        _uri('/api/ui/v1/payables/submissions'),
         headers: await _headers(),
         body: jsonEncode({
+          if (scenario != null) 'scenario': scenario.toJson(),
           if (imageBase64.isNotEmpty) 'image_base64': imageBase64,
           if (filename.isNotEmpty) 'filename': filename,
-          if (note.isNotEmpty) 'note': note,
         }),
       ),
-      // Up to three vision ModelCalls plus adjudication.
+      // A vision ModelCall plus resolution, matching and adjudication.
       timeout: const Duration(seconds: 90),
     );
     _check(resp);
-    return PayableInvoice.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+    return PayableOutcome.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
   // ---- employee hub ----
@@ -704,6 +800,15 @@ class ApiClient {
   /// Decide a task. `payload` is the structured half of a `corrected`
   /// verdict — edited values, added or removed lines, a chosen entity id.
   /// Prose alone cannot say "split this receipt into two lines".
+  /// One Task by id — what the outcome's gate points at.
+  Future<QueueTask> getTask(String id) async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/tasks/$id'), headers: await _headers()),
+    );
+    _check(resp);
+    return QueueTask.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
   Future<QueueTask> decideTask(
     String id, {
     required String verdict,
@@ -844,18 +949,6 @@ class ApiClient {
         .toList();
   }
 
-  Future<RunStats> runStats({String? flowId}) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/runs/stats', {
-          if (flowId != null && flowId.isNotEmpty) 'flow_id': flowId,
-        }),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return RunStats.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
-  }
 
   Future<FlowRun> getRun(String runId) async {
     final resp = await _send(
@@ -867,14 +960,6 @@ class ApiClient {
 
   // ---- the entity layer ----
 
-  Future<Map<String, dynamic>> graphStats() async {
-    final resp = await _send(
-      _http.get(_uri('/api/v1/graph/stats'), headers: await _headers()),
-    );
-    _check(resp);
-    return jsonDecode(resp.body) as Map<String, dynamic>;
-  }
-
   Future<Ontology> ontology() async {
     final resp = await _send(
       _http.get(_uri('/api/v1/graph/ontology'), headers: await _headers()),
@@ -883,12 +968,20 @@ class ApiClient {
     return Ontology.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  Future<InvariantReport> graphInvariants() async {
+  /// Everything the model diagram draws, in one call: the types, the links,
+  /// the Collections it clusters by, and — when [flow] names one — that
+  /// flow's observed footprint beside the one it declared.
+  Future<OntologyScreen> ontologyScreen({String? flow}) async {
     final resp = await _send(
-      _http.get(_uri('/api/v1/graph/invariants'), headers: await _headers()),
+      _http.get(
+        _uri('/api/ui/v1/ontology', {
+          if (flow != null && flow.isNotEmpty) 'flow': flow,
+        }),
+        headers: await _headers(),
+      ),
     );
     _check(resp);
-    return InvariantReport.fromJson(
+    return OntologyScreen.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
   }
@@ -975,16 +1068,6 @@ class ApiClient {
     );
   }
 
-  Future<List<VendorRecord>> listVendors() async {
-    final resp = await _send(
-      _http.get(_uri('/api/v1/graph/vendors'), headers: await _headers()),
-    );
-    _check(resp);
-    return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => VendorRecord.fromJson(j as Map<String, dynamic>))
-        .toList();
-  }
-
   /// The analytical question: two hops and a sum, with the path attached.
   Future<ExpenseRollup> employeeExpenses(String email, {int days = 180}) async {
     final resp = await _send(
@@ -1001,55 +1084,21 @@ class ApiClient {
 
   // ---- the data layer's governance views ----
 
-  Future<List<DataCollection>> listCollections({String? role}) async {
+  /// Every inbound feed against the contract it lands under, plus the
+  /// artifacts its runs left — the whole Sources screen in one call.
+  ///
+  /// Health and contract in one row is the argument for the screen: a feed
+  /// delivering cleanly under a mapping nobody declared is a different problem
+  /// from one that is failing, and reading them off two lists side by side is
+  /// how the second kind goes unnoticed.
+  Future<SourcesScreen> sourcesScreen() async {
     final resp = await _send(
-      _http.get(
-        _uri('/api/v1/collections', {
-          if (role != null && role.isNotEmpty) 'role': role,
-        }),
-        headers: await _headers(),
-      ),
+      _http.get(_uri('/api/ui/v1/sources'), headers: await _headers()),
     );
     _check(resp);
-    return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => DataCollection.fromJson(j as Map<String, dynamic>))
-        .toList();
-  }
-
-  Future<List<SourceStatus>> listSources() async {
-    final resp = await _send(
-      _http.get(_uri('/api/v1/sources'), headers: await _headers()),
-    );
-    _check(resp);
-    return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => SourceStatus.fromJson(j as Map<String, dynamic>))
-        .toList();
-  }
-
-  Future<MappingRegistry> listMappings() async {
-    final resp = await _send(
-      _http.get(_uri('/api/v1/mappings'), headers: await _headers()),
-    );
-    _check(resp);
-    return MappingRegistry.fromJson(
+    return SourcesScreen.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
-  }
-
-  Future<List<StoredDocument>> listDocuments({String? kind, String? runId}) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/documents', {
-          if (kind != null && kind.isNotEmpty) 'kind': kind,
-          if (runId != null && runId.isNotEmpty) 'run_id': runId,
-        }),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => StoredDocument.fromJson(j as Map<String, dynamic>))
-        .toList();
   }
 
   Future<StoredDocument> getDocument(String documentId) async {
@@ -1063,14 +1112,6 @@ class ApiClient {
     return StoredDocument.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
-  }
-
-  Future<Map<String, dynamic>> documentStats() async {
-    final resp = await _send(
-      _http.get(_uri('/api/v1/documents/stats'), headers: await _headers()),
-    );
-    _check(resp);
-    return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
   /// The artifact's bytes, for a review screen to draw boxes over. Returns
@@ -1196,44 +1237,6 @@ class ApiClient {
     );
   }
 
-  Future<List<RunSummary>> flowRuns(String id, {int limit = 25}) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/flows/$id/runs', {'limit': '$limit'}),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => RunSummary.fromJson(j as Map<String, dynamic>))
-        .toList();
-  }
-
-  /// The full journal of one run: every step, ModelCall, verdict and commit.
-  Future<RunDetail> flowRun(String id, String runId) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/flows/$id/runs/$runId'),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return RunDetail.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
-  }
-
-  Future<List<AuditEntry>> flowAudit(String id, {int limit = 60}) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/flows/$id/audit', {'limit': '$limit'}),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => AuditEntry.fromJson(j as Map<String, dynamic>))
-        .toList();
-  }
-
   /// Published history plus any open draft, newest first.
   Future<List<FlowVersion>> flowVersions(String id) async {
     final resp = await _send(
@@ -1285,8 +1288,8 @@ class ApiClient {
         .toList();
   }
 
-  /// Stages a recommendation into the draft version — never the live one —
-  /// and reports the experiment auto-launched to measure it.
+  /// Stages a recommendation into the draft version — never the live one.
+  /// Measuring it is the eval spec's job, run deliberately.
   Future<AppliedRecommendation> applyRecommendation(
     String id,
     String recommendationId,
@@ -1301,187 +1304,6 @@ class ApiClient {
     return AppliedRecommendation.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
-  }
-
-  /// The declared canonical facts plus the derived producer map for one
-  /// version (the active one when [version] is null).
-  Future<FlowContractInfo> flowContract(String id, {int? version}) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/flows/$id/contract', {
-          if (version != null) 'version': '$version',
-        }),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return FlowContractInfo.fromJson(
-      jsonDecode(resp.body) as Map<String, dynamic>,
-    );
-  }
-
-  Future<List<CorrectionSet>> flowCorrectionSets(String id) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/flows/$id/correction-sets'),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => CorrectionSet.fromJson(j as Map<String, dynamic>))
-        .toList();
-  }
-
-  Future<GoldenSetInfo> flowGoldenSet(String id) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/flows/$id/golden-set'),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return GoldenSetInfo.fromJson(
-      jsonDecode(resp.body) as Map<String, dynamic>,
-    );
-  }
-
-  /// Adds a case. Pass [runId] to promote a real execution — the server tags
-  /// it `promoted-from-run` and keeps the pointer back to that run.
-  Future<GoldenSetInfo> addGoldenCase(
-    String id, {
-    required String name,
-    String inputRef = '',
-    String expected = '',
-    String source = 'human-authored',
-    String runId = '',
-    String payload = '',
-  }) async {
-    final resp = await _send(
-      _http.post(
-        _uri('/api/v1/flows/$id/golden-set'),
-        headers: await _headers(),
-        body: jsonEncode({
-          'name': name,
-          'input_ref': inputRef,
-          'expected': expected,
-          'source': source,
-          if (runId.isNotEmpty) 'run_id': runId,
-          if (payload.isNotEmpty) 'payload': payload,
-        }),
-      ),
-    );
-    _check(resp);
-    return GoldenSetInfo.fromJson(
-      jsonDecode(resp.body) as Map<String, dynamic>,
-    );
-  }
-
-  Future<GoldenSetInfo> removeGoldenCase(String id, String caseId) async {
-    final resp = await _send(
-      _http.delete(
-        _uri('/api/v1/flows/$id/golden-set/$caseId'),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return GoldenSetInfo.fromJson(
-      jsonDecode(resp.body) as Map<String, dynamic>,
-    );
-  }
-
-  /// Bulk upload: JSONL, one case per line — many cases, one dataset revision.
-  Future<GoldenSetInfo> importGoldenCases(String id, String jsonl) async {
-    final resp = await _send(
-      _http.post(
-        _uri('/api/v1/flows/$id/golden-set/import'),
-        headers: await _headers(),
-        body: jsonEncode({'jsonl': jsonl}),
-      ),
-    );
-    _check(resp);
-    return GoldenSetInfo.fromJson(
-      jsonDecode(resp.body) as Map<String, dynamic>,
-    );
-  }
-
-  /// The fixture document behind a case, with grounded field regions.
-  Future<CaseDocument> goldenCaseDocument(String id, String caseId) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/flows/$id/golden-set/$caseId/document'),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return CaseDocument.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
-  }
-
-  /// Records a human's pass over the case's labels. An empty [corrections]
-  /// map confirms the case as labelled; either way the dataset version moves.
-  Future<GoldenSetInfo> reviewGoldenCase(
-    String id,
-    String caseId, {
-    Map<String, String> corrections = const {},
-  }) async {
-    final resp = await _send(
-      _http.post(
-        _uri('/api/v1/flows/$id/golden-set/$caseId/review'),
-        headers: await _headers(),
-        body: jsonEncode({'corrections': corrections}),
-      ),
-    );
-    _check(resp);
-    return GoldenSetInfo.fromJson(
-      jsonDecode(resp.body) as Map<String, dynamic>,
-    );
-  }
-
-  Future<List<TestRun>> flowTestRuns(String id) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/flows/$id/test-runs'),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return (jsonDecode(resp.body) as List<dynamic>)
-        .map((j) => TestRun.fromJson(j as Map<String, dynamic>))
-        .toList();
-  }
-
-  /// Kicks off a golden-set evaluation; the harness runs case-by-case in the
-  /// background, so poll [flowTestRun] for progress. Writes suppressed.
-  Future<TestRun> launchTestRun(
-    String id, {
-    String candidateVersion = '',
-    String baselineVersion = '',
-    String reads = 'pinned',
-  }) async {
-    final resp = await _send(
-      _http.post(
-        _uri('/api/v1/flows/$id/test-runs'),
-        headers: await _headers(),
-        body: jsonEncode({
-          'candidate_version': candidateVersion,
-          'baseline_version': baselineVersion,
-          'reads': reads,
-        }),
-      ),
-    );
-    _check(resp);
-    return TestRun.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
-  }
-
-  Future<TestRun> flowTestRun(String id, String testId) async {
-    final resp = await _send(
-      _http.get(
-        _uri('/api/v1/flows/$id/test-runs/$testId'),
-        headers: await _headers(),
-      ),
-    );
-    _check(resp);
-    return TestRun.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
   // ---- API keys ----

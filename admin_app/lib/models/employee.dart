@@ -22,17 +22,41 @@ class Benefit {
   );
 }
 
+/// The hub's view of a person.
+///
+/// Keyed by **email**, because that is the `Employee` object's natural key in
+/// the graph — the same key the calendar and the reimbursement rows use. The
+/// org-chart half (name, title, team, manager, location) is read through from
+/// the graph on every call rather than stored here, so it cannot rot; only the
+/// balance, the accrual and the benefits are the hub's own state.
 class EmployeeProfile {
-  final String uid;
+  final String email;
   final String name;
+  final String title;
+  final String team;
+  final String manager;
+  final String location;
+
+  /// False for a principal the org chart has never heard of — Naviant Support
+  /// is the standing case. [workforceNote] says so in a sentence, so an empty
+  /// hub reads as correct rather than broken.
+  final bool inWorkforce;
+  final String workforceNote;
+
   final double ptoBalanceDays;
   final double ptoAccrualPerMonth;
   final String nextCompanyHoliday;
   final List<Benefit> benefits;
 
   const EmployeeProfile({
-    required this.uid,
+    required this.email,
     required this.name,
+    required this.title,
+    required this.team,
+    required this.manager,
+    required this.location,
+    required this.inWorkforce,
+    required this.workforceNote,
     required this.ptoBalanceDays,
     required this.ptoAccrualPerMonth,
     required this.nextCompanyHoliday,
@@ -41,8 +65,14 @@ class EmployeeProfile {
 
   factory EmployeeProfile.fromJson(Map<String, dynamic> json) =>
       EmployeeProfile(
-        uid: json['uid'] as String,
+        email: json['email'] as String? ?? '',
         name: json['name'] as String? ?? '',
+        title: json['title'] as String? ?? '',
+        team: json['team'] as String? ?? '',
+        manager: json['manager'] as String? ?? '',
+        location: json['location'] as String? ?? '',
+        inWorkforce: json['in_workforce'] as bool? ?? false,
+        workforceNote: json['workforce_note'] as String? ?? '',
         ptoBalanceDays: (json['pto_balance_days'] as num? ?? 0).toDouble(),
         ptoAccrualPerMonth:
             (json['pto_accrual_per_month'] as num? ?? 0).toDouble(),

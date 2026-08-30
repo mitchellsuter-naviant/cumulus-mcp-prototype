@@ -105,22 +105,23 @@ ADMIN_API_KEY="$(cat "$KEY_FILE")"
 # skip both.
 EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-vertex}"
 
-# The generative half of search: the planner behind /api/v1/ask. Same client
-# library, same service account, same aiplatform.user role as embeddings — so
-# it costs no extra credential, only tokens. Set ANSWER_BACKEND=none to deploy
-# the endpoint in its retrieval-only form, where it returns ranked documents
-# and labels itself as such rather than generating prose.
-ANSWER_BACKEND="${ANSWER_BACKEND:-vertex}"
+# Every ModelCall in the system — the document readers, the HR agent, the
+# /ask planner. Same client library, same service account, same
+# aiplatform.user role as embeddings, so it costs no extra credential, only
+# tokens. Set MODEL_BACKEND=none to deploy on the deterministic local readers
+# and a retrieval-only /ask, which labels itself as such rather than
+# pretending to generate.
+MODEL_BACKEND="${MODEL_BACKEND:-vertex}"
 
-# Both current models (gemini-embedding-2, gemini-3.5-flash-lite) are served
+# Both current models (gemini-embedding-2, gemini-3.7-flash) are served
 # only from the `global` endpoint; a regional one 404s. This is deliberately
 # NOT $REGION — Cloud Run and Firestore stay regional, only the model calls
 # are global. Override if you pin back to a regional model such as
 # text-embedding-005.
 VERTEX_MODEL_LOCATION="${VERTEX_MODEL_LOCATION:-global}"
 
-if [[ "$EMBEDDING_BACKEND" == "vertex" || "$ANSWER_BACKEND" == "vertex" ]]; then
-  echo "==> Enabling Vertex AI (embeddings: $EMBEDDING_BACKEND, answering: $ANSWER_BACKEND, endpoint: $VERTEX_MODEL_LOCATION)"
+if [[ "$EMBEDDING_BACKEND" == "vertex" || "$MODEL_BACKEND" == "vertex" ]]; then
+  echo "==> Enabling Vertex AI (embeddings: $EMBEDDING_BACKEND, models: $MODEL_BACKEND, endpoint: $VERTEX_MODEL_LOCATION)"
   gcloud services enable aiplatform.googleapis.com --quiet
 
   RUNTIME_SA="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com"
@@ -154,7 +155,7 @@ gcloud run deploy "$SERVICE" \
   --source "$REPO_ROOT/server" \
   --region "$REGION" \
   --allow-unauthenticated \
-  --set-env-vars "STORAGE_BACKEND=firestore,AUTH_BACKEND=firebase,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ADMIN_API_KEY=$ADMIN_API_KEY,EMBEDDING_BACKEND=$EMBEDDING_BACKEND,EMBEDDING_LOCATION=$VERTEX_MODEL_LOCATION,ANSWER_BACKEND=$ANSWER_BACKEND,ANSWER_LOCATION=$VERTEX_MODEL_LOCATION,$GENERATION_ENV" \
+  --set-env-vars "STORAGE_BACKEND=firestore,AUTH_BACKEND=firebase,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ADMIN_API_KEY=$ADMIN_API_KEY,EMBEDDING_BACKEND=$EMBEDDING_BACKEND,EMBEDDING_LOCATION=$VERTEX_MODEL_LOCATION,MODEL_BACKEND=$MODEL_BACKEND,MODEL_LOCATION=$VERTEX_MODEL_LOCATION,$GENERATION_ENV" \
   --quiet
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"

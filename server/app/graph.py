@@ -63,7 +63,7 @@ class Claim(BaseModel):
     """One source's assertion about one field of one object.
 
     `source` is a namespaced actor: `human:dana@customer.example`,
-    `erp:vendors`, `flow:accounts-payable`, `model:gemini-2.5-flash`. The
+    `erp:vendors`, `flow:accounts-payable`, `model:gemini-3.7-flash`. The
     prefix before the colon is what precedence sorts on.
     """
 
@@ -165,6 +165,63 @@ class LinkRecord(BaseModel):
     def ref(self) -> str:
         """The write-set reference form: `link:identified_as/link_ab12cd`."""
         return f"link:{self.type}/{self.id}"
+
+
+# ---------------------------------------------------------------------------
+# The ref grammar, read backwards
+# ---------------------------------------------------------------------------
+
+
+class Ref(BaseModel):
+    """A ref taken apart: what scheme it is in, and what it addresses.
+
+    `type` is populated only for the two-part schemes (`graph:`, `link:`);
+    the flat ones put everything in `id`. `revision` is 0 when the ref pinned
+    none, which is a fact about the ref rather than a default.
+    """
+
+    namespace: str = ""
+    type: str = ""
+    id: str = ""
+    revision: int = 0
+    raw: str = ""
+
+
+_REVISION = re.compile(r"@rev(\d+)$")
+
+
+def parse_ref(ref: str) -> Ref:
+    """Read a ref back into its parts. Total: it never raises.
+
+    The revision suffix is optional in fact and not merely in the grammar,
+    and that is where a careless parser goes wrong. A flow that reads a
+    governed asset which is not there records `knowledge:invoice-posting-policy`
+    with no revision to pin, and a purchase order looked up by the number
+    printed on an invoice is recorded as `graph:PurchaseOrder/PO-7741` — a
+    natural key, no minted id, no revision. Requiring `@rev` would silently
+    drop precisely the reads worth knowing about: the policy that was missing
+    and the lookup that had only a printed number to go on.
+
+    Anything with no scheme comes back with an empty namespace and the whole
+    string as its id. That is the right answer for the two schemeless refs
+    the grammar allows (`run_...`, `task_...`) and a harmless one for junk,
+    which matters because these are read off stored journals that outlive the
+    code that wrote them.
+    """
+    raw = ref or ""
+    namespace, scheme_sep, rest = raw.partition(":")
+    if not scheme_sep:
+        return Ref(id=raw, raw=raw)
+    match = _REVISION.search(rest)
+    revision = int(match.group(1)) if match else 0
+    if match:
+        rest = rest[: match.start()]
+    head, path_sep, tail = rest.partition("/")
+    if not path_sep:
+        return Ref(namespace=namespace, id=head, revision=revision, raw=raw)
+    return Ref(
+        namespace=namespace, type=head, id=tail, revision=revision, raw=raw
+    )
 
 
 # ---------------------------------------------------------------------------

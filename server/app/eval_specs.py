@@ -1,4 +1,4 @@
-"""The eval specs and cases, per flow.
+"""The eval specs, the worlds their cases run in, and the cases.
 
 Declared in Python and exported to the map as governed knowledge, the same way
 the ontology and the Collection registry are — a spec is a declarative config
@@ -12,24 +12,33 @@ regress silently — one model call reading the document and the resolver (not
 the model) settling the entity, the match re-running after a correction rather
 than being overridden, and the same vendor seen twice resolving to one object
 rather than two.
+
+The **fixtures** are declared here too, and named. Three AP cases run in the
+same world; before it had a name each of them carried its own copy, so "make
+the receipt short" was a change in one place and a silent divergence in three.
+Code is the authoring source until a console curates them, which is why they
+are seeded into a store rather than read out of this module at grading time.
 """
 
 from __future__ import annotations
 
 from .evals import (
-    Checkpoint,
     EvalCase,
     EvalSpec,
     ExpectedObject,
-    CheckpointExpectation,
     FieldRule,
+    Fixture,
     FixtureObject,
-    GraphFixture,
+    FixtureStore,
     LinkRule,
+    Milestone,
+    MilestoneExpectation,
     ObjectRule,
     ScriptedDecision,
     TrajectoryRule,
 )
+
+DECLARED_IN = "server/app/eval_specs.py"
 
 # ---------------------------------------------------------------------------
 # Shared fixture pieces
@@ -77,13 +86,179 @@ def _receipt(short: float = 0.0) -> dict:
     }
 
 
-def _ap_world(short: float = 0.0, vendors: list[dict] | None = None) -> GraphFixture:
-    return GraphFixture(deliveries=[
+def _ap_deliveries(short: float = 0.0) -> list[dict]:
+    return [
         {"source": "erp-vendors", "watermark": "2026-08-01T00:00:00Z",
-         "vendors": vendors if vendors is not None else [_ACME, _NORTHWIND]},
+         "vendors": [_ACME, _NORTHWIND]},
         {"source": "erp-purchasing", "purchase_orders": [_PO_7741]},
         {"source": "wms-receiving", "receiving_reports": [_receipt(short)]},
-    ])
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The fixtures
+# ---------------------------------------------------------------------------
+#
+# Built by a function rather than held as module constants because the demo
+# world's deliveries come from `payables.py`, which imports its way back here
+# through the world builder. Nothing needs them at import time.
+
+
+def declared_fixtures() -> list[Fixture]:
+    """Every world declared in code, eval and demo alike.
+
+    The demo seed is in this list because it is the same kind of thing: a
+    fragment of ABox written by hand, only observable by running it. Giving it
+    a different name would have been two registries for one concept.
+    """
+    common = {"origin": "declared", "authored_by": "platform-eng"}
+    ap = {
+        **common, "flow_id": "accounts-payable", "derived_from": DECLARED_IN,
+        "read_set": ["knowledge:invoice-posting-policy@rev1"],
+    }
+    expense = {
+        **common, "flow_id": "expense-reimbursement", "derived_from": DECLARED_IN,
+        "read_set": ["knowledge:expense-approval-policy@rev1"],
+    }
+    return [
+        Fixture(
+            id="ap/acme-po-7741-clean",
+            name="Acme, PO-7741, received in full",
+            summary=(
+                "A known vendor in the master, its order, and a receiving "
+                "report that agrees with the order line for line. The world "
+                "three cases need: the one that must post untouched, the one "
+                "whose price a clerk corrects, and the unknown vendor that "
+                "arrives beside it."
+            ),
+            deliveries=_ap_deliveries(),
+            **ap,
+        ),
+        Fixture(
+            id="ap/acme-po-7741-short-receipt",
+            name="Acme, PO-7741, one plate short",
+            summary=(
+                "The same world with the receiving report one unit light. The "
+                "receiving leg is the one most three-way matches skip, so it "
+                "gets a world of its own rather than a flag on a case."
+            ),
+            deliveries=_ap_deliveries(short=1.0),
+            **ap,
+        ),
+        Fixture(
+            id="ap/acme-po-7741-meridian-onboarded",
+            name="Acme's order, and Meridian already on the master",
+            summary=(
+                "A vendor an earlier invoice onboarded, standing in the graph "
+                "as an entity rather than a delivery. The precondition for "
+                "asking whether the second invoice links to it or mints a "
+                "duplicate."
+            ),
+            deliveries=_ap_deliveries(),
+            objects=[FixtureObject(
+                type="Vendor", key="Meridian Supply Ltd.",
+                props={
+                    "name": "Meridian Supply Ltd.",
+                    "slug": "meridian-supply",
+                    "status": "active",
+                },
+                label="Meridian Supply Ltd.",
+            )],
+            **ap,
+        ),
+        Fixture(
+            id="expense/pat-on-the-roster",
+            name="Pat, on the roster",
+            summary=(
+                "One Employee and nothing else. Org membership is a member_of "
+                "link rather than a field, so a fixture claiming `team` here "
+                "would be re-smuggling the string the ontology just retired."
+            ),
+            objects=[FixtureObject(
+                type="Employee", key="pat@customer.example",
+                props={
+                    "email": "pat@customer.example", "title": "Field Engineer",
+                },
+                label="pat@customer.example",
+            )],
+            **expense,
+        ),
+        Fixture(
+            id="expense/kim-on-the-roster",
+            name="Kim, on the roster",
+            summary="One Employee, for the compound receipt a reviewer trims.",
+            objects=[FixtureObject(
+                type="Employee", key="kim@customer.example",
+                props={"email": "kim@customer.example"},
+                label="kim@customer.example",
+            )],
+            **expense,
+        ),
+        Fixture(
+            id="expense/sam-on-the-roster",
+            name="Sam, on the roster",
+            summary="One Employee, for the restricted category that is denied.",
+            objects=[FixtureObject(
+                type="Employee", key="sam@customer.example",
+                props={"email": "sam@customer.example"},
+                label="sam@customer.example",
+            )],
+            **expense,
+        ),
+        _demo_world(),
+    ]
+
+
+def _demo_world() -> Fixture:
+    """The world every seeded run stands on, as one fragment.
+
+    It belongs to no flow — it is what the whole prototype is set on — so its
+    `flow_id` is empty rather than guessed at.
+    """
+    from .payables import (
+        _seed_po_delivery,
+        _seed_receiving_delivery,
+        _seed_vendor_deliveries,
+    )
+
+    return Fixture(
+        id="seed/demo-world",
+        name="Demo world",
+        summary=(
+            "The vendors, purchase orders and receiving reports every seeded "
+            "run stands on — including a byte-identical redelivery, a "
+            "cross-system match that auto-links, and a misspelling that waits "
+            "for a steward."
+        ),
+        deliveries=[
+            *_seed_vendor_deliveries(),
+            _seed_po_delivery(),
+            _seed_receiving_delivery(),
+        ],
+        origin="declared",
+        derived_from="server/app/payables.py",
+        authored_by="platform-eng",
+    )
+
+
+def seed_fixtures_if_empty(store: FixtureStore) -> int:
+    """Register the worlds declared here, without stepping on curated ones.
+
+    By origin rather than by emptiness, which is the difference that matters:
+    a stored fixture still marked `declared` is code's to replace, so editing
+    one in this file reaches an environment that already has it — the trap a
+    seed-once pass falls into. Anything a person authored or a run was promoted
+    into is left exactly as it stands, because a redeploy must never discard a
+    world somebody built.
+    """
+    written = 0
+    for fixture in declared_fixtures():
+        existing = store.get(fixture.id)
+        if existing is not None and existing.origin != "declared":
+            continue
+        store.put(fixture)
+        written += 1
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -102,16 +277,21 @@ AP_SPEC = EvalSpec(
         "flow — due dates, currency — are ignored on purpose: grading them "
         "would be grading the wrong system."
     ),
-    checkpoints=[
-        Checkpoint(
-            id="vendor-resolved",
-            after_step="z1",
-            label="after resolve-vendor",
+    milestones=[
+        Milestone(
+            id="vendor-settled",
+            anchor="last_of_kind",
+            selector="resolve",
+            label="once the vendor has been settled",
             note=(
                 "A division-of-labour promise, not just an outcome: the model "
                 "contributes a name it read off a page and the *resolver* "
                 "decides which entity that is, against the master and the "
                 "governed thresholds. One model call gets to see the document."
+                "\n\nAnchored on the kind rather than on an effect, because a "
+                "resolver that recognises a vendor already on the master "
+                "writes nothing at all — there is no ref that could name this "
+                "point, only the act."
             ),
             objects=[
                 ObjectRule(
@@ -136,27 +316,33 @@ AP_SPEC = EvalSpec(
             ],
             trajectory=[
                 TrajectoryRule(
-                    kind="step_ran", expected="m1",
-                    note="one pass reads the document",
+                    kind="read", expected="document:",
+                    note="a pass over the document happened before this point",
                 ),
                 TrajectoryRule(
-                    kind="step_absent", expected="m2",
-                    note="…and only one: no second reading of the same page",
+                    kind="model_calls_at_most", expected="1",
+                    note=(
+                        "…and only one: no second reading of the same page. "
+                        "A count, not a named step, so splitting or renaming "
+                        "the extraction cannot fake it either way"
+                    ),
                 ),
-                TrajectoryRule(kind="model_calls_at_most", expected="1"),
             ],
         ),
-        Checkpoint(
-            id="committed",
-            after_step="a1",
-            label="once the invoice is posted",
+        Milestone(
+            id="invoice-retained",
+            anchor="wrote",
+            selector="graph:Invoice/",
+            label="once the invoice is retained",
             note=(
-                "The flow writes the graph once, at commit. A run held at a "
-                "gate never reaches this checkpoint, so declaring it in a case "
-                "*is* the assertion that this invoice should have posted — and "
-                "a case for a held invoice asserts the entities are absent "
-                "instead, which pins the rule that nothing is committed until "
-                "the gate is answered."
+                "The flow writes the graph once, at commit, so the commit is "
+                "named by its effect rather than by the step that happens to "
+                "perform it. A run held at a gate never reaches this "
+                "milestone, so declaring it in a case *is* the assertion that "
+                "this invoice should have posted — and a case for a held "
+                "invoice asserts the entities are absent at `held` instead, "
+                "which pins the rule that nothing is committed until the gate "
+                "is answered."
             ),
             objects=[
                 ObjectRule(
@@ -228,19 +414,36 @@ AP_SPEC = EvalSpec(
                 ),
             ],
         ),
-        Checkpoint(
+        Milestone(
             id="outcome",
-            after_step="final",
-            label="however the run ended",
+            anchor="terminal",
+            label="once the run has finished",
             note=(
-                "Applies to every case, committed or held. The object rules "
-                "are here too so a held case can assert the entities are "
-                "*absent*."
+                "Only a run that finished has an outcome, so this refuses to "
+                "resolve for one still sitting at a gate rather than quietly "
+                "grading a partial journal as if it were the end. A case about "
+                "an invoice that is *held* asserts against `held` instead, and "
+                "the two are not interchangeable."
             ),
-            objects=[
-                ObjectRule(type="Invoice"),
-                ObjectRule(type="MatchSet"),
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(kind="gate_count"),
+                TrajectoryRule(kind="queue"),
             ],
+        ),
+        Milestone(
+            id="held",
+            anchor="first_of_kind",
+            selector="task",
+            label="the first time the run stopped for a person",
+            note=(
+                "The counterpart to `outcome`, and the reason a `first_of_kind` "
+                "anchor exists at all: a suspended run has no terminal to "
+                "anchor on, and what a held invoice is judged on is precisely "
+                "that nothing was committed *before* the gate was answered. "
+                "First rather than last, because a second gate later in the "
+                "run would move the point the absence is asserted at."
+            ),
             trajectory=[
                 TrajectoryRule(kind="terminal_status"),
                 TrajectoryRule(kind="gate_count"),
@@ -261,7 +464,7 @@ AP_CASES = [
             "is in the master, the lines match the order and the receipt, and "
             "the total is under the governed limit."
         ),
-        fixture=_ap_world(),
+        fixture_id="ap/acme-po-7741-clean",
         trigger={
             "submitted_by": "ap-intake@customer.example",
             "filename": "acme.pdf",
@@ -269,8 +472,8 @@ AP_CASES = [
                     "lines=STL-0250:2,FAS-M12:3",
         },
         expectations=[
-            CheckpointExpectation(
-                checkpoint="vendor-resolved",
+            MilestoneExpectation(
+                milestone="vendor-settled",
                 objects=[ExpectedObject(
                     type="Vendor", key="Acme Industrial Inc.",
                     fields={
@@ -280,8 +483,8 @@ AP_CASES = [
                     },
                 )],
             ),
-            CheckpointExpectation(
-                checkpoint="committed",
+            MilestoneExpectation(
+                milestone="invoice-retained",
                 objects=[
                     ExpectedObject(
                         type="Invoice", key="acme-industrial:ACME-INV-1",
@@ -305,8 +508,8 @@ AP_CASES = [
                     ),
                 ],
             ),
-            CheckpointExpectation(
-                checkpoint="outcome",
+            MilestoneExpectation(
+                milestone="outcome",
                 trajectory={"terminal_status": "succeeded", "gate_count": "0"},
             ),
         ],
@@ -321,7 +524,7 @@ AP_CASES = [
             "rule. If this ever passes with one gate and no second match, the "
             "correction path has quietly become an override."
         ),
-        fixture=_ap_world(),
+        fixture_id="ap/acme-po-7741-clean",
         trigger={
             "submitted_by": "ap-intake@customer.example",
             "filename": "acme.pdf",
@@ -334,8 +537,8 @@ AP_CASES = [
             payload={"lines": [{"ordinal": 1, "unit_price_usd": 486.00}]},
         )],
         expectations=[
-            CheckpointExpectation(
-                checkpoint="committed",
+            MilestoneExpectation(
+                milestone="invoice-retained",
                 objects=[
                     ExpectedObject(
                         type="Invoice", key="acme-industrial:ACME-INV-2",
@@ -347,8 +550,8 @@ AP_CASES = [
                     ),
                 ],
             ),
-            CheckpointExpectation(
-                checkpoint="outcome",
+            MilestoneExpectation(
+                milestone="outcome",
                 trajectory={"terminal_status": "succeeded", "gate_count": "1"},
             ),
         ],
@@ -361,18 +564,19 @@ AP_CASES = [
             "The receiving leg is the one most three-way matches skip. A short "
             "receipt has to stop the invoice even though the PO agrees."
         ),
-        fixture=_ap_world(short=1.0),
+        fixture_id="ap/acme-po-7741-short-receipt",
         trigger={
             "submitted_by": "ap-intake@customer.example",
             "filename": "acme.pdf",
             "hint": "vendor=acme-industrial po=PO-7741 invoice=ACME-INV-3 "
                     "lines=STL-0250:2,FAS-M12:3",
         },
-        expectations=[CheckpointExpectation(
-            checkpoint="outcome",
+        expectations=[MilestoneExpectation(
+            # `held`, not `outcome`: this run has not finished, and judging it
+            # as though it had is exactly the vacuous pass a milestone must
+            # refuse. Asserting the absence *at the gate* is the point.
+            milestone="held",
             objects=[
-                # Nothing is committed until the gate is answered. Asserting
-                # the absence is the point.
                 ExpectedObject(
                     type="Invoice", key="acme-industrial:ACME-INV-3",
                     absent=True,
@@ -398,7 +602,7 @@ AP_CASES = [
             "resembles this name, so it is minted rather than matched — and it "
             "stays `onboarding` until a human vouches for it."
         ),
-        fixture=_ap_world(),
+        fixture_id="ap/acme-po-7741-clean",
         trigger={
             "submitted_by": "ap-intake@customer.example",
             "filename": "mer.pdf",
@@ -406,15 +610,15 @@ AP_CASES = [
                     "lines=PPE-GLV:2 total=190.00",
         },
         expectations=[
-            CheckpointExpectation(
-                checkpoint="vendor-resolved",
+            MilestoneExpectation(
+                milestone="vendor-settled",
                 objects=[ExpectedObject(
                     type="Vendor", key="Meridian Supply Ltd.",
                     fields={"status": "onboarding", "slug": "meridian-supply"},
                 )],
             ),
-            CheckpointExpectation(
-                checkpoint="outcome",
+            MilestoneExpectation(
+                milestone="held",
                 objects=[ExpectedObject(
                     type="Invoice", key="meridian-supply:MER-1", absent=True,
                 )],
@@ -437,18 +641,7 @@ AP_CASES = [
             "`onboarding` duplicate — even though the name is only ever read "
             "off a page."
         ),
-        fixture=GraphFixture(
-            deliveries=_ap_world().deliveries,
-            objects=[FixtureObject(
-                type="Vendor", key="Meridian Supply Ltd.",
-                props={
-                    "name": "Meridian Supply Ltd.",
-                    "slug": "meridian-supply",
-                    "status": "active",
-                },
-                label="Meridian Supply Ltd.",
-            )],
-        ),
+        fixture_id="ap/acme-po-7741-meridian-onboarded",
         trigger={
             "submitted_by": "ap-intake@customer.example",
             "filename": "mer2.pdf",
@@ -459,22 +652,22 @@ AP_CASES = [
             ScriptedDecision(verdict="approved", note="No PO at this size."),
         ],
         expectations=[
-            CheckpointExpectation(
-                checkpoint="vendor-resolved",
+            MilestoneExpectation(
+                milestone="vendor-settled",
                 objects=[ExpectedObject(
                     type="Vendor", key="Meridian Supply Ltd.",
                     fields={"status": "active", "slug": "meridian-supply"},
                 )],
             ),
-            CheckpointExpectation(
-                checkpoint="committed",
+            MilestoneExpectation(
+                milestone="invoice-retained",
                 objects=[ExpectedObject(
                     type="Invoice", key="meridian-supply:MER-2",
                     fields={"state": "posted", "total_usd": 112.00},
                 )],
             ),
-            CheckpointExpectation(
-                checkpoint="outcome",
+            MilestoneExpectation(
+                milestone="outcome",
                 trajectory={"terminal_status": "succeeded", "gate_count": "1"},
             ),
         ],
@@ -497,11 +690,18 @@ EXPENSE_SPEC = EvalSpec(
         "document — is the unit graded, because a compound receipt is two "
         "facts and a reviewer can add a third."
     ),
-    checkpoints=[
-        Checkpoint(
+    milestones=[
+        Milestone(
             id="recorded",
-            after_step="final",
-            label="at the end of the run",
+            anchor="terminal",
+            label="once the run has finished",
+            note=(
+                "One milestone is enough here, and it is the honest one: the "
+                "expense flow commits at the end and every declared case runs "
+                "to completion, a denial included. A `resolve` or `check` "
+                "milestone copied over from the AP spec would find no such "
+                "step and say so rather than passing on an empty scope."
+            ),
             objects=[
                 ObjectRule(
                     type="ExpenseRequest",
@@ -558,29 +758,19 @@ EXPENSE_SPEC = EvalSpec(
 )
 
 
-_PAT = FixtureObject(
-    type="Employee", key="pat@customer.example",
-    # Org membership is a member_of link, not a field — a fixture that
-    # claimed `team` here would be re-smuggling the string the ontology
-    # just retired.
-    props={"email": "pat@customer.example", "title": "Field Engineer"},
-    label="pat@customer.example",
-)
-
-
 EXPENSE_CASES = [
     EvalCase(
         id="expense-in-policy-auto-approves",
         spec_id=EXPENSE_SPEC.id,
         name="An in-policy receipt with a stated purpose needs nobody",
-        fixture=GraphFixture(objects=[_PAT]),
+        fixture_id="expense/pat-on-the-roster",
         trigger={
             "employee": "pat@customer.example",
             "commentary": "Team lunch after the Acme Phase 1 review.",
             "hint": "total=64.20 category=meals vendor=corner-bistro",
         },
-        expectations=[CheckpointExpectation(
-            checkpoint="recorded",
+        expectations=[MilestoneExpectation(
+            milestone="recorded",
             objects=[
                 ExpectedObject(
                     type="ExpenseRequest", key="$run",
@@ -614,7 +804,7 @@ EXPENSE_CASES = [
             "less than the paper is legitimate and must not need a human; the "
             "two amounts are kept apart so the difference stays legible."
         ),
-        fixture=GraphFixture(objects=[_PAT]),
+        fixture_id="expense/pat-on-the-roster",
         trigger={
             "employee": "pat@customer.example",
             "commentary": "Client dinner, Acme Phase 2.",
@@ -628,8 +818,8 @@ EXPENSE_CASES = [
                 ),
             }],
         },
-        expectations=[CheckpointExpectation(
-            checkpoint="recorded",
+        expectations=[MilestoneExpectation(
+            milestone="recorded",
             objects=[
                 ExpectedObject(
                     type="ExpenseRequest", key="$run",
@@ -656,11 +846,7 @@ EXPENSE_CASES = [
             "Rule. `origin: human` on both lines is what proves the reviewer's "
             "values were applied rather than logged."
         ),
-        fixture=GraphFixture(objects=[FixtureObject(
-            type="Employee", key="kim@customer.example",
-            props={"email": "kim@customer.example"},
-            label="kim@customer.example",
-        )]),
+        fixture_id="expense/kim-on-the-roster",
         trigger={
             "employee": "kim@customer.example",
             "commentary": "Two nights at the Acme onsite.",
@@ -675,8 +861,8 @@ EXPENSE_CASES = [
                  "purpose": "Parking at the onsite, capped rate."},
             ]},
         )],
-        expectations=[CheckpointExpectation(
-            checkpoint="recorded",
+        expectations=[MilestoneExpectation(
+            milestone="recorded",
             objects=[
                 ExpectedObject(
                     type="ExpenseRequest", key="$run",
@@ -699,11 +885,7 @@ EXPENSE_CASES = [
         id="expense-restricted-category-denied",
         spec_id=EXPENSE_SPEC.id,
         name="A restricted category is always reviewed, and can be denied",
-        fixture=GraphFixture(objects=[FixtureObject(
-            type="Employee", key="sam@customer.example",
-            props={"email": "sam@customer.example"},
-            label="sam@customer.example",
-        )]),
+        fixture_id="expense/sam-on-the-roster",
         trigger={
             "employee": "sam@customer.example",
             "commentary": "Client gift wine for the Acme close.",
@@ -713,8 +895,8 @@ EXPENSE_CASES = [
             verdict="rejected",
             note="Out of policy §4.2 — use the gifting desk.",
         )],
-        expectations=[CheckpointExpectation(
-            checkpoint="recorded",
+        expectations=[MilestoneExpectation(
+            milestone="recorded",
             objects=[ExpectedObject(
                 type="ExpenseRequest", key="$run",
                 fields={"state": "denied", "approved_usd": 0.0},
@@ -756,6 +938,7 @@ EVAL_SPEC_ASSET_ID = "flow-eval-specs"
 
 
 def specs_markdown() -> str:
+    fixtures = declared_fixtures()
     lines = [
         "# Flow eval specs",
         "",
@@ -764,6 +947,21 @@ def specs_markdown() -> str:
         "says which parts of it a given flow establishes, how strictly to "
         "compare them, and at which point in a run to look. Authored in Python "
         "(`server/app/eval_specs.py`) and exported here.",
+        "",
+        "A **milestone** is where in a run to look, and it is a predicate over "
+        "the journal rather than a step id: the last step of a given kind, the "
+        "step that wrote a given kind of record, the first time the run stopped "
+        "for a person, or the end of a finished run. That is deliberate and "
+        "load-bearing — flow-level expectations are affixed to the data that "
+        "seeds a flow, so LLM calls and other transactions can be added, "
+        "removed or rearranged without every case having to be re-authored "
+        "against the new step names.",
+        "",
+        "A milestone the run never reaches **fails**, and the failure names "
+        "what the run did instead — the kinds of step it ran, or the records "
+        "it wrote. Declaring one is itself the assertion that it is reachable, "
+        "so a milestone can never be quietly skipped and a case can never pass "
+        "by asserting nothing about a point the run never got to.",
         "",
         "Match rules: `exact` (numbers compare as numbers), `approx` with a "
         "tolerance, `fuzzy` with a similarity floor (for values a model reads "
@@ -781,16 +979,17 @@ def specs_markdown() -> str:
             f"Never graded: {', '.join(f'`{f}`' for f in spec.ignore_fields)}.",
             "",
         ]
-        for checkpoint in spec.checkpoints:
+        for milestone in spec.milestones:
             lines += [
-                f"### Checkpoint `{checkpoint.id}` — {checkpoint.label}",
+                f"### Milestone `{milestone.id}` — {milestone.label}",
                 "",
-                f"Evaluated once step `{checkpoint.after_step}` has completed.",
+                f"Resolved at **{milestone.describe()}** — a predicate over "
+                "the run's journal, never a step id.",
                 "",
             ]
-            if checkpoint.note:
-                lines += [checkpoint.note, ""]
-            for rule in checkpoint.objects:
+            if milestone.note:
+                lines += [milestone.note, ""]
+            for rule in milestone.objects:
                 lines.append(f"**{rule.type}**")
                 lines.append("")
                 for field in rule.fields:
@@ -812,10 +1011,10 @@ def specs_markdown() -> str:
                         f"{link.expect}{detail}"
                     )
                 lines.append("")
-            if checkpoint.trajectory:
+            if milestone.trajectory:
                 lines.append("**Trajectory**")
                 lines.append("")
-                for rule in checkpoint.trajectory:
+                for rule in milestone.trajectory:
                     detail = f" — {rule.note}" if rule.note else ""
                     expected = f" `{rule.expected}`" if rule.expected else ""
                     lines.append(f"- `{rule.kind}`{expected}{detail}")
@@ -826,7 +1025,29 @@ def specs_markdown() -> str:
             lines.append(f"- **{case.name}** (`{case.id}`)")
             if case.summary:
                 lines.append(f"  - {case.summary}")
+            if case.fixture_id:
+                lines.append(f"  - world: `{case.fixture_id}`")
         lines.append("")
+        wanted = {c.fixture_id for c in cases}
+        used = [f for f in fixtures if f.id in wanted]
+        if used:
+            lines += [
+                "### Fixtures",
+                "",
+                "The worlds those cases run in. A world is named and shared, so "
+                "two cases over the same one reference a single declaration "
+                "rather than carrying a copy each — and the pinned reads say "
+                "which governed values a result is comparable against.",
+                "",
+            ]
+            for fixture in used:
+                lines.append(f"- `{fixture.id}` — {fixture.name}")
+                if fixture.summary:
+                    lines.append(f"  - {fixture.summary}")
+                if fixture.read_set:
+                    pins = ", ".join(f"`{ref}`" for ref in fixture.read_set)
+                    lines.append(f"  - pinned reads: {pins}")
+            lines.append("")
     return "\n".join(lines)
 
 

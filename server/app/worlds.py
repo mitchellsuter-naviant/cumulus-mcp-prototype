@@ -1,63 +1,42 @@
-"""Authored ABoxes: the instance fragments declared in Python, made viewable.
+"""Materializing a Fixture: what a declared world actually asserts.
 
-The ontology is a TBox and the console already shows it as a diagram. The
-*ABox* — the instances — has until now been visible in only one form: whatever
-the live graph happens to hold. But a good deal of ABox is **authored**, in
-Python, and was invisible:
+The ontology is a TBox and the console already draws it. The *ABox* — the
+instances — was visible in only one form: whatever the live graph happens to
+hold. But a good deal of ABox is **authored**, in Python, and was invisible.
+Every one of those fragments is a `Fixture` (`evals.py`): the world an eval
+case runs in, and the demo seed's feed deliveries, which are the same kind of
+thing and so live in one registry. Browsing and grading read the same
+declaration, which is the only reason a preview is worth trusting.
 
-- every eval case's `GraphFixture` — the world that must exist before the
-  trigger fires;
-- the demo seed's feed deliveries — the vendors, purchase orders and receiving
-  reports the whole prototype stands on.
-
-Both are assertions about instances, written by hand, and both were only
-observable through their effects. You could see that a vendor existed; you
-could not see the fragment that said so, or check what it would assert before
-running anything.
-
-**Materialize rather than predict.** A fragment is shown by running it into a
+**Materialize rather than predict.** A fixture is shown by running it into a
 throwaway in-memory world and reading the graph back — not by statically
 guessing what it would produce. That difference matters: a delivery goes
 through the real sync flow, so what you see includes the resolution the flow
 performed (which vendor it matched, at what score, by what method) and the
 Tasks it escalated. A static expansion would show the payload; this shows the
-consequence.
+consequence. It is also the fixture *editor*: authoring a world is worth
+nothing without seeing what it asserts.
 
 It also answers the question a natural key always raises: what id does this
 resolve to. Every materialized object carries both.
 
-Nothing here writes anywhere real. It is the same isolation the eval harness
-uses, for the same reason.
+Nothing here writes anywhere real — it establishes the world through the same
+`seed_fixture` a graded run does, so a preview cannot show something an eval
+never sees.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .graph import Claim, TBoxViolation
-from .evals import GraphFixture, build_world
+from .graph import TBoxViolation
+from .eval_world import build_world
+from .evals import Fixture, seed_fixture
 
 log = logging.getLogger("cumulus.worlds")
-
-WorldKind = Literal["eval-fixture", "seed-world"]
-
-
-class AuthoredWorld(BaseModel):
-    """A fragment of ABox declared in code, before it is materialized."""
-
-    id: str
-    name: str
-    summary: str = ""
-    kind: WorldKind
-    # Where in the codebase it is declared, so the view points back at source.
-    declared_in: str = ""
-    # What owns it: an eval case id, or the seed pass.
-    owner: str = ""
-    deliveries: int = 0
-    direct_objects: int = 0
 
 
 class MaterializedClaim(BaseModel):
@@ -112,7 +91,9 @@ class MaterializedTask(BaseModel):
 
 
 class MaterializedWorld(BaseModel):
-    world: AuthoredWorld
+    # `world` rather than `fixture`: the fixture *is* the world, and this is
+    # what it turned out to be.
+    world: Fixture
     objects: list[MaterializedObject] = Field(default_factory=list)
     links: list[MaterializedLink] = Field(default_factory=list)
     runs: list[MaterializedRun] = Field(default_factory=list)
@@ -127,110 +108,23 @@ class MaterializedWorld(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# The registry
-# ---------------------------------------------------------------------------
-
-
-def _seed_world_fixture() -> GraphFixture:
-    """The demo world every seeded run stands on, as one fragment."""
-    from .payables import (
-        _seed_po_delivery,
-        _seed_receiving_delivery,
-        _seed_vendor_deliveries,
-    )
-
-    return GraphFixture(deliveries=[
-        *_seed_vendor_deliveries(),
-        _seed_po_delivery(),
-        _seed_receiving_delivery(),
-    ])
-
-
-def catalog() -> list[tuple[AuthoredWorld, GraphFixture]]:
-    """Every authored ABox fragment, with the fixture that expresses it."""
-    from .eval_specs import CASES
-
-    out: list[tuple[AuthoredWorld, GraphFixture]] = [(
-        AuthoredWorld(
-            id="seed:demo-world",
-            name="Demo world",
-            summary=(
-                "The vendors, purchase orders and receiving reports every "
-                "seeded run stands on — including a byte-identical "
-                "redelivery, a cross-system match that auto-links, and a "
-                "misspelling that waits for a steward."
-            ),
-            kind="seed-world",
-            declared_in="server/app/payables.py",
-            owner="seed_payables_if_empty",
-            deliveries=len(_seed_world_fixture().deliveries),
-        ),
-        _seed_world_fixture(),
-    )]
-    for spec_id, cases in CASES.items():
-        for case in cases:
-            fixture = case.fixture
-            if not fixture.deliveries and not fixture.objects:
-                continue
-            out.append((
-                AuthoredWorld(
-                    id=f"eval:{case.id}",
-                    name=case.name,
-                    summary=case.summary or (
-                        "The precondition this case asserts before its trigger "
-                        "fires."
-                    ),
-                    kind="eval-fixture",
-                    declared_in="server/app/eval_specs.py",
-                    owner=f"{spec_id} · {case.id}",
-                    deliveries=len(fixture.deliveries),
-                    direct_objects=len(fixture.objects),
-                ),
-                fixture,
-            ))
-    return out
-
-
-def worlds() -> list[AuthoredWorld]:
-    return [world for world, _ in catalog()]
-
-
-def find(world_id: str) -> tuple[AuthoredWorld, GraphFixture] | None:
-    return next((entry for entry in catalog() if entry[0].id == world_id), None)
-
-
-# ---------------------------------------------------------------------------
 # Materializing
 # ---------------------------------------------------------------------------
+#
+# The registry that used to live here is gone: the catalog of authored worlds
+# is the FixtureStore, and a caller resolves an id through that before asking
+# for a preview.
 
 
-def materialize(world_id: str, knowledge=None) -> MaterializedWorld | None:
-    """Run a fragment into a throwaway world and read the graph back."""
-    entry = find(world_id)
-    if entry is None:
-        return None
-    world, fixture = entry
-    result = MaterializedWorld(world=world)
+def materialize(fixture: Fixture, knowledge=None) -> MaterializedWorld:
+    """Run a fixture into a throwaway world and read the graph back."""
+    result = MaterializedWorld(world=fixture)
     try:
         sandbox = build_world(knowledge)
-        for delivery in fixture.deliveries:
-            from .sync import SyncRequest
-
-            sandbox.sync.deliver(
-                SyncRequest.model_validate(delivery), actor="system:world-preview"
-            )
-        writer = sandbox.graph.writer("preview", "f0")
-        for entity in fixture.objects:
-            writer.upsert(
-                entity.type, entity.key,
-                [
-                    Claim(field=field, value=value, source="fixture")
-                    for field, value in entity.props.items()
-                ],
-                label=entity.label or entity.key,
-                provenance="authored fixture",
-            )
-
+        seed_fixture(
+            sandbox, fixture,
+            actor="system:world-preview", provenance="authored fixture",
+        )
         records = sandbox.graph.store.objects()
         by_id = {record.id: record for record in records}
         for record in sorted(records, key=lambda r: (r.type, r.label)):
@@ -283,12 +177,14 @@ def materialize(world_id: str, knowledge=None) -> MaterializedWorld | None:
         log.info(
             "World materialized",
             extra={
-                "worldId": world_id, "objects": len(result.objects),
+                "fixtureId": fixture.id, "objects": len(result.objects),
                 "links": len(result.links), "runs": len(result.runs),
             },
         )
     except Exception as exc:  # noqa: BLE001 — a broken fixture is a viewable fact
-        log.exception("Materializing a world failed", extra={"worldId": world_id})
+        log.exception(
+            "Materializing a fixture failed", extra={"fixtureId": fixture.id}
+        )
         result.error = f"{type(exc).__name__}: {exc}"
     return result
 
@@ -362,7 +258,7 @@ def project_live(graph, object_type: str | None = None, limit: int = 400) -> Mat
     ]
     objects, projected_links = _project(records, links, by_id)
     result = MaterializedWorld(
-        world=AuthoredWorld(
+        world=Fixture(
             id="live",
             name=object_type or "The running graph",
             summary=(
@@ -371,9 +267,7 @@ def project_live(graph, object_type: str | None = None, limit: int = 400) -> Mat
                 if object_type else
                 "Every instance the flows have written, as it stands now."
             ),
-            kind="seed-world",
-            declared_in="written by Flows, through Actions",
-            owner="live",
+            derived_from="written by Flows, through Actions",
         ),
         objects=objects,
         links=projected_links,

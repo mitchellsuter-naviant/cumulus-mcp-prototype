@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../models/flow.dart';
+import '../models/run.dart';
 import '../theme/cumulus_theme.dart';
 import 'ui_kit.dart';
 
@@ -41,6 +42,8 @@ String? governedBadge(String type) => switch (type) {
 /// branches to both an Action and a Task and the Task ran, `rule → action` and
 /// `task → action` are both edges between executed steps — but only the second
 /// was traversed. [fromRun] resolves that by walking the journal in order.
+///
+/// Journal ids and node ids are not the same alphabet — see [canvasNode].
 class RunPath {
   final String runId;
   final Map<String, String> statusByStep;
@@ -54,59 +57,55 @@ class RunPath {
 
   static String edgeKey(String from, String to) => '$from>$to';
 
-  bool executed(String stepId) {
-    final status = statusByStep[stepId];
-    return status != null && status != 'skipped';
+  /// A journal holds only the steps that ran, so presence *is* execution.
+  bool executed(String stepId) => statusByStep.containsKey(stepId);
+
+  /// The canvas node a journal entry ran as.
+  ///
+  /// A loop mints one journal step per iteration of a declared step: the AP
+  /// review cycle records `r2_1`, `k2_1`, `c1_1`, then `r2_2` when the
+  /// correction sends it round again, while the definition declares `r2`,
+  /// `k2` and `c1` exactly once. Trimming the round suffix is what lets a
+  /// second pass light up the node it belongs to. A declared id always wins
+  /// outright, so a definition that really does name a step `x_1` is never
+  /// mistaken for a second visit to `x`; a journal step with no node at all
+  /// (the engine runs steps the Tier-2 export does not show) keeps its own id
+  /// and simply matches nothing.
+  static String canvasNode(String journalStepId, Set<String> nodeIds) {
+    if (nodeIds.contains(journalStepId)) return journalStepId;
+    final cut = journalStepId.lastIndexOf('_');
+    if (cut <= 0) return journalStepId;
+    if (int.tryParse(journalStepId.substring(cut + 1)) == null) {
+      return journalStepId;
+    }
+    final base = journalStepId.substring(0, cut);
+    return nodeIds.contains(base) ? base : journalStepId;
   }
 
-  factory RunPath.fromRun(RunDetail run, List<FlowStep> steps) {
+  factory RunPath.fromRun(FlowRun run, List<FlowStep> steps) {
     final byId = {for (final s in steps) s.id: s};
-    final statuses = {for (final e in run.steps) e.stepId: e.status};
-    // The journal is in definition order; consecutive *executed* entries are
-    // the traversal, so an edge is taken when the next executed step is one
-    // this step actually points at.
-    final executed = run.steps
-        .where((e) => e.status != 'skipped' && byId.containsKey(e.stepId))
-        .toList();
+    final nodeIds = byId.keys.toSet();
+    // Journal order is execution order, so the last visit to a looped node is
+    // the one the canvas shows: a gate that suspended on its second round
+    // reads as waiting, not as decided.
+    final visited = [
+      for (final e in run.steps) MapEntry(canvasNode(e.stepId, nodeIds), e.status),
+    ].where((e) => byId.containsKey(e.key)).toList();
+    // Consecutive entries are the traversal, so an edge is taken when the next
+    // step is one this step actually points at.
     final taken = <String>{};
-    for (var i = 0; i < executed.length - 1; i++) {
-      final from = executed[i].stepId;
-      final to = executed[i + 1].stepId;
-      if (byId[from]!.next.contains(to)) {
-        taken.add(edgeKey(from, to));
-      }
+    for (var i = 0; i < visited.length - 1; i++) {
+      final from = visited[i].key;
+      final to = visited[i + 1].key;
+      if (byId[from]!.next.contains(to)) taken.add(edgeKey(from, to));
     }
     return RunPath(
       runId: run.id,
-      statusByStep: statuses,
+      statusByStep: {for (final e in visited) e.key: e.value},
       takenEdges: taken,
     );
   }
 }
-
-/// What one experiment measured, projected onto the graph: for each step, the
-/// pass rate of the assertions it owns under the candidate's producer map.
-class EvalOverlay {
-  /// e.g. "v15-draft vs v14 · dataset v3"
-  final String label;
-  final Map<String, StepStat> statsByStep;
-
-  const EvalOverlay({required this.label, required this.statsByStep});
-
-  factory EvalOverlay.fromRun(TestRun run) => EvalOverlay(
-    label:
-        '${run.candidateVersion} vs ${run.baselineVersion}'
-        ' · dataset v${run.datasetVersion}'
-        '${run.reads == 'live' ? ' · live reads' : ''}',
-    statsByStep: {for (final s in run.stepStats) s.stepId: s},
-  );
-}
-
-Color evalTone(double rate) => rate >= 0.995
-    ? CumulusColors.success
-    : rate >= 0.85
-    ? CumulusColors.warn
-    : CumulusColors.danger;
 
 class _PlacedNode {
   final FlowStep step;
@@ -347,10 +346,6 @@ class FlowCanvas extends StatefulWidget {
   /// fade to ghosts and the traversed edges are drawn in the accent.
   final RunPath? runPath;
 
-  /// When set, each node paints the pass rate of the assertions it owns in
-  /// the selected experiment — the graph as an evaluation heatmap.
-  final EvalOverlay? evalOverlay;
-
   final String? selectedStepId;
   final ValueChanged<FlowStep?> onSelect;
   final VoidCallback? onExportSchema;
@@ -361,7 +356,6 @@ class FlowCanvas extends StatefulWidget {
     required this.onSelect,
     this.diffAgainst = '',
     this.runPath,
-    this.evalOverlay,
     this.selectedStepId,
     this.onExportSchema,
   });
@@ -446,10 +440,6 @@ class _FlowCanvasState extends State<FlowCanvas> {
                         selected: node.step.id == widget.selectedStepId,
                         runStatus: widget.runPath?.statusByStep[node.step.id],
                         inRun: widget.runPath?.executed(node.step.id),
-                        evalMode: widget.evalOverlay != null,
-                        evalStat: widget
-                            .evalOverlay
-                            ?.statsByStep[node.step.id],
                         onTap: () => widget.onSelect(
                           node.step.id == widget.selectedStepId
                               ? null
@@ -469,10 +459,7 @@ class _FlowCanvasState extends State<FlowCanvas> {
           top: 12,
           child: Row(
             children: [
-              // The eval overlay owns the graph's color story while it is
-              // up; showing the diff legend beside it would claim two
-              // meanings for one border.
-              if (widget.diffAgainst.isNotEmpty && widget.evalOverlay == null)
+              if (widget.diffAgainst.isNotEmpty)
                 _FloatingBar(
                   children: [
                     Text(
@@ -503,26 +490,6 @@ class _FlowCanvasState extends State<FlowCanvas> {
                       color: CumulusColors.inkMuted,
                       label: 'not taken',
                     ),
-                  ],
-                ),
-              if (widget.evalOverlay != null)
-                _FloatingBar(
-                  children: [
-                    Text('EVAL', style: CumulusText.statLabel),
-                    const SizedBox(width: 8),
-                    Text(
-                      widget.evalOverlay!.label,
-                      style: CumulusText.mono.copyWith(fontSize: 11.5),
-                    ),
-                    const SizedBox(width: 10),
-                    const _Key(
-                      color: CumulusColors.success,
-                      label: 'all pass',
-                    ),
-                    const SizedBox(width: 8),
-                    const _Key(color: CumulusColors.warn, label: '≥ 85%'),
-                    const SizedBox(width: 8),
-                    const _Key(color: CumulusColors.danger, label: 'failing'),
                   ],
                 ),
             ],
@@ -815,11 +782,6 @@ class _CanvasNode extends StatelessWidget {
   final String? runStatus;
   final bool? inRun;
 
-  /// Eval lens: whether an experiment overlay is active, and this step's
-  /// stat under it (null when the step owns no assertions).
-  final bool evalMode;
-  final StepStat? evalStat;
-
   final VoidCallback onTap;
 
   const _CanvasNode({
@@ -827,8 +789,6 @@ class _CanvasNode extends StatelessWidget {
     required this.selected,
     required this.runStatus,
     required this.inRun,
-    required this.evalMode,
-    required this.evalStat,
     required this.onTap,
   });
 
@@ -844,16 +804,12 @@ class _CanvasNode extends StatelessWidget {
     // position, so the shape of the definition survives, but visibly not part
     // of what happened.
     final excluded = inRun == false;
-    final heat = evalMode && evalStat != null && evalStat!.total > 0
-        ? evalTone(evalStat!.passRate)
-        : null;
 
     final borderColor = selected
         ? CumulusColors.ink
-        : heat ??
-          (runStatus == 'failed'
+        : runStatus == 'failed'
         ? CumulusColors.danger
-        : runStatus == 'waiting'
+        : runStatus == 'suspended'
         ? CumulusColors.accent
         : inRun == true
         ? CumulusColors.accent.withValues(alpha: 0.55)
@@ -867,7 +823,7 @@ class _CanvasNode extends StatelessWidget {
         ? CumulusColors.danger
         : modified
         ? CumulusColors.warn
-        : CumulusColors.border);
+        : CumulusColors.border;
 
     final config = [
       if (step.config['model'] != null) step.config['model']!,
@@ -876,36 +832,26 @@ class _CanvasNode extends StatelessWidget {
       if (step.config['target'] != null) '→ ${step.config['target']}',
     ].join(' · ');
 
-    // In eval mode the note IS the measurement: what this step's assertions
-    // did in the selected experiment, or the honest absence of any.
-    final note = evalMode
-        ? (evalStat != null && evalStat!.total > 0
-              ? '${evalStat!.passed}/${evalStat!.total} assertions pass'
-                    '${evalStat!.failed > 0 ? ' · ${evalStat!.failed} failing' : ''}'
-              : 'owns no assertions')
-        : switch (node.change) {
+    final note = switch (node.change) {
             'added' => 'added in this draft',
             'removed' => 'removed in this draft',
             'modified' => 'changed: ${node.changedFields.join(', ')}',
-            _ => switch (runStatus) {
-              'failed' => 'failed in this run',
-              'waiting' => 'waiting on a human',
-              'skipped' => 'not taken in this run',
-              _ => null,
-            },
-          };
-    final noteColor = evalMode
-        ? (heat ?? CumulusColors.inkMuted)
-        : switch (node.change) {
-            'added' => CumulusColors.success,
-            'removed' => CumulusColors.danger,
-            'modified' => CumulusColors.warn,
-            _ => runStatus == 'failed'
-                ? CumulusColors.danger
-                : runStatus == 'waiting'
-                ? CumulusColors.accent
-                : CumulusColors.inkMuted,
-          };
+      _ => switch (runStatus) {
+        'failed' => 'failed in this run',
+        'suspended' => 'waiting on a human',
+        _ => inRun == false ? 'not taken in this run' : null,
+      },
+    };
+    final noteColor = switch (node.change) {
+      'added' => CumulusColors.success,
+      'removed' => CumulusColors.danger,
+      'modified' => CumulusColors.warn,
+      _ => runStatus == 'failed'
+          ? CumulusColors.danger
+          : runStatus == 'suspended'
+          ? CumulusColors.accent
+          : CumulusColors.inkMuted,
+    };
 
     // A step outside this run is muted, not made transparent. Transparency
     // reads as a rendering fault — half-drawn rather than deliberately off —
@@ -931,17 +877,7 @@ class _CanvasNode extends StatelessWidget {
             ),
             boxShadow: inert
                 ? const []
-                // A step with failing assertions glows in its heat color, so
-                // the eye lands on it before reading any number.
-                : heat != null && evalStat!.failed > 0
-                ? [
-                    BoxShadow(
-                      color: heat.withValues(alpha: 0.25),
-                      blurRadius: 14,
-                      spreadRadius: 1,
-                    ),
-                  ]
-                : added && !evalMode
+                : added
                 ? [
                     BoxShadow(
                       color: CumulusColors.success.withValues(alpha: 0.22),

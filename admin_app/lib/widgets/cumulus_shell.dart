@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../models/session.dart';
 import '../theme/cumulus_theme.dart';
 import 'command_palette.dart';
+import 'ui_kit.dart';
 
 /// One stop on the left rail.
 ///
@@ -76,6 +78,14 @@ class CumulusShell extends StatefulWidget {
   final String? accountLabel;
   final VoidCallback? onSignOut;
 
+  /// The acting persona and the roster behind the switcher, or null while the
+  /// first session request is still in flight.
+  final Session? session;
+
+  /// Acts as another persona. The switcher is only offered when this is
+  /// non-null *and* the session says the operator may switch.
+  final ValueChanged<String>? onSwitchPersona;
+
   /// Opens the API reference from the help menu.
   final VoidCallback? onOpenApiDocs;
 
@@ -99,6 +109,8 @@ class CumulusShell extends StatefulWidget {
     this.searchHint = 'Search, jump to, or ask Cumulus a question…',
     this.accountLabel,
     this.onSignOut,
+    this.session,
+    this.onSwitchPersona,
     this.onOpenApiDocs,
     this.onOpenEmployeeHub,
     this.employeeHubActive = false,
@@ -111,9 +123,19 @@ class CumulusShell extends StatefulWidget {
 
 /// Top bar height, and the offset the palette hangs from. Shared so the panel
 /// stays welded to the bottom edge of the search pill.
-const double _topBarHeight = 66;
-const double _paletteTop = 62;
+const double _topBarHeight = 74;
+const double _paletteTop = 66;
 const double _searchMaxWidth = 680;
+
+/// The two fixed end slots of the top bar. Equal on purpose: the search pill
+/// centres inside what is left over, so unequal ends would drag the console's
+/// command line off the middle of the window.
+const double _endSlot = 344;
+
+/// The persona control is a fixed width rather than sized to its contents,
+/// because a persona with a longer title would otherwise widen the right slot
+/// and shift the search pill every time you switched.
+const double _personaWidth = 250;
 
 class _CumulusShellState extends State<CumulusShell> {
   @override
@@ -186,6 +208,8 @@ class _CumulusShellState extends State<CumulusShell> {
                     hint: widget.searchHint,
                     accountLabel: widget.accountLabel,
                     onSignOut: widget.onSignOut,
+                    session: widget.session,
+                    onSwitchPersona: widget.onSwitchPersona,
                     onOpenApiDocs: widget.onOpenApiDocs,
                     onOpenEmployeeHub: widget.onOpenEmployeeHub,
                     employeeHubActive: widget.employeeHubActive,
@@ -248,6 +272,8 @@ class _TopBar extends StatelessWidget {
   final String hint;
   final String? accountLabel;
   final VoidCallback? onSignOut;
+  final Session? session;
+  final ValueChanged<String>? onSwitchPersona;
   final VoidCallback? onOpenApiDocs;
   final VoidCallback? onOpenEmployeeHub;
   final bool employeeHubActive;
@@ -257,6 +283,8 @@ class _TopBar extends StatelessWidget {
     required this.hint,
     this.accountLabel,
     this.onSignOut,
+    this.session,
+    this.onSwitchPersona,
     this.onOpenApiDocs,
     this.onOpenEmployeeHub,
     this.employeeHubActive = false,
@@ -264,13 +292,25 @@ class _TopBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Impersonation colours the whole bar, not just the control that caused
+    // it. A tinted chip is something you can look past for an hour; a chrome
+    // that has changed colour is not, and the cost of forgetting whose session
+    // you are in is a decision recorded against the wrong person.
+    final acting = session?.impersonating ?? false;
     return Container(
       height: _topBarHeight,
       padding: const EdgeInsets.symmetric(horizontal: 18),
-      color: CumulusColors.canvas,
+      decoration: BoxDecoration(
+        color: acting ? CumulusColors.accentSoft : CumulusColors.canvas,
+        border: acting
+            ? const Border(
+                bottom: BorderSide(color: CumulusColors.accent, width: 2),
+              )
+            : null,
+      ),
       child: Row(
         children: [
-          const SizedBox(width: 220, child: _Wordmark()),
+          const SizedBox(width: _endSlot, child: _Wordmark()),
           Expanded(
             child: Center(
               child: ConstrainedBox(
@@ -280,10 +320,14 @@ class _TopBar extends StatelessWidget {
             ),
           ),
           SizedBox(
-            width: 220,
+            width: _endSlot,
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
+                if (session != null) ...[
+                  _PersonaButton(session: session!, onSwitch: onSwitchPersona),
+                  const SizedBox(width: 10),
+                ],
                 _HelpButton(onOpenApiDocs: onOpenApiDocs),
                 const SizedBox(width: 10),
                 _AccountButton(
@@ -298,6 +342,76 @@ class _TopBar extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+/// Who the console is answering as, and the way to become somebody else.
+///
+/// Deliberately not folded into the account button beside it: the account is
+/// who signed in and the persona is who the server is answering as, and while
+/// impersonation is running those are two different people. One control for
+/// both would be the fastest way to lose that distinction.
+class _PersonaButton extends StatelessWidget {
+  final Session session;
+  final ValueChanged<String>? onSwitch;
+
+  const _PersonaButton({required this.session, this.onSwitch});
+
+  bool get _canSwitch => session.maySwitchPersona && onSwitch != null;
+
+  String get _tooltip {
+    final name = session.displayName;
+    return [
+      session.label == name ? name : '$name · ${session.label}',
+      session.title,
+      if (!session.inWorkforce)
+        'No Employee record behind this persona, so the Hub, the calendar '
+            'and the personal queues are empty by design.',
+    ].join('\n');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_canSwitch) {
+      return Tooltip(
+        message: _tooltip,
+        child: _PersonaFace(session: session, canSwitch: false),
+      );
+    }
+    return PopupMenuButton<String>(
+      tooltip: _tooltip,
+      offset: const Offset(0, 62),
+      constraints: const BoxConstraints(minWidth: 400, maxWidth: 420),
+      onSelected: onSwitch,
+      itemBuilder: (context) => _items(),
+      child: _PersonaFace(session: session, canSwitch: true),
+    );
+  }
+
+  List<PopupMenuEntry<String>> _items() {
+    final entries = <PopupMenuEntry<String>>[];
+    for (final group in session.groups) {
+      if (entries.isNotEmpty) entries.add(const PopupMenuDivider());
+      entries.add(
+        PopupMenuItem<String>(
+          enabled: false,
+          height: 34,
+          child: Text(group.label.toUpperCase(), style: CumulusText.statLabel),
+        ),
+      );
+      for (final option in group.personas) {
+        entries.add(
+          PopupMenuItem<String>(
+            value: option.id,
+            child: _PersonaEntry(
+              option: option,
+              selected: option.id == session.personaId,
+            ),
+          ),
+        );
+      }
+    }
+    return entries;
   }
 }
 
@@ -497,6 +611,172 @@ class _KeyHint extends StatelessWidget {
           fontWeight: FontWeight.w600,
           color: CumulusColors.inkMuted,
         ),
+      ),
+    );
+  }
+}
+
+/// The persona as it reads in the bar: role above, person, title below —
+/// the same eyebrow/title/subtitle rhythm every page heading uses.
+///
+/// While an impersonation is running the eyebrow spends itself on the operator
+/// instead of the role — "MITCHELL SUTER · ACTING AS" over "Kim Reyes" — so
+/// the bar answers *whose session is this* with two names rather than one and
+/// an inference. The role is worth the line the rest of the time, except when
+/// it is the person's own name, which is how the customer-user personas are
+/// named on the server: "TOMAS BERG" above "Tomas Berg" says nothing.
+class _PersonaFace extends StatelessWidget {
+  final Session session;
+  final bool canSwitch;
+
+  const _PersonaFace({required this.session, required this.canSwitch});
+
+  String get _role =>
+      session.label == session.displayName ? '' : session.label;
+
+  String get _eyebrow {
+    if (!session.impersonating) return _role.toUpperCase();
+    // An operator who is not on the roster cannot be named, so the eyebrow
+    // falls back to saying only that this is an impersonation.
+    final operator = session.operator;
+    final parts = operator != null
+        ? [operator.displayName, 'Acting as']
+        : ['Acting as', if (_role.isNotEmpty) _role];
+    return parts.join(' · ').toUpperCase();
+  }
+
+  /// The title, plus the reason a persona's personal surfaces will be empty.
+  /// Naviant Support is not in the customer's org chart, and a hub with
+  /// nothing in it should read as correct rather than as a failed request.
+  String get _subtitle => session.inWorkforce
+      ? session.title
+      : '${session.title} · no employee record';
+
+  @override
+  Widget build(BuildContext context) {
+    final acting = session.impersonating;
+    final eyebrow = _eyebrow;
+    return Container(
+      width: _personaWidth,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+      decoration: BoxDecoration(
+        color: CumulusColors.surface,
+        borderRadius: BorderRadius.circular(CumulusRadius.control),
+        border: Border.all(
+          color: acting ? CumulusColors.accent : CumulusColors.border,
+          width: acting ? 1.5 : 1,
+        ),
+        boxShadow: CumulusShadows.card,
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (eyebrow.isNotEmpty)
+                  Text(
+                    eyebrow,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: CumulusText.statLabel.copyWith(
+                      fontSize: 10,
+                      height: 1.3,
+                      color: acting
+                          ? CumulusColors.accentInk
+                          : CumulusColors.inkMuted,
+                    ),
+                  ),
+                Text(
+                  session.displayName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: CumulusText.rowTitle.copyWith(
+                    fontSize: 13,
+                    height: 1.25,
+                  ),
+                ),
+                Text(
+                  _subtitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: CumulusText.sectionSubtitle.copyWith(
+                    fontSize: 11,
+                    height: 1.25,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (canSwitch)
+            const Padding(
+              padding: EdgeInsets.only(left: 6),
+              child: Icon(
+                Icons.unfold_more,
+                size: 16,
+                color: CumulusColors.inkMuted,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// One persona in the switcher. The blurb is the row's reason to exist: the
+/// roster is a set of test subjects, and "owns no queue at all" is the only
+/// thing that tells you which one answers the question you are asking.
+class _PersonaEntry extends StatelessWidget {
+  final PersonaOption option;
+  final bool selected;
+
+  const _PersonaEntry({required this.option, required this.selected});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 22,
+            child: selected
+                ? const Icon(
+                    Icons.check,
+                    size: 15,
+                    color: CumulusColors.accent,
+                  )
+                : null,
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        option.displayName,
+                        overflow: TextOverflow.ellipsis,
+                        style: CumulusText.rowTitle.copyWith(fontSize: 13),
+                      ),
+                    ),
+                    if (option.label != option.displayName) ...[
+                      const SizedBox(width: 8),
+                      StatusBadge(option.label, dense: true),
+                    ],
+                  ],
+                ),
+                Text(option.title, style: CumulusText.sectionSubtitle),
+                const SizedBox(height: 5),
+                Text(option.blurb, style: CumulusText.meta),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

@@ -939,35 +939,6 @@ const flowsGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/flows/{id}/runs',
-      summary: 'Recent runs, newest first.',
-      auth: ApiAuth.reader,
-      params: [
-        ApiParam('limit', 'int', where: 'query', defaultValue: '25'),
-      ],
-    ),
-    Endpoint(
-      method: 'GET',
-      path: '/api/v1/flows/{id}/runs/{run_id}',
-      summary: 'One run\'s full journal: steps, ModelCalls, decisions.',
-      auth: ApiAuth.reader,
-      notes:
-          'Every ModelCall records model, tokens and cost; Task entries name '
-          'the decider; Action entries carry their ledger reference.',
-      errors: [ApiError(404, 'Run not found (journals are kept 45 days).')],
-    ),
-    Endpoint(
-      method: 'GET',
-      path: '/api/v1/flows/{id}/audit',
-      summary: 'The ledger view: decisions, gateway commits, resolutions, '
-          'knowledge changes.',
-      auth: ApiAuth.reader,
-      params: [
-        ApiParam('limit', 'int', where: 'query', defaultValue: '40'),
-      ],
-    ),
-    Endpoint(
-      method: 'GET',
       path: '/api/v1/flows/{id}/versions',
       summary: 'Published history plus any open draft, newest first.',
       auth: ApiAuth.reader,
@@ -1056,108 +1027,6 @@ const flowsGroup = EndpointGroup(
         ApiError(409, 'The insight is advisory; there is no mechanical change to apply.'),
       ],
     ),
-    Endpoint(
-      method: 'GET',
-      path: '/api/v1/flows/{id}/golden-set',
-      summary: 'The golden set, plus where its seeded half came from.',
-      auth: ApiAuth.reader,
-      notes:
-          'FDEs author golden cases in code as well as in the console, so the '
-          'set names the repository file it was seeded from rather than '
-          'implying the UI is the only source.',
-      responseExample: '''{
-  "flow_id": "invoice-intake",
-  "synced_from": "server/tests/golden/invoice-intake.json",
-  "synced_at": "2026-08-25T07:12:00Z",
-  "cases": [
-    {"id": "gc-001", "name": "Standard invoice · single PO",
-     "expected": "amount \$2,340 · automatic path",
-     "source": "correction-set", "run_id": "", "payload": ""}
-  ]
-}''',
-    ),
-    Endpoint(
-      method: 'POST',
-      path: '/api/v1/flows/{id}/golden-set',
-      status: 201,
-      summary: 'Add a golden case; returns the updated set.',
-      auth: ApiAuth.humanAdmin,
-      notes:
-          'Passing `run_id` promotes a real execution: the server tags the '
-          'case `promoted-from-run` and keeps the pointer back to that run, '
-          'so a future failure on it is traceable to the execution it came '
-          'from. This is the flywheel in miniature.',
-      params: [
-        ApiParam('name', 'string', required: true),
-        ApiParam('expected', 'string',
-            description: 'What a passing run must produce.'),
-        ApiParam('input_ref', 'string',
-            description: 'The pinned input document or fixture.'),
-        ApiParam('source', 'string', defaultValue: 'human-authored',
-            description:
-                '`correction-set`, `human-authored`, or '
-                '`promoted-from-run`.'),
-        ApiParam('run_id', 'string',
-            description: 'The run being promoted, if any.'),
-        ApiParam('payload', 'string',
-            description:
-                'A JSON fixture, stored verbatim — re-serializing it would '
-                'quietly change what is under test.'),
-      ],
-    ),
-    Endpoint(
-      method: 'DELETE',
-      path: '/api/v1/flows/{id}/golden-set/{case_id}',
-      summary: 'Remove a golden case; returns the updated set.',
-      auth: ApiAuth.humanAdmin,
-      errors: [ApiError(404, 'Golden case not found.')],
-    ),
-    Endpoint(
-      method: 'GET',
-      path: '/api/v1/flows/{id}/test-runs',
-      summary: 'Past and in-flight test runs, newest first.',
-      auth: ApiAuth.reader,
-    ),
-    Endpoint(
-      method: 'POST',
-      path: '/api/v1/flows/{id}/test-runs',
-      status: 202,
-      summary: 'Launch a golden-set evaluation. Writes suppressed.',
-      auth: ApiAuth.admin,
-      notes:
-          'Every case is graded against BOTH the candidate and the baseline, '
-          'so the comparison is like-for-like rather than candidate-versus-'
-          'remembered-numbers, and `regressions` counts cases the baseline '
-          'passed and the candidate did not. Executes case-by-case in the '
-          'background — poll the returned run for progress. Admin but not '
-          'human-gated: launching an eval from CI with a minted key is a '
-          'legitimate machine act. No Action reaches the gateway from a test.',
-      params: [
-        ApiParam('candidate_version', 'string',
-            description: 'Defaults to the open draft.'),
-        ApiParam('baseline_version', 'string',
-            description: 'Defaults to the active version.'),
-      ],
-      responseExample: '''{
-  "id": "test_9f21c4a0bd", "candidate_version": "v15-draft",
-  "baseline_version": "v14", "status": "completed",
-  "total_cases": 8, "passed": 7, "baseline_passed": 7,
-  "cost_usd": 0.71, "baseline_cost_usd": 1.42,
-  "cost_delta_usd": -0.71, "latency_delta_ms": -310,
-  "regressions": 0, "writes_suppressed": true,
-  "results": [{"case_id": "gc-001", "passed": true,
-               "baseline_passed": true, "cost_usd": 0.09,
-               "baseline_cost_usd": 0.18}]
-}''',
-      errors: [ApiError(409, 'No golden set: add cases first.')],
-    ),
-    Endpoint(
-      method: 'GET',
-      path: '/api/v1/flows/{id}/test-runs/{test_id}',
-      summary: 'One test run with per-case verdicts.',
-      auth: ApiAuth.reader,
-      errors: [ApiError(404, 'Test run not found.')],
-    ),
   ],
 );
 
@@ -1178,7 +1047,7 @@ const reimbursementsGroup = EndpointGroup(
       summary: 'Submit a receipt — one live run of the flow.',
       auth: ApiAuth('user+', keysRefused: true),
       notes:
-          'With RECEIPT_BACKEND=vertex the image is read by a multimodal '
+          'With MODEL_BACKEND=vertex the image is read by a multimodal '
           'ModelCall; locally a deterministic stub honors hints like '
           '`total=64.20 category=meals vendor=corner-bistro` (and the word '
           '`blurry` drops confidence) so the pipeline is drivable without a '
@@ -1349,7 +1218,7 @@ const employeeGroup = EndpointGroup(
       summary: 'Ask the HR Agent — grounded on people/ knowledge, cited.',
       auth: ApiAuth.reader,
       notes:
-          'With ANSWER_BACKEND=vertex the agent plans with tools over the '
+          'With MODEL_BACKEND=vertex the agent plans with tools over the '
           'knowledge layer; locally it degrades to retrieval plus the '
           'caller\'s structured facts, honestly labelled '
           '`"backend": "retrieval"`. Citations name real asset ids.',

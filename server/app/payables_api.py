@@ -3,9 +3,12 @@
 Submitting is the trigger of the accounts-payable flow: the invoice runs
 synchronously through one extraction pass → vendor resolution → the three-way
 match → the anomaly screen → the governed posting rule, and lands as a row. Submission is a human act (a person is entering a
-vendor's invoice), so minted API keys are refused; reads are any
-authenticated role — the table is a data-role dataset the whole console
-may see.
+vendor's invoice), so minted API keys are refused.
+
+Reads are any authenticated role, narrowed to what the reader is accountable
+for: a clerk bound to the AP queue works the whole table, and somebody who
+merely entered an invoice sees the ones they entered. The table used to hand
+every vendor, amount and posting decision in the tenant to anyone signed in.
 """
 
 import logging
@@ -13,7 +16,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from .auth import Principal, get_principal, require_reader
+from .auth import Principal, get_principal, require_human, require_reader
 
 # Resolved through the module (deps.get_payable_service()) rather than a
 # from-import, so the singleton installed at wiring/test time is the one
@@ -38,29 +41,24 @@ class PayableSubmit(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
-def _require_human(principal: Principal) -> None:
-    if principal.key_id is not None:
-        raise HTTPException(
-            status_code=403,
-            detail="API keys cannot submit invoices; sign in as yourself.",
-        )
-
-
 @router.get("", response_model=list[InvoiceRecord])
 def list_payables(
     state: PayableState | None = Query(default=None),
     principal: Principal = Depends(get_principal),
 ) -> list[InvoiceRecord]:
+    """The invoices this reader is accountable for — see `visible_to`."""
     require_reader(principal)
-    return get_service().list(state=state)
+    return get_service().list(state=state, principal=principal)
 
 
 @router.get("/stats", response_model=PayableStats)
 def payable_stats(
     principal: Principal = Depends(get_principal),
 ) -> PayableStats:
+    """Counts over the same slice `list_payables` returns, so the strip and the
+    table under it can never disagree."""
     require_reader(principal)
-    return get_service().stats()
+    return get_service().stats(principal=principal)
 
 
 @router.get("/{record_id}", response_model=InvoiceRecord)
@@ -68,8 +66,11 @@ def get_payable(
     record_id: str, principal: Principal = Depends(get_principal)
 ) -> InvoiceRecord:
     require_reader(principal)
-    record = get_service().get(record_id)
-    if record is None:
+    service = get_service()
+    record = service.get(record_id)
+    # A row outside your slice answers 404, not 403. A 403 would confirm the id
+    # exists, which is the one bit an unauthorized caller should not get back.
+    if record is None or not service.visible_to(principal)(record):
         raise HTTPException(
             status_code=404, detail=f"Invoice not found: {record_id}"
         )
@@ -82,9 +83,9 @@ def submit_payable(
     principal: Principal = Depends(get_principal),
 ) -> InvoiceRecord:
     require_reader(principal)
-    _require_human(principal)
+    require_human(principal, "submit invoices; sign in as yourself")
     record = get_service().submit(
-        submitted_by=principal.uid,
+        submitted_by=principal.email,
         image_b64=body.image_base64,
         filename=body.filename,
         hint=body.note,

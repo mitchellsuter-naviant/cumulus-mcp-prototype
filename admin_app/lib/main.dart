@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'firebase_options.dart';
 import 'screens/home_shell.dart';
 import 'screens/login_screen.dart';
+import 'services/api_client.dart';
 import 'services/auth_service.dart';
 import 'theme/cumulus_theme.dart';
 
@@ -52,8 +53,14 @@ class AuthGate extends StatelessWidget {
   Widget build(BuildContext context) {
     return ValueListenableBuilder<bool>(
       valueListenable: AuthService.instance.signedIn,
-      builder: (context, signedIn, _) =>
-          signedIn ? const HomeShell() : const LoginScreen(),
+      builder: (context, signedIn, _) {
+        // A persona belongs to a session, not to the browser. Dropping it on
+        // sign-out is what stops the next person who signs in from silently
+        // inheriting the last impersonation; the shell then loads a session of
+        // its own and the switcher starts from whoever they really are.
+        if (!signedIn) ApiClient.persona = null;
+        return signedIn ? const HomeShell() : const LoginScreen();
+      },
     );
   }
 }

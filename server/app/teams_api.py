@@ -17,6 +17,7 @@ from typing import Literal
 from .auth import (
     Principal,
     get_principal,
+    require_human,
     is_team_admin,
     require_reader,
     require_role,
@@ -81,18 +82,6 @@ class TeamPublic(BaseModel):
     # offer without replaying the permission rules itself.
     my_team_role: str | None = None
     can_administer: bool = False
-
-
-def _require_human(principal: Principal) -> None:
-    """A key may not reshape the team graph its own authority derives from."""
-    if principal.key_id is not None:
-        log.warning(
-            "API key attempted team management", extra={"keyId": principal.key_id}
-        )
-        raise HTTPException(
-            status_code=403,
-            detail="API keys cannot manage teams; sign in as an admin.",
-        )
 
 
 def _may_see_roster(principal: Principal, team: Team) -> bool:
@@ -191,7 +180,7 @@ def create_team(
     # Creating a team creates a container of authority, so it stays a platform
     # action even though everything inside the team is self-served.
     require_role(principal, "admin")
-    _require_human(principal)
+    require_human(principal, "manage teams; sign in as an admin")
     try:
         team = get_team_service().create(
             slug=payload.slug,
@@ -236,7 +225,7 @@ def team_assets(
 def update_team(
     slug: str, payload: TeamUpdate, principal: Principal = Depends(get_principal)
 ) -> TeamPublic:
-    _require_human(principal)
+    require_human(principal, "manage teams; sign in as an admin")
     require_team_admin(principal, slug)
     try:
         team = get_team_service().update_details(
@@ -251,7 +240,7 @@ def update_team(
 @router.delete("/{slug}", status_code=204)
 def delete_team(slug: str, principal: Principal = Depends(get_principal)) -> None:
     require_role(principal, "admin")
-    _require_human(principal)
+    require_human(principal, "manage teams; sign in as an admin")
     owned = _asset_count(slug)
     if owned:
         # Deleting the owner would silently orphan documents. Make the caller
@@ -284,7 +273,7 @@ def set_member(
     remain a platform-admin action — that separation is what keeps team admin
     from being a path to platform admin.
     """
-    _require_human(principal)
+    require_human(principal, "manage teams; sign in as an admin")
     require_team_admin(principal, slug)
     service = get_team_service()
     if service.get(slug) is None:
@@ -350,7 +339,7 @@ def set_member(
 def remove_member(
     slug: str, identity_uid: str, principal: Principal = Depends(get_principal)
 ) -> TeamPublic:
-    _require_human(principal)
+    require_human(principal, "manage teams; sign in as an admin")
     require_team_admin(principal, slug)
     service = get_team_service()
     team = service.get(slug)

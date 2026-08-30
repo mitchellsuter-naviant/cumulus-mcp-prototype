@@ -25,8 +25,10 @@ from pydantic import BaseModel, Field
 from . import deps
 from .auth import Principal, get_principal, require_reader
 from .graph import Claim, ObjectRecord, TBoxViolation, normalize_key, object_id
+from .evals import FIXTURE_PAYLOAD
 from .models import utcnow
 from .ontology import ONTOLOGY
+from .worlds import MaterializedWorld, project_live
 
 log = logging.getLogger("cumulus.graph.api")
 
@@ -185,9 +187,38 @@ def _summary(record: ObjectRecord) -> ObjectSummary:
     )
 
 
+def require_graph_reader(principal: Principal) -> Principal:
+    """Gate the routes that return *individuals*, not just the model.
+
+    `/graph/objects`, `/links`, `/instances`, `/search` and `/vendors` all
+    answer the same questions as `/graph/employees/{email}/expenses` — one
+    unfiltered call returns every colleague's expense rows with their amounts.
+    Guarding that one route while its four neighbours stayed open bought
+    nothing, so the gate belongs on the surface.
+
+    The model itself (`/ontology`, `/invariants`) stays open: a TBox names
+    types and links and no individuals, and reading it discloses nothing about
+    a person.
+
+    So does `/vendors`. The distinction that matters is not graph-versus-not —
+    it is whose facts these are. A vendor master is company data and an AP
+    clerk cannot work the queue without it; an expense row belongs to the
+    person who submitted it. Gating the clerk out of the vendor master would
+    be this guard doing harm rather than work.
+    """
+    require_reader(principal)
+    if not principal.reads_beyond_self:
+        raise HTTPException(
+            status_code=403,
+            detail="Browsing the graph is a governance surface; "
+                   "this persona reads only its own work.",
+        )
+    return principal
+
+
 @router.get("/stats")
 def graph_stats(principal: Principal = Depends(get_principal)) -> dict:
-    require_reader(principal)
+    require_graph_reader(principal)
     return deps.get_graph_service().stats()
 
 
@@ -279,20 +310,24 @@ def ontology(principal: Principal = Depends(get_principal)) -> OntologyView:
     )
 
 
-@router.get("/instances")
+@router.get(
+    "/instances",
+    response_model=MaterializedWorld,
+    response_model_exclude={"world": FIXTURE_PAYLOAD},
+)
 def instances(
     type: str | None = Query(default=None),
     limit: int = Query(default=400, ge=1, le=2000),
     principal: Principal = Depends(get_principal),
-):
-    """The live ABox in the same shape an authored fragment comes back in.
+) -> MaterializedWorld:
+    """The live ABox in the same shape a declared world comes back in.
 
-    One renderer for both, so the running graph and a declared fixture are
-    peers in the console rather than two views that merely resemble each other.
+    One renderer for both, so the running graph and a Fixture are peers in the
+    console rather than two views that merely resemble each other. The fixture
+    standing for the live graph declares nothing — nobody authored it — and
+    carries only the name the view puts on it.
     """
-    require_reader(principal)
-    from .worlds import project_live
-
+    require_graph_reader(principal)
     return project_live(deps.get_graph_service(), type, limit)
 
 
@@ -308,7 +343,7 @@ def search_entities(
     SourceRecord, the canonical entity it `identified_as` is surfaced too,
     so an external system's id resolves to the thing it means here.
     """
-    require_reader(principal)
+    require_graph_reader(principal)
     graph = deps.get_graph_service()
     raw = q.strip().lower()
     needle = normalize_key(q)
@@ -387,7 +422,7 @@ def list_links(
     liveness and the run that wrote it, per pair, instead of a dashed line
     on a diagram.
     """
-    require_reader(principal)
+    require_graph_reader(principal)
     graph = deps.get_graph_service()
     rows: list[LinkRow] = []
     for link in graph.store.links():
@@ -425,7 +460,7 @@ def list_objects(
     limit: int = Query(default=100, ge=1, le=500),
     principal: Principal = Depends(get_principal),
 ) -> list[ObjectSummary]:
-    require_reader(principal)
+    require_graph_reader(principal)
     records = deps.get_graph_service().find(type)
     if q:
         needle = normalize_key(q)
@@ -442,7 +477,7 @@ def get_object(
     link_type: str | None = Query(default=None),
     principal: Principal = Depends(get_principal),
 ) -> ObjectDetail:
-    require_reader(principal)
+    require_graph_reader(principal)
     graph = deps.get_graph_service()
     record = graph.get(object_ref)
     if record is None:
@@ -523,8 +558,19 @@ def employee_expenses(
     Two hops and a sum. Worth noticing what this is *not*: retrieval. No
     document contains this number, so no amount of search would find it — the
     answer lives in the edges, which is the argument for having them.
+
+    Naming the employee in the path is what makes it a traversal, and what
+    made it readable by anyone who could guess a colleague's address. An
+    own-scoped persona may walk from itself and no other root.
     """
     require_reader(principal)
+    if not principal.reads_beyond_self and normalize_key(email) != normalize_key(
+        principal.email
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="This persona may only read its own expenses.",
+        )
     graph = deps.get_graph_service()
     rollup = ExpenseRollup(
         employee=email, window_days=days,

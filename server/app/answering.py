@@ -846,7 +846,7 @@ def build_answer_backend(
             max_steps=max_steps,
             max_output_tokens=max_output_tokens,
         )
-    raise ValueError(f"Unknown ANSWER_BACKEND: {backend}")
+    raise ValueError(f"Unknown MODEL_BACKEND: {backend}")
 
 
 # ---- The service ------------------------------------------------------------
@@ -868,7 +868,7 @@ class AnswerService:
     def status(self) -> dict:
         return {
             "mode": self._backend.name if self._backend else "retrieval",
-            "model": settings.answer_model if self._backend else None,
+            "model": settings.model if self._backend else None,
         }
 
     def ask(

@@ -150,7 +150,7 @@ class _FlowsSectionState extends State<FlowsSection> {
               'Every Flow in the enterprise — the authored logic that does '
               'the work, governed, costed, and auditable.',
           pills: [
-            MetaPill('${stats.definitions} definitions'),
+            MetaPill('${stats.flows} flows'),
             if (stats.attention.isNotEmpty)
               MetaPill(
                 '${stats.attention.length} need attention',
@@ -165,12 +165,17 @@ class _FlowsSectionState extends State<FlowsSection> {
         ),
         StatStrip(
           tiles: [
+            // The fleet is every flow that runs. Five of them are sync feeds
+            // with no declarative export, and counting only the two that have
+            // one told the reader the enterprise had two flows when seven were
+            // writing the graph.
             StatTile(
-              label: 'Definitions',
-              value: '${stats.definitions}',
-              caption:
-                  '${stats.active} active · ${stats.draft} draft · '
-                  '${stats.paused} paused',
+              label: 'Flows',
+              value: '${stats.flows}',
+              caption: stats.withoutDefinition > 0
+                  ? '${stats.definitions} declared · '
+                        '${stats.withoutDefinition} without an export'
+                  : '${stats.active} active · ${stats.draft} draft',
             ),
             StatTile(
               label: 'Runs · 30d',
@@ -180,13 +185,18 @@ class _FlowsSectionState extends State<FlowsSection> {
             StatTile(
               label: 'Model spend · 30d',
               value: money(stats.modelSpendUsd),
-              caption:
-                  'from ${compactCount(stats.modelCalls)} audited ModelCalls',
+              // A spend of zero means two things. `unrecorded` is the one
+              // that is true here: the calls happened and nothing priced them.
+              caption: stats.costBasis == 'unrecorded'
+                  ? '${compactCount(stats.modelCalls)} calls, none priced'
+                  : '${compactCount(stats.pricedModelCalls)} of '
+                        '${compactCount(stats.modelCalls)} calls priced',
             ),
             StatTile(
               label: 'Hours returned · 30d',
               value: '${stats.hoursReturned.round()}h',
-              caption: '≈${money(stats.roiUsd)} at loaded cost',
+              caption: '≈${money(stats.roiUsd)} · an assumption, not a '
+                  'measurement',
               valueColor: CumulusColors.success,
             ),
             StatTile(
@@ -255,7 +265,7 @@ class _FlowsSectionState extends State<FlowsSection> {
         if (stats.attention.isNotEmpty)
           SectionCard(
             title: 'Needs attention',
-            subtitle: 'below the success bar, or missing its golden set',
+            subtitle: 'below the success bar, or with no eval cases',
             borderColor: CumulusColors.warn.withValues(alpha: 0.4),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

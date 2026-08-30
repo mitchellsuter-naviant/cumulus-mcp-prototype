@@ -15,7 +15,8 @@ import 'team_detail_screen.dart';
 const _roles = ['owner', 'admin', 'user'];
 
 const _roleBlurbs = {
-  'owner': 'Full control, including other owners and admin-scoped keys. '
+  'owner':
+      'Full control, including other owners and admin-scoped keys. '
       'Cannot hold an API key.',
   'admin': 'Authors and publishes knowledge; manages plain users.',
   'user': 'Reads the governed corpus.',
@@ -267,9 +268,7 @@ class _IdentitiesSectionState extends State<IdentitiesSection> {
                       // later, so derive it until the user takes it over.
                       onChanged: (v) {
                         if (slugEdited) return;
-                        setDialogState(
-                          () => slugController.text = _slugify(v),
-                        );
+                        setDialogState(() => slugController.text = _slugify(v));
                       },
                       validator: (v) => (v == null || v.trim().isEmpty)
                           ? 'Give the team a name'
@@ -693,9 +692,7 @@ class _IdentitiesSectionState extends State<IdentitiesSection> {
         myRole: _myRole,
         isMe: detail.uid == AuthService.instance.uid,
         onClose: _closeDetail,
-        onChangeRole: manageable
-            ? (role) => _changeRole(detail, role)
-            : null,
+        onChangeRole: manageable ? (role) => _changeRole(detail, role) : null,
         onDelete: manageable ? () => _deleteFromDetail(detail) : null,
         assignableRoles: manageable ? _assignableRoles(detail) : const [],
         teams: _teamsFor(detail.uid),
@@ -713,7 +710,7 @@ class _IdentitiesSectionState extends State<IdentitiesSection> {
               'reaches through. Open an identity to mint, inspect, or revoke '
               'its credentials.',
           pills: [
-            MetaPill('${_identities.length} total'),
+            MetaPill('${_identities.length} identity(s)'),
             MetaPill('you are $_myRole', tone: toneForRole(_myRole)),
           ],
           trailing: Row(
@@ -740,14 +737,10 @@ class _IdentitiesSectionState extends State<IdentitiesSection> {
                   label: const Text('New agent'),
                 ),
               ],
-              if (_isPlatformAdmin) ...[
-                const SizedBox(width: 10),
-                FilledButton.icon(
-                  onPressed: _createTeamDialog,
-                  icon: const Icon(Icons.groups_outlined, size: 17),
-                  label: const Text('New team'),
-                ),
-              ],
+              // "New team" lives on the Teams card, beside the list it adds
+              // to, rather than a fourth button up here competing with three
+              // others for a reader who has not decided what they are doing
+              // yet.
             ],
           ),
         ),
@@ -890,7 +883,9 @@ class _IdentitiesSectionState extends State<IdentitiesSection> {
       ),
       title: Row(
         children: [
-          Flexible(child: Text(identity.label, overflow: TextOverflow.ellipsis)),
+          Flexible(
+            child: Text(identity.label, overflow: TextOverflow.ellipsis),
+          ),
           if (!identity.isPerson) ...[
             const SizedBox(width: 8),
             StatusBadge(

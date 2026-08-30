@@ -116,29 +116,50 @@ class TrajectoryRule {
   );
 }
 
-class EvalCheckpoint {
+/// A point the flow *reaches*, resolved from the run journal at grading time.
+///
+/// It used to name a literal step id, which meant renaming `z1` failed every
+/// case that mentioned it. An anchor names the point by what the flow does
+/// instead — "the last step of kind `resolve`", "the step that writes
+/// `graph:Invoice/`" — so splitting, adding, renaming or reordering a
+/// ModelCall moves nothing.
+class EvalMilestone {
   final String id;
 
-  /// A step id, or `final`. Evaluating mid-run is what lets a spec assert an
-  /// *ordering* — "the vendor is settled before anything is extracted".
-  final String afterStep;
+  /// `last_of_kind` · `first_of_kind` · `wrote` · `terminal`.
+  final String anchor;
+
+  /// A step kind for the `*_of_kind` anchors, a ref prefix for `wrote`, and
+  /// empty for `terminal`.
+  final String selector;
   final String label;
   final List<ObjectRule> objects;
   final List<TrajectoryRule> trajectory;
   final String note;
 
-  const EvalCheckpoint({
+  const EvalMilestone({
     required this.id,
-    required this.afterStep,
+    required this.anchor,
+    required this.selector,
     required this.label,
     required this.objects,
     required this.trajectory,
     required this.note,
   });
 
-  factory EvalCheckpoint.fromJson(Map<String, dynamic> json) => EvalCheckpoint(
+  /// How the anchor reads on screen, in the words the spec publishes.
+  String get anchorLabel => switch (anchor) {
+    'last_of_kind' => 'the last step of kind `$selector`',
+    'first_of_kind' => 'the first step of kind `$selector`',
+    'wrote' => 'the step that writes `$selector`',
+    'terminal' => 'however the run ended',
+    _ => anchor,
+  };
+
+  factory EvalMilestone.fromJson(Map<String, dynamic> json) => EvalMilestone(
     id: json['id'] as String? ?? '',
-    afterStep: json['after_step'] as String? ?? 'final',
+    anchor: json['anchor'] as String? ?? '',
+    selector: json['selector'] as String? ?? '',
     label: json['label'] as String? ?? '',
     objects: (json['objects'] as List<dynamic>? ?? const [])
         .map((e) => ObjectRule.fromJson(e as Map<String, dynamic>))
@@ -156,7 +177,7 @@ class EvalSpec {
   final int version;
   final String summary;
   final List<String> ignoreFields;
-  final List<EvalCheckpoint> checkpoints;
+  final List<EvalMilestone> milestones;
 
   const EvalSpec({
     required this.id,
@@ -164,7 +185,7 @@ class EvalSpec {
     required this.version,
     required this.summary,
     required this.ignoreFields,
-    required this.checkpoints,
+    required this.milestones,
   });
 
   factory EvalSpec.fromJson(Map<String, dynamic> json) => EvalSpec(
@@ -175,8 +196,8 @@ class EvalSpec {
     ignoreFields: (json['ignore_fields'] as List<dynamic>? ?? const [])
         .map((e) => '$e')
         .toList(),
-    checkpoints: (json['checkpoints'] as List<dynamic>? ?? const [])
-        .map((e) => EvalCheckpoint.fromJson(e as Map<String, dynamic>))
+    milestones: (json['milestones'] as List<dynamic>? ?? const [])
+        .map((e) => EvalMilestone.fromJson(e as Map<String, dynamic>))
         .toList(),
   );
 }
@@ -186,7 +207,7 @@ class EvalSpecSummary {
   final String flowId;
   final int version;
   final String summary;
-  final int checkpoints;
+  final int milestones;
   final int cases;
   final int gradedFields;
   final int ignoredFields;
@@ -198,7 +219,7 @@ class EvalSpecSummary {
     required this.flowId,
     required this.version,
     required this.summary,
-    required this.checkpoints,
+    required this.milestones,
     required this.cases,
     required this.gradedFields,
     required this.ignoredFields,
@@ -212,7 +233,7 @@ class EvalSpecSummary {
         flowId: json['flow_id'] as String? ?? '',
         version: json['version'] as int? ?? 1,
         summary: json['summary'] as String? ?? '',
-        checkpoints: json['checkpoints'] as int? ?? 0,
+        milestones: json['milestones'] as int? ?? 0,
         cases: json['cases'] as int? ?? 0,
         gradedFields: json['graded_fields'] as int? ?? 0,
         ignoredFields: json['ignored_fields'] as int? ?? 0,
@@ -225,19 +246,24 @@ class EvalCase {
   final String id;
   final String name;
   final String summary;
+
+  /// The world this case runs in, by name. Shared, so re-authoring the world
+  /// leaves every case that names it alone.
+  final String fixtureId;
   final int deliveries;
   final int fixtureObjects;
   final int decisions;
-  final List<String> checkpoints;
+  final List<String> milestones;
 
   const EvalCase({
     required this.id,
     required this.name,
     required this.summary,
+    required this.fixtureId,
     required this.deliveries,
     required this.fixtureObjects,
     required this.decisions,
-    required this.checkpoints,
+    required this.milestones,
   });
 
   factory EvalCase.fromJson(Map<String, dynamic> json) {
@@ -246,18 +272,19 @@ class EvalCase {
       id: json['id'] as String? ?? '',
       name: json['name'] as String? ?? '',
       summary: json['summary'] as String? ?? '',
+      fixtureId: json['fixture_id'] as String? ?? '',
       deliveries: (fixture['deliveries'] as List<dynamic>? ?? const []).length,
       fixtureObjects: (fixture['objects'] as List<dynamic>? ?? const []).length,
       decisions: (json['decisions'] as List<dynamic>? ?? const []).length,
-      checkpoints: (json['expectations'] as List<dynamic>? ?? const [])
-          .map((e) => '${(e as Map<String, dynamic>)['checkpoint']}')
+      milestones: (json['expectations'] as List<dynamic>? ?? const [])
+          .map((e) => '${(e as Map<String, dynamic>)['milestone']}')
           .toList(),
     );
   }
 }
 
 class EvalAssertion {
-  final String checkpoint;
+  final String milestone;
   final String target;
   final String field;
   final String rule;
@@ -267,7 +294,7 @@ class EvalAssertion {
   final String detail;
 
   const EvalAssertion({
-    required this.checkpoint,
+    required this.milestone,
     required this.target,
     required this.field,
     required this.rule,
@@ -278,7 +305,7 @@ class EvalAssertion {
   });
 
   factory EvalAssertion.fromJson(Map<String, dynamic> json) => EvalAssertion(
-    checkpoint: json['checkpoint'] as String? ?? '',
+    milestone: json['milestone'] as String? ?? '',
     target: json['target'] as String? ?? '',
     field: json['field'] as String? ?? '',
     rule: json['rule'] as String? ?? '',
@@ -337,6 +364,45 @@ class EvalCaseResult {
   );
 }
 
+/// The promotion gate: no case the previous run passed may now fail, and the
+/// pass count may not drop.
+///
+/// [comparable] is the part worth reading carefully. The server refuses to
+/// compare two runs that measured different things — an edited spec, a
+/// different set of cases — and then reports rather than judges. A blocked
+/// gate for that reason is not a regression, and saying "regression" would
+/// name the wrong problem.
+class EvalGate {
+  final bool passed;
+  final bool comparable;
+  final String baselineAtIso;
+  final List<String> reasons;
+
+  /// Cases the baseline passed and this run did not, by id — so "3
+  /// regressions" is three things somebody can go and open.
+  final List<String> regressed;
+
+  const EvalGate({
+    required this.passed,
+    required this.comparable,
+    required this.baselineAtIso,
+    required this.reasons,
+    required this.regressed,
+  });
+
+  factory EvalGate.fromJson(Map<String, dynamic> json) => EvalGate(
+    passed: json['passed'] as bool? ?? false,
+    comparable: json['comparable'] as bool? ?? true,
+    baselineAtIso: json['baseline_at_iso'] as String? ?? '',
+    reasons: (json['reasons'] as List<dynamic>? ?? const [])
+        .map((e) => '$e')
+        .toList(),
+    regressed: (json['regressed'] as List<dynamic>? ?? const [])
+        .map((e) => '$e')
+        .toList(),
+  );
+}
+
 class EvalRunResult {
   final String specId;
   final String flowId;
@@ -350,6 +416,14 @@ class EvalRunResult {
   final int invariantViolations;
   final List<EvalCaseResult> cases;
 
+  /// Null on a first run: with nothing to compare against, a gate would be
+  /// asserting a judgment it has no evidence for.
+  final EvalGate? gate;
+
+  /// A fingerprint of what was graded — the spec's content plus the cases.
+  /// Two pass rates are comparable exactly when this matches.
+  final String measured;
+
   const EvalRunResult({
     required this.specId,
     required this.flowId,
@@ -362,6 +436,8 @@ class EvalRunResult {
     required this.failedAssertions,
     required this.invariantViolations,
     required this.cases,
+    required this.gate,
+    required this.measured,
   });
 
   factory EvalRunResult.fromJson(Map<String, dynamic> json) {
@@ -380,6 +456,10 @@ class EvalRunResult {
       cases: (result['cases'] as List<dynamic>? ?? const [])
           .map((e) => EvalCaseResult.fromJson(e as Map<String, dynamic>))
           .toList(),
+      gate: json['gate'] == null
+          ? null
+          : EvalGate.fromJson(json['gate'] as Map<String, dynamic>),
+      measured: result['measured'] as String? ?? '',
     );
   }
 }

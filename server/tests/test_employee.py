@@ -1,42 +1,85 @@
-"""The Employee Hub: profile, governed PTO, and the grounded HR agent."""
+"""The Employee Hub: profile, governed PTO, and the grounded HR agent.
+
+The hub is a personal surface, so the question underneath every test here is
+"who is me". The answer is the signed-in email, because that is the natural
+key the graph holds an `Employee` under; anything else resolves to nobody.
+"""
 
 import pytest
 
 import app.deps as deps
+from app import personas
 from app.config import settings
 from app.employee import (
     EmployeeService,
     InMemoryEmployeeDirectory,
     seed_employee_if_empty,
 )
-from app.service import KnowledgeService, seed_if_empty
-from app.storage import InMemoryRepository
-from app.tasks import InMemoryTaskDirectory, TaskService, seed_tasks_if_empty
+from app.tasks import seed_tasks_if_empty
+from app.workforce import seed_workforce_if_empty
+from tests import world as test_world
 
 
 @pytest.fixture()
 def client(_client):
-    deps._service = KnowledgeService(InMemoryRepository())
-    seed_if_empty(deps._service, settings.seed_dir)
-    deps._task_service = TaskService(InMemoryTaskDirectory())
-    seed_tasks_if_empty(deps._task_service)
+    world = test_world.fresh()
+    seed_workforce_if_empty(world.sync, world.graph)
+    seed_tasks_if_empty(world.tasks)
     deps._employee_service = EmployeeService(
         InMemoryEmployeeDirectory(),
-        deps._service,
-        deps._task_service,
+        world.knowledge,
+        world.tasks,
+        world.graph,
         answer_backend=None,
     )
     seed_employee_if_empty(deps._employee_service)
     return _client
 
 
-def test_profile_is_created_on_first_read(client):
+def _as(persona_id: str) -> dict[str, str]:
+    return {"X-Cumulus-Persona": persona_id}
+
+
+def test_the_profile_is_the_person_the_org_chart_knows(client):
+    """Title, team and manager are read through from the graph, not defaulted.
+
+    The hub used to mint a blank profile the first time anybody read it, so it
+    showed a synthesized person with a balance nobody had accrued.
+    """
     me = client.get("/api/v1/employee/me").json()
-    assert me["uid"] == "dev"
+    assert me["email"] == personas.DEFAULT_PERSONA.email
+    assert me["name"] == "Mitchell Suter"
+    assert me["title"] == "Director, Platform & Operations"
+    assert me["team"] == "Firm Leadership"
+    assert me["manager"] == "Rowan Ellis"
+    assert me["location"] == "Boston, MA"
+    assert me["in_workforce"] is True
+
+    # The hub's own state is still the hub's, and still stored.
     assert me["pto_balance_days"] == 17.5
     assert len(me["benefits"]) == 4
     kinds = {b["kind"] for b in me["benefits"]}
     assert "medical" in kinds and "retirement" in kinds
+
+
+def test_the_persona_decides_whose_hub_it_is(client):
+    me = client.get("/api/v1/employee/me", headers=_as("customer-user:kim")).json()
+    assert me["email"] == "kim@customer.example"
+    assert me["name"] == "Kim Reyes"
+    assert me["title"] == "Senior Data Engineer"
+    assert me["team"] == "Data Engineering"
+    assert me["manager"] == "Priya Raghavan"
+
+
+def test_a_principal_outside_the_workforce_is_told_so(client):
+    """Naviant Support is not the customer's employee. The hub renders and
+    says that, rather than inventing a colleague to fill the screen."""
+    me = client.get("/api/v1/employee/me", headers=_as("naviant-support")).json()
+    assert me["email"] == personas.SUPPORT.email
+    assert me["in_workforce"] is False
+    assert "not in the workforce" in me["workforce_note"]
+    assert me["name"] == "" and me["benefits"] == []
+    assert me["pto_balance_days"] == 0
 
 
 def test_short_pto_auto_approves_within_governed_window(client):
@@ -84,11 +127,16 @@ def test_pto_over_balance_is_declined(client):
 
 
 def test_seeded_pending_request_pairs_with_seeded_task(client):
+    """And belongs to the default persona, so it is visible in their hub."""
     mine = client.get("/api/v1/employee/pto").json()
     seeded = next(r for r in mine if r["id"] == "pto_seed_01")
     assert seeded["state"] == "pending"
     assert seeded["task_id"] == "task_pto_seed_01"
+    assert seeded["email"] == personas.DEFAULT_PERSONA.email
     assert client.get("/api/v1/tasks/task_pto_seed_01").json()["queue"] == "hr"
+    assert client.get(
+        "/api/v1/employee/pto", headers=_as("customer-user:kim")
+    ).json() == []
 
 
 def test_hr_chat_grounds_on_facts_and_cites_policy(client):

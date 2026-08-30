@@ -14,12 +14,25 @@ from app.config import settings
 from app.identities import IdentityService, InMemoryMachineIdentityDirectory
 from app.tasks import InMemoryTaskDirectory, TaskService, seed_tasks_if_empty
 from app.users import InMemoryUserDirectory
+from tests import world as test_world
 
 
 @pytest.fixture()
 def client(_client):
+    """The seeded queue, with one task decided.
+
+    The seed used to ship two hand-written `done` rows so the Done view would
+    not be empty; they duplicated decisions the real seeded runs already raise,
+    and the panel showed each one twice. Deciding a seeded task here is the
+    honest substitute — a done task is one somebody decided, which is what the
+    ordering and filter assertions below are actually about.
+    """
     deps._task_service = TaskService(InMemoryTaskDirectory())
     seed_tasks_if_empty(deps._task_service)
+    oldest = deps._task_service.list(status="open")[-1]
+    deps._task_service.decide(
+        oldest.id, verdict="approved", decided_by="nadia@customer.example"
+    )
     return _client
 
 
@@ -33,13 +46,41 @@ def owner(monkeypatch):
 # ---- seeding and listing ----
 
 
+def test_no_seeded_task_names_a_ref_that_does_not_resolve(_client):
+    """The sweep, over every seeded task rather than the ones anyone remembers.
+
+    A task's `refs` are read-set strings and the console dereferences them in a
+    drawer, so a ref naming an asset the corpus does not hold is not a stale
+    comment — it is a visible error in front of whoever opened the task. Two of
+    these rotted silently when the machinery behind them was deleted; a sweep is
+    what stops the third, because the failure mode is always a ref nobody
+    thought to re-check.
+    """
+    world = test_world.fresh()
+    seed_tasks_if_empty(world.tasks)
+    tasks = world.tasks.list()
+    assert tasks
+
+    refs = [ref for task in tasks for ref in task.refs]
+    assert any(ref.startswith("knowledge:") for ref in refs)
+    for ref in refs:
+        resp = _client.get(f"/api/v1/refs/{ref}")
+        # 422 means the ref does not parse, 404 that it names something the
+        # corpus does not have. Both are the same bug from different sides.
+        assert resp.status_code == 200, f"{ref} -> {resp.status_code} {resp.text}"
+        if ref.startswith("knowledge:"):
+            assert resp.json()["resolved"], ref
+
+
+
+
 def test_seed_is_idempotent(client):
     assert seed_tasks_if_empty(deps._task_service) == 0
 
 
 def test_seeded_queue_lists_open_first_high_priority_first(client):
     rows = client.get("/api/v1/tasks").json()
-    assert len(rows) >= 8
+    assert len(rows) >= 6
     statuses = [r["status"] for r in rows]
     # Open before done, no interleaving.
     assert statuses == sorted(statuses, key=lambda s: 0 if s == "open" else 1)
@@ -53,7 +94,7 @@ def test_seeded_queue_lists_open_first_high_priority_first(client):
 
 def test_filters(client):
     for params, check in [
-        ({"queue": "data-steward"}, lambda r: r["queue"] == "data-steward"),
+        ({"queue": "vendor-stewardship"}, lambda r: r["queue"] == "vendor-stewardship"),
         ({"kind": "curation"}, lambda r: r["kind"] == "curation"),
         ({"status": "done"}, lambda r: r["status"] == "done"),
     ]:

@@ -13,7 +13,7 @@ and all three are knowledge-layer streams:
   curation decision, never an inline side effect.
 
 Prototype honesty: tasks are *real stored state* (like flow definitions and
-golden sets): deciding one is a durable, attributed write — the prototype's
+eval specs): deciding one is a durable, attributed write — the prototype's
 stand-in for the curation-ledger entry the doctrine requires every human
 decision to land as. For tasks raised by the live expense-reimbursement
 runner, deciding genuinely resumes the run (reimbursements.py picks the
@@ -26,10 +26,14 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import timedelta
+from collections.abc import Callable, Collection
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
+from . import personas
+from .auth import Principal
+from .graph import normalize_key
 from .models import utcnow
 
 log = logging.getLogger("cumulus.tasks")
@@ -90,8 +94,9 @@ class Task(BaseModel):
     kind: TaskKind
     title: str
     summary: str = ""
-    # The Queue this task routed to. Principals bind to queues via roles;
-    # the prototype shows every queue to every signed-in human.
+    # The Queue this task routed to. Principals bind to queues through their
+    # persona, and `require_queue` gates deciding on the binding — so this
+    # field decides who may act, not merely where the row is filed.
     queue: str
     priority: TaskPriority = "normal"
     status: TaskStatus = "open"
@@ -275,10 +280,19 @@ class TaskService:
         )
         return decided
 
-    def stats(self) -> TaskStats:
+    def stats(self, queues: Collection[str] | None = None) -> TaskStats:
+        """Counts over the open queue, narrowed to `queues` when given.
+
+        Every number is computed from the same slice. Filtering the breakdown
+        while leaving the headline total alone is worse than not filtering at
+        all: a badge reading 11 over a list showing none is a screen arguing
+        with itself.
+        """
         stats = TaskStats()
         for t in self.directory.list():
             if t.status != "open":
+                continue
+            if queues is not None and t.queue not in queues:
                 continue
             stats.open += 1
             if t.priority == "high":
@@ -286,6 +300,46 @@ class TaskService:
             stats.by_queue[t.queue] = stats.by_queue.get(t.queue, 0) + 1
             stats.by_kind[t.kind] = stats.by_kind.get(t.kind, 0) + 1
         return stats
+
+    def workspace_scope(
+        self, principal: Principal, queue: str = ""
+    ) -> Callable[[str, str], bool]:
+        """Whether a workspace row belongs to this principal, by (owner, task).
+
+        `reads_beyond_self` is the right test for a **governance** surface —
+        the knowledge layer, the graph browser — and the wrong one for a
+        **workspace**. A workspace is where work gets done, and you can see the
+        work you are accountable for: your own rows, plus the rows of any run
+        whose Task landed in a queue you own. Narrowing an own-scoped principal
+        to their own email alone shut the approver of a queue out of the very
+        table the queue is about, which is the opposite of what a queue binding
+        is for.
+
+        `queue` is the queue this workspace's flow routes to. Owning it makes
+        the whole table yours, task or no task — Lens 4 calls a Workspace a
+        Seeing Space and says plainly that it is impersonal, that you can watch
+        how a workstream runs without being assigned anything in it. Scoping to
+        rows that raised a Task would have shown an AP clerk only the invoices
+        that went wrong: `run_ap_seed01` auto-posted cleanly and so was
+        invisible to the one person whose job it is, leaving him no baseline to
+        judge the exceptions against.
+
+        Returned as a predicate over the two fields rather than over rows,
+        because the two workspaces name them differently — `employee` against
+        `submitted_by` — and that naming is the only part of this rule that
+        differs between them. Both spend one line on it in their own
+        `visible_to`; the rule itself is written here once so it cannot drift
+        into two rules again.
+        """
+        if principal.reads_beyond_self or (queue and principal.owns_queue(queue)):
+            return lambda owner, task_id: True
+        mine = normalize_key(principal.email)
+        # Resolved once per call, not once per row: one set answers every row,
+        # and a lookup per row is a directory read per row.
+        owned = {t.id for t in self.directory.list() if t.queue in principal.queues}
+        return lambda owner, task_id: (
+            normalize_key(owner) == mine or task_id in owned
+        )
 
 
 def build_task_service(
@@ -360,7 +414,7 @@ def _seed_tasks() -> list[Task]:
                 "reversal info retained; rejecting creates a new canonical "
                 "merchant."
             ),
-            queue="data-steward",
+            queue="vendor-stewardship",
             priority="normal",
             flow_id="expense-reimbursement",
             case_ref="run_er_seed01",
@@ -386,20 +440,20 @@ def _seed_tasks() -> list[Task]:
         Task(
             id="task_cur_0210",
             kind="curation",
-            title="Promote correction set entries into the receipt prompt",
+            title="Promote a repeated reviewer correction into the receipt prompt",
             summary=(
-                "Five consistent human corrections on thermal-paper receipts. "
-                "The promotion Rule proposes amending the extraction prompt so "
-                "the tip line stops being read as the total; promotion into "
-                "canonical knowledge is a curation decision, never automatic."
+                "Five reviewers on the expense-review queue made the same "
+                "correction on thermal-paper receipts: the tip line had been "
+                "read as the total. The proposal amends the extraction prompt "
+                "so the flow stops making it. The prompt is an asset in the "
+                "corpus, so this amends knowledge and not code \u2014 which is "
+                "exactly why promoting it is a curation decision and not an "
+                "automatic side effect of five people agreeing."
             ),
             queue="knowledge-curation",
             priority="normal",
             flow_id="expense-reimbursement",
-            refs=[
-                "knowledge:receipt-extraction-prompt@rev3",
-                "knowledge:receipt-extraction-corrections@rev41",
-            ],
+            refs=["knowledge:receipt-extraction-prompt@rev1"],
             evidence=[
                 TaskEvidence(
                     label="Pattern", value="tip line mis-read as total, 5\u00d7"
@@ -410,9 +464,12 @@ def _seed_tasks() -> list[Task]:
             proposal=TaskProposal(
                 action="amend-prompt",
                 target="knowledge-layer",
-                summary="Prompt rev3 \u2192 rev4 with the tip-line instruction",
+                summary="Prompt rev1 \u2192 rev2 with the tip-line instruction",
             ),
-            resumes="prompt revision published; change ledgered",
+            resumes=(
+                "prompt revision published; every run after it records the new "
+                "rev in its ModelCall read-set"
+            ),
             created_at_iso=_ago_iso(50),
         ),
         Task(
@@ -444,34 +501,51 @@ def _seed_tasks() -> list[Task]:
             resumes="losing clause marked superseded; ledger records why",
             created_at_iso=_ago_iso(76),
         ),
-        # ---- Eval: a judge that cannot decide raises a review Task ----
+        # ---- Eval: governed knowledge moved under a declared case ----
         Task(
             id="task_eval_0032",
             kind="eval_review",
-            title="Judge could not grade a golden-set assertion",
+            title="A graded case read knowledge its fixture never declared",
             summary=(
-                "The rubric judge returned `cannot_decide` on one fact in the "
-                "expense-reimbursement golden set rather than guessing."
+                "`expense/pat-on-the-roster` is declared against the expense "
+                "approval policy alone, but the graded run also read the "
+                "receipt extraction prompt \u2014 governed knowledge the flow "
+                "reads at run time. A fixture's read-set is a claim about what "
+                "a case was written against, so a run that read more than the "
+                "claim is the signal that knowledge moved under the case rather "
+                "than the flow regressing. Which of the two it is, only a "
+                "person can say."
             ),
             queue="eval-review",
             priority="normal",
             flow_id="expense-reimbursement",
-            case_ref="golden:exp-fixture-007",
-            refs=["knowledge:expense-approval-policy"],
+            case_ref="eval:expense-in-policy-auto-approves",
+            refs=[
+                "knowledge:expense-approval-policy@rev1",
+                "knowledge:receipt-extraction-prompt@rev1",
+            ],
             evidence=[
-                TaskEvidence(label="Fact", value="reimbursement.verdict"),
-                TaskEvidence(label="Expected", value="elevate"),
                 TaskEvidence(
-                    label="Candidate said",
-                    value="approve at confidence 0.79 (rubric boundary)",
+                    label="Declared", value="knowledge:expense-approval-policy@rev1"
+                ),
+                TaskEvidence(
+                    label="Also read",
+                    value="knowledge:receipt-extraction-prompt@rev1",
+                ),
+                TaskEvidence(
+                    label="Consequence",
+                    value="the case still passes, but against a wider read-set",
                 ),
             ],
             proposal=TaskProposal(
-                action="label-case",
-                target="golden-set",
-                summary="Set the expected value; dataset version moves",
+                action="redeclare-read-set",
+                target="eval-fixtures",
+                summary=(
+                    "Pin `expense/pat-on-the-roster` to the revisions the run "
+                    "actually read"
+                ),
             ),
-            resumes="case relabelled; pending experiment re-grades it",
+            resumes="fixture re-declared; later runs compare against it",
             created_at_iso=_ago_iso(96),
         ),
         # ---- HR: a PTO request over the auto-approval window ----
@@ -488,7 +562,9 @@ def _seed_tasks() -> list[Task]:
             case_ref="pto_seed_01",
             refs=["knowledge:pto-policy"],
             evidence=[
-                TaskEvidence(label="Employee", value="dev"),
+                TaskEvidence(
+                    label="Employee", value=personas.DEFAULT_PERSONA.person
+                ),
                 TaskEvidence(label="Dates", value="Oct 12 \u2013 Oct 20 \u00b7 7 working days"),
                 TaskEvidence(label="Balance", value="17.5 days"),
                 TaskEvidence(
@@ -502,58 +578,6 @@ def _seed_tasks() -> list[Task]:
             ),
             resumes="balance deducted; calendar hold confirmed",
             created_at_iso=_ago_iso(20),
-        ),
-        # ---- A little history so the panel's Done view isn't empty ----
-        Task(
-            id="task_hist_hotel",
-            kind="decision",
-            title="Elevated reimbursement: harbor-hotel $612.00",
-            summary="Over the auto-approval limit; conference rate confirmed.",
-            queue="expense-review",
-            flow_id="expense-reimbursement",
-            case_ref="run_er_seed03",
-            status="done",
-            refs=["knowledge:expense-approval-policy"],
-            evidence=[TaskEvidence(label="Amount", value="$612.00")],
-            proposal=TaskProposal(
-                action="record-reimbursement",
-                target="reimbursements",
-                summary="Record as approved",
-            ),
-            created_at_iso=_ago_iso(390),
-            decision=TaskDecision(
-                verdict="approved",
-                note="Conference block rate confirmed against the event contract.",
-                decided_by="dana@customer.example",
-                decided_at_iso=_ago_iso(388),
-            ),
-        ),
-        Task(
-            id="task_hist_taxi",
-            kind="decision",
-            title="Elevated reimbursement: airport-taxi $58.75",
-            summary="Low extraction confidence; amount verified off the card feed.",
-            queue="expense-review",
-            flow_id="expense-reimbursement",
-            case_ref="run_er_seed08",
-            status="done",
-            refs=["knowledge:expense-approval-policy"],
-            evidence=[
-                TaskEvidence(label="Extraction confidence", value="0.58"),
-            ],
-            proposal=TaskProposal(
-                action="record-reimbursement",
-                target="reimbursements",
-                summary="Record as approved",
-            ),
-            created_at_iso=_ago_iso(148),
-            decision=TaskDecision(
-                verdict="corrected",
-                note="Amount matches the card feed; corrected vendor spelling.",
-                correction="vendor: airport-taxi (was: airporttaxi-114)",
-                decided_by="dana@customer.example",
-                decided_at_iso=_ago_iso(146),
-            ),
         ),
     ]
 

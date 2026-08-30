@@ -85,7 +85,7 @@ def _seeded_teams() -> TeamService:
 
 @pytest.fixture()
 def wired(_client, monkeypatch):
-    monkeypatch.setattr(settings, "answer_backend", "none")
+    monkeypatch.setattr(settings, "model_backend", "none")
     deps._service = _seeded_service()
     deps._team_service = _seeded_teams()
     deps._user_directory = InMemoryUserDirectory()

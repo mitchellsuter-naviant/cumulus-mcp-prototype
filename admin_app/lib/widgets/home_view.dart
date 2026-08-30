@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../models/session.dart';
 
 import '../models/calendar.dart';
 import '../models/payable.dart';
@@ -20,6 +21,10 @@ import 'ui_kit.dart';
 class HomeSection extends StatefulWidget {
   final ApiClient api;
 
+  /// The acting session, so the page can tell "nothing happened" from "you
+  /// cannot see it". Null only before the first session load.
+  final Session? session;
+
   /// Where the two panels hand off to: the week view and the AP workspace.
   final VoidCallback? onOpenCalendar;
   final VoidCallback? onOpenPayables;
@@ -28,6 +33,7 @@ class HomeSection extends StatefulWidget {
   const HomeSection({
     super.key,
     required this.api,
+    this.session,
     this.onOpenCalendar,
     this.onOpenPayables,
     this.onOpenTasks,
@@ -38,6 +44,15 @@ class HomeSection extends StatefulWidget {
 }
 
 class _HomeSectionState extends State<HomeSection> {
+  /// Whether the AP queue is this persona's work. The panel below is scoped
+  /// server-side, so an unbound persona sees an empty table either way — this
+  /// is only how the page decides what that emptiness *means*.
+  bool get _seesTheQueue {
+    final s = widget.session;
+    if (s == null) return true;
+    return s.scope != 'own' || s.queues.contains('ap-clerk');
+  }
+
   Agenda? _agenda;
   PayableStats? _payables;
   List<PayableInvoice> _pending = const [];
@@ -85,7 +100,8 @@ class _HomeSectionState extends State<HomeSection> {
         Padding(
           padding: const EdgeInsets.fromLTRB(28, 20, 28, 0),
           child: PageHeading(
-            eyebrow: 'Home · ${weekdayName(now.weekday)}, ${monthDayLabel(now)}',
+            eyebrow:
+                'Home · ${weekdayName(now.weekday)}, ${monthDayLabel(now)}',
             title: agenda == null || agenda.name.isEmpty
                 ? 'Your day'
                 : '${_salutation(now)}, ${agenda.name.split(' ').first}',
@@ -133,11 +149,7 @@ class _HomeSectionState extends State<HomeSection> {
                 )
               : Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    schedule,
-                    const SizedBox(height: 16),
-                    payables,
-                  ],
+                  children: [schedule, const SizedBox(height: 16), payables],
                 ),
         );
       },
@@ -198,7 +210,7 @@ class _HomeSectionState extends State<HomeSection> {
               Expanded(
                 child: Text(
                   'Mirrored from ${agenda.calendar?.provider ?? 'the calendar '
-                      'provider'} · times are wall clock in '
+                          'provider'} · times are wall clock in '
                   '${agenda.calendar?.timezone ?? 'the calendar\'s zone'}',
                   style: CumulusText.meta,
                 ),
@@ -277,9 +289,19 @@ class _HomeSectionState extends State<HomeSection> {
             const SizedBox(height: 16),
             const FieldLabel('Waiting on judgment'),
             if (_pending.isEmpty)
+              // An empty list has two causes and they are opposite claims:
+              // nothing is held, or nothing is *yours to see*. The system
+              // knows which — a persona bound to no AP queue is scoped out of
+              // the table entirely — and saying the first when it means the
+              // second tells the person least able to check that the business
+              // is fine when it is not. Two invoices really are held here.
               Text(
-                'Nothing is held. Every invoice this window cleared the '
-                'gate on its own.',
+                _seesTheQueue
+                    ? 'Nothing is held. Every invoice this window cleared '
+                          'the gate on its own.'
+                    : 'You are not bound to the AP queue, so held invoices '
+                          'are not shown here. This is what you can see, not '
+                          'what there is.',
                 style: CumulusText.meta,
               )
             else
@@ -303,7 +325,7 @@ class _HomeSectionState extends State<HomeSection> {
                       '${_tasks.open} task${_tasks.open == 1 ? '' : 's'} '
                       'across every queue are waiting on a person'
                       '${_tasks.highPriority > 0 ? ', ${_tasks.highPriority} '
-                            'of them high priority' : ''}.',
+                                'of them high priority' : ''}.',
                       style: CumulusText.meta,
                     ),
                   ),

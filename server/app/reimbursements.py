@@ -21,11 +21,13 @@ The flow body below is the whole thing, and it reads as straight-line code
 because the engine hides the replay. Steps:
 
   t1 trigger → s1 store-documents (Action, into the audit-documents
-  Collection) → m{i} extract-receipt per document (ModelCall) → x1 read-policy
-  (governed values, at the revision read) → x2 project-lines (documents +
-  extractions + commentary → facts) → then a loop: r{n} needs-elevation (Rule)
-  → k{n} elevate-review (gate) → x{n} apply-correction → back to the Rule →
-  a1 record-expense (Action: writes the graph) → e1 ExpenseRecorded (Event).
+  Collection) → x0 read-prompt (the ModelCall's own governed knowledge, at the
+  revision read) → m{i} extract-receipt per document (ModelCall) → x1
+  read-policy (governed values, at the revision read) → x2 project-lines
+  (documents + extractions + commentary → facts) → then a loop: r{n}
+  needs-elevation (Rule)
+  → k{n} elevate-review (gate) → x{n} apply-correction → back to the Rule → a1
+  record-expense (Action: writes the graph) → e1 ExpenseRecorded (Event).
 
 Everything non-deterministic — model calls, id minting, clock reads — happens
 inside a step, so a replay is exact.
@@ -39,14 +41,19 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Callable
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
 from . import data_collections
+from .auth import Principal, flow_principal
+from .dispatch import Dispatcher, InMemoryEventLog
 from .documents import DOCUMENT_COLLECTION, DocumentService, Region
-from .graph import Claim, GraphService, GraphWriter
+from .gateway import ActionGateway, InMemoryLedgerStore
+from .graph import Claim, GraphService, GraphWriter, InMemoryGraphStore
 from .models import utcnow
+from .prompts import GovernedPrompt, read_prompt
 from .runs import RunContext, RunEngine, RunRecord
 from .tasks import Task, TaskEvidence, TaskProposal, TaskService
 
@@ -54,7 +61,15 @@ log = logging.getLogger("cumulus.reimbursements")
 
 FLOW_ID = "expense-reimbursement"
 POLICY_ASSET_ID = "expense-approval-policy"
+PROMPT_ASSET_ID = "receipt-extraction-prompt"
 REVIEW_QUEUE = "expense-review"
+
+#: Who records an expense that no approver saw. A clean request under the
+#: governed limit is committed on the Flow's own authority, bound to the queue
+#: an approver would decide it from — the Gateway asks the same question of
+#: both, and un-binding this stops auto-approval rather than exempting it.
+EXPENSE_FLOW = flow_principal(FLOW_ID, REVIEW_QUEUE)
+
 # Correction rounds before the flow stops asking and denies. A reviewer who
 # has corrected the same request three times is telling us the submission is
 # wrong, not that the checks are.
@@ -274,10 +289,32 @@ class ReimbursementStats(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# What the ModelCall runs on when the corpus has not seeded yet. The governed
+# copy is `seed/receipt-extraction-prompt.md`, whose fenced block is this text;
+# the two are expected to diverge the first time a customer edits the asset,
+# which is the whole point of the asset existing.
+DEFAULT_RECEIPT_PROMPT = """\
+Extract from this receipt: vendor (lowercase slug), date (ISO), total_usd
+(number), category (one of meals, travel, lodging, mileage, supplies, software,
+alcohol, gifts, entertainment, other), your confidence 0-1, and lines: an array
+of the distinct charges on the receipt, each with vendor, date, category,
+amount_usd and description. If the receipt covers only one charge, return a
+single line. Respond with only a JSON object with keys vendor, date, total_usd,
+category, confidence, lines."""
+
+
 class ReceiptReader(Protocol):
     def read(
-        self, image: bytes | None, filename: str, hint: str
-    ) -> ReceiptExtraction: ...
+        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+    ) -> ReceiptExtraction:
+        """`prompt` is the governed instruction the flow read for this run.
+
+        Passed in rather than held by the reader because it is knowledge and the
+        reader is machinery. A reader with no model behind it ignores it and
+        says so; the flow records the revision either way, because the flow
+        really did read it.
+        """
+        ...
 
 
 _CATEGORIES = ["meals", "travel", "lodging", "mileage", "supplies", "software"]
@@ -327,7 +364,9 @@ class StubReceiptReader:
 
     name = "stub"
 
-    def read(self, image: bytes | None, filename: str, hint: str) -> ReceiptExtraction:
+    def read(
+        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+    ) -> ReceiptExtraction:
         text = f"{filename} {hint}".lower()
         seed = hashlib.sha256(
             (image or b"") + filename.encode() + hint.encode()
@@ -405,7 +444,9 @@ class VertexReceiptReader:
         self._client = genai.Client(vertexai=True, project=project, location=location)
         self._model = model
 
-    def read(self, image: bytes | None, filename: str, hint: str) -> ReceiptExtraction:
+    def read(
+        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+    ) -> ReceiptExtraction:
         from google.genai import types
 
         parts: list = []
@@ -415,16 +456,8 @@ class VertexReceiptReader:
         parts.append(
             types.Part(
                 text=(
-                    "Extract from this receipt: vendor (lowercase slug), date "
-                    "(ISO), total_usd (number), category (one of meals, travel, "
-                    "lodging, mileage, supplies, software, alcohol, gifts, "
-                    "entertainment, other), your confidence 0-1, and lines: an "
-                    "array of the distinct charges on the receipt, each with "
-                    "vendor, date, category, amount_usd and description. If the "
-                    "receipt covers only one charge, return a single line. "
-                    "Respond with only a JSON object with keys vendor, date, "
-                    "total_usd, category, confidence, lines."
-                    + (f" Submitter note: {hint}" if hint else "")
+                    (prompt or DEFAULT_RECEIPT_PROMPT)
+                    + (f"\n\nSubmitter note: {hint}" if hint else "")
                 )
             )
         )
@@ -654,6 +687,8 @@ class ReimbursementService:
         engine: RunEngine | None = None,
         graph: GraphService | None = None,
         documents: DocumentService | None = None,
+        gateway: ActionGateway | None = None,
+        dispatcher: Dispatcher | None = None,
     ) -> None:
         self.directory = directory
         self.reader = reader
@@ -662,27 +697,65 @@ class ReimbursementService:
         self.engine = engine
         self.graph = graph
         self.documents = documents
+        # Never None — see the same note in payables.py. A service wired
+        # without a Gateway still writes through one.
+        self.gateway = gateway or ActionGateway(
+            graph or GraphService(InMemoryGraphStore()), InMemoryLedgerStore()
+        )
+        # Never bypassed either — see the same note in payables.py. A service
+        # wired without a Dispatcher still starts its runs through one.
+        self.dispatcher = dispatcher or (
+            Dispatcher(engine, InMemoryEventLog()) if engine is not None else None
+        )
         if engine is not None:
             engine.register(FLOW_ID, self._body)
 
     # -- reads --------------------------------------------------------------
 
+    def visible_to(
+        self, principal: Principal
+    ) -> Callable[[ReimbursementRequest], bool]:
+        """Which expense rows this principal may see. `employee` is the owner.
+
+        The rule, and why it is not `reads_beyond_self`, lives in
+        `TaskService.workspace_scope`.
+        """
+        allowed = self.tasks.workspace_scope(principal, REVIEW_QUEUE)
+        return lambda r: allowed(r.employee, r.task_id)
+
     def list(
-        self, state: ReimbursementState | None = None, employee: str | None = None
+        self,
+        state: ReimbursementState | None = None,
+        employee: str | None = None,
+        principal: Principal | None = None,
     ) -> list[ReimbursementRequest]:
+        """The table. `employee` is the explicit "just mine" filter; `principal`
+        is the scoping rule. `principal=None` is unscoped, for seeding and
+        internals — every caller that serves a request passes one."""
         items = self.directory.list()
         if state is not None:
             items = [r for r in items if r.state == state]
         if employee is not None:
             items = [r for r in items if r.employee == employee]
+        if principal is not None:
+            visible = self.visible_to(principal)
+            items = [r for r in items if visible(r)]
         return sorted(items, key=lambda r: r.submitted_at_iso, reverse=True)
 
     def get(self, request_id: str) -> ReimbursementRequest | None:
         return self.directory.get(request_id)
 
-    def stats(self) -> ReimbursementStats:
+    def stats(self, principal: Principal | None = None) -> ReimbursementStats:
+        """Totals over exactly the rows `list` would return.
+
+        A total is a read of every row it counts, so an org-wide figure handed
+        to someone who may see four of the rows leaks the other eight in
+        aggregate. Counted *from* `list` rather than beside it so the two can
+        never be computed over different slices — a strip arguing with the
+        table under it is worse than no strip at all.
+        """
         stats = ReimbursementStats()
-        for r in self.directory.list():
+        for r in self.list(principal=principal):
             stats.total += 1
             stats.lines += len(r.lines)
             stats.human_corrected += sum(1 for line in r.lines if line.corrected_by)
@@ -707,6 +780,9 @@ class ReimbursementService:
             f"knowledge:{POLICY_ASSET_ID}@rev{getattr(asset, 'revision', 1)}"
         )
         return values
+
+    def read_prompt(self) -> GovernedPrompt:
+        return read_prompt(self.knowledge, PROMPT_ASSET_ID, DEFAULT_RECEIPT_PROMPT)
 
     # -- the entry point ----------------------------------------------------
 
@@ -745,23 +821,35 @@ class ReimbursementService:
             "submitted_at_iso": submitted_at_iso or utcnow().isoformat(),
             "documents": [d.model_dump() for d in docs],
         }
-        if self.engine is None:
+        if self.dispatcher is None:
             raise RuntimeError("Reimbursement service has no run engine wired")
-        record = self.engine.start(
-            FLOW_ID, inputs, actor=employee, run_id=run_id
-        )
+        # The fact is that an expense was submitted; which response that
+        # starts is the Trigger's answer, not this call site's.
+        record = self.dispatcher.emit(
+            "ExpenseSubmitted", inputs, actor=employee, run_id=run_id,
+        ).one()
         return self._project(record)
 
-    def resume_for_task(self, task: Task) -> ReimbursementRequest | None:
-        """A decided Task releases the gate its run is suspended on."""
+    def resume_for_task(
+        self, task: Task, principal: Principal | None = None
+    ) -> ReimbursementRequest | None:
+        """A decided Task releases the gate its run is suspended on.
+
+        `principal` is the human who decided, carried through to the commit:
+        the Gateway checks the committer at the write, and a uid recovered
+        from `decided_by` afterwards would name the right person while proving
+        nothing about their authority.
+        """
         if task.flow_id != FLOW_ID or self.engine is None:
             return None
-        record = self.engine.resume_for_task(task.id)
+        record = self.engine.resume_for_task(task.id, principal=principal)
         return self._project(record) if record else None
 
     # Kept under the old name: tasks_api calls it after a decision.
-    def apply_task_decision(self, task: Task) -> ReimbursementRequest | None:
-        return self.resume_for_task(task)
+    def apply_task_decision(
+        self, task: Task, principal: Principal | None = None
+    ) -> ReimbursementRequest | None:
+        return self.resume_for_task(task, principal)
 
     # -- the flow body ------------------------------------------------------
 
@@ -798,20 +886,34 @@ class ReimbursementService:
         )
         slot_models = [DocumentSlot.model_validate(s) for s in slots]
 
+        # x0 · transform — the governed read the ModelCall runs on. A prompt is
+        # knowledge, so it is read here at a revision rather than compiled in,
+        # and the revision travels onto every extraction step below.
+        prompt = GovernedPrompt.model_validate(ctx.step(
+            "x0", "read-prompt", "transform",
+            fn=lambda: self.read_prompt().model_dump(),
+            summary=lambda out: (
+                f"{out['source_ref']}: {len(out['text'])} characters"
+                + ("" if out["found_asset"]
+                   else " — not in the corpus, running on the built-in default")
+            ),
+        ))
+        ctx.note_refs(prompt.source_ref)
+
         # m{i} · ModelCall — one step per document, so a retry, a correction or
         # a cost lands on the document it belongs to.
         extractions: list[ReceiptExtraction] = []
         for index, (slot, doc) in enumerate(zip(slot_models, submitted), start=1):
             raw = ctx.step(
                 f"m{index}", f"extract-receipt[{index}]", "modelcall",
-                fn=lambda d=doc, s=slot: self._extract(d, s).model_dump(),
+                fn=lambda d=doc, s=slot: self._extract(d, s, prompt.text).model_dump(),
                 summary=lambda out: (
                     f"{out['model']}: {out['vendor']} · ${out['total_usd']:,.2f} · "
                     f"{out['category']} · {len(out['lines'])} line(s) · "
                     f"confidence {out['confidence']:.2f}"
                 ),
                 model=getattr(self.reader, "name", ""),
-                refs=[f"document:{slot.document_id}"],
+                refs=[f"document:{slot.document_id}", prompt.source_ref],
                 retries=1,
                 escalate_queue=REVIEW_QUEUE,
             )
@@ -954,15 +1056,25 @@ class ReimbursementService:
             decision_note=decision_note,
         ).refresh_projections()
 
-        writer = self.graph.writer(ctx.record.id, "a1") if self.graph else None
+        # Who commits it: the approver who released the last gate, or the Flow
+        # itself when a clean request cleared the governed limit with no gate
+        # at all. Crediting the submitter with a decision nobody made would be
+        # the ledger's first lie.
+        commit = self.gateway.action(
+            "record-expense", ctx.principal or EXPENSE_FLOW,
+            run=ctx.record, step_id="a1",
+            task_id=request.task_id, decided_by=decided_by,
+        )
         written = ctx.step(
             "a1", "record-expense", "action",
-            fn=lambda: self._write_graph(request, policy, decided_by, writer),
-            writes=lambda _out: writer.refs if writer is not None else [],
+            fn=lambda: commit.commit(
+                lambda w: self._write_graph(request, policy, decided_by, w)
+            ),
+            writes=lambda _out: commit.writes,
             summary=lambda out: (
                 f"{request.state} · ${request.requested_usd:,.2f} · "
                 f"{out['objects']} object(s) and {out['links']} link(s) written "
-                f"· ledger led_{request.id[-6:]}"
+                f"· ledger {commit.entry.id}"
             ),
         )
         request.graph_ref = written.get("request_ref", "")
@@ -1017,13 +1129,15 @@ class ReimbursementService:
             ))
         return slots
 
-    def _extract(self, doc: SubmittedDocument, slot: DocumentSlot) -> ReceiptExtraction:
+    def _extract(
+        self, doc: SubmittedDocument, slot: DocumentSlot, prompt: str
+    ) -> ReceiptExtraction:
         image = base64.b64decode(doc.content_b64) if doc.content_b64 else None
         # The reader sees the submitter's note as well as the hint: with a real
         # multimodal extractor the note is genuinely useful context ("the wine
         # was mine"), and with the stub it is the hint that steers.
         extraction = self.reader.read(
-            image, doc.filename, f"{doc.hint} {doc.note}".strip()
+            image, doc.filename, f"{doc.hint} {doc.note}".strip(), prompt=prompt
         )
         if self.documents is not None and extraction.regions:
             self.documents.set_regions(slot.document_id, extraction.regions)
@@ -1520,6 +1634,8 @@ def build_reimbursement_service(
     engine: RunEngine | None = None,
     graph: GraphService | None = None,
     documents: DocumentService | None = None,
+    gateway: ActionGateway | None = None,
+    dispatcher: Dispatcher | None = None,
 ) -> ReimbursementService:
     directory: ReimbursementDirectory
     if backend == "firestore":
@@ -1527,7 +1643,8 @@ def build_reimbursement_service(
     else:
         directory = InMemoryReimbursementDirectory()
     return ReimbursementService(
-        directory, reader, knowledge, tasks, engine, graph, documents
+        directory, reader, knowledge, tasks, engine, graph, documents, gateway,
+        dispatcher,
     )
 
 

@@ -1,10 +1,13 @@
 """REST surface for the Employee Hub: profile, PTO, and the HR agent.
 
-Everything here is scoped to the signed-in person — the hub is a personal
-surface, not an admin one — so every route is user+ and human-only where it
-mutates. The HR agent read path allows keys (an ambient agent asking on a
-person's behalf is the MCP posture), but PTO requests are judgments about
-your own time and are refused to keys.
+"Me" is `principal.email`, everywhere and without exception: the graph keys
+an `Employee` on their email, so any other key resolves to nobody.
+
+Everything here is scoped to that person — the hub is a personal surface, not
+an admin one — so every route is user+ and human-only where it mutates. The
+HR agent read path allows keys (an ambient agent asking on a person's behalf
+is the MCP posture), but PTO requests are judgments about your own time and
+are refused to keys.
 """
 
 import logging
@@ -12,7 +15,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from .auth import Principal, get_principal, require_reader
+from .auth import Principal, get_principal, require_human, require_reader
 from .deps import get_employee_service
 from .employee import EmployeeProfile, HrChatReply, PtoRequest
 
@@ -32,20 +35,10 @@ class HrChatMessage(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
 
 
-def _require_human(principal: Principal) -> None:
-    if principal.key_id is not None:
-        raise HTTPException(
-            status_code=403,
-            detail="API keys cannot act on an employee's behalf here.",
-        )
-
-
 @router.get("/me", response_model=EmployeeProfile)
 def my_profile(principal: Principal = Depends(get_principal)) -> EmployeeProfile:
     require_reader(principal)
-    return get_employee_service().profile(
-        principal.uid, name=principal.email or principal.uid
-    )
+    return get_employee_service().profile(principal.email)
 
 
 @router.get("/pto", response_model=list[PtoRequest])
@@ -53,7 +46,7 @@ def my_pto_requests(
     principal: Principal = Depends(get_principal),
 ) -> list[PtoRequest]:
     require_reader(principal)
-    return get_employee_service().requests_for(principal.uid)
+    return get_employee_service().requests_for(principal.email)
 
 
 @router.post("/pto", response_model=PtoRequest, status_code=201)
@@ -61,11 +54,11 @@ def request_pto(
     body: PtoSubmit, principal: Principal = Depends(get_principal)
 ) -> PtoRequest:
     require_reader(principal)
-    _require_human(principal)
+    require_human(principal, "act on an employee's behalf")
     if body.end_date < body.start_date:
         raise HTTPException(status_code=422, detail="end_date precedes start_date")
     return get_employee_service().request_pto(
-        principal.uid, body.start_date, body.end_date, body.days, body.note
+        principal.email, body.start_date, body.end_date, body.days, body.note
     )
 
 
@@ -74,4 +67,4 @@ def hr_chat(
     body: HrChatMessage, principal: Principal = Depends(get_principal)
 ) -> HrChatReply:
     require_reader(principal)
-    return get_employee_service().chat(principal.uid, body.message)
+    return get_employee_service().chat(principal.email, body.message)

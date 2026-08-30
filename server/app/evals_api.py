@@ -9,7 +9,13 @@ than suspicious. Deciding a Task is the opposite, and stays refused for keys.
 Results are returned by the POST and the most recent one per spec is kept in
 memory. They are deliberately not persisted yet: a result is only meaningful
 against the knowledge revisions it read, and inventing a durable store before
-that pinning is real would be storing numbers nobody can compare.
+that pinning is real would be storing numbers nobody can compare. The kept
+result is what the next run's promotion gate measures against, so the gate is
+per-process and says so by coming back null when there is nothing to compare.
+
+Fixtures live under here too. They are what a case names rather than a thing
+of their own, and previewing one is a read for the same reason running an eval
+cannot touch the live graph: the world is a throwaway copy.
 """
 
 from __future__ import annotations
@@ -21,7 +27,15 @@ from pydantic import BaseModel, Field
 
 from . import deps
 from .auth import Principal, get_principal, require_reader, require_role
-from .evals import EvalCase, EvalResult, EvalSpec
+from .evals import (
+    FIXTURE_PAYLOAD,
+    EvalCase,
+    EvalResult,
+    EvalSpec,
+    Fixture,
+    GateResult,
+)
+from .worlds import MaterializedWorld, materialize
 
 log = logging.getLogger("cumulus.evals.api")
 
@@ -33,7 +47,7 @@ class SpecSummary(BaseModel):
     flow_id: str
     version: int
     summary: str
-    checkpoints: int
+    milestones: int
     cases: int
     graded_fields: int
     ignored_fields: int
@@ -54,13 +68,16 @@ class EvalResultView(BaseModel):
     assertions: int
     failed_assertions: int
     invariant_violations: int
+    # None until there is a previous run of the same measurement to compare
+    # against — the gate is a judgment about a change, not about a number.
+    gate: GateResult | None = None
     result: EvalResult
 
 
 def _summarize(spec: EvalSpec, cases: list[EvalCase]) -> SpecSummary:
     graded = ignored = links = 0
-    for checkpoint in spec.checkpoints:
-        for rule in checkpoint.objects:
+    for milestone in spec.milestones:
+        for rule in milestone.objects:
             for field in rule.fields:
                 if field.match == "ignore":
                     ignored += 1
@@ -69,7 +86,7 @@ def _summarize(spec: EvalSpec, cases: list[EvalCase]) -> SpecSummary:
             links += len(rule.links)
     return SpecSummary(
         id=spec.id, flow_id=spec.flow_id, version=spec.version,
-        summary=spec.summary, checkpoints=len(spec.checkpoints),
+        summary=spec.summary, milestones=len(spec.milestones),
         cases=len(cases), graded_fields=graded, ignored_fields=ignored,
         graded_links=links,
     )
@@ -84,6 +101,7 @@ def _view(result: EvalResult) -> EvalResultView:
         launched_by=result.launched_by, passed=result.passed,
         failed=result.failed, assertions=assertions, failed_assertions=failed,
         invariant_violations=sum(len(c.invariants) for c in result.cases),
+        gate=result.gate,
         result=result,
     )
 
@@ -99,6 +117,69 @@ def list_specs(
         _summarize(spec, service.cases(spec.id))
         for spec in service.specs(flow_id=flow_id)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Fixtures — the worlds cases run in
+# ---------------------------------------------------------------------------
+#
+# Declared before `/{spec_id}`, or that route would swallow `/fixtures`.
+
+
+@router.get(
+    "/fixtures",
+    response_model=list[Fixture],
+    response_model_exclude={"__all__": FIXTURE_PAYLOAD},
+)
+def list_fixtures(
+    flow_id: str | None = Query(default=None),
+    principal: Principal = Depends(get_principal),
+) -> list[Fixture]:
+    """Every declared world, without the payload that declares it."""
+    require_reader(principal)
+    rows = deps.get_fixture_store().list()
+    if flow_id is not None:
+        rows = [f for f in rows if f.flow_id == flow_id]
+    return rows
+
+
+def _fixture(fixture_id: str) -> Fixture:
+    fixture = deps.get_fixture_store().get(fixture_id)
+    if fixture is None:
+        raise HTTPException(status_code=404, detail=f"No such fixture: {fixture_id}")
+    return fixture
+
+
+@router.get(
+    "/fixtures/{fixture_id:path}/preview",
+    response_model=MaterializedWorld,
+    response_model_exclude={"world": FIXTURE_PAYLOAD},
+)
+def preview_fixture(
+    fixture_id: str, principal: Principal = Depends(get_principal)
+) -> MaterializedWorld:
+    """Run the world into a throwaway copy and return what it asserts.
+
+    Materialized rather than statically expanded, so what comes back includes
+    the resolution the sync flow actually performed — which vendor it matched,
+    at what score, by what method — and any Task it escalated. A prediction
+    would show the payload; this shows the consequence, which is what makes it
+    a fixture editor rather than a JSON viewer.
+
+    A read, despite doing work: the copy is isolated, and that isolation is
+    why looking at a world is not a privileged act.
+    """
+    require_reader(principal)
+    return materialize(_fixture(fixture_id), knowledge=deps.get_service())
+
+
+@router.get("/fixtures/{fixture_id:path}", response_model=Fixture)
+def get_fixture(
+    fixture_id: str, principal: Principal = Depends(get_principal)
+) -> Fixture:
+    """One world, payload and all. The authoring surface."""
+    require_reader(principal)
+    return _fixture(fixture_id)
 
 
 @router.get("/{spec_id}", response_model=EvalSpec)

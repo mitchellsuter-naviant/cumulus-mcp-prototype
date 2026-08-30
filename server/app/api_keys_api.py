@@ -25,6 +25,7 @@ from .api_keys import (
 from .auth import (
     Principal,
     get_principal,
+    require_human,
     is_team_admin,
     require_any_team_admin,
     require_role,
@@ -54,19 +55,6 @@ class ApiKeyMinted(BaseModel):
     key: ApiKeyPublic
     token: str = Field(description="Shown once; not recoverable afterwards")
     mcp_config: dict = Field(description="Ready-to-paste MCP client configuration")
-
-
-def _require_human(principal: Principal) -> None:
-    """Block minted keys from managing keys (see module docstring)."""
-    if principal.key_id is not None:
-        log.warning(
-            "API key attempted key management",
-            extra={"keyId": principal.key_id},
-        )
-        raise HTTPException(
-            status_code=403,
-            detail="API keys cannot manage API keys; sign in as an admin.",
-        )
 
 
 def _require_can_touch(principal: Principal, key_role: str) -> None:
@@ -155,7 +143,7 @@ def _mcp_config(token: str, name: str) -> dict:
 @router.get("", response_model=list[ApiKeyPublic])
 def list_keys(principal: Principal = Depends(get_principal)) -> list[ApiKeyPublic]:
     require_any_team_admin(principal)
-    _require_human(principal)
+    require_human(principal, "manage API keys; sign in as an admin")
     identities = {i.uid: i for i in get_identity_service().list()}
     keys = get_api_key_directory().list()
     if not principal.outranks_or_is("admin"):
@@ -169,7 +157,7 @@ def list_keys(principal: Principal = Depends(get_principal)) -> list[ApiKeyPubli
 def create_key(
     payload: ApiKeyCreate, principal: Principal = Depends(get_principal)
 ) -> ApiKeyMinted:
-    _require_human(principal)
+    require_human(principal, "manage API keys; sign in as an admin")
     identity = _resolve_identity(payload.identity_uid)
     _require_can_manage(principal, identity.uid)
     if identity.disabled:
@@ -227,7 +215,7 @@ def create_key(
 
 @router.delete("/{key_id}", status_code=204)
 def revoke_key(key_id: str, principal: Principal = Depends(get_principal)) -> None:
-    _require_human(principal)
+    require_human(principal, "manage API keys; sign in as an admin")
     directory = get_api_key_directory()
     existing = directory.get(key_id)
     if existing is None:
@@ -255,7 +243,7 @@ def key_usage(
     days: int = Query(default=30, ge=1, le=365),
     principal: Principal = Depends(get_principal),
 ) -> list[UsageDay]:
-    _require_human(principal)
+    require_human(principal, "manage API keys; sign in as an admin")
     directory = get_api_key_directory()
     existing = directory.get(key_id)
     if existing is None:

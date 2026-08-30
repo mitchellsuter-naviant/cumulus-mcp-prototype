@@ -4,7 +4,8 @@ The doctrine retired the Workflow/DataFlow split, and this module is what that
 decision looks like in code. A vendor feed landing 200 rows and an invoice
 arriving for extraction are the same kind of thing — authored logic, run by the
 engine, journalled, resumable — differing only in their Trigger and in whether
-they suspend.
+they suspend. `deliver` says what arrived and `dispatch.TRIGGERS` says what
+that starts; the five bindings here are the windowed ones.
 
 One rule they do *not* share, and it matters: **a batch feed never suspends for
 one ambiguous row.** A per-case Flow blocks on a gate because the case cannot
@@ -16,7 +17,8 @@ steps here.
 
 What each sync run does, in order:
 
-  t1 SourceDelivered (trigger) → x1 read-resolution-policy (governed
+  t1 …Delivered (the trigger row: the run's record that the Dispatcher
+  started it, logged before it existed) → x1 read-resolution-policy (governed
   thresholds) → s1 land-records (SourceRecords, exactly as they arrived) →
   z1 resolve-records (score against what we know; assert nothing) →
   a1 apply-resolutions (mint, link, or raise a steward Task) →
@@ -37,7 +39,17 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from .anomaly import parse_anomaly_thresholds
-from .graph import Claim, GraphService, GraphWriter, normalize_key, object_id
+from .auth import Principal, flow_principal
+from .dispatch import Dispatcher, InMemoryEventLog
+from .gateway import ActionGateway, InMemoryLedgerStore, PendingAction
+from .graph import (
+    Claim,
+    GraphService,
+    GraphWriter,
+    InMemoryGraphStore,
+    normalize_key,
+    object_id,
+)
 from .matching import parse_match_tolerances
 from .models import utcnow
 from .resolution import (
@@ -57,7 +69,16 @@ RECEIVING_FLOW_ID = "receiving-sync"
 WORKFORCE_FLOW_ID = "workforce-sync"
 CALENDAR_FLOW_ID = "calendar-sync"
 STEWARD_QUEUE = "vendor-stewardship"
-PEOPLE_QUEUE = "people-ops"
+
+# The fact each feed shape reports. One name per shape rather than a single
+# `SourceDelivered`, because a name bound to five Triggers would start five
+# flows on every delivery. `deliver` names these; `dispatch.TRIGGERS` says
+# which flow each one starts, and this module no longer decides that.
+VENDOR_EVENT = "VendorRecordsDelivered"
+PO_EVENT = "PurchaseOrdersDelivered"
+RECEIVING_EVENT = "ReceivingReportsDelivered"
+WORKFORCE_EVENT = "WorkforceDelivered"
+CALENDAR_EVENT = "CalendarsDelivered"
 
 SyncKind = Literal[
     "vendors", "purchase-orders", "receiving-reports", "workforce",
@@ -254,11 +275,22 @@ class SyncService:
         knowledge,
         tasks: TaskService,
         engine: RunEngine | None = None,
+        gateway: ActionGateway | None = None,
+        dispatcher: Dispatcher | None = None,
     ) -> None:
         self.graph = graph
         self.knowledge = knowledge
         self.tasks = tasks
         self.engine = engine
+        # Never None — see the note in payables.py. Every write in this module
+        # goes through the Gateway, including the ones no human authorized.
+        self.gateway = gateway or ActionGateway(
+            graph or GraphService(InMemoryGraphStore()), InMemoryLedgerStore()
+        )
+        # Never bypassed, for the same reason — see the note in payables.py.
+        self.dispatcher = dispatcher or (
+            Dispatcher(engine, InMemoryEventLog()) if engine is not None else None
+        )
         if engine is not None:
             engine.register(VENDOR_FLOW_ID, self._vendor_body)
             engine.register(PO_FLOW_ID, self._po_body)
@@ -266,42 +298,66 @@ class SyncService:
             engine.register(WORKFORCE_FLOW_ID, self._workforce_body)
             engine.register(CALENDAR_FLOW_ID, self._calendar_body)
 
+    def _act(self, ctx: RunContext, action_id: str, step_id: str) -> PendingAction:
+        """A sync write, committed by the Flow that is running.
+
+        Nobody *decided* a feed delivery — a source reported and Cumulus
+        recorded — so the committing Principal is the Flow itself, with no
+        queue binding, and the Action it names carries the regime: an
+        observation for a landing or an apply, a resolution for the identity
+        choice the governed thresholds made. That is the whole difference
+        between the two kinds of write in this module, and it is declared
+        rather than guessed from what the step touched.
+        """
+        return self.gateway.action(
+            action_id, flow_principal(ctx.record.flow_id),
+            run=ctx.record, step_id=step_id,
+        )
+
     # -- entry point --------------------------------------------------------
 
     def deliver(self, request: SyncRequest, actor: str = "") -> list[dict]:
-        """Accept one push and run whichever sync flows it carries."""
-        if self.engine is None:
+        """Accept one push and report the fact each feed shape carries.
+
+        This used to name the flow to run. It now names what happened — "two
+        hundred vendor records arrived from `erp-vendors`" — and the Dispatcher
+        answers with the response, which is why the outcomes read `flow_id` off
+        the run that started rather than off a variable set here. A delivery
+        this module has no Trigger for raises rather than quietly landing
+        nowhere.
+        """
+        if self.engine is None or self.dispatcher is None:
             raise RuntimeError("Sync service has no run engine wired")
         outcomes: list[dict] = []
-        plan: list[tuple[str, str, list[Any]]] = [
-            (VENDOR_FLOW_ID, "vendors", request.vendors),
-            (PO_FLOW_ID, "purchase_orders", request.purchase_orders),
-            (RECEIVING_FLOW_ID, "receiving_reports", request.receiving_reports),
+        plan: list[tuple[str, list[Any]]] = [
+            (VENDOR_EVENT, request.vendors),
+            (PO_EVENT, request.purchase_orders),
+            (RECEIVING_EVENT, request.receiving_reports),
         ]
         if request.teams or request.employees:
-            plan.append((WORKFORCE_FLOW_ID, "workforce", []))
+            plan.append((WORKFORCE_EVENT, []))
         if request.calendars or request.calendar_events:
-            plan.append((CALENDAR_FLOW_ID, "calendars", []))
+            plan.append((CALENDAR_EVENT, []))
         # The two multi-shape feeds carry their records in named lists rather
         # than one `records` column, so they are exempt from the emptiness
         # check and build their own inputs below.
-        multi_shape = (WORKFORCE_FLOW_ID, CALENDAR_FLOW_ID)
-        for flow_id, field, records in plan:
-            if flow_id not in multi_shape and not records:
+        multi_shape = (WORKFORCE_EVENT, CALENDAR_EVENT)
+        for event, records in plan:
+            if event not in multi_shape and not records:
                 continue
             inputs = {
                 "source": request.source,
                 "watermark": request.watermark,
                 "records": [r.model_dump() for r in records],
             }
-            if flow_id == WORKFORCE_FLOW_ID:
+            if event == WORKFORCE_EVENT:
                 inputs = {
                     "source": request.source,
                     "watermark": request.watermark,
                     "teams": [t.model_dump() for t in request.teams],
                     "employees": [e.model_dump() for e in request.employees],
                 }
-            elif flow_id == CALENDAR_FLOW_ID:
+            elif event == CALENDAR_EVENT:
                 inputs = {
                     "source": request.source,
                     "watermark": request.watermark,
@@ -313,26 +369,29 @@ class SyncService:
             run_id = None
             if request.idempotency_key:
                 # A retried delivery re-enters the same run, which replays its
-                # completed steps and changes nothing.
+                # completed steps and changes nothing. Keyed on the fact, not
+                # on the flow: the same fact redelivered is the same delivery,
+                # whatever the Trigger table decides to do with it.
                 digest = hashlib.sha256(
-                    f"{flow_id}:{request.source}:{request.idempotency_key}".encode()
+                    f"{event}:{request.source}:{request.idempotency_key}".encode()
                 ).hexdigest()[:10]
                 run_id = f"run_sync_{digest}"
                 existing = self.engine.get(run_id)
                 if existing is not None:
                     outcomes.append({
-                        "flow_id": flow_id, "run_id": run_id,
+                        "flow_id": existing.flow_id, "run_id": run_id,
                         "status": existing.status, "replayed": True,
                         **(existing.outputs or {}),
                     })
                     continue
-            record = self.engine.start(
-                flow_id, inputs, actor=actor or f"source:{request.source}",
+            record = self.dispatcher.emit(
+                event, inputs, actor=actor or f"source:{request.source}",
                 run_id=run_id,
-            )
+            ).one()
             outcomes.append({
-                "flow_id": flow_id, "run_id": record.id, "status": record.status,
-                "replayed": False, **(record.outputs or {}),
+                "flow_id": record.flow_id, "run_id": record.id,
+                "status": record.status, "replayed": False,
+                **(record.outputs or {}),
             })
         return outcomes
 
@@ -344,7 +403,7 @@ class SyncService:
         records = [VendorRecord.model_validate(r) for r in inputs["records"]]
 
         ctx.event(
-            "t1", "SourceDelivered",
+            "t1", VENDOR_EVENT,
             f"{len(records)} vendor record(s) from `{source}`"
             + (f" · watermark {watermark}" if watermark else ""),
             kind="trigger",
@@ -361,14 +420,13 @@ class SyncService:
         thresholds = ResolutionThresholds.model_validate(thresholds_raw)
         ctx.note_refs(thresholds.source_ref)
 
-        landing_writer = self.graph.writer(ctx.record.id, "s1")
+        landing = self._act(ctx, "land-source-records", "s1")
         landed = ctx.step(
             "s1", "land-records", "sync",
-            fn=lambda: self._land(
-                source, "vendor", [r.model_dump() for r in records],
-                landing_writer,
-            ),
-            writes=lambda _out: landing_writer.refs,
+            fn=lambda: landing.commit(lambda w: self._land(
+                source, "vendor", [r.model_dump() for r in records], w,
+            )),
+            writes=lambda _out: landing.writes,
             summary=lambda out: (
                 f"{out['landed']} landed, {out['unchanged']} unchanged "
                 f"(byte-identical redelivery) in `source-landing`"
@@ -390,15 +448,15 @@ class SyncService:
             refs=[thresholds.source_ref],
         )
 
-        apply_writer = self.graph.writer(ctx.record.id, "a1")
+        apply = self._act(ctx, "resolve-identities", "a1")
         applied = ctx.step(
             "a1", "apply-resolutions", "action",
-            fn=lambda: self._apply_vendors(
+            fn=lambda: apply.commit(lambda w: self._apply_vendors(
                 source, records,
                 [ResolutionOutcome.model_validate(r) for r in resolutions],
-                ctx.record.id, apply_writer,
-            ),
-            writes=lambda _out: apply_writer.refs,
+                ctx.record.id, w,
+            )),
+            writes=lambda _out: apply.writes,
             summary=lambda out: (
                 f"{out['linked']} linked to existing vendors · {out['created']} "
                 f"minted · {out['deactivated']} deactivated · "
@@ -587,27 +645,27 @@ class SyncService:
         source = inputs["source"]
         records = [PurchaseOrderRecord.model_validate(r) for r in inputs["records"]]
         ctx.event(
-            "t1", "SourceDelivered",
+            "t1", PO_EVENT,
             f"{len(records)} purchase order(s) from `{source}`", kind="trigger",
         )
-        landing_writer = self.graph.writer(ctx.record.id, "s1")
+        landing = self._act(ctx, "land-source-records", "s1")
         landed = ctx.step(
             "s1", "land-records", "sync",
-            fn=lambda: self._land(
-                source, "po", [r.model_dump() for r in records], landing_writer,
-            ),
-            writes=lambda _out: landing_writer.refs,
+            fn=lambda: landing.commit(lambda w: self._land(
+                source, "po", [r.model_dump() for r in records], w,
+            )),
+            writes=lambda _out: landing.writes,
             summary=lambda out: (
                 f"{out['landed']} landed, {out['unchanged']} unchanged"
             ),
         )
-        apply_writer = self.graph.writer(ctx.record.id, "a1")
+        apply = self._act(ctx, "apply-source-records", "a1")
         applied = ctx.step(
             "a1", "apply-purchase-orders", "action",
-            fn=lambda: self._apply_pos(
-                source, records, ctx.record.id, apply_writer
-            ),
-            writes=lambda _out: apply_writer.refs,
+            fn=lambda: apply.commit(lambda w: self._apply_pos(
+                source, records, ctx.record.id, w,
+            )),
+            writes=lambda _out: apply.writes,
             summary=lambda out: (
                 f"{out['orders']} order(s) and {out['lines']} line(s) written · "
                 f"{out['vendor_linked']} linked to a vendor · "
@@ -699,27 +757,27 @@ class SyncService:
         source = inputs["source"]
         records = [ReceivingRecord.model_validate(r) for r in inputs["records"]]
         ctx.event(
-            "t1", "SourceDelivered",
+            "t1", RECEIVING_EVENT,
             f"{len(records)} receiving report(s) from `{source}`", kind="trigger",
         )
-        landing_writer = self.graph.writer(ctx.record.id, "s1")
+        landing = self._act(ctx, "land-source-records", "s1")
         landed = ctx.step(
             "s1", "land-records", "sync",
-            fn=lambda: self._land(
-                source, "rr", [r.model_dump() for r in records], landing_writer,
-            ),
-            writes=lambda _out: landing_writer.refs,
+            fn=lambda: landing.commit(lambda w: self._land(
+                source, "rr", [r.model_dump() for r in records], w,
+            )),
+            writes=lambda _out: landing.writes,
             summary=lambda out: (
                 f"{out['landed']} landed, {out['unchanged']} unchanged"
             ),
         )
-        apply_writer = self.graph.writer(ctx.record.id, "a1")
+        apply = self._act(ctx, "apply-source-records", "a1")
         applied = ctx.step(
             "a1", "apply-receiving-reports", "action",
-            fn=lambda: self._apply_receipts(
-                source, records, ctx.record.id, apply_writer
-            ),
-            writes=lambda _out: apply_writer.refs,
+            fn=lambda: apply.commit(lambda w: self._apply_receipts(
+                source, records, ctx.record.id, w,
+            )),
+            writes=lambda _out: apply.writes,
             summary=lambda out: (
                 f"{out['reports']} report(s) and {out['lines']} line(s) written · "
                 f"{out['po_linked']} booked against a PO · {out['po_missing']} "
@@ -752,35 +810,37 @@ class SyncService:
             EmployeeRecord.model_validate(e) for e in inputs.get("employees", [])
         ]
         ctx.event(
-            "t1", "SourceDelivered",
+            "t1", WORKFORCE_EVENT,
             f"{len(teams)} team(s) and {len(employees)} employee(s) from "
             f"`{source}`",
             kind="trigger",
         )
 
-        team_writer = self.graph.writer(ctx.record.id, "a1")
+        team_act = self._act(ctx, "apply-source-records", "a1")
         team_out = ctx.step(
             "a1", "apply-teams", "action",
-            fn=lambda: self._apply_teams(source, teams, ctx.record.id, team_writer),
-            writes=lambda _out: team_writer.refs,
+            fn=lambda: team_act.commit(
+                lambda w: self._apply_teams(source, teams, ctx.record.id, w)
+            ),
+            writes=lambda _out: team_act.writes,
             summary=lambda out: f"{out['teams']} team(s) written",
         )
-        people_writer = self.graph.writer(ctx.record.id, "a2")
+        people_act = self._act(ctx, "apply-source-records", "a2")
         people_out = ctx.step(
             "a2", "apply-employees", "action",
-            fn=lambda: self._apply_employees(
-                source, employees, ctx.record.id, people_writer
-            ),
-            writes=lambda _out: people_writer.refs,
+            fn=lambda: people_act.commit(lambda w: self._apply_employees(
+                source, employees, ctx.record.id, w,
+            )),
+            writes=lambda _out: people_act.writes,
             summary=lambda out: f"{out['employees']} employee(s) written",
         )
-        chart_writer = self.graph.writer(ctx.record.id, "a3")
+        chart_act = self._act(ctx, "apply-source-records", "a3")
         chart_out = ctx.step(
             "a3", "wire-org-chart", "action",
-            fn=lambda: self._wire_org_chart(
-                teams, employees, chart_writer
+            fn=lambda: chart_act.commit(
+                lambda w: self._wire_org_chart(teams, employees, w)
             ),
-            writes=lambda _out: chart_writer.refs,
+            writes=lambda _out: chart_act.writes,
             summary=lambda out: (
                 f"{out['member_of']} membership(s), {out['reports_to']} "
                 f"reporting line(s), {out['subteam_of']} nesting(s), "
@@ -945,38 +1005,40 @@ class SyncService:
             CalendarEventRecord.model_validate(e) for e in inputs.get("events", [])
         ]
         ctx.event(
-            "t1", "SourceDelivered",
+            "t1", CALENDAR_EVENT,
             f"{len(calendars)} calendar(s) and {len(events)} event(s) from "
             f"`{source}`",
             kind="trigger",
         )
 
-        calendar_writer = self.graph.writer(ctx.record.id, "a1")
+        calendar_act = self._act(ctx, "apply-source-records", "a1")
         calendar_out = ctx.step(
             "a1", "apply-calendars", "action",
-            fn=lambda: self._apply_calendars(
-                source, calendars, ctx.record.id, calendar_writer
-            ),
-            writes=lambda _out: calendar_writer.refs,
+            fn=lambda: calendar_act.commit(lambda w: self._apply_calendars(
+                source, calendars, ctx.record.id, w,
+            )),
+            writes=lambda _out: calendar_act.writes,
             summary=lambda out: (
                 f"{out['calendars']} calendar(s) written, "
                 f"{out['owners']} owner link(s)"
             ),
         )
-        event_writer = self.graph.writer(ctx.record.id, "a2")
+        event_act = self._act(ctx, "apply-source-records", "a2")
         event_out = ctx.step(
             "a2", "apply-events", "action",
-            fn=lambda: self._apply_events(
-                source, events, ctx.record.id, event_writer
-            ),
-            writes=lambda _out: event_writer.refs,
+            fn=lambda: event_act.commit(lambda w: self._apply_events(
+                source, events, ctx.record.id, w,
+            )),
+            writes=lambda _out: event_act.writes,
             summary=lambda out: f"{out['events']} event(s) written",
         )
-        attendance_writer = self.graph.writer(ctx.record.id, "a3")
+        attendance_act = self._act(ctx, "apply-source-records", "a3")
         attendance_out = ctx.step(
             "a3", "wire-attendance", "action",
-            fn=lambda: self._wire_attendance(events, attendance_writer),
-            writes=lambda _out: attendance_writer.refs,
+            fn=lambda: attendance_act.commit(
+                lambda w: self._wire_attendance(events, w)
+            ),
+            writes=lambda _out: attendance_act.writes,
             summary=lambda out: (
                 f"{out['attended_by']} attendance(s), "
                 f"{out['organized_by']} organizer(s)"
@@ -1253,13 +1315,19 @@ class SyncService:
 
     # -- the steward's decision --------------------------------------------
 
-    def apply_match_decision(self, task: Task) -> dict | None:
+    def apply_match_decision(
+        self, task: Task, principal: Principal | None = None
+    ) -> dict | None:
         """Assert (or refuse) the link a steward just ruled on.
 
         This is the resolution stream of the Task queue becoming real: nothing
         was asserted while the Task was open, so the decision is the first
         write. `approved` links to the top candidate, `corrected` links to
         whichever id the steward names, `rejected` mints a new entity.
+
+        It carries no run — a batch feed does not suspend for one row — so the
+        Gateway is the only thing that records it happened, which is precisely
+        why it goes through the Gateway rather than straight at the graph.
         """
         if task.kind != "match_review" or task.decision is None:
             return None
@@ -1270,7 +1338,26 @@ class SyncService:
         record = VendorRecord.model_validate(payload) if payload else None
         if record is None:
             return None
+        act = self.gateway.action(
+            "link-source-record",
+            # The steward, when a live caller carried one. A seed or a test
+            # that did not is committing on the Flow's declared authority, and
+            # `decided_by` on the entry still names whose judgment it was.
+            principal or flow_principal(VENDOR_FLOW_ID, STEWARD_QUEUE),
+            step_id="steward-decision", task_id=task.id,
+            decided_by=task.decision.decided_by, target=source_record.ref(),
+        )
+        return act.commit(
+            lambda w: self._assert_steward_decision(task, record, source_record, w)
+        )
 
+    def _assert_steward_decision(
+        self,
+        task: Task,
+        record: VendorRecord,
+        source_record,
+        graph: GraphWriter,
+    ) -> dict | None:
         verdict = task.decision.verdict
         target_id = str(task.decision.payload.get("object_id") or "")
         if verdict == "approved" and not target_id:
@@ -1287,7 +1374,7 @@ class SyncService:
             vendor = self.graph.get(target_id)
             if vendor is None:
                 return None
-            self.graph.upsert(
+            graph.upsert(
                 "Vendor", vendor.natural_key,
                 [
                     Claim(field="aliases", value=[record.name], source=claim_source),
@@ -1296,7 +1383,7 @@ class SyncService:
                 ],
                 label=vendor.label,
             )
-            link = self.graph.link(
+            link = graph.link(
                 "identified_as", vendor.id, source_record.id,
                 props={
                     "source": record and str(source_record.props.get("source")),
@@ -1315,7 +1402,7 @@ class SyncService:
             )
             return {"action": "linked", "vendor_id": vendor.id, "link_id": link.id}
 
-        vendor = self.graph.upsert(
+        vendor = graph.upsert(
             "Vendor", record.name,
             [
                 Claim(field="name", value=record.name, source=claim_source),
@@ -1325,7 +1412,7 @@ class SyncService:
             label=record.name,
             provenance=f"minted by steward decision on {task.id}",
         )
-        self.graph.link(
+        graph.link(
             "identified_as", vendor.id, source_record.id,
             props={"external_id": record.external_id,
                    "decided_by": task.decision.decided_by},
@@ -1421,6 +1508,11 @@ def _authority(source: str) -> str:  # noqa: D401
 
 
 def build_sync_service(
-    graph: GraphService, knowledge, tasks: TaskService, engine: RunEngine | None
+    graph: GraphService,
+    knowledge,
+    tasks: TaskService,
+    engine: RunEngine | None,
+    gateway: ActionGateway | None = None,
+    dispatcher: Dispatcher | None = None,
 ) -> SyncService:
-    return SyncService(graph, knowledge, tasks, engine)
+    return SyncService(graph, knowledge, tasks, engine, gateway, dispatcher)

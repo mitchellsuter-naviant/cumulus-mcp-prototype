@@ -12,15 +12,23 @@ The doctrinal assertions:
 - the anomaly screen is scored against the vendor's own history with governed
   thresholds;
 - the posting rule's values come from the governed document;
-- a clerk's correction re-runs the match rather than overriding it.
+- a clerk's correction re-runs the match rather than overriding it;
+- the hint grammar is one model, and every hint the repository ships
+  round-trips through it verbatim.
 """
 
 import pytest
+from pydantic import ValidationError
 
 from app.graph import object_id
 from app.matching import MatchLine, MatchTolerances, match_invoice
 from app.models import AssetUpdate
-from app.payables import seed_payables_if_empty
+from app.payables import (
+    InvoiceScenario,
+    ScenarioLine,
+    _seed_invoices,
+    seed_payables_if_empty,
+)
 from app.sync import SyncRequest
 from tests import world as test_world
 
@@ -85,6 +93,145 @@ def _receipts(world, short: float = 0.0):
             ],
         }],
     }), actor="system:test")
+
+
+
+# ---- the case-authoring language ------------------------------------------
+#
+# The hint string is not debug scaffolding. It is what the seeded world is
+# written in, what the eval cases state their triggers in, and what a person
+# composing an invoice in the console sends. One grammar, three consumers.
+
+
+def _shipped_hints() -> list[str]:
+    """Every hint string this repository ships, from where it actually lives.
+
+    Read out of the seeds and the eval specs rather than copied here, so a
+    hint added to either is covered the moment it is added — a fixture list
+    that has to be kept in step is the thing this test exists to prevent.
+    """
+    from app.eval_specs import AP_CASES
+
+    return (
+        [case.hint for case in _seed_invoices()]
+        + [c.trigger["hint"] for c in AP_CASES if c.trigger.get("hint")]
+    )
+
+
+@pytest.mark.parametrize("hint", _shipped_hints())
+def test_every_shipped_hint_round_trips_verbatim(hint):
+    """The load-bearing property.
+
+    Serialization drifting by one character does not fail loudly: the seed
+    builds a *different* world and the eval suite goes red looking like a Flow
+    regression. So the string is asserted byte-for-byte, both ways.
+    """
+    scenario = InvoiceScenario.parse(hint)
+    assert scenario.to_hint() == hint
+    assert InvoiceScenario.parse(scenario.to_hint()) == scenario
+
+
+def test_the_grammar_distinguishes_what_an_empty_string_cannot():
+    """`nopo` is not an absent `po=`, and a named new vendor is not a bare one.
+
+    Both pairs serialize to different strings and reach different branches, so
+    collapsing either into one empty field would silently retarget a case.
+    """
+    no_order = InvoiceScenario.parse("vendor=acme-industrial nopo")
+    unstated = InvoiceScenario.parse("vendor=acme-industrial")
+    assert no_order.no_po and not unstated.no_po
+    assert no_order.to_hint() != unstated.to_hint()
+
+    named = InvoiceScenario.parse("newvendor=meridian-supply")
+    bare = InvoiceScenario.parse("newvendor po=PO-9001")
+    assert named.new_vendor == "meridian-supply" and not named.unnamed_new_vendor
+    assert bare.unnamed_new_vendor and not bare.new_vendor
+    assert bare.to_hint() == "newvendor po=PO-9001"
+
+
+def test_lines_carry_the_quantity_the_composer_stepped_to():
+    scenario = InvoiceScenario.parse("lines=STL-0250:2,FAS-M12:3")
+    assert [(line.sku, line.quantity) for line in scenario.lines] == [
+        ("STL-0250", 2.0), ("FAS-M12", 3.0)
+    ]
+    scenario.lines[1].quantity = 5
+    assert scenario.to_hint() == "lines=STL-0250:2,FAS-M12:5"
+
+
+def test_the_grammar_refuses_what_it_cannot_spell():
+    """Closure, not fussiness.
+
+    `to_hint` and `parse` are one round trip, so a field holding a character
+    the parser's charset cannot read back would let the console preview one
+    invoice number and the run receive a different one. Refusing is the only
+    answer that keeps "what this sends" true.
+    """
+    with pytest.raises(ValidationError):
+        InvoiceScenario(invoice_number="ACME INV 1")
+    with pytest.raises(ValidationError):
+        InvoiceScenario(po_number="7741")
+    # Case and surrounding space are normalized rather than refused: a person
+    # typing an invoice number is not making a different case.
+    assert InvoiceScenario(invoice_number=" acme-inv-1 ").to_hint() == (
+        "invoice=ACME-INV-1"
+    )
+
+
+TWIST_BRANCHES = {
+    "price_variance": "price variance",
+    "over_receipt": "quantity variance",
+    "low_confidence": "low extraction confidence",
+    "tax_id": "tax-id resolution",
+}
+
+
+@pytest.mark.parametrize("twist", sorted(TWIST_BRANCHES))
+def test_each_twist_reaches_the_branch_it_advertises(world, twist):
+    """A checkbox that names a branch has to reach it.
+
+    The composer labels each twist with the branch it exercises and the
+    governed clause that decides it. If a twist stopped reaching its branch the
+    label would still read correctly and the screen would be teaching the
+    wrong thing, which is the failure this catches.
+    """
+    _vendors(world)
+    _orders(world)
+    _receipts(world)
+    scenario = InvoiceScenario(
+        vendor_slug="acme-industrial", po_number="PO-7741",
+        invoice_number=f"ACME-{twist.upper().replace('_', '-')}",
+        lines=[
+            ScenarioLine(sku="STL-0250", quantity=2),
+            ScenarioLine(sku="FAS-M12", quantity=3),
+        ],
+        **{twist: True},
+    )
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf", hint=scenario.to_hint()
+    )
+    if twist == "price_variance":
+        assert record.match_verdict == "variance"
+        assert any(
+            p["verdict"] == "price-variance" for p in record.match_pairings
+        )
+    elif twist == "over_receipt":
+        assert record.match_verdict == "variance"
+        assert any(
+            p["verdict"] == "quantity-variance" for p in record.match_pairings
+        )
+    elif twist == "low_confidence":
+        assert "confidence 0.55 is below" in record.verdict_reason
+    else:
+        # The twist prints a tax id, which is where the resolver's strongest
+        # signal is read from. Whether it *settles* the vendor depends on the
+        # master holding that id — the resolver's business, not the
+        # extractor's, and exactly the division this flow exists to show.
+        assert record.vendor_tax_id
+        plain = world.payables.submit(
+            "ap@customer.example", filename="acme.pdf",
+            hint=scenario.model_copy(update={"tax_id": False}).to_hint(),
+        )
+        assert not plain.vendor_tax_id
 
 
 # ---- the governed read -----------------------------------------------------
@@ -207,6 +354,61 @@ def test_one_model_call_reads_the_document(world):
     step_ids = {s.step_id for s in run.steps}
     assert step_ids >= {"s1", "m1", "z1", "x3", "c1", "c2"}
     assert [s.step_id for s in run.steps if s.kind == "modelcall"] == ["m1"]
+
+
+def test_the_extraction_prompt_is_an_asset_the_modelcall_names(world):
+    """The one call is steered by governed knowledge, and says which revision.
+
+    The AP flow already read its posting policy at a revision; the instruction
+    that produced the extraction the policy is then applied to was a string
+    literal. Now both are assets, and the ModelCall's read-set names the one it
+    ran on — which is what makes a posting explainable end to end.
+    """
+    asset = world.knowledge.repo.get("invoice-extraction-prompt")
+    assert asset is not None
+    assert asset.kind == "prompt"
+
+    prompt = world.payables.read_prompt()
+    assert prompt.found_asset
+    assert prompt.source_ref == "knowledge:invoice-extraction-prompt@rev1"
+    # The instruction that keeps identity out of the model's hands is a value a
+    # customer can read and revise, not a literal buried in the reader.
+    assert "not normalized and not guessed at" in prompt.text
+
+    _vendors(world)
+    _orders(world)
+    _receipts(world)
+    record = world.payables.submit(
+        "ap@customer.example", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-9 lines=STL-0250:2",
+    )
+    run = world.engine.get(record.run_id)
+    [model_step] = [s for s in run.steps if s.kind == "modelcall"]
+    assert "knowledge:invoice-extraction-prompt@rev1" in model_step.refs
+
+
+def test_a_corpus_without_the_prompt_still_extracts():
+    """A deployment that has not seeded yet still reads invoices.
+
+    The built-in default carries the extraction and the unpinned ref says the
+    run never got a revision — the same degradation as every other governed
+    read here, because a missing asset is a corpus problem and not a reason to
+    stop reading documents.
+    """
+    world = test_world.fresh(seed_corpus=False)
+    prompt = world.payables.read_prompt()
+    assert not prompt.found_asset
+    assert prompt.source_ref == "knowledge:invoice-extraction-prompt"
+
+    record = world.payables.submit(
+        "ap@customer.example", filename="mer.pdf",
+        hint="newvendor po=PO-9001 invoice=MER-7 total=480.00",
+    )
+    run = world.engine.get(record.run_id)
+    [model_step] = [s for s in run.steps if s.kind == "modelcall"]
+    assert model_step.status == "done"
+    assert "knowledge:invoice-extraction-prompt" in model_step.refs
+    assert record.total_usd > 0
 
 
 def test_an_unknown_vendor_is_minted_onboarding_and_graduates_on_posting(world):
@@ -509,3 +711,239 @@ def test_api_exposes_the_table_the_match_and_the_vendors(client, world):
     assert {s["kind"] for s in sources} >= {
         "vendors", "purchase-orders", "receiving-reports"
     }
+
+
+# ---- who the AP table belongs to ------------------------------------------
+#
+# Kim is the whole point of this block. She owns no queue and has never entered
+# an invoice, and until this rule landed her `/payables/stats` came back
+# byte-identical to the engineer's — every vendor, every amount, every posting
+# decision in the tenant, handed to a data engineer because she was signed in.
+#
+# The rule is one sentence: your own rows, plus the rows of any run whose Task
+# sits in a queue you own. It reads off `InvoiceRecord.task_id` and `Task.queue`
+# — both already stored — so an `ap-clerk` binding is what opens the table
+# rather than a second notion of authority.
+
+#: Rows each persona reaches over the seeded AP world, and why.
+AP_VISIBLE = {
+    # Platform scope: the deployment is theirs to diagnose.
+    "naviant-engineer": 7,
+    "naviant-support": 7,
+    # Tenant scope: the customer's own map, whole, by design.
+    "customer-admin": 7,
+    # Bound to `ap-clerk`, which is the queue this flow routes to — so the
+    # whole workspace is theirs, including `run_ap_seed01`, which auto-posted
+    # and raised nothing. A clerk shown only the invoices that went wrong has
+    # no baseline to judge the exceptions against.
+    "customer-user:ap": 7,
+    "customer-user:nadia": 7,
+    # Owns no queue and entered no invoice.
+    "customer-user:kim": 0,
+    # Approves expenses, which says nothing about invoices.
+    "customer-user:rowan": 0,
+}
+
+
+@pytest.mark.parametrize("persona,expected", sorted(AP_VISIBLE.items()))
+def test_the_ap_table_shows_the_work_you_are_accountable_for(
+    client, world, persona, expected
+):
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    rows = client.get(
+        "/api/v1/payables", headers={"X-Cumulus-Persona": persona}
+    ).json()
+    assert len(rows) == expected
+
+
+@pytest.mark.parametrize("persona,expected", sorted(AP_VISIBLE.items()))
+def test_the_ap_strip_counts_the_table_under_it(client, world, persona, expected):
+    """A strip computed over a different slice than its table is a screen
+    arguing with itself — the bug already caught once on the task badge, where
+    the per-queue breakdown was filtered and the headline was not."""
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    headers = {"X-Cumulus-Persona": persona}
+    rows = client.get("/api/v1/payables", headers=headers).json()
+    stats = client.get("/api/v1/payables/stats", headers=headers).json()
+    assert stats["total"] == len(rows) == expected
+    # Every band, not just the headline: a filtered total over an unfiltered
+    # breakdown is the same bug wearing the other hat.
+    assert stats["posted"] + stats["pending"] + stats["denied"] == len(rows)
+
+
+def test_a_total_is_a_read_of_every_row_it_counts(client, world):
+    """The money, not just the count. An org-wide figure handed to somebody who
+    may see none of the rows leaks all of them in aggregate."""
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    everyone = client.get("/api/v1/payables/stats").json()
+    kim = client.get(
+        "/api/v1/payables/stats", headers={"X-Cumulus-Persona": "customer-user:kim"}
+    ).json()
+    tomas = client.get(
+        "/api/v1/payables/stats", headers={"X-Cumulus-Persona": "customer-user:ap"}
+    ).json()
+    assert everyone["posted_usd"] > 0 and everyone["anomalies"] > 0
+    assert kim["posted_usd"] == 0.0 and kim["anomalies"] == 0
+    # Tomas owns the queue this flow routes to, so the workspace is his and
+    # his totals are the tenant's — that is what a Seeing Space is. The leak
+    # this guards is Kim's, who owns no queue and entered no invoice.
+    assert tomas["posted_usd"] == everyone["posted_usd"]
+    assert tomas["anomalies"] == everyone["anomalies"]
+
+
+def test_an_invoice_outside_your_slice_is_missing_not_forbidden(client, world):
+    """404 rather than 403: a 403 confirms the id exists, which is the one bit
+    an unauthorized caller should not get back."""
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    record_id = "run_ap_seed03"  # raised an ap-clerk task, still pending
+    assert client.get(
+        f"/api/v1/payables/{record_id}",
+        headers={"X-Cumulus-Persona": "customer-user:ap"},
+    ).status_code == 200
+    refused = client.get(
+        f"/api/v1/payables/{record_id}",
+        headers={"X-Cumulus-Persona": "customer-user:kim"},
+    )
+    assert refused.status_code == 404
+
+
+# ---- the console's own door -----------------------------------------------
+#
+# `/api/ui/v1/payables` replaces a free-text hint box with a composer built out
+# of the graph, and answers a submission with a screen rather than a sentence.
+# Three things are worth defending: the composer's controls are real rows, the
+# outcome names the clause the Rule cited without re-deriving the verdict, and
+# `may_decide` answers `require_queue` before the 403 rather than after it.
+
+UI_PAYABLES = "/api/ui/v1/payables"
+UI_SUBMISSIONS = "/api/ui/v1/payables/submissions"
+
+
+def _composed(**overrides) -> dict:
+    scenario = {
+        "vendor_slug": "acme-industrial",
+        "po_number": "PO-7741",
+        "invoice_number": "ACME-INV-9001",
+        "lines": [{"sku": "STL-0250", "quantity": 2}, {"sku": "FAS-M12", "quantity": 3}],
+    }
+    scenario.update(overrides)
+    return {"scenario": scenario}
+
+
+def test_every_composer_control_is_a_row_from_the_graph(client, world):
+    """The picker is the vendor master, its orders and their lines.
+
+    Not a list of example strings: choosing Acme and then PO-7741 is what makes
+    `lines=STL-0250:2,FAS-M12:3` appear, and nobody composing an invoice has to
+    know that spelling exists.
+    """
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    composer = client.get(UI_PAYABLES).json()["composer"]
+
+    acme = next(v for v in composer["vendors"] if "Acme" in v["label"])
+    assert acme["status"] == "active"
+    # The vendor master's whole point, at the moment you pick one.
+    assert {s["source"] for s in acme["sources"]} >= {"erp-vendors", "procurement-coupa"}
+
+    [order] = acme["orders"]
+    assert order["po_number"] == "PO-7741" and order["receipts"] == ["RR-5501"]
+    # In the order's own ordinal order: a twist that says "the first line"
+    # has to mean line 1 of the purchase order, not whichever SKU sorts first.
+    assert [(line["sku"], line["quantity_ordered"]) for line in order["lines"]] == [
+        ("STL-0250", 2.0), ("FAS-M12", 3.0)
+    ]
+    assert [line["quantity_received"] for line in order["lines"]] == [2.0, 3.0]
+    # The catalog is the line source for an invoice with no order behind it.
+    assert {line["sku"] for line in composer["catalog"]} >= {"PPE-GLV", "STL-0375"}
+
+    # Every twist names a clause the flow actually reads.
+    clause_ids = {clause["id"] for clause in composer["policy"]}
+    assert {t["clause_id"] for t in composer["twists"]} <= clause_ids
+    limit = next(c for c in composer["policy"] if c["id"] == "auto-post-limit")
+    assert limit["value"] == "$2,500.00"
+    assert limit["ref"] == "knowledge:invoice-posting-policy@rev1"
+
+
+def test_a_composed_submission_sends_the_string_it_showed(client, world):
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    outcome = client.post(UI_SUBMISSIONS, json=_composed()).json()
+    assert outcome["hint"] == (
+        "vendor=acme-industrial po=PO-7741 invoice=ACME-INV-9001 "
+        "lines=STL-0250:2,FAS-M12:3"
+    )
+    assert outcome["invoice"]["state"] == "posted"
+    assert outcome["invoice"]["match_verdict"] == "matched"
+    assert outcome["gate"] is None
+
+
+def test_the_outcome_marks_the_clause_the_rule_cited(client, world):
+    """Juxtaposition, not prediction.
+
+    The screen shows $9,800.00 beside "auto-post ≤ $2,500.00" and marks the
+    clause the Rule's own reason names. Marking is attribution of a sentence
+    `_posting_check` already wrote; deciding here would be a second copy of the
+    rule, and the two would eventually disagree.
+    """
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    outcome = client.post(UI_SUBMISSIONS, json=_composed(
+        invoice_number="ACME-INV-9002",
+        lines=[{"sku": "STL-0375", "quantity": 12}],
+        total_usd=9800.0,
+    )).json()
+    assert outcome["invoice"]["state"] == "pending"
+    deciding = {c["id"] for c in outcome["policy"] if c["deciding"]}
+    assert "auto-post-limit" in deciding
+    # A clause nothing cited stays unmarked, so the marks mean something.
+    assert "freight-allowance" not in deciding
+
+
+def test_may_decide_answers_require_queue_before_the_403(client, world):
+    """Tomas is bound to `ap-clerk`; Kim is bound to nothing.
+
+    The gate is the same gate. What differs is who may release it, and that is
+    a queue binding rather than a rung on the write ladder — so the screen has
+    to say which queue, not merely "not allowed".
+    """
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    body = _composed(invoice_number="ACME-INV-9003", total_usd=9800.0)
+
+    tomas = client.post(
+        UI_SUBMISSIONS, json=body, headers={"X-Cumulus-Persona": "customer-user:ap"}
+    ).json()["gate"]
+    assert tomas["queue"] == "ap-clerk"
+    assert tomas["may_decide"] and tomas["why_not"] == ""
+    # Which step stopped it, not merely that something did.
+    assert tomas["step_id"].startswith("k2") and tomas["step_name"] == "review-invoice"
+
+    body["scenario"]["invoice_number"] = "ACME-INV-9004"
+    kim = client.post(
+        UI_SUBMISSIONS, json=body, headers={"X-Cumulus-Persona": "customer-user:kim"}
+    ).json()["gate"]
+    assert not kim["may_decide"]
+    assert kim["why_not"] == "this is in ap-clerk; you are bound to no queue"
+
+
+def test_an_upload_carries_no_hints_and_a_key_gets_no_door(client, world):
+    """The two honest halves.
+
+    An upload is a document and says nothing about the case — with no model
+    configured the extractor reads the filename, which the screen admits rather
+    than dressing up. And the console door refuses a minted key outright: a
+    machine has no screens.
+    """
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    outcome = client.post(UI_SUBMISSIONS, json={"filename": "a-scan.pdf"}).json()
+    assert outcome["hint"] == "" and outcome["invoice"]["id"]
+    assert client.post(UI_SUBMISSIONS, json={}).status_code == 400
+    assert client.get(UI_PAYABLES, headers={"X-API-Key": "k"}).status_code == 401
+
+
+def test_the_screen_and_its_strip_count_the_same_slice(client, world):
+    """One route, so the strip cannot be computed over a different read than
+    the table under it — the failure the two-call version made possible."""
+    seed_payables_if_empty(world.payables, sync=world.sync)
+    for persona, expected in sorted(AP_VISIBLE.items()):
+        screen = client.get(
+            UI_PAYABLES, headers={"X-Cumulus-Persona": persona}
+        ).json()
+        assert len(screen["invoices"]) == screen["stats"]["total"] == expected

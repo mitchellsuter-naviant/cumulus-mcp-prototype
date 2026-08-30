@@ -11,8 +11,10 @@ from .embeddings import build_embedder
 from .identities import IdentityService, build_machine_identity_directory
 from .anomaly import AnomalyService, build_anomaly_service
 from .documents import DocumentService, build_document_service
-from .evals import EvalService
-from .eval_specs import DeclaredSpecStore
+from .evals import EvalService, FixtureStore, build_fixture_store
+from .eval_specs import DeclaredSpecStore, seed_fixtures_if_empty
+from .dispatch import Dispatcher, build_dispatcher
+from .gateway import ActionGateway, build_action_gateway
 from .graph import GraphService, build_graph_service
 from .runs import RunEngine, build_run_engine
 from .sync import SyncService, build_sync_service
@@ -65,12 +67,15 @@ _reimbursement_service: ReimbursementService | None = None
 _employee_service: EmployeeService | None = None
 _payable_service: PayableService | None = None
 _graph_service: GraphService | None = None
+_action_gateway: ActionGateway | None = None
+_dispatcher: Dispatcher | None = None
 _document_service: DocumentService | None = None
 _run_engine: RunEngine | None = None
 _anomaly_service: AnomalyService | None = None
 _sync_service: SyncService | None = None
 _calendar_service: CalendarService | None = None
 _eval_service: EvalService | None = None
+_fixture_store: FixtureStore | None = None
 # The generative backend is expensive to construct (a Vertex client) and holds
 # no request state, so it is cached; the AnswerService wrapper around it is
 # cheap and is rebuilt per call so it can never hold a stale KnowledgeService.
@@ -201,8 +206,6 @@ def get_flow_service() -> FlowService:
             settings.storage_backend,
             settings.firestore_project,
             settings.flows_collection,
-            settings.golden_sets_collection,
-            settings.test_runs_collection,
         )
         with _lock:
             if _flow_service is None:
@@ -239,6 +242,50 @@ def get_graph_service() -> GraphService:
             if _graph_service is None:
                 _graph_service = service
     return _graph_service
+
+
+def get_action_gateway() -> ActionGateway:
+    """The one chokepoint every decision write passes through.
+
+    One per deployment, holding the same graph everything else reads: a second
+    Gateway would be a second ledger, and two ledgers is no ledger.
+    """
+    global _action_gateway
+    if _action_gateway is None:
+        graph = get_graph_service()  # resolved before the lock; not reentrant
+        gateway = build_action_gateway(
+            graph,
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.ledger_collection,
+        )
+        with _lock:
+            if _action_gateway is None:
+                _action_gateway = gateway
+    return _action_gateway
+
+
+def get_dispatcher() -> Dispatcher:
+    """The one place a run is started, and the one event log.
+
+    One per deployment for the Gateway's reason: a second Dispatcher would be
+    a second log, and two logs is no history. It registers itself as the run
+    engine's event sink when it is built, so a Flow's emitted Events and the
+    facts that started Flows land in the same place.
+    """
+    global _dispatcher
+    if _dispatcher is None:
+        engine = get_run_engine()  # resolved before the lock; not reentrant
+        dispatcher = build_dispatcher(
+            engine,
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.events_collection,
+        )
+        with _lock:
+            if _dispatcher is None:
+                _dispatcher = dispatcher
+    return _dispatcher
 
 
 def get_document_service() -> DocumentService:
@@ -303,7 +350,11 @@ def get_sync_service() -> SyncService:
         knowledge = get_service()
         tasks = get_task_service()
         engine = get_run_engine()
-        service = build_sync_service(graph, knowledge, tasks, engine)
+        gateway = get_action_gateway()
+        dispatcher = get_dispatcher()
+        service = build_sync_service(
+            graph, knowledge, tasks, engine, gateway, dispatcher
+        )
         with _lock:
             if _sync_service is None:
                 _sync_service = service
@@ -332,6 +383,28 @@ def get_calendar_service() -> CalendarService:
     return _calendar_service
 
 
+def get_fixture_store() -> FixtureStore:
+    """The worlds cases run in, and the demo seed's fragment beside them.
+
+    Seeded from the declarations in code the way the flow registry is: code is
+    the authoring source until a console curates them, and the seeder leaves
+    anything not marked `declared` alone so curating one is not undone by the
+    next deploy.
+    """
+    global _fixture_store
+    if _fixture_store is None:
+        store = build_fixture_store(
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.fixtures_collection,
+        )
+        with _lock:
+            if _fixture_store is None:
+                seed_fixtures_if_empty(store)
+                _fixture_store = store
+    return _fixture_store
+
+
 def get_eval_service() -> EvalService:
     """Graph-shaped evals over the declared specs.
 
@@ -341,8 +414,12 @@ def get_eval_service() -> EvalService:
     """
     global _eval_service
     if _eval_service is None:
-        knowledge = get_service()  # resolved before the lock; not reentrant
-        service = EvalService(DeclaredSpecStore(), knowledge=knowledge)
+        # Resolved before the lock: `_lock` is not reentrant and both take it.
+        knowledge = get_service()
+        fixtures = get_fixture_store()
+        service = EvalService(
+            DeclaredSpecStore(), knowledge=knowledge, fixtures=fixtures
+        )
         with _lock:
             if _eval_service is None:
                 _eval_service = service
@@ -360,15 +437,15 @@ def get_reimbursement_service() -> ReimbursementService:
         get_document_service()
         try:
             reader = build_receipt_reader(
-                settings.receipt_backend,
+                settings.model_backend,
                 settings.firestore_project,
-                settings.answer_location,
-                settings.receipt_model,
+                settings.model_location,
+                settings.model,
             )
         except Exception:
             log.exception(
                 "Receipt backend unavailable; falling back to the stub reader",
-                extra={"backend": settings.receipt_backend},
+                extra={"backend": settings.model_backend},
             )
             reader = build_receipt_reader("none", None, "", "")
         service = build_reimbursement_service(
@@ -381,6 +458,8 @@ def get_reimbursement_service() -> ReimbursementService:
             engine=get_run_engine(),
             graph=get_graph_service(),
             documents=get_document_service(),
+            gateway=get_action_gateway(),
+            dispatcher=get_dispatcher(),
         )
         with _lock:
             if _reimbursement_service is None:
@@ -399,15 +478,15 @@ def get_payable_service() -> PayableService:
         get_anomaly_service()
         try:
             reader = build_invoice_reader(
-                settings.receipt_backend,
+                settings.model_backend,
                 settings.firestore_project,
-                settings.answer_location,
-                settings.receipt_model,
+                settings.model_location,
+                settings.model,
             )
         except Exception:
             log.exception(
                 "Invoice reader backend unavailable; falling back to the stub",
-                extra={"backend": settings.receipt_backend},
+                extra={"backend": settings.model_backend},
             )
             reader = build_invoice_reader("none", None, "", "")
         service = build_payable_service(
@@ -421,6 +500,8 @@ def get_payable_service() -> PayableService:
             graph=get_graph_service(),
             documents=get_document_service(),
             anomaly=get_anomaly_service(),
+            gateway=get_action_gateway(),
+            dispatcher=get_dispatcher(),
         )
         with _lock:
             if _payable_service is None:
@@ -447,6 +528,9 @@ def get_employee_service() -> EmployeeService:
         knowledge = get_service()
         tasks = get_task_service()
         teams = get_team_service()
+        # The hub resolves "me" against the org chart, which rides in with the
+        # payables seed — same ordering the calendar depends on.
+        get_payable_service()
         if _answer_backend is _MISSING:
             backend = _build_answer_backend()
             with _lock:
@@ -458,6 +542,7 @@ def get_employee_service() -> EmployeeService:
             settings.employee_collection,
             knowledge,
             tasks,
+            get_graph_service(),
             answer_backend=_answer_backend,
             teams=teams,
         )
@@ -476,17 +561,17 @@ def _build_answer_backend():
     """
     try:
         return build_answer_backend(
-            settings.answer_backend,
+            settings.model_backend,
             settings.firestore_project,
-            settings.answer_location,
-            settings.answer_model,
+            settings.model_location,
+            settings.model,
             settings.answer_max_steps,
             settings.answer_max_output_tokens,
         )
     except Exception:
         log.exception(
             "Answer backend unavailable; /ask will return ranked documents",
-            extra={"backend": settings.answer_backend},
+            extra={"backend": settings.model_backend},
         )
         return None
 

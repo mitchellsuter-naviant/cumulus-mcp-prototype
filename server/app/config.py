@@ -32,15 +32,14 @@ class Settings:
         )
         # Teams: the owner of assets and the second axis of authorization.
         self.teams_collection: str = os.environ.get("TEAMS_COLLECTION", "teams")
-        # Flow registry, plus its golden sets and test runs.
+        # The flow registry. Grading lives in the eval specs, not here.
         self.flows_collection: str = os.environ.get(
             "FLOWS_COLLECTION", "flows"
         )
-        self.golden_sets_collection: str = os.environ.get(
-            "GOLDEN_SETS_COLLECTION", "flow_golden_sets"
-        )
-        self.test_runs_collection: str = os.environ.get(
-            "TEST_RUNS_COLLECTION", "flow_test_runs"
+        # The worlds eval cases run in, and the demo seed's fragment with them
+        # — one registry, because they are the same kind of thing.
+        self.fixtures_collection: str = os.environ.get(
+            "FIXTURES_COLLECTION", "eval_fixtures"
         )
         # The Task Queue: units of human judgment, routed through queues.
         self.tasks_collection: str = os.environ.get("TASKS_COLLECTION", "tasks")
@@ -69,6 +68,20 @@ class Settings:
         )
         # Durable Flow runs: the journal a suspended run resumes from.
         self.runs_collection: str = os.environ.get("RUNS_COLLECTION", "flow_runs")
+        # The curation ledger: append-only, one document per Action the
+        # Gateway let through or refused. Separate from the runs collection on
+        # purpose — a run is deleted when a flow is retired, and the record of
+        # who decided what must outlive the machinery that ran it.
+        self.ledger_collection: str = os.environ.get(
+            "LEDGER_COLLECTION", "curation_ledger"
+        )
+        # The event log: append-only, one document per Event the Dispatcher
+        # recorded or a Flow emitted. Its own collection for the ledger's
+        # reason — a fact outlives the run it caused, and the run journals are
+        # deleted with the flow.
+        self.events_collection: str = os.environ.get(
+            "EVENTS_COLLECTION", "events"
+        )
         # Submitted artifacts (receipts, invoices) with their extracted regions.
         # Custody is "copy": the bytes live in the map, under the retention the
         # owning Collection declares.
@@ -86,15 +99,6 @@ class Settings:
         # rebuildable: delete it and the profile Flow recomputes from the graph.
         self.vendor_profiles_collection: str = os.environ.get(
             "VENDOR_PROFILES_COLLECTION", "vendor_profiles"
-        )
-        # The receipt reader behind the flow's extract-receipt ModelCall.
-        # Follows ANSWER_BACKEND unless set explicitly, so a deployment that
-        # can answer can also read receipts with no extra configuration.
-        self.receipt_backend: str = os.environ.get(
-            "RECEIPT_BACKEND", os.environ.get("ANSWER_BACKEND", "none")
-        )
-        self.receipt_model: str = os.environ.get(
-            "RECEIPT_MODEL", "gemini-2.5-flash"
         )
         # "none" (default, local dev: everyone is owner) or "firebase".
         self.auth_backend: str = os.environ.get("AUTH_BACKEND", "none")
@@ -191,13 +195,20 @@ class Settings:
         # like "which assets does the HR team manage" — that answer lives in
         # the owner field, not in any document's text, so retrieval alone
         # cannot reach it.
-        self.answer_backend: str = os.environ.get("ANSWER_BACKEND", "none")
-        self.answer_model: str = os.environ.get(
-            "ANSWER_MODEL", "gemini-3.5-flash-lite"
-        )
-        # Also `global`-only, for the same reason as the encoder above.
-        self.answer_location: str = os.environ.get(
-            "ANSWER_LOCATION", os.environ.get("VERTEX_LOCATION", "global")
+        # One switch for every ModelCall. "none" (default) keeps the whole
+        # system on its deterministic local readers and retrieval-only /ask —
+        # no credential, no network, and what the test suite runs against.
+        # "vertex" turns every ModelCall into a real call.
+        self.model_backend: str = os.environ.get("MODEL_BACKEND", "none")
+        # One generation model for every ModelCall in the system — the receipt
+        # and invoice readers, the HR agent, the /ask planner. A deployment
+        # that reasons about its own cost should have one number to reason
+        # about, and a golden set graded against two different models is
+        # measuring two systems.
+        self.model: str = os.environ.get("MODEL", "gemini-3.7-flash")
+        # `global`-only, for the same reason as the encoder above.
+        self.model_location: str = os.environ.get(
+            "MODEL_LOCATION", os.environ.get("VERTEX_LOCATION", "global")
         )
         # Each step is one model call plus the tool calls it requests. Six is
         # enough for resolve-team -> list-assets -> read-a-document -> answer

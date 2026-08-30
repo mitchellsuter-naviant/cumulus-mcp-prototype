@@ -28,8 +28,9 @@ def my_agenda(
 ) -> Agenda:
     """The signed-in person's window. Defaults to the current week, Monday-first.
 
-    A principal with no Employee record — every local-dev session — gets the
-    demo persona's calendar, with `persona_note` saying whose it is.
+    A principal with no Employee record — Naviant Support, a machine
+    credential — gets the demo persona's calendar, with `persona_note` saying
+    whose it is.
     """
     require_reader(principal)
     return get_calendar_service().agenda(principal.email, start=start, days=days)

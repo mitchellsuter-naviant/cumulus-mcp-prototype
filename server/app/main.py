@@ -14,11 +14,13 @@ from . import (
     data_api,
     evals_api,
     graph_api,
+    ledger_api,
     mappings_api,
     identities_api,
     rest_api,
     runs_api,
     teams_api,
+    ui_api,
     worlds_api,
     users_api,
     flows_api,
@@ -33,6 +35,7 @@ from .deps import (
     get_calendar_service,
     get_asset_usage,
     get_anomaly_service,
+    get_dispatcher,
     get_document_service,
     get_graph_service,
     get_identity_service,
@@ -84,6 +87,10 @@ async def lifespan(app: FastAPI):
     get_graph_service()
     get_document_service()
     get_run_engine()
+    # Before anything can run: the Dispatcher registers itself as the engine's
+    # event sink when it is built, and a flow that ran first would emit into a
+    # sink that did not exist yet.
+    get_dispatcher()
     get_anomaly_service()
     get_sync_service()  # registers the four inbound sync bodies
     get_reimbursement_service()  # hydrate the table (and seed decided history)
@@ -184,6 +191,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
+app.include_router(ui_api.router)
 app.include_router(rest_api.router)
 app.include_router(users_api.router)
 app.include_router(identities_api.router)
@@ -195,6 +203,7 @@ app.include_router(payables_api.router)
 app.include_router(employee_api.router)
 app.include_router(calendar_api.router)
 app.include_router(graph_api.router)
+app.include_router(ledger_api.router)
 app.include_router(mappings_api.router)
 app.include_router(runs_api.router)
 app.include_router(data_api.router)

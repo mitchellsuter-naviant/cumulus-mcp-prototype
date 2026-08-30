@@ -22,13 +22,25 @@ and the case only supplies the values. Three things fall out of that split:
 - **The spec is reviewable on its own.** "What does the AP flow promise about
   an Invoice" is a document, not an inference over fifty cases.
 
-**Checkpoints** are the other half. A spec evaluates the world at points *in*
-the run — after `z1` the vendor should be resolved and linked; after `x3` the
-lines should exist; at the end the MatchSet should say `matched`. That is
-possible without snapshots because claims and links carry the step that wrote
-them: the state as of a step is the resolution of claims whose step came no
-later. Point-in-time reconstruction for free, and the direct payoff of
-recording provenance.
+**Milestones** are the other half. A spec evaluates the world at points *in*
+the run — once the vendor has been settled it should be resolved and linked;
+once the invoice exists the MatchSet should say `matched`. That is possible
+without snapshots because claims and links carry the step that wrote them: the
+state as of a step is the resolution of claims whose step came no later.
+Point-in-time reconstruction for free, and the direct payoff of recording
+provenance.
+
+A milestone names that point by a **predicate over the journal**, never by a
+step id. This is the property the whole eval layer exists to have: flow-level
+expectations are affixed to the data that seeds a flow, so ModelCalls and
+other transactions can be added, split, renamed or reordered without the
+golden set having to be rebuilt. `after_step="z1"` could not survive any of
+those; `last_of_kind: resolve` survives all of them.
+
+**The fixture is named.** A case says which world it runs in and carries none,
+so three AP cases over one Acme world reference one declaration rather than
+holding three copies that drift. That is also what lets a golden set survive a
+re-architecture: rewrite the world, leave the cases alone.
 
 **Isolation.** A case runs in its own in-memory world. Object ids are derived
 from natural keys, so an eval fixture named "Acme Industrial Inc." *is* the
@@ -38,35 +50,40 @@ invoices are judged against. The corpus is copied in (frozen for the run,
 writable, so nothing a graded run writes touches the real shelf) and the
 revisions read are recorded, so two results are only compared when they
 measured the same knowledge.
+
+**The gate.** A result is graded against the previous one for the same spec:
+no case that passed may now fail, and the pass count may not drop. It runs
+only when the two runs measured the same thing — same rules, same cases —
+because a pass rate compared across a spec edit is two different questions
+wearing one number.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
-from typing import Any, Callable, Literal, Protocol
+import threading
+from collections.abc import Iterable
+from datetime import datetime
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from .anomaly import AnomalyService, InMemoryProfileStore
-from .calendars import CalendarService
-from .documents import DocumentService, InMemoryDocumentStore
+from .eval_world import FLOW_ENTRYPOINTS, EvalWorld, build_world
 from .graph import (
     Claim,
     GraphService,
-    InMemoryGraphStore,
     LinkRecord,
     ObjectRecord,
     TBoxViolation,
     object_id,
+    parse_ref,
     resolve_props,
 )
 from .models import utcnow
 from .resolution import name_similarity
-from .runs import InMemoryRunStore, RunEngine, RunRecord
-from .service import KnowledgeService
-from .storage import InMemoryRepository
-from .sync import SyncRequest, SyncService
-from .tasks import InMemoryTaskDirectory, TaskService
+from .runs import RunRecord
+from .sync import SyncRequest
 
 log = logging.getLogger("cumulus.evals")
 
@@ -141,23 +158,63 @@ class TrajectoryRule(BaseModel):
     note: str = ""
 
 
-class Checkpoint(BaseModel):
-    """What must be true once a given step has completed.
+MilestoneAnchor = Literal["first_of_kind", "last_of_kind", "wrote", "terminal"]
 
-    `after_step` is a step id, or `final` for the end of the run. Evaluating
-    mid-run is what makes a spec able to say "the vendor is resolved before any
-    extraction happens" — an ordering promise, not just an outcome.
+
+class Milestone(BaseModel):
+    """What must be true at a point in the run, located by what *happened*.
+
+    This was `after_step="z1"` — a literal step id — which made every golden
+    set a hostage of one flow's internal naming. Rename `z1`, split the model
+    call in two, insert a step: every case that mentioned the id failed
+    without a single fact about the world having changed. A milestone says
+    what the point *is*, and is resolved against the journal at grading time:
+
+        last_of_kind   selector = a step kind    "once the resolver has run"
+        first_of_kind  selector = a step kind    "the first time it stopped"
+        wrote          selector = a ref prefix   "once the invoice exists"
+        terminal       —                         "however it ended, if it did"
+
+    Four anchors, and the shortlist was argued down to what cases actually
+    need. `wrote` names a commit by its effect and would cover most points —
+    but a resolver that links an *already known* vendor writes nothing at all,
+    so the point after it can only be named by kind. And a suspended run has
+    no terminal to anchor on, so a case asserting what is **not** committed
+    before the first gate needs `first_of_kind`. Each of the four is the only
+    way to name a milestone some declared case depends on.
+
+    Everything downstream is untouched: this resolves to a step id and
+    `steps_upto` / `snapshot_as_of` take it from there. A resolver, not a
+    second grading path — which is what keeps it small.
     """
 
     id: str
-    after_step: str = "final"
     label: str = ""
+    anchor: MilestoneAnchor = "terminal"
+    # A step kind for the two `*_of_kind` anchors, a ref prefix for `wrote`
+    # (keep the trailing slash — `graph:Invoice/` names one type, while
+    # `graph:Invoice` would also catch `graph:InvoiceLine/`), and unused by
+    # `terminal`.
+    selector: str = ""
+    note: str = ""
     objects: list[ObjectRule] = Field(default_factory=list)
     trajectory: list[TrajectoryRule] = Field(default_factory=list)
-    note: str = ""
 
     def rule_for(self, object_type: str) -> ObjectRule | None:
         return next((r for r in self.objects if r.type == object_type), None)
+
+    def describe(self) -> str:
+        """The point this names, in words.
+
+        One phrasing, so the failure a reader sees and the published spec they
+        review cannot describe the same anchor two different ways.
+        """
+        if self.anchor == "terminal":
+            return "the end of the run, which must have finished"
+        if self.anchor == "wrote":
+            return f"a step that writes `{self.selector}`"
+        which = "last" if self.anchor == "last_of_kind" else "first"
+        return f"the {which} step of kind `{self.selector}`"
 
 
 class EvalSpec(BaseModel):
@@ -171,15 +228,17 @@ class EvalSpec(BaseModel):
     ignore_fields: list[str] = Field(
         default_factory=lambda: ["revision", "updated_at", "created_at"]
     )
-    checkpoints: list[Checkpoint] = Field(default_factory=list)
+    milestones: list[Milestone] = Field(default_factory=list)
 
-    def checkpoint(self, checkpoint_id: str) -> Checkpoint | None:
-        return next((c for c in self.checkpoints if c.id == checkpoint_id), None)
+    def milestone(self, milestone_id: str) -> Milestone | None:
+        return next((m for m in self.milestones if m.id == milestone_id), None)
 
 
 # ---------------------------------------------------------------------------
-# The case: the fixture, the trigger, and the expected values
+# The fixture: the world a case runs in, named and shared
 # ---------------------------------------------------------------------------
+
+FixtureOrigin = Literal["declared", "authored", "promoted", "synthesized"]
 
 
 class FixtureObject(BaseModel):
@@ -197,8 +256,14 @@ class FixtureObject(BaseModel):
     label: str = ""
 
 
-class GraphFixture(BaseModel):
-    """The world as it must be before the trigger fires.
+class Fixture(BaseModel):
+    """The world as it must be before a trigger fires — named, and shared.
+
+    This used to be an anonymous literal inside the one case that needed it,
+    which made two cases over the same world two copies of it and tied a golden
+    set to the file its worlds happened to be written in. Naming the world is
+    what lets a case say only *which* one it runs in: reshape the flow, rewrite
+    the fixture, and the cases still stand.
 
     Preferred form is `deliveries`: the same push payloads the real feeds send,
     so the precondition is established the way production established it — and
@@ -206,12 +271,76 @@ class GraphFixture(BaseModel):
     for entities no feed provides yet, an Employee being the standing example.
     """
 
+    id: str
+    # The flow whose cases run here. Empty for a world that belongs to no one
+    # flow — the demo seed being the standing example.
+    flow_id: str = ""
+    name: str = ""
+    summary: str = ""
     deliveries: list[dict] = Field(default_factory=list)
     objects: list[FixtureObject] = Field(default_factory=list)
+    # The governed knowledge this world was declared against, at the revisions
+    # it was declared at. A claim rather than an enforcement: what a graded run
+    # actually read comes back on the result, and the two disagreeing is the
+    # signal that a policy moved under a case rather than the case regressing.
+    read_set: list[str] = Field(default_factory=list)
+    # `declared` is written in code and code owns it; `authored` is built in a
+    # console, `promoted` lifted off a real run, `synthesized` generated from
+    # another. Only the first is in use — the rest are here because the seeder
+    # has to know which fixtures a redeploy may replace and which it must not.
+    origin: FixtureOrigin = "declared"
+    # Where it came from: the module that declares it, the run it was promoted
+    # out of, or the fixture it was generated against. Points a reader at the
+    # source rather than leaving them to grep for the id.
+    derived_from: str = ""
+    authored_by: str = ""
+    # When it entered the store, not when the world it describes happened.
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+# The payload a fixture declares, kept off the catalog and off the preview. A
+# catalog is a catalog; and the preview answers "what does this world assert"
+# by *running* it, so handing back the declaration alongside the consequence
+# would answer the same question twice, in the weaker form. Exactly one route
+# serves it — the fixture itself — because that is the authoring surface.
+FIXTURE_PAYLOAD = {"deliveries", "objects"}
+
+
+def seed_fixture(
+    world: EvalWorld, fixture: Fixture, *, actor: str, provenance: str
+) -> None:
+    """Establish a fixture's world the way production would have.
+
+    Deliveries go through the real sync flows, so a fixture is not a privileged
+    back door: if the sync path would have rejected or escalated a row, whoever
+    is looking at this world sees that too.
+
+    Shared with the preview in `worlds.py` deliberately. A preview that
+    established the world by a second route could show something no graded run
+    ever sees, and a fixture editor you cannot trust is worse than none.
+    """
+    for delivery in fixture.deliveries:
+        world.sync.deliver(SyncRequest.model_validate(delivery), actor=actor)
+    writer = world.graph.writer("fixture", "f0")
+    for entity in fixture.objects:
+        writer.upsert(
+            entity.type, entity.key,
+            [
+                Claim(field=field, value=value, source="fixture")
+                for field, value in entity.props.items()
+            ],
+            label=entity.label or entity.key,
+            provenance=provenance,
+        )
+
+
+# ---------------------------------------------------------------------------
+# The case: which world, the trigger, and the expected values
+# ---------------------------------------------------------------------------
 
 
 class ExpectedObject(BaseModel):
-    """What one entity should look like at a checkpoint.
+    """What one entity should look like at a milestone.
 
     `key` is a natural key, with two conveniences that exist because some
     natural keys are minted rather than authored:
@@ -230,12 +359,12 @@ class ExpectedObject(BaseModel):
     link_counts: dict[str, int] = Field(default_factory=dict)
     # Props on one edge, keyed `link_type.prop`.
     link_props: dict[str, Any] = Field(default_factory=dict)
-    # True when this object must *not* exist at this checkpoint.
+    # True when this object must *not* exist at this milestone.
     absent: bool = False
 
 
-class CheckpointExpectation(BaseModel):
-    checkpoint: str
+class MilestoneExpectation(BaseModel):
+    milestone: str
     objects: list[ExpectedObject] = Field(default_factory=list)
     trajectory: dict[str, str] = Field(default_factory=dict)
 
@@ -258,10 +387,13 @@ class EvalCase(BaseModel):
     spec_id: str
     name: str
     summary: str = ""
-    fixture: GraphFixture = Field(default_factory=GraphFixture)
+    # The world this case runs in, by name. A case carries expectations and
+    # never a world: that is what lets two cases share one, and what lets a
+    # fixture be re-authored without a single case being touched.
+    fixture_id: str = ""
     trigger: dict = Field(default_factory=dict)
     decisions: list[ScriptedDecision] = Field(default_factory=list)
-    expectations: list[CheckpointExpectation] = Field(default_factory=list)
+    expectations: list[MilestoneExpectation] = Field(default_factory=list)
     source: str = "authored"
     added_by: str = ""
 
@@ -272,7 +404,7 @@ class EvalCase(BaseModel):
 
 
 class AssertionResult(BaseModel):
-    checkpoint: str
+    milestone: str
     target: str
     field: str = ""
     rule: str = ""
@@ -298,6 +430,25 @@ class CaseResult(BaseModel):
         return [a for a in self.assertions if not a.passed]
 
 
+class GateResult(BaseModel):
+    """The promotion gate, stated rather than implied: no regressions, and at
+    least as many cases passing as the run this one is measured against.
+
+    `comparable` is false when the baseline measured something else — a spec
+    someone edited, or a different set of cases. The gate then reports rather
+    than judges: refusing to promote is right, but calling it a regression
+    would be naming the wrong problem.
+    """
+
+    passed: bool
+    comparable: bool = True
+    baseline_at_iso: str = ""
+    reasons: list[str] = Field(default_factory=list)
+    # Cases the baseline passed and this run did not, by id — "3 regressions"
+    # is a number, and these are the three things somebody can go and look at.
+    regressed: list[str] = Field(default_factory=list)
+
+
 class EvalResult(BaseModel):
     spec_id: str
     flow_id: str
@@ -305,6 +456,15 @@ class EvalResult(BaseModel):
     at_iso: str = Field(default_factory=lambda: utcnow().isoformat())
     launched_by: str = ""
     cases: list[CaseResult] = Field(default_factory=list)
+    # What this run measured: the spec's graded content plus the ids of the
+    # cases it actually graded. `spec_version` says the same thing when whoever
+    # edited the spec remembered to bump it; this says it either way, which is
+    # the property the gate needs and the reason it is a hash and not a number.
+    measured: str = ""
+    # Set when there was a previous result for this spec to measure against.
+    # None is the honest answer for a first run: with nothing to compare, a
+    # gate would be asserting a judgment it has no evidence for.
+    gate: GateResult | None = None
 
     @property
     def passed(self) -> int:
@@ -316,6 +476,62 @@ class EvalResult(BaseModel):
 
     def summary(self) -> str:
         return f"{self.passed}/{len(self.cases)} case(s) passed"
+
+
+def measurement(spec: EvalSpec, case_ids: Iterable[str]) -> str:
+    """A fingerprint of what a run measured: the rules, and the cases graded.
+
+    Two pass rates are comparable exactly when this matches. A declared
+    version says so when whoever edited the spec remembered to bump it; a hash
+    over the spec's own content says so whether they did or not — and folding
+    the case ids in means a run over three of the cases is not silently
+    compared against a run over all of them.
+    """
+    payload = spec.model_dump_json() + "\n" + "\n".join(sorted(case_ids))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def gate(candidate: EvalResult, baseline: EvalResult | None) -> GateResult | None:
+    """Grade a result against the previous one for the same spec.
+
+    A regression is a case the baseline passed and this run did not — named,
+    because "3 regressions" is a number and "these three cases" is something
+    someone can go and look at.
+    """
+    if baseline is None:
+        return None
+    if baseline.measured != candidate.measured:
+        return GateResult(
+            passed=False,
+            comparable=False,
+            baseline_at_iso=baseline.at_iso,
+            reasons=[
+                "the previous run measured something else — the spec or the "
+                "set of cases changed, so the two pass rates are answers to "
+                "different questions. Re-run the baseline to compare."
+            ],
+        )
+    before = {c.case_id: c.passed for c in baseline.cases}
+    regressed = [
+        c.case_id for c in candidate.cases if before.get(c.case_id) and not c.passed
+    ]
+    reasons: list[str] = []
+    if regressed:
+        reasons.append(
+            f"{len(regressed)} regression{'s' if len(regressed) != 1 else ''} "
+            f"against the run at {baseline.at_iso}: {', '.join(regressed)}"
+        )
+    if candidate.passed < baseline.passed:
+        reasons.append(
+            f"candidate passes {candidate.passed}/{len(candidate.cases)}, "
+            f"below the baseline's {baseline.passed}/{len(baseline.cases)}"
+        )
+    return GateResult(
+        passed=not reasons,
+        baseline_at_iso=baseline.at_iso,
+        reasons=reasons,
+        regressed=regressed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +638,7 @@ def steps_upto(run: RunRecord, after_step: str) -> tuple[list[str], bool]:
     """The step ids up to and including `after_step`, and whether it was reached.
 
     One helper, used by both the graph snapshot and the trajectory checks, so a
-    checkpoint cannot end up judging state as of one point and the path as of
+    milestone cannot end up judging state as of one point and the path as of
     another.
     """
     if after_step in ("", "final"):
@@ -468,97 +684,103 @@ def snapshot_as_of(
 
 
 # ---------------------------------------------------------------------------
-# The isolated world
+# Resolving a milestone against a journal
 # ---------------------------------------------------------------------------
 
 
-class EvalWorld(BaseModel):
-    """Everything a flow needs, in memory, sharing nothing writable."""
+def ref_family(raw: str) -> str:
+    """A written ref reduced to what it addresses, minus the minted id.
 
-    model_config = {"arbitrary_types_allowed": True}
+    `graph:Invoice/invoice_1d5ad4a21f28@rev2` becomes `graph:Invoice/`. That is
+    the form a `wrote` milestone selects on and the form a failure lists back,
+    because a reader comparing "what I asked for" against "what the run wrote"
+    cannot do it against forty hashes.
 
-    knowledge: Any
-    tasks: Any
-    engine: Any
-    graph: Any
-    documents: Any
-    anomaly: Any
-    sync: Any
-    expenses: Any
-    payables: Any
-    calendars: Any = None
-    knowledge_revisions: dict[str, int] = Field(default_factory=dict)
-
-
-def build_world(source_knowledge=None, *, seed_dir: str | None = None) -> EvalWorld:
-    """An isolated world, with the corpus copied in rather than shared.
-
-    Copied rather than shared: a graded run reads governed knowledge and may
-    write it, and neither should reach the corpus the console is showing. The
-    revisions copied are recorded, so two results are only compared when they
-    read the same knowledge.
+    Parsing rather than string surgery, through the same `parse_ref` the flow
+    projection uses: the revision suffix is optional in fact and not just in
+    the grammar, and a second parser here would drift from that one.
     """
-    # Deferred: the flow modules import this one for their seed helpers.
-    from .payables import (
-        InMemoryPayableDirectory,
-        PayableService,
-        StubInvoiceReader,
-    )
-    from .platform_assets import publish_generated_assets
-    from .reimbursements import (
-        InMemoryReimbursementDirectory,
-        ReimbursementService,
-        StubReceiptReader,
-    )
-    from .config import settings
-    from .service import seed_if_empty
+    ref = parse_ref(raw)
+    if not ref.namespace:
+        return raw
+    if ref.type:
+        return f"{ref.namespace}:{ref.type}/"
+    # Flat schemes: a `document:` id addresses one artifact and is noise in a
+    # list of what a run touched, but a `knowledge:` id *is* the thing named.
+    if ref.namespace == "document":
+        return f"{ref.namespace}:"
+    return f"{ref.namespace}:{ref.id}"
 
-    repo = InMemoryRepository()
-    revisions: dict[str, int] = {}
-    if source_knowledge is not None:
-        for asset in source_knowledge.repo.all():
-            repo.put(asset.model_copy(deep=True))
-            revisions[asset.id] = getattr(asset, "revision", 1)
-    knowledge = KnowledgeService(repo)
-    if source_knowledge is None:
-        seed_if_empty(knowledge, seed_dir or settings.seed_dir)
-        publish_generated_assets(knowledge)
-        revisions = {a.id: getattr(a, "revision", 1) for a in repo.all()}
 
-    tasks = TaskService(InMemoryTaskDirectory())
-    engine = RunEngine(InMemoryRunStore(), tasks)
-    graph = GraphService(InMemoryGraphStore())
-    documents = DocumentService(InMemoryDocumentStore(), 700_000)
-    anomaly = AnomalyService(InMemoryProfileStore(), graph)
-    sync = SyncService(graph, knowledge, tasks, engine)
-    expenses = ReimbursementService(
-        InMemoryReimbursementDirectory(), StubReceiptReader(), knowledge, tasks,
-        engine, graph, documents,
-    )
-    payables = PayableService(
-        InMemoryPayableDirectory(), StubInvoiceReader(), knowledge, tasks,
-        engine, graph, documents, anomaly,
-    )
-    calendars = CalendarService(graph)
-    return EvalWorld(
-        knowledge=knowledge, tasks=tasks, engine=engine, graph=graph,
-        documents=documents, anomaly=anomaly, sync=sync, expenses=expenses,
-        payables=payables, calendars=calendars, knowledge_revisions=revisions,
-    )
+def _listed(values: Iterable[str], limit: int = 120) -> str:
+    """Distinct values in the order the run produced them, elided if long."""
+    text = ", ".join(dict.fromkeys(v for v in values if v))
+    if not text:
+        return "nothing"
+    return f"{text[:limit]} …" if len(text) > limit else text
+
+
+def resolve_milestone(
+    milestone: Milestone, run: RunRecord
+) -> tuple[str, AssertionResult | None]:
+    """Where in this run the milestone falls, or the check saying it never did.
+
+    Returns `(step_id, None)` when it resolves — `final` for the whole run,
+    which is the sentinel `steps_upto` and `snapshot_as_of` already speak.
+
+    The second element is the *failing check*, not a reason string, and that
+    is the whole guarantee: declaring a milestone is itself the claim that the
+    run reaches it, so there is no path through the grader on which a
+    milestone contributes nothing. A milestone with no expectations at all
+    still fails loudly when it is unreachable, and the failure names the
+    alternatives the run actually offered rather than saying "not found".
+    """
+
+    def unreachable(actual: str, detail: str) -> tuple[str, AssertionResult]:
+        return "", AssertionResult(
+            milestone=milestone.id, target="milestone", rule="reached",
+            passed=False, expected=milestone.describe(), actual=actual,
+            detail=detail,
+        )
+
+    if milestone.anchor == "terminal":
+        if run.status in ("running", "suspended"):
+            return unreachable(
+                _listed(s.step_id for s in run.steps),
+                f"the run never finished — it ended {run.status}"
+                + (f" at {run.suspended_at_step}" if run.suspended_at_step else ""),
+            )
+        return "final", None
+
+    if milestone.anchor == "wrote":
+        wrote = [
+            s.step_id for s in run.steps
+            if any(ref_family(w).startswith(milestone.selector) for w in s.writes)
+        ]
+        if not wrote:
+            return unreachable(
+                _listed(ref_family(w) for s in run.steps for w in s.writes),
+                f"no step wrote `{milestone.selector}` — the run ended "
+                f"{run.status}",
+            )
+        # The *first* writer. The milestone is the moment the thing came to
+        # exist; a later step touching it again has not moved that point.
+        return wrote[0], None
+
+    of_kind = [s.step_id for s in run.steps if s.kind == milestone.selector]
+    if not of_kind:
+        kinds = _listed(s.kind for s in run.steps)
+        return unreachable(
+            kinds,
+            f"this flow ran no step of kind '{milestone.selector}' — it ran: "
+            f"{kinds}.",
+        )
+    return (of_kind[-1] if milestone.anchor == "last_of_kind" else of_kind[0]), None
 
 
 # ---------------------------------------------------------------------------
-# The runner
+# The stores
 # ---------------------------------------------------------------------------
-
-# How a case's trigger reaches its flow. Kept as an explicit table rather than
-# reflection: a flow that wants to be evaluated has to say how it is started,
-# and a typo in a case's `trigger` should be an error rather than a silent
-# no-op.
-FLOW_ENTRYPOINTS: dict[str, Callable[[EvalWorld, dict], Any]] = {
-    "expense-reimbursement": lambda world, trigger: world.expenses.submit(**trigger),
-    "accounts-payable": lambda world, trigger: world.payables.submit(**trigger),
-}
 
 
 class SpecStore(Protocol):
@@ -566,14 +788,111 @@ class SpecStore(Protocol):
     def cases(self, spec_id: str) -> list[EvalCase]: ...
 
 
+class FixtureStore(Protocol):
+    """Where declared worlds live. `put` is here for the console that will
+    curate them; nothing deletes one yet, because a case may still name it."""
+
+    def list(self) -> list[Fixture]: ...
+    def get(self, fixture_id: str) -> Fixture | None: ...
+    def put(self, fixture: Fixture) -> Fixture: ...
+
+
+class InMemoryFixtureStore:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._items: dict[str, Fixture] = {}
+
+    def list(self) -> list[Fixture]:
+        with self._lock:
+            return sorted(self._items.values(), key=lambda f: f.id)
+
+    def get(self, fixture_id: str) -> Fixture | None:
+        with self._lock:
+            return self._items.get(fixture_id)
+
+    def put(self, fixture: Fixture) -> Fixture:
+        with self._lock:
+            self._items[fixture.id] = fixture
+            return fixture
+
+
+class FirestoreFixtureStore:
+    """A fixture id reads as a path — `ap/acme-po-7741-clean` — and a Firestore
+    document id cannot hold a slash, so it is swapped on the way in. The id
+    inside the document is the real one and is never reconstructed from the
+    document name, so the encoding can change without stranding what is stored.
+    """
+
+    def __init__(self, project: str | None, collection: str) -> None:
+        from google.cloud import firestore  # deferred: not needed for local dev
+
+        self._client = firestore.Client(project=project)
+        self._col = self._client.collection(collection)
+
+    @staticmethod
+    def _doc_id(fixture_id: str) -> str:
+        return fixture_id.replace("/", "__")
+
+    def list(self) -> list[Fixture]:
+        out: list[Fixture] = []
+        for doc in self._col.stream():
+            try:
+                out.append(Fixture.model_validate(doc.to_dict()))
+            except Exception:
+                log.exception("Skipping unparseable fixture", extra={"docId": doc.id})
+        return sorted(out, key=lambda f: f.id)
+
+    def get(self, fixture_id: str) -> Fixture | None:
+        snap = self._col.document(self._doc_id(fixture_id)).get()
+        if not snap.exists:
+            return None
+        try:
+            return Fixture.model_validate(snap.to_dict())
+        except Exception:
+            log.exception("Unparseable fixture", extra={"fixtureId": fixture_id})
+            return None
+
+    def put(self, fixture: Fixture) -> Fixture:
+        self._col.document(self._doc_id(fixture.id)).set(
+            fixture.model_dump(mode="json")
+        )
+        return fixture
+
+
+def build_fixture_store(
+    backend: str, project: str | None, collection: str
+) -> FixtureStore:
+    if backend == "firestore":
+        return FirestoreFixtureStore(project, collection)
+    return InMemoryFixtureStore()
+
+
+def declared_fixture_store() -> FixtureStore:
+    """The fixtures declared in code, in memory. What a standalone test wants."""
+    from .eval_specs import seed_fixtures_if_empty
+
+    store = InMemoryFixtureStore()
+    seed_fixtures_if_empty(store)
+    return store
+
+
 class EvalService:
     """Runs cases against a spec, in a world nothing else can see."""
 
-    def __init__(self, store: SpecStore, knowledge=None) -> None:
+    def __init__(
+        self,
+        store: SpecStore,
+        knowledge=None,
+        fixtures: FixtureStore | None = None,
+    ) -> None:
         self.store = store
         # The corpus to copy into each world. None means "seed from disk",
         # which is what a standalone test wants.
         self.knowledge = knowledge
+        # The worlds cases name. Same posture as `knowledge`: None means the
+        # ones declared in code, so a test can run the declared cases without
+        # standing up a store first.
+        self.fixtures = fixtures if fixtures is not None else declared_fixture_store()
         # The most recent result per spec, in memory only. Not persisted: a
         # result is only comparable against the knowledge revisions it read,
         # and storing numbers nobody can compare is worse than storing none.
@@ -611,9 +930,14 @@ class EvalService:
         result = EvalResult(
             spec_id=spec.id, flow_id=spec.flow_id, spec_version=spec.version,
             launched_by=launched_by,
+            measured=measurement(spec, [c.id for c in cases]),
         )
         for case in cases:
             result.cases.append(self.run_case(spec, case))
+        # Read the baseline before overwriting it: the gate is the whole point
+        # of keeping the last result, and a run that has nothing to compare
+        # against says so rather than passing itself.
+        result.gate = gate(result, self._results.get(spec.id))
         self._results[spec.id] = result
         log.info(
             "Eval completed",
@@ -621,6 +945,7 @@ class EvalService:
                 "specId": spec.id, "flowId": spec.flow_id,
                 "cases": len(result.cases), "passed": result.passed,
                 "failed": result.failed, "actor": launched_by,
+                "gate": None if result.gate is None else result.gate.passed,
             },
         )
         return result
@@ -628,9 +953,19 @@ class EvalService:
     def run_case(self, spec: EvalSpec, case: EvalCase) -> CaseResult:
         outcome = CaseResult(case_id=case.id, name=case.name)
         try:
+            fixture = self.fixture_for(case)
+            if fixture is None:
+                outcome.error = (
+                    f"the case runs in fixture '{case.fixture_id}', which is "
+                    "not registered"
+                )
+                return outcome
             world = build_world(self.knowledge)
             outcome.knowledge_revisions = world.knowledge_revisions
-            self._seed_fixture(world, case.fixture)
+            seed_fixture(
+                world, fixture,
+                actor="system:eval-fixture", provenance="eval fixture",
+            )
             run = self._drive(world, spec, case)
             outcome.run_id = run.id if run else ""
             outcome.run_status = run.status if run else ""
@@ -652,28 +987,16 @@ class EvalService:
 
     # -- fixture ------------------------------------------------------------
 
-    def _seed_fixture(self, world: EvalWorld, fixture: GraphFixture) -> None:
-        """Establish the precondition the way production would have.
+    def fixture_for(self, case: EvalCase) -> Fixture | None:
+        """The world a case names, or None when nobody declared it.
 
-        Deliveries go through the real sync flows, so the fixture is not a
-        privileged back door: if the sync path would have rejected or escalated
-        a row, the case sees that too.
+        A case naming nothing is legitimate — the flow's own trigger is the
+        whole precondition — and gets an empty world rather than a failure.
+        A case naming a fixture that is gone is a broken case, and says so.
         """
-        for delivery in fixture.deliveries:
-            world.sync.deliver(
-                SyncRequest.model_validate(delivery), actor="system:eval-fixture"
-            )
-        writer = world.graph.writer("fixture", "f0")
-        for entity in fixture.objects:
-            writer.upsert(
-                entity.type, entity.key,
-                [
-                    Claim(field=field, value=value, source="fixture")
-                    for field, value in entity.props.items()
-                ],
-                label=entity.label or entity.key,
-                provenance="eval fixture",
-            )
+        if not case.fixture_id:
+            return Fixture(id="", name="an empty world")
+        return self.fixtures.get(case.fixture_id)
 
     # -- the trigger and the gates -----------------------------------------
 
@@ -711,49 +1034,46 @@ class EvalService:
     ) -> list[AssertionResult]:
         results: list[AssertionResult] = []
         for expectation in case.expectations:
-            checkpoint = spec.checkpoint(expectation.checkpoint)
-            if checkpoint is None:
+            milestone = spec.milestone(expectation.milestone)
+            if milestone is None:
                 results.append(AssertionResult(
-                    checkpoint=expectation.checkpoint, target="spec",
+                    milestone=expectation.milestone, target="spec",
                     passed=False,
                     detail=(
-                        f"the case expects checkpoint "
-                        f"'{expectation.checkpoint}' which the spec does not "
+                        f"the case expects milestone "
+                        f"'{expectation.milestone}' which the spec does not "
                         "declare"
                     ),
                 ))
                 continue
-            prefix, reached = steps_upto(run, checkpoint.after_step)
-            if not reached:
-                results.append(AssertionResult(
-                    checkpoint=checkpoint.id, target="checkpoint",
-                    rule="reached", passed=False,
-                    expected=f"step {checkpoint.after_step} runs",
-                    actual=", ".join(s.step_id for s in run.steps),
-                    detail=(
-                        f"the run never reached {checkpoint.after_step} — it "
-                        f"ended {run.status}"
-                        + (
-                            f" at {run.suspended_at_step}"
-                            if run.suspended_at_step else ""
-                        )
-                    ),
-                ))
+            step_id, unreachable = resolve_milestone(milestone, run)
+            if unreachable is not None:
+                results.append(unreachable)
                 continue
-            snapshot = snapshot_as_of(world.graph, run, checkpoint.after_step)
+            # Recorded even when it resolves. Naming a milestone is a claim
+            # that the run reaches it, so the resolution is an assertion in
+            # its own right — and `actual` holding the step it landed on is
+            # what lets a reader (or a test) see that reshaping the flow did
+            # not move the point being judged.
+            results.append(AssertionResult(
+                milestone=milestone.id, target="milestone", rule="reached",
+                passed=True, expected=milestone.describe(), actual=step_id,
+            ))
+            prefix, _reached = steps_upto(run, step_id)
+            snapshot = snapshot_as_of(world.graph, run, step_id)
             for expected in expectation.objects:
                 results.extend(
-                    self._grade_object(spec, checkpoint, snapshot, expected, run)
+                    self._grade_object(spec, milestone, snapshot, expected, run)
                 )
             results.extend(
-                self._grade_trajectory(checkpoint, expectation, run, world, prefix)
+                self._grade_trajectory(milestone, expectation, run, world, prefix)
             )
         return results
 
     def _grade_object(
         self,
         spec: EvalSpec,
-        checkpoint: Checkpoint,
+        milestone: Milestone,
         snapshot: GraphSnapshot,
         expected: ExpectedObject,
         run: RunRecord,
@@ -762,34 +1082,34 @@ class EvalService:
         record, addressing = self._resolve_expected(snapshot, expected, run)
         if addressing:
             return [AssertionResult(
-                checkpoint=checkpoint.id, target=target, rule="addressing",
+                milestone=milestone.id, target=target, rule="addressing",
                 passed=False, detail=addressing,
             )]
         if expected.absent:
             return [AssertionResult(
-                checkpoint=checkpoint.id, target=target, rule="absent",
+                milestone=milestone.id, target=target, rule="absent",
                 passed=record is None,
                 actual="present" if record is not None else "absent",
                 detail=(
-                    "must not exist at this checkpoint"
+                    "must not exist at this milestone"
                     if record is not None else "correctly absent"
                 ),
             )]
         if record is None:
             return [AssertionResult(
-                checkpoint=checkpoint.id, target=target, rule="exists",
+                milestone=milestone.id, target=target, rule="exists",
                 passed=False, expected="exists", actual="missing",
                 detail=(
                     f"no {expected.type} with natural key '{expected.key}' "
-                    f"as of {checkpoint.after_step}"
+                    f"as of {snapshot.after_step}"
                 ),
             )]
 
-        object_rule = checkpoint.rule_for(expected.type) or ObjectRule(
+        object_rule = milestone.rule_for(expected.type) or ObjectRule(
             type=expected.type
         )
         results: list[AssertionResult] = [AssertionResult(
-            checkpoint=checkpoint.id, target=target, rule="exists",
+            milestone=milestone.id, target=target, rule="exists",
             passed=True, expected="exists", actual=record.ref(),
         )]
 
@@ -799,7 +1119,7 @@ class EvalService:
             rule = object_rule.rule_for(field) or FieldRule(field=field)
             passed, why = compare(rule, value, record.props.get(field))
             results.append(AssertionResult(
-                checkpoint=checkpoint.id, target=target, field=field,
+                milestone=milestone.id, target=target, field=field,
                 rule=rule.match, expected=f"{value}",
                 actual=f"{record.props.get(field)}", passed=passed, detail=why,
             ))
@@ -809,7 +1129,7 @@ class EvalService:
             drifted = sorted(set(record.props) - named)
             if drifted:
                 results.append(AssertionResult(
-                    checkpoint=checkpoint.id, target=target, rule="no-drift",
+                    milestone=milestone.id, target=target, rule="no-drift",
                     passed=False, actual=", ".join(drifted),
                     detail=(
                         "the flow claimed fields this spec does not name — "
@@ -818,7 +1138,7 @@ class EvalService:
                 ))
 
         results.extend(
-            self._grade_links(checkpoint, object_rule, snapshot, record, expected, target)
+            self._grade_links(milestone, object_rule, snapshot, record, expected, target)
         )
         return results
 
@@ -839,7 +1159,7 @@ class EvalService:
 
     def _grade_links(
         self,
-        checkpoint: Checkpoint,
+        milestone: Milestone,
         object_rule: ObjectRule,
         snapshot: GraphSnapshot,
         record: ObjectRecord,
@@ -852,7 +1172,7 @@ class EvalService:
             label = f"{target} --{link_rule.type}-->"
             if link_rule.expect == "absent":
                 results.append(AssertionResult(
-                    checkpoint=checkpoint.id, target=label, rule="absent",
+                    milestone=milestone.id, target=label, rule="absent",
                     passed=not edges, expected="0", actual=f"{len(edges)}",
                     detail="no such edge" if not edges else "edge present",
                 ))
@@ -862,14 +1182,14 @@ class EvalService:
                 if wanted is None:
                     continue
                 results.append(AssertionResult(
-                    checkpoint=checkpoint.id, target=label, rule="count",
+                    milestone=milestone.id, target=label, rule="count",
                     passed=len(edges) == wanted, expected=f"{wanted}",
                     actual=f"{len(edges)}",
                     detail=f"{len(edges)} edge(s) of {link_rule.type}",
                 ))
                 continue
             results.append(AssertionResult(
-                checkpoint=checkpoint.id, target=label, rule="exists",
+                milestone=milestone.id, target=label, rule="exists",
                 passed=bool(edges), expected="≥1", actual=f"{len(edges)}",
                 detail=(
                     f"→ {edges[0][1].label}" if edges else "no such edge"
@@ -882,7 +1202,7 @@ class EvalService:
                 actual = edges[0][0].props.get(prop_rule.field) if edges else None
                 passed, why = compare(prop_rule, expected.link_props[key], actual)
                 results.append(AssertionResult(
-                    checkpoint=checkpoint.id, target=label, field=prop_rule.field,
+                    milestone=milestone.id, target=label, field=prop_rule.field,
                     rule=prop_rule.match, expected=f"{expected.link_props[key]}",
                     actual=f"{actual}", passed=passed, detail=why,
                 ))
@@ -890,19 +1210,19 @@ class EvalService:
 
     def _grade_trajectory(
         self,
-        checkpoint: Checkpoint,
-        expectation: CheckpointExpectation,
+        milestone: Milestone,
+        expectation: MilestoneExpectation,
         run: RunRecord,
         world: EvalWorld,
         prefix: list[str],
     ) -> list[AssertionResult]:
         results: list[AssertionResult] = []
-        # Scoped to the checkpoint, so "no second model call before the
-        # vendor is resolved" means what it says.
+        # Scoped to the milestone, so "no second model call before the
+        # vendor is settled" means what it says.
         in_scope = [s for s in run.steps if s.step_id in set(prefix)]
         step_ids = [s.step_id for s in in_scope]
         gates = [s for s in in_scope if s.kind == "task"]
-        for rule in checkpoint.trajectory:
+        for rule in milestone.trajectory:
             expected = expectation.trajectory.get(rule.kind, rule.expected)
             if not expected and rule.kind not in ("step_absent",):
                 continue
@@ -910,7 +1230,7 @@ class EvalService:
                 rule.kind, expected, run, step_ids, gates, world, in_scope
             )
             results.append(AssertionResult(
-                checkpoint=checkpoint.id, target="trajectory", field=rule.kind,
+                milestone=milestone.id, target="trajectory", field=rule.kind,
                 rule=rule.kind, expected=expected, actual=actual, passed=passed,
                 detail=rule.note,
             ))

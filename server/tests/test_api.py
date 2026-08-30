@@ -23,22 +23,33 @@ def client(_client):
 def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    # 9 seed documents + 4 generated schema-exports (ontology, collections,
-    # mappings, eval specs) — the fixture publishes them like startup does.
-    assert resp.json()["assets"] == 13
+    # 9 seed documents + 2 seeded extraction prompts + 4 generated
+    # schema-exports (ontology, collections, mappings, eval specs) — the
+    # fixture publishes them like startup does.
+    assert resp.json()["assets"] == 15
 
 
 def test_list_and_prefix_filter(client):
-    assert len(client.get("/api/v1/assets").json()) == 13
+    assert len(client.get("/api/v1/assets").json()) == 15
     # The kind filter carves the Library out of the corpus: documents only.
     docs = client.get("/api/v1/assets", params={"kind": "document"}).json()
     assert len(docs) == 9
     assert all(a["kind"] == "document" for a in docs)
+    # And it carves out the governed prompts, which are knowledge without being
+    # documents: they instruct a ModelCall rather than arguing with a policy.
+    prompts = client.get("/api/v1/assets", params={"kind": "prompt"}).json()
+    assert {a["id"] for a in prompts} == {
+        "receipt-extraction-prompt",
+        "invoice-extraction-prompt",
+    }
+    assert all(a["authority_level"] is None for a in prompts)
     finance = client.get("/api/v1/assets", params={"prefix": "finance"}).json()
     assert {a["id"] for a in finance} == {
         "expense-approval-policy",
         "travel-booking-guideline",
         "invoice-posting-policy",
+        "receipt-extraction-prompt",
+        "invoice-extraction-prompt",
     }
 
 
@@ -245,11 +256,14 @@ def test_users_crud_and_role_rules(client):
     assert client.delete(f"/api/v1/users/{uid}").status_code == 204
     assert client.delete(f"/api/v1/users/{uid}").status_code == 404
 
-    # Cannot change your own role or delete yourself (dev principal uid = "dev").
+    # Cannot change your own role or delete yourself. Asked rather than
+    # hardcoded: the signed-in uid is the acting persona's, not a literal.
+    me_uid = client.get("/api/v1/users/me").json()["uid"]
     assert (
-        client.put("/api/v1/users/dev/role", json={"role": "user"}).status_code == 400
+        client.put(f"/api/v1/users/{me_uid}/role",
+                   json={"role": "user"}).status_code == 400
     )
-    assert client.delete("/api/v1/users/dev").status_code == 400
+    assert client.delete(f"/api/v1/users/{me_uid}").status_code == 400
 
 
 def test_a2a_agent_card_and_message(client):

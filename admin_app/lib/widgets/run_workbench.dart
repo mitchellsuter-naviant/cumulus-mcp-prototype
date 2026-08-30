@@ -3,7 +3,17 @@ import 'package:flutter/material.dart';
 import '../models/run.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'ref_chips.dart';
 import 'ui_kit.dart';
+
+/// How long a run took, or an honest silence.
+///
+/// Every seeded run reports `0ms`, because the durable engine records a
+/// duration only for steps that actually waited on something and the stub
+/// readers wait on nothing. Printing "0ms" claims a measurement of zero;
+/// "not timed" says there is no measurement, which is the true statement and
+/// the one that stops a reader believing the flow is instantaneous.
+String _duration(int ms) => ms <= 0 ? 'not timed' : '${ms}ms';
 
 /// The Flow Runs list, and the journal behind one run.
 ///
@@ -29,7 +39,8 @@ class FlowRunsCard extends StatefulWidget {
     super.key,
     required this.api,
     required this.flowId,
-    this.subtitle = 'every run of this flow, newest first · click one for its journal',
+    this.subtitle =
+        'every run of this flow, newest first · click one for its journal',
   });
 
   @override
@@ -99,7 +110,9 @@ class _FlowRunsCardState extends State<FlowRunsCard> {
   Widget build(BuildContext context) {
     final runs = _runs;
     if (_error != null && runs == null) {
-      return CumulusCard(child: ErrorNotice(message: _error!, onRetry: _load));
+      return CumulusCard(
+        child: ErrorNotice(message: _error!, onRetry: _load),
+      );
     }
     if (runs == null) {
       return const CumulusCard(child: CumulusLoading());
@@ -116,7 +129,7 @@ class _FlowRunsCardState extends State<FlowRunsCard> {
           for (final lens in const ['all', 'succeeded', 'suspended', 'failed'])
             LensChip(
               label: lens.toUpperCase(),
-              tone: _toneForStatus(lens),
+              tone: runTone(lens),
               selected: _lens == lens,
               onTap: () => setState(() => _lens = lens),
             ),
@@ -142,14 +155,16 @@ class _FlowRunsCardState extends State<FlowRunsCard> {
                     padding: EdgeInsets.symmetric(vertical: 18),
                     child: CumulusLoading(),
                   )
-                : RunJournalView(run: _expanded),
+                : RunJournalView(api: widget.api, run: _expanded),
         ],
       ],
     );
   }
 }
 
-CumulusTone _toneForStatus(String status) => switch (status) {
+/// One vocabulary for run status across the console: the four states
+/// `runs.py` actually stores.
+CumulusTone runTone(String status) => switch (status) {
   'succeeded' => CumulusTone.success,
   'suspended' => CumulusTone.warn,
   'failed' => CumulusTone.danger,
@@ -170,7 +185,7 @@ class _RunRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final tone = _toneForStatus(run.status);
+    final tone = runTone(run.status);
     return CumulusListRow(
       onTap: onTap,
       leading: Container(
@@ -218,7 +233,7 @@ class _RunRow extends StatelessWidget {
       ),
       subtitle: Text(
         '${run.steps} step(s) · ${run.modelCalls} ModelCall(s) · '
-        '${run.durationMs}ms · ${run.refs.length} governed read(s)'
+        '${_duration(run.durationMs)} · ${run.refs.length} governed read(s)'
         '${run.actor.isEmpty ? '' : ' · ${run.actor}'}'
         '${run.error.isEmpty ? '' : ' · ${run.error}'}',
       ),
@@ -229,15 +244,18 @@ class _RunRow extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               Text(
-                _ago(run.startedAtIso),
+                agoIso(run.startedAtIso),
                 style: const TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
                   color: CumulusColors.ink,
                 ),
               ),
-              Text(run.id, style: CumulusText.statCaption,
-                  overflow: TextOverflow.ellipsis),
+              Text(
+                run.id,
+                style: CumulusText.statCaption,
+                overflow: TextOverflow.ellipsis,
+              ),
             ],
           ),
         ),
@@ -253,9 +271,10 @@ class _RunRow extends StatelessWidget {
 
 /// One run's journal: the steps, in order, with what each read and returned.
 class RunJournalView extends StatelessWidget {
+  final ApiClient api;
   final FlowRun? run;
 
-  const RunJournalView({super.key, required this.run});
+  const RunJournalView({super.key, required this.api, required this.run});
 
   @override
   Widget build(BuildContext context) {
@@ -280,9 +299,9 @@ class RunJournalView extends StatelessWidget {
               MetaPill('${run.modelCalls} ModelCall(s)'),
               if (run.costUsd > 0)
                 MetaPill('\$${run.costUsd.toStringAsFixed(4)} audited spend'),
-              MetaPill('${run.durationMs}ms'),
+              MetaPill(_duration(run.durationMs)),
               if (run.finishedAtIso.isNotEmpty)
-                MetaPill('finished ${_ago(run.finishedAtIso)}'),
+                MetaPill('finished ${agoIso(run.finishedAtIso)}'),
             ],
           ),
           if (run.writes.isNotEmpty) ...[
@@ -299,13 +318,14 @@ class RunJournalView extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 6),
-            _RefChips(refs: run.writes, tone: CumulusTone.success),
+            RefChips(api: api, refs: run.writes, tone: CumulusTone.success),
           ],
           if (run.refs.isNotEmpty) ...[
             const SizedBox(height: 14),
             Text('READ-SET', style: CumulusText.statLabel),
             const SizedBox(height: 6),
-            _RefChips(
+            RefChips(
+              api: api,
               refs: run.refs,
               tooltip:
                   'Pinned at the revision the run actually read, so the '
@@ -344,8 +364,8 @@ class _StepTile extends StatelessWidget {
               color: failed
                   ? CumulusTone.danger.background
                   : step.status == 'suspended'
-                      ? CumulusTone.warn.background
-                      : tone.background,
+                  ? CumulusTone.warn.background
+                  : tone.background,
               borderRadius: BorderRadius.circular(8),
             ),
             child: Icon(
@@ -354,8 +374,8 @@ class _StepTile extends StatelessWidget {
               color: failed
                   ? CumulusTone.danger.foreground
                   : step.status == 'suspended'
-                      ? CumulusTone.warn.foreground
-                      : tone.foreground,
+                  ? CumulusTone.warn.foreground
+                  : tone.foreground,
             ),
           ),
           const SizedBox(width: 10),
@@ -464,78 +484,3 @@ IconData _iconForKind(String kind) => switch (kind) {
   'resolve' => Icons.hub_outlined,
   _ => Icons.circle_outlined,
 };
-
-/// Refs as chips. Shared by the read-set and the write-set so the two read as
-/// the same kind of thing seen from opposite ends.
-class _RefChips extends StatelessWidget {
-  final List<String> refs;
-  final String tooltip;
-  final CumulusTone tone;
-
-  const _RefChips({
-    required this.refs,
-    this.tooltip = '',
-    this.tone = CumulusTone.neutral,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 6,
-      children: [
-        for (final ref in refs)
-          Tooltip(
-            message: tooltip.isEmpty ? _describe(ref) : tooltip,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-              decoration: BoxDecoration(
-                color: tone == CumulusTone.neutral
-                    ? CumulusColors.surface
-                    : tone.background,
-                borderRadius: BorderRadius.circular(7),
-                border: Border.all(
-                  color: tone == CumulusTone.neutral
-                      ? CumulusColors.border
-                      : Colors.transparent,
-                ),
-              ),
-              child: Text(
-                ref,
-                style: CumulusText.mono.copyWith(
-                  color: tone == CumulusTone.neutral
-                      ? CumulusColors.inkSecondary
-                      : tone.foreground,
-                ),
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-
-  static String _describe(String ref) {
-    if (ref.startsWith('link:')) {
-      return 'A typed edge this step asserted. Identity edges can be '
-          'withdrawn later without erasing that they were made.';
-    }
-    if (ref.startsWith('graph:')) {
-      return 'An entity this step minted or claimed on, at the revision it '
-          'left behind.';
-    }
-    if (ref.startsWith('document:')) {
-      return 'An artifact stored under its Collection’s retention.';
-    }
-    if (ref.startsWith('knowledge:')) {
-      return 'A governed-knowledge write — promotion into canonical knowledge '
-          'is a decision, never a side effect.';
-    }
-    return ref;
-  }
-}
-
-String _ago(String iso) {
-  if (iso.isEmpty) return '—';
-  final when = DateTime.tryParse(iso);
-  return when == null ? '—' : agoLabel(when);
-}

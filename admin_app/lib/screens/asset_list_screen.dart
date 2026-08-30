@@ -149,22 +149,17 @@ class _AssetsSectionState extends State<AssetsSection> {
       _error = null;
     });
     try {
-      // The Library is documents people wrote. Schema-exports live under
-      // Ontology — same corpus, different question, so the kind filter carves
-      // this screen's slice server-side.
-      final assets = await _api.listAssets(kind: 'document');
+      final screen = await _api.libraryScreen();
       if (!mounted) return;
       setState(() {
-        _assets = assets;
+        // The Library is documents people wrote. The route returns the whole
+        // corpus because the Ontology's generated exports and the flows'
+        // prompts are governed alongside them; this screen shows the half
+        // that argues and carries authority.
+        _assets = screen.assets.where((a) => a.kind == 'document').toList();
+        _usage = screen.usage;
         _loading = false;
       });
-      // Usage is a second request on purpose: the taxonomy must render even if
-      // metrics are unavailable, so an accounting outage costs a column rather
-      // than the page.
-      try {
-        final usage = await _api.corpusUsage();
-        if (mounted) setState(() => _usage = usage);
-      } catch (_) {}
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -173,6 +168,16 @@ class _AssetsSectionState extends State<AssetsSection> {
       });
     }
   }
+
+  /// Whether anything at all was recorded against the corpus in the window.
+  ///
+  /// The usage map is zero-filled, so its size says nothing. Without this the
+  /// screen called every document undiscovered — in red — whenever search had
+  /// simply not been run, which flags a healthy corpus as broken. No traffic
+  /// is a fact about the window, not a verdict on the documents.
+  bool get _hasTraffic => _usage.values.any(
+    (u) => u.reads > 0 || u.citations > 0 || u.impressions > 0,
+  );
 
   void _openEditor({String? assetId}) =>
       setState(() => _editing = (id: assetId));
@@ -196,7 +201,7 @@ class _AssetsSectionState extends State<AssetsSection> {
       .toList();
 
   bool _matchesUsageLens(AssetSummary asset) {
-    if (_usageLens == null) return true;
+    if (_usageLens == null || !_hasTraffic) return true;
     final usage = _usage[asset.id];
     // No row at all means no recorded traffic of any kind — undiscovered.
     if (usage == null) return _usageLens == 'undiscovered';
@@ -249,14 +254,22 @@ class _AssetsSectionState extends State<AssetsSection> {
 
   Widget _heading() {
     final published = _assets.where((a) => a.status == 'published').length;
+    final reads = _usage.values.fold<int>(0, (sum, u) => sum + u.reads);
     return PlaneHeader(
       summary:
-          'What people wrote: policies, standards, guidelines and notes — the '
-          'documents that argue and carry authority. Generated exports live '
-          'under Ontology.',
+          'What people wrote down that agents must obey: policies, standards, '
+          'guidelines and notes — the documents that argue and carry '
+          'authority. Generated exports live under Ontology.',
       pills: [
-        MetaPill('${_assets.length} assets'),
+        MetaPill('${_assets.length} documents'),
         MetaPill('$published published', tone: CumulusTone.success),
+        // Traffic belongs here rather than on a survey screen, because the
+        // lenses that act on it are two chips below. Stated as a plain fact
+        // when there is none: nothing has been read is not an alarm.
+        if (!_loading)
+          MetaPill(
+            _hasTraffic ? '$reads reads in 30d' : 'no reads recorded in 30d',
+          ),
       ],
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
@@ -294,7 +307,7 @@ class _AssetsSectionState extends State<AssetsSection> {
             selected: _lens == level,
             onTap: () => setState(() => _lens = _lens == level ? null : level),
           ),
-        if (_usage.isNotEmpty) ...[
+        if (_hasTraffic) ...[
           const SizedBox(width: 12),
           LensChip(
             label: 'ignored',
@@ -334,8 +347,10 @@ class _AssetsSectionState extends State<AssetsSection> {
           children: [
             SectionHeader(
               title: 'Authority lens',
-              subtitle:
-                  'filter the corpus by how much force a document carries',
+              subtitle: _hasTraffic
+                  ? 'filter by how much force a document carries, or by how '
+                        'it is failing to be used'
+                  : 'filter by how much force a document carries',
               trailing: Text(
                 '${visible.length} shown',
                 style: CumulusText.sectionSubtitle,
@@ -411,7 +426,7 @@ class _AssetsSectionState extends State<AssetsSection> {
         overflow: TextOverflow.ellipsis,
       ),
       trailing: [
-        _UsagePip(usage: _usage[asset.id], known: _usage.isNotEmpty),
+        _UsagePip(usage: _usage[asset.id], known: _hasTraffic),
         const SizedBox(width: 8),
         StatusBadge(asset.status, tone: toneForStatus(asset.status)),
         const SizedBox(width: 8),

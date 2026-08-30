@@ -1,12 +1,16 @@
 # Cumulus MCP Prototype dev container
 
-One reproducible Linux environment for both halves of the prototype:
+One reproducible Linux environment for both halves of the prototype, plus the
+simulation engine they run against:
 
 - **Flutter web admin app** (`admin_app/`) — Firebase Auth + Firebase Hosting
 - **Python API server** (`server/`) — FastAPI serving three front doors over the
   same knowledge store: REST (`/api/v1`), MCP over Streamable HTTP (`/mcp/`), and
   A2A (`/a2a`). Storage is Firestore in production, in-memory locally. Hosted on
   **Cloud Run** in GCP project `cumulus-mcp-prototype`.
+- **Simulation engine** (`cumulus-demo-ecosystem/`) — a *separate repo*,
+  bind-mounted in and opened alongside this one. See
+  [Two repos, one window](#two-repos-one-window).
 
 ## What's inside
 
@@ -27,18 +31,74 @@ Runs as root (the Miniforge image's standard pattern).
 1. Host prerequisites: Docker Desktop + the VS Code
    [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
    extension.
-2. Authenticate gcloud on the **host** (the config dir is bind-mounted in):
+2. Clone the simulation engine **beside** this repo, so the two are siblings:
+
+   ```sh
+   cd ..            # the directory containing cumulus-mcp-prototype/
+   git clone <cumulus-demo-ecosystem remote> cumulus-demo-ecosystem
+   ```
+
+   This is a hard prerequisite: the mount is a bind, and Docker refuses to start
+   a container whose bind source does not exist.
+3. Authenticate gcloud on the **host** (the config dir is bind-mounted in):
 
    ```sh
    gcloud auth login
    gcloud auth application-default login
    ```
 
-3. Load your SSH signing key into the host agent _before_ opening the container
+4. Load your SSH signing key into the host agent _before_ opening the container
    so commits get signed (see `setup-git-signing.sh` for the per-OS command).
-4. **Dev Containers: Reopen in Container**. On first create, `postCreateCommand`
-   runs `flutter pub get` in `admin_app/` and builds `server/.venv` from
-   `server/requirements.txt` (each step skipped if that half of the repo is absent).
+5. **Dev Containers: Reopen in Container**. It opens the multi-root workspace
+   `cumulus.code-workspace`, not the bare folder. On first create,
+   `postCreateCommand` runs `flutter pub get` in `admin_app/` and builds
+   `server/.venv` from `server/requirements.txt` (each step skipped if that half
+   of the repo is absent).
+
+## Two repos, one window
+
+`cumulus-demo-ecosystem/` — the simulation engine this prototype codes against —
+is a separate repo with its own history and its own remote. It is **bind-mounted,
+not copied**: the container sees the host checkout, so edits, branches, and
+commits made in either place are the same working tree.
+
+| Where | Path |
+| ----- | ---- |
+| Host | `<parent of this repo>/cumulus-demo-ecosystem` |
+| Container | `/workspaces/cumulus-demo-ecosystem` |
+
+Two pieces of config make that work, and they must agree:
+
+- `devcontainer.json` → `mounts` binds
+  `${localWorkspaceFolder}/../cumulus-demo-ecosystem` to
+  `/workspaces/cumulus-demo-ecosystem`, and `workspaceFolder` points at
+  `cumulus.code-workspace` so VS Code attaches to the multi-root workspace.
+- [`cumulus.code-workspace`](../cumulus.code-workspace) (repo root) lists both
+  folders and carries the settings that need a folder qualifier — in a multi-root
+  window a bare `${workspaceFolder}` is ambiguous, so the Python interpreter and
+  pytest paths are written `${workspaceFolder:cumulus-mcp-prototype}/…`.
+
+Consequences worth knowing:
+
+- **Cloned somewhere else?** Change the `source=` of that mount in
+  `devcontainer.json` and the second `path` in `cumulus.code-workspace`, then
+  rebuild.
+- **Git is per-folder.** The Source Control view shows two repositories. Both are
+  registered as `safe.directory` by `postCreateCommand`. Commit signing applies to
+  both — it is configured globally.
+- **No shared dependency install.** `postCreateCommand` bootstraps only this repo;
+  the simulation engine sets itself up per its own README. If it grows a build the
+  container needs on every create, add it there rather than assuming it.
+- **Deploy scripts stay single-repo.** `deploy/deploy.sh` still operates on
+  `cumulus-mcp-prototype` only.
+- **Claude Code reaches both.** `.claude/settings.json` lists
+  `/workspaces/cumulus-demo-ecosystem` under `permissions.additionalDirectories`,
+  so a session started in this repo can read and edit the engine without a prompt
+  per file.
+
+Prefer running the container's Dockerfile over adding engine toolchains ad hoc: if
+the engine needs a runtime this image lacks, add it to
+[`Dockerfile`](Dockerfile) so the environment stays reproducible.
 
 ## Running the front end
 

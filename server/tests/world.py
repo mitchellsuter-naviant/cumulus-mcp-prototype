@@ -1,6 +1,6 @@
 """A fully wired in-memory world, for tests that exercise a whole Flow.
 
-The construction itself lives in `app.evals.build_world`, because the eval
+The construction itself lives in `app.eval_world.build_world`, because the eval
 harness needs exactly the same thing — an isolated copy of the machinery with
 the corpus copied in rather than shared. Duplicating it here would guarantee
 the two drift, and the test world is the one that would quietly stop matching
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import app.deps as deps
 from app.config import settings
-from app.evals import EvalWorld, build_world
+from app.eval_world import EvalWorld, build_world
 
 World = EvalWorld
 
@@ -33,6 +33,8 @@ def install(world: EvalWorld) -> EvalWorld:
     deps._task_service = world.tasks
     deps._run_engine = world.engine
     deps._graph_service = world.graph
+    deps._action_gateway = world.gateway
+    deps._dispatcher = world.dispatcher
     deps._document_service = world.documents
     deps._anomaly_service = world.anomaly
     deps._sync_service = world.sync

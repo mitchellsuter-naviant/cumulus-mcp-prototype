@@ -8,7 +8,7 @@ The hub is deliberately built from the same primitives as everything else:
   human's decision resumes it.
 - The HR agent is a grounded answerer over the knowledge layer scoped to the
   `people/` taxonomy plus the employee's own live facts (balance, requests).
-  With `ANSWER_BACKEND=vertex` it plans with tools; locally it degrades to
+  With `MODEL_BACKEND=vertex` it plans with tools; locally it degrades to
   retrieval plus the structured facts — cited either way, never invented.
 """
 
@@ -21,6 +21,8 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
+from . import personas
+from .graph import GraphService, object_id
 from .models import AssetFilter, utcnow
 from .tasks import Task, TaskEvidence, TaskProposal, TaskService
 
@@ -45,8 +47,26 @@ class Benefit(BaseModel):
 
 
 class EmployeeProfile(BaseModel):
-    uid: str
+    """Who this person is, and the state the hub keeps about them.
+
+    The two halves have different owners, which is why only one of them is
+    stored. Name, title, team, manager and location belong to the org chart,
+    so they are read back out of the graph on every call rather than copied
+    once and left to rot; the balance, the accrual and the benefits are the
+    hub's own and are the only part it writes down.
+    """
+
+    email: str
     name: str = ""
+    title: str = ""
+    team: str = ""
+    manager: str = ""
+    location: str = ""
+    #: False when no `Employee` in the org chart carries this email. The hub
+    #: still renders and says why it is empty — the alternative, and what this
+    #: used to do, is to invent a person nobody employs.
+    in_workforce: bool = True
+    workforce_note: str = ""
     pto_balance_days: float = 17.5
     pto_accrual_per_month: float = 1.67
     next_company_holiday: str = "Labor Day · Sep 7"
@@ -55,7 +75,7 @@ class EmployeeProfile(BaseModel):
 
 class PtoRequest(BaseModel):
     id: str
-    uid: str
+    email: str
     start_date: str
     end_date: str
     days: float
@@ -110,7 +130,7 @@ def _default_benefits() -> list[Benefit]:
 
 
 class EmployeeDirectory(Protocol):
-    def get_profile(self, uid: str) -> EmployeeProfile | None: ...
+    def get_profile(self, email: str) -> EmployeeProfile | None: ...
     def put_profile(self, profile: EmployeeProfile) -> EmployeeProfile: ...
     def list_requests(self) -> list[PtoRequest]: ...
     def get_request(self, request_id: str) -> PtoRequest | None: ...
@@ -123,13 +143,13 @@ class InMemoryEmployeeDirectory:
         self._profiles: dict[str, EmployeeProfile] = {}
         self._requests: dict[str, PtoRequest] = {}
 
-    def get_profile(self, uid: str) -> EmployeeProfile | None:
+    def get_profile(self, email: str) -> EmployeeProfile | None:
         with self._lock:
-            return self._profiles.get(uid)
+            return self._profiles.get(email)
 
     def put_profile(self, profile: EmployeeProfile) -> EmployeeProfile:
         with self._lock:
-            self._profiles[profile.uid] = profile
+            self._profiles[profile.email] = profile
             return profile
 
     def list_requests(self) -> list[PtoRequest]:
@@ -154,18 +174,18 @@ class FirestoreEmployeeDirectory:
         self._profiles = self._client.collection(f"{collection}_profiles")
         self._requests = self._client.collection(f"{collection}_pto")
 
-    def get_profile(self, uid: str) -> EmployeeProfile | None:
-        snap = self._profiles.document(uid).get()
+    def get_profile(self, email: str) -> EmployeeProfile | None:
+        snap = self._profiles.document(email).get()
         if not snap.exists:
             return None
         try:
             return EmployeeProfile.model_validate(snap.to_dict())
         except Exception:
-            log.exception("Unparseable profile", extra={"uid": uid})
+            log.exception("Unparseable profile", extra={"email": email})
             return None
 
     def put_profile(self, profile: EmployeeProfile) -> EmployeeProfile:
-        self._profiles.document(profile.uid).set(profile.model_dump(mode="json"))
+        self._profiles.document(profile.email).set(profile.model_dump(mode="json"))
         return profile
 
     def list_requests(self) -> list[PtoRequest]:
@@ -214,30 +234,58 @@ class EmployeeService:
         directory: EmployeeDirectory,
         knowledge,  # KnowledgeService — duck-typed to avoid an import cycle
         tasks: TaskService,
+        graph: GraphService,
         answer_backend=None,
         teams=None,
     ) -> None:
         self.directory = directory
         self.knowledge = knowledge
         self.tasks = tasks
+        self.graph = graph
         self.answer_backend = answer_backend
         self.teams = teams
 
     # -- profile --------------------------------------------------------------
 
-    def profile(self, uid: str, name: str = "") -> EmployeeProfile:
-        existing = self.directory.get_profile(uid)
-        if existing is not None:
-            return existing
-        profile = EmployeeProfile(
-            uid=uid, name=name or uid, benefits=_default_benefits()
+    def profile(self, email: str) -> EmployeeProfile:
+        """The hub's view of one person, keyed the way the graph keys them.
+
+        A principal the org chart has never heard of gets an empty profile
+        that says so. It used to get a freshly minted one instead, complete
+        with a default balance and a full set of benefits — so the hub showed
+        a person nobody employs and days nobody had accrued.
+        """
+        person = self.graph.get(object_id("Employee", email)) if email else None
+        if person is None:
+            return EmployeeProfile(
+                email=email,
+                in_workforce=False,
+                workforce_note=(
+                    f"{email or 'This principal'} is not in the workforce, so "
+                    "there is no balance, manager or enrollment to show."
+                ),
+                pto_balance_days=0.0,
+                pto_accrual_per_month=0.0,
+                next_company_holiday="",
+            )
+        profile = self.directory.get_profile(email) or self.directory.put_profile(
+            EmployeeProfile(email=email, benefits=_default_benefits())
         )
-        self.directory.put_profile(profile)
+        profile.name = str(person.props.get("name") or person.label)
+        profile.title = str(person.props.get("title") or "")
+        profile.location = str(person.props.get("location") or "")
+        profile.team = self._linked_label(person.id, "member_of")
+        profile.manager = self._linked_label(person.id, "reports_to")
         return profile
 
-    def requests_for(self, uid: str) -> list[PtoRequest]:
+    def _linked_label(self, person_id: str, link_type: str) -> str:
+        for _, other in self.graph.neighbors(person_id, link_type, "out"):
+            return other.label
+        return ""
+
+    def requests_for(self, email: str) -> list[PtoRequest]:
         return sorted(
-            (r for r in self.directory.list_requests() if r.uid == uid),
+            (r for r in self.directory.list_requests() if r.email == email),
             key=lambda r: r.created_at_iso,
             reverse=True,
         )
@@ -253,13 +301,13 @@ class EmployeeService:
         return parse_auto_approve_days(asset.content), ref
 
     def request_pto(
-        self, uid: str, start_date: str, end_date: str, days: float, note: str = ""
+        self, email: str, start_date: str, end_date: str, days: float, note: str = ""
     ) -> PtoRequest:
-        profile = self.profile(uid)
+        profile = self.profile(email)
         window, policy_ref = self.auto_approve_window()
-        rid = f"pto_{uid}_{start_date.replace('-', '')}"
+        rid = f"pto_{email}_{start_date.replace('-', '')}"
         request = PtoRequest(
-            id=rid, uid=uid, start_date=start_date, end_date=end_date,
+            id=rid, email=email, start_date=start_date, end_date=end_date,
             days=days, note=note, created_at_iso=utcnow().isoformat(),
         )
 
@@ -294,7 +342,7 @@ class EmployeeService:
                 case_ref=rid,
                 refs=[policy_ref],
                 evidence=[
-                    TaskEvidence(label="Employee", value=profile.name or uid),
+                    TaskEvidence(label="Employee", value=profile.name or email),
                     TaskEvidence(label="Dates",
                                  value=f"{start_date} → {end_date} · {days:g} days"),
                     TaskEvidence(label="Balance",
@@ -317,7 +365,7 @@ class EmployeeService:
         log.info(
             "PTO requested",
             extra={"ptoId": rid, "state": request.state, "days": days,
-                   "actor": uid},
+                   "actor": email},
         )
         return request
 
@@ -335,7 +383,7 @@ class EmployeeService:
             + (f" — {task.decision.note}" if task.decision.note else "")
         )
         if approved:
-            profile = self.profile(request.uid)
+            profile = self.profile(request.email)
             profile.pto_balance_days = round(
                 profile.pto_balance_days - request.days, 2
             )
@@ -350,14 +398,14 @@ class EmployeeService:
 
     # -- the HR agent -----------------------------------------------------------
 
-    def _employee_facts(self, uid: str) -> list[str]:
-        profile = self.profile(uid)
+    def _employee_facts(self, email: str) -> list[str]:
+        profile = self.profile(email)
         facts = [
             f"PTO balance: {profile.pto_balance_days:g} days "
             f"(accruing {profile.pto_accrual_per_month:g}/month)",
             f"Next company holiday: {profile.next_company_holiday}",
         ]
-        pending = [r for r in self.requests_for(uid) if r.state == "pending"]
+        pending = [r for r in self.requests_for(email) if r.state == "pending"]
         if pending:
             facts.append(
                 "Pending PTO requests: "
@@ -368,9 +416,9 @@ class EmployeeService:
         )
         return facts
 
-    def chat(self, uid: str, message: str) -> HrChatReply:
+    def chat(self, email: str, message: str) -> HrChatReply:
         """Grounded HR answer: the employee's own facts + cited HR knowledge."""
-        facts = self._employee_facts(uid)
+        facts = self._employee_facts(email)
         hits = self.knowledge.search(
             message, limit=4, filters=AssetFilter(path_prefix="people/")
         )
@@ -419,7 +467,7 @@ class EmployeeService:
             lines.append(f"{facts[1]}.")
         if any(w in lowered for w in ("benefit", "medical", "health", "dental",
                                       "vision", "401", "retirement", "stipend")):
-            profile = self.profile(uid)
+            profile = self.profile(email)
             lines.extend(f"{b.name}: {b.summary}" for b in profile.benefits)
         if hits:
             top = hits[0].asset
@@ -445,6 +493,7 @@ def build_employee_service(
     collection: str,
     knowledge,
     tasks: TaskService,
+    graph: GraphService,
     answer_backend=None,
     teams=None,
 ) -> EmployeeService:
@@ -453,7 +502,9 @@ def build_employee_service(
         directory = FirestoreEmployeeDirectory(project, collection)
     else:
         directory = InMemoryEmployeeDirectory()
-    return EmployeeService(directory, knowledge, tasks, answer_backend, teams)
+    return EmployeeService(
+        directory, knowledge, tasks, graph, answer_backend, teams
+    )
 
 
 def seed_employee_if_empty(service: EmployeeService) -> int:
@@ -461,7 +512,7 @@ def seed_employee_if_empty(service: EmployeeService) -> int:
     if service.directory.get_request("pto_seed_01") is not None:
         return 0
     service.directory.put_request(PtoRequest(
-        id="pto_seed_01", uid="dev",
+        id="pto_seed_01", email=personas.DEFAULT_PERSONA.email,
         start_date="2026-10-12", end_date="2026-10-20", days=7,
         note="Family trip", state="pending",
         reason="over the governed 3-day window; routed to HR",

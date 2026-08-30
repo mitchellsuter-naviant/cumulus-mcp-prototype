@@ -1,37 +1,29 @@
-"""REST surface for the Flows section: registry, telemetry, audit, testing.
+"""REST surface for the Flows section: the registry, its versions, telemetry.
 
 Reads need any authenticated role — watching how a workstream runs is a
-Workspace-grade capability, not an admin one. Registering, editing, pausing,
-and everything on the golden set or the harness is admin+, and — like teams —
-a minted key may read but never reshape the registry it authenticates against.
+Workspace-grade capability, not an admin one. Registering, editing and pausing
+are admin+, and — like teams — a minted key may read but never reshape the
+registry it authenticates against.
+
+Grading a flow is not here. `/api/v1/evals` owns that: it executes the flow in
+an isolated world and grades what it wrote, which is a different kind of thing
+from a registry entry and reads a different store.
 """
 
 import logging
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from .auth import Principal, get_principal, require_reader, require_role
+from .auth import Principal, get_principal, require_human, require_reader, require_role
 from .deps import get_flow_service
-from .models import utcnow
 from .flows import (
-    AuditEntry,
-    CaseDocument,
-    ContractFact,
-    CorrectionSet,
-    FactAssertion,
-    GoldenCase,
-    GoldenSet,
-    GoldenSetRevision,
-    GoldenSource,
-    PinnedRead,
-    ReadMode,
+    CostBasis,
     Recommendation,
-    RunDetail,
-    RunSummary,
+    RoiBasis,
     StepDiff,
-    TestRun,
-    TrajectoryAssertion,
     UsageDay,
     FlowDefinition,
     FlowExistsError,
@@ -39,18 +31,25 @@ from .flows import (
     FlowStatus,
     FlowStep,
     FlowVersion,
-    audit_entries,
-    case_document,
-    case_from_run,
-    correction_sets,
-    find_run,
+    cost_basis,
+    eval_case_count,
+    fleet_flow_ids,
+    fleet_runs,
+    flow_runs,
     open_tasks,
-    producer_map,
-    recent_runs,
+    open_tasks_by_flow,
+    roi_basis,
     usage_series,
 )
+from .runs import RunRecord
 
 log = logging.getLogger("cumulus.flows.api")
+
+# What a *row* of the fleet can be in. `undeclared` is the absence of a
+# definition to have a lifecycle state, so it is filterable and readable but
+# deliberately absent from `FlowUpdate`: it is not a state a definition can be
+# moved into.
+FleetStatus = FlowStatus | Literal["undeclared"]
 
 router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
 
@@ -59,9 +58,20 @@ router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
 
 
 class FlowSummaryPublic(BaseModel):
+    """One row of the fleet, whether or not anyone authored a definition for it.
+
+    Five of the seven flows that write the graph are inbound sync feeds with
+    no `FlowDefinition`. They run, they write, and the fleet used to omit them
+    entirely — so the console reported a two-flow world and a console that
+    cannot see five of its seven flows is worse than one showing a row with
+    empty columns. `has_definition` is how a row says which kind it is; the
+    definition-only fields stay at their defaults on a feed.
+    """
+
     id: str
     name: str
-    status: FlowStatus
+    status: FleetStatus
+    has_definition: bool = True
     description: str
     team: str
     tags: list[str]
@@ -69,7 +79,9 @@ class FlowSummaryPublic(BaseModel):
     updated_at: str
     runs_30d: int = 0
     cost_30d_usd: float = 0.0
+    # Of finished runs. In-flight runs are evidence of neither outcome.
     success_30d: float | None = None
+    cost_basis_30d: CostBasis = "no-model-calls"
     tasks_open: int = 0
     minutes_saved_30d: float = 0.0
     # Daily run counts for the last 14 days — the row sparkline.
@@ -85,6 +97,9 @@ class FlowDetailPublic(FlowSummaryPublic):
     model_budget_usd_per_run: float = 0.0
     authored_by: str = ""
     created_at: str = ""
+    # Cases that grade this flow, counted off the eval registry. The wire name
+    # predates the split and is kept: renaming a field the console reads is a
+    # separate, coordinated change.
     golden_cases: int = 0
     # What the version selector needs without a second round trip.
     active_version_label: str = ""
@@ -105,19 +120,47 @@ class FleetAttention(BaseModel):
 
 
 class FleetStats(BaseModel):
+    """The fleet header, every figure read off stored runs.
+
+    Three fields exist to keep a number from being read as more than it is:
+
+    * `flows` vs `definitions` — the fleet is every flow that runs (seven);
+      `definitions` is how many of those have a Tier-2 declarative export
+      (two). The header used to show the second and call it the fleet.
+    * `cost_basis` — whether the spend figure is a measurement or a hole. See
+      `flows.cost_basis`; a $0.00 that means "nobody recorded it" must not
+      read as "$0.00 spent".
+    * `roi_basis` — the derivation of `hours_returned` and `roi_usd`, which
+      are a real run count multiplied by a governed assumption. Nothing timed
+      a person against these flows, and a dollar figure that does not say so
+      will be read as though something did.
+    """
+
     days: int
+    # Every flow that runs: registered bodies, flows with stored runs, and
+    # registered definitions.
+    flows: int = 0
     definitions: int
+    without_definition: int = 0
     active: int
     paused: int
     draft: int
     runs: int
     completed: int
+    failed: int = 0
+    in_flight: int = 0
+    # Over finished runs only — a suspended run waiting on a person is not a
+    # failure, and counting it as one was the easiest way to make this number
+    # move without anything changing.
     success_rate: float | None = None
     model_spend_usd: float
     tokens: int
     model_calls: int
+    priced_model_calls: int = 0
+    cost_basis: CostBasis = "no-model-calls"
     hours_returned: float
     roi_usd: float
+    roi_basis: RoiBasis = Field(default_factory=RoiBasis)
     tasks_open: int
     escalated: int
     series: list[FleetSeriesDay]
@@ -149,125 +192,90 @@ class FlowUpdate(BaseModel):
     model_budget_usd_per_run: float | None = None
 
 
-class GoldenCaseCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
-    input_ref: str = Field(default="", max_length=200)
-    expected: str = Field(default="", max_length=600)
-    source: GoldenSource = "human-authored"
-    # Set when promoting a real execution: the case keeps a pointer back to
-    # the run that motivated it, so a failing eval is traceable.
-    run_id: str = Field(default="", max_length=80)
-    # A JSON fixture pasted or uploaded from the console. Held verbatim —
-    # re-serializing would quietly change what is under test.
-    payload: str = Field(default="", max_length=20000)
-    document_ref: str = Field(default="", max_length=200)
-    assertions: list[FactAssertion] = Field(default_factory=list)
-    trajectory: list[TrajectoryAssertion] = Field(default_factory=list)
-    read_set: list[PinnedRead] = Field(default_factory=list)
-
-
-class GoldenImport(BaseModel):
-    """Bulk upload: one JSON object per line, the same shape the Python SDK's
-    `cumulus eval push` emits."""
-
-    jsonl: str = Field(min_length=1, max_length=400_000)
-
-
-class CaseReview(BaseModel):
-    """A human's pass over the case's labels: path -> corrected expected
-    value. Empty corrections = confirmed as labelled."""
-
-    corrections: dict[str, str] = Field(default_factory=dict)
-
-
-class GoldenSetPublic(BaseModel):
-    flow_id: str
-    cases: list[GoldenCase] = Field(default_factory=list)
-    version: int = 1
-    revisions: list[GoldenSetRevision] = Field(default_factory=list)
-    synced_from: str = ""
-    synced_at: str = ""
-
-
-class ContractPublic(BaseModel):
-    flow_id: str
-    version_label: str
-    facts: list[ContractFact] = Field(default_factory=list)
-    # {fact path -> step id} for the requested version — derived, so it is
-    # served next to the facts rather than stored anywhere.
-    producer_map: dict[str, str] = Field(default_factory=dict)
-
-
 class AppliedRecommendation(BaseModel):
     recommendation_id: str
     draft: FlowVersion
     summary: str
-    # The experiment auto-launched against the staged draft, when the golden
-    # set allows one — the estimated saving becomes a measured one.
-    test_run_id: str = ""
-
-
-class TestRunLaunch(BaseModel):
-    candidate_version: str = Field(default="", max_length=60)
-    baseline_version: str = Field(default="", max_length=60)
-    reads: ReadMode = "pinned"
 
 
 class FlowUsage(BaseModel):
+    """One flow's window, summed from the same series it returns."""
+
     flow_id: str
+    has_definition: bool = True
     days: int
     runs: int
     completed: int
+    failed: int = 0
+    in_flight: int = 0
     success_rate: float | None
     cost_usd: float
     tokens: int
     model_calls: int
+    priced_model_calls: int = 0
+    cost_basis: CostBasis = "no-model-calls"
     tasks_raised: int
     escalated: int
     minutes_saved: float
     roi_usd: float
+    roi_basis: RoiBasis = Field(default_factory=RoiBasis)
     series: list[UsageDay]
 
 
 # ---- helpers ---------------------------------------------------------------
 
 
-def _require_human(principal: Principal) -> None:
-    """A key may not reshape the registry it authenticates against."""
-    if principal.key_id is not None:
-        log.warning(
-            "API key attempted flow management", extra={"keyId": principal.key_id}
-        )
-        raise HTTPException(
-            status_code=403,
-            detail="API keys cannot manage flows; sign in as an admin.",
-        )
+def _label(flow_id: str) -> str:
+    """A name for a flow nobody wrote a definition for."""
+    return flow_id.replace("-", " ").capitalize()
 
 
-def _rollup(defn: FlowDefinition) -> FlowSummaryPublic:
-    series = usage_series(defn, 30)
-    runs = sum(d.runs for d in series)
+def _rollup(
+    flow_id: str,
+    defn: FlowDefinition | None,
+    runs: list[RunRecord],
+    tasks_open: int,
+) -> FlowSummaryPublic:
+    series = usage_series(runs, 30, defn.roi_minutes_per_run if defn else 0.0)
+    total = sum(d.runs for d in series)
     completed = sum(d.completed for d in series)
+    finished = completed + sum(d.failed for d in series)
+    calls = sum(d.model_calls for d in series)
+    priced = sum(d.priced_model_calls for d in series)
     return FlowSummaryPublic(
-        id=defn.id,
-        name=defn.name or defn.id,
-        status=defn.status,
-        description=defn.description,
-        team=defn.team,
-        tags=defn.tags,
-        version=defn.version,
-        updated_at=defn.updated_at.isoformat(),
-        runs_30d=runs,
+        id=flow_id,
+        name=(defn.name or flow_id) if defn else _label(flow_id),
+        status=defn.status if defn else "undeclared",
+        has_definition=defn is not None,
+        description=defn.description if defn else "",
+        team=defn.team if defn else "",
+        tags=defn.tags if defn else [],
+        version=defn.version if defn else 0,
+        updated_at=(
+            defn.updated_at.isoformat()
+            if defn
+            else max((r.updated_at_iso for r in runs), default="")
+        ),
+        runs_30d=total,
         cost_30d_usd=round(sum(d.cost_usd for d in series), 2),
-        success_30d=round(completed / runs, 4) if runs else None,
-        tasks_open=open_tasks(defn),
+        success_30d=round(completed / finished, 4) if finished else None,
+        cost_basis_30d=cost_basis(calls, priced),
+        tasks_open=tasks_open,
         minutes_saved_30d=round(sum(d.minutes_saved for d in series), 1),
         spark=[d.runs for d in series[-14:]],
     )
 
 
-def _detail(defn: FlowDefinition, golden_cases: int) -> FlowDetailPublic:
-    base = _rollup(defn)
+def _detail(
+    flow_id: str,
+    defn: FlowDefinition | None,
+    eval_cases: int,
+) -> FlowDetailPublic:
+    base = _rollup(flow_id, defn, flow_runs(flow_id), open_tasks(flow_id))
+    if defn is None:
+        # A sync feed has runs and no map. Saying so beats a 404 on a row the
+        # fleet list just showed, and beats inventing a definition for it.
+        return FlowDetailPublic(**base.model_dump(), golden_cases=eval_cases)
     draft = defn.draft_version()
     return FlowDetailPublic(
         **base.model_dump(),
@@ -279,7 +287,7 @@ def _detail(defn: FlowDefinition, golden_cases: int) -> FlowDetailPublic:
         model_budget_usd_per_run=defn.model_budget_usd_per_run,
         authored_by=defn.authored_by,
         created_at=defn.created_at.isoformat(),
-        golden_cases=golden_cases,
+        golden_cases=eval_cases,
         active_version_label=defn.active_version().display(),
         draft_version_label=draft.display() if draft else "",
         version_count=len(defn.version_history()),
@@ -287,8 +295,22 @@ def _detail(defn: FlowDefinition, golden_cases: int) -> FlowDetailPublic:
 
 
 def _get_or_404(flow_id: str) -> FlowDefinition:
+    """For routes that act on a definition: editing, versioning, drafting."""
     defn = get_flow_service().get(flow_id)
     if defn is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_id}")
+    return defn
+
+
+def _in_fleet_or_404(flow_id: str) -> FlowDefinition | None:
+    """For read routes: a definition when there is one, else None if it runs.
+
+    A flow the engine runs is a real flow. Refusing to report on it because
+    nobody authored a Tier-2 export is how the console came to describe a
+    seven-flow system as a two-flow one.
+    """
+    defn = get_flow_service().get(flow_id)
+    if defn is None and flow_id not in fleet_flow_ids():
         raise HTTPException(status_code=404, detail=f"Flow not found: {flow_id}")
     return defn
 
@@ -299,25 +321,34 @@ def _get_or_404(flow_id: str) -> FlowDefinition:
 @router.get("", response_model=list[FlowSummaryPublic])
 def list_flows(
     q: str = "",
-    status: FlowStatus | None = None,
+    status: FleetStatus | None = None,
     team: str | None = None,
     principal: Principal = Depends(get_principal),
 ) -> list[FlowSummaryPublic]:
     require_reader(principal)
     out = []
     needle = q.strip().lower()
-    for defn in get_flow_service().list():
-        if status is not None and defn.status != status:
+    service = get_flow_service()
+    runs_by_flow = fleet_runs()
+    tasks_by_flow = open_tasks_by_flow()
+    for flow_id in fleet_flow_ids():
+        defn = service.get(flow_id)
+        row = _rollup(
+            flow_id, defn, runs_by_flow.get(flow_id, []), tasks_by_flow.get(flow_id, 0)
+        )
+        if status is not None and row.status != status:
             continue
-        if team is not None and defn.team != team:
+        if team is not None and row.team != team:
             continue
         if needle and needle not in " ".join(
-            [defn.id, defn.name, defn.description, defn.team, *defn.tags]
+            [row.id, row.name, row.description, row.team, *row.tags]
         ).lower():
             continue
-        out.append(_rollup(defn))
-    # Highest model spend first: the list doubles as the cost report.
-    out.sort(key=lambda w: w.cost_30d_usd, reverse=True)
+        out.append(row)
+    # Busiest first, then by spend, then by id. Spend led this list when it
+    # was invented; with real journals most of it is zero, and a fleet ordered
+    # by a column that reads zero everywhere has no order at all.
+    out.sort(key=lambda w: (-w.runs_30d, -w.cost_30d_usd, w.id))
     return out
 
 
@@ -329,23 +360,44 @@ def fleet_stats(
     require_reader(principal)
     service = get_flow_service()
     defs = service.list()
+    runs_by_flow = fleet_runs()
+    tasks_by_flow = open_tasks_by_flow()
+    flow_ids = fleet_flow_ids()
+
     per_day: dict[str, FleetSeriesDay] = {}
-    runs = completed = tokens = calls = escalated = tasks_open = 0
-    cost = minutes = roi_usd = 0.0
+    runs = completed = failed = tokens = calls = priced = escalated = 0
+    tasks_open = no_assumption = 0
+    cost = minutes = roi_usd = rate_weight = 0.0
     attention: list[FleetAttention] = []
-    for defn in defs:
-        series = usage_series(defn, days)
+
+    for flow_id in flow_ids:
+        defn = service.get(flow_id)
+        series = usage_series(
+            runs_by_flow.get(flow_id, []),
+            days,
+            defn.roi_minutes_per_run if defn else 0.0,
+        )
         d_runs = sum(d.runs for d in series)
         d_completed = sum(d.completed for d in series)
+        d_failed = sum(d.failed for d in series)
+        d_minutes = sum(d.minutes_saved for d in series)
         runs += d_runs
         completed += d_completed
+        failed += d_failed
         cost += sum(d.cost_usd for d in series)
         tokens += sum(d.tokens for d in series)
         calls += sum(d.model_calls for d in series)
+        priced += sum(d.priced_model_calls for d in series)
         escalated += sum(d.escalated for d in series)
-        minutes += sum(d.minutes_saved for d in series)
-        roi_usd += sum(d.minutes_saved for d in series) / 60.0 * defn.roi_hourly_rate_usd
-        tasks_open += open_tasks(defn)
+        minutes += d_minutes
+        tasks_open += tasks_by_flow.get(flow_id, 0)
+        if defn and defn.roi_minutes_per_run:
+            roi_usd += d_minutes / 60.0 * defn.roi_hourly_rate_usd
+            rate_weight += d_completed * defn.roi_hourly_rate_usd
+        else:
+            # A flow with no ROI assumption returns no modelled hours. Its
+            # runs are still real; they just do not belong in this figure.
+            no_assumption += d_completed
         for day in series:
             key = day.date.isoformat()
             row = per_day.setdefault(
@@ -354,31 +406,59 @@ def fleet_stats(
             row.runs += day.runs
             row.cost_usd = round(row.cost_usd + day.cost_usd, 2)
             row.tasks_raised += day.tasks_raised
-        if d_runs and (d_completed / d_runs) < 0.95:
+        d_finished = d_completed + d_failed
+        if d_finished and (d_completed / d_finished) < 0.95:
+            # The sample size travels with the rate. Three failures out of
+            # four runs and three hundred out of four hundred are not the
+            # same finding, and a bare percentage hides which one this is.
             attention.append(
                 FleetAttention(
-                    flow_id=defn.id,
-                    reason=f"success {d_completed / d_runs:.1%} over the last {days}d",
+                    flow_id=flow_id,
+                    reason=(
+                        f"success {d_completed / d_finished:.1%} of {d_finished} "
+                        f"finished run(s) in {days}d"
+                    ),
                 )
             )
-        if defn.status == "active" and not service.golden_set(defn.id).cases:
+        if defn and defn.status == "active" and not eval_case_count(flow_id):
             attention.append(
-                FleetAttention(flow_id=defn.id, reason="active with no golden set")
+                FleetAttention(flow_id=flow_id, reason="active with no eval spec")
             )
+        if defn is None and d_runs:
+            attention.append(
+                FleetAttention(
+                    flow_id=flow_id,
+                    reason=f"{d_runs} run(s) with no declarative export to audit",
+                )
+            )
+
+    finished = completed + failed
+    weighted_rate = (
+        rate_weight / (completed - no_assumption)
+        if completed > no_assumption
+        else 0.0
+    )
     return FleetStats(
         days=days,
+        flows=len(flow_ids),
         definitions=len(defs),
+        without_definition=len(flow_ids) - len(defs),
         active=sum(1 for d in defs if d.status == "active"),
         paused=sum(1 for d in defs if d.status == "paused"),
         draft=sum(1 for d in defs if d.status == "draft"),
         runs=runs,
         completed=completed,
-        success_rate=round(completed / runs, 4) if runs else None,
+        failed=failed,
+        in_flight=runs - finished,
+        success_rate=round(completed / finished, 4) if finished else None,
         model_spend_usd=round(cost, 2),
         tokens=tokens,
         model_calls=calls,
+        priced_model_calls=priced,
+        cost_basis=cost_basis(calls, priced),
         hours_returned=round(minutes / 60.0, 1),
         roi_usd=round(roi_usd, 2),
+        roi_basis=roi_basis(completed, minutes, weighted_rate, no_assumption),
         tasks_open=tasks_open,
         escalated=escalated,
         series=sorted(per_day.values(), key=lambda r: r.date),
@@ -391,7 +471,7 @@ def create_flow(
     payload: FlowCreate, principal: Principal = Depends(get_principal)
 ) -> FlowDetailPublic:
     require_role(principal, "admin")
-    _require_human(principal)
+    require_human(principal, "manage flows; sign in as an admin")
     defn = FlowDefinition(
         **payload.model_dump(),
         status="draft",
@@ -405,7 +485,7 @@ def create_flow(
             status_code=409, detail=f"A flow named '{payload.id}' already exists"
         )
     log.info("Flow registered", extra={"flowId": created.id, "actor": principal.uid})
-    return _detail(created, 0)
+    return _detail(created.id, created, 0)
 
 
 @router.get("/{flow_id}", response_model=FlowDetailPublic)
@@ -413,9 +493,8 @@ def get_flow(
     flow_id: str, principal: Principal = Depends(get_principal)
 ) -> FlowDetailPublic:
     require_reader(principal)
-    defn = _get_or_404(flow_id)
-    golden = get_flow_service().golden_set(flow_id)
-    return _detail(defn, len(golden.cases))
+    defn = _in_fleet_or_404(flow_id)
+    return _detail(flow_id, defn, eval_case_count(flow_id))
 
 
 @router.patch("/{flow_id}", response_model=FlowDetailPublic)
@@ -425,7 +504,7 @@ def update_flow(
     principal: Principal = Depends(get_principal),
 ) -> FlowDetailPublic:
     require_role(principal, "admin")
-    _require_human(principal)
+    require_human(principal, "manage flows; sign in as an admin")
     defn = _get_or_404(flow_id)
     patch = {k: v for k, v in payload.model_dump().items() if v is not None}
     # A status change is a governed lifecycle act; log it distinctly so the
@@ -442,8 +521,7 @@ def update_flow(
         )
     updated = get_flow_service().update(defn.model_copy(update=patch))
     log.info("Flow updated", extra={"flowId": flow_id, "actor": principal.uid})
-    golden = get_flow_service().golden_set(flow_id)
-    return _detail(updated, len(golden.cases))
+    return _detail(flow_id, updated, eval_case_count(flow_id))
 
 
 @router.delete("/{flow_id}", status_code=204)
@@ -451,7 +529,7 @@ def delete_flow(
     flow_id: str, principal: Principal = Depends(get_principal)
 ) -> None:
     require_role(principal, "admin")
-    _require_human(principal)
+    require_human(principal, "manage flows; sign in as an admin")
     defn = _get_or_404(flow_id)
     if defn.status == "active":
         # Definitions are map assets; an active one is deprecated, not erased.
@@ -476,60 +554,39 @@ def flow_usage(
     principal: Principal = Depends(get_principal),
 ) -> FlowUsage:
     require_reader(principal)
-    defn = _get_or_404(flow_id)
-    series = usage_series(defn, days)
+    defn = _in_fleet_or_404(flow_id)
+    series = get_flow_service().usage(flow_id, days)
     runs = sum(d.runs for d in series)
     completed = sum(d.completed for d in series)
+    failed = sum(d.failed for d in series)
+    finished = completed + failed
     minutes = sum(d.minutes_saved for d in series)
+    calls = sum(d.model_calls for d in series)
+    priced = sum(d.priced_model_calls for d in series)
+    rate = defn.roi_hourly_rate_usd if defn and defn.roi_minutes_per_run else 0.0
     return FlowUsage(
         flow_id=flow_id,
+        has_definition=defn is not None,
         days=days,
         runs=runs,
         completed=completed,
-        success_rate=round(completed / runs, 4) if runs else None,
+        failed=failed,
+        in_flight=runs - finished,
+        success_rate=round(completed / finished, 4) if finished else None,
         cost_usd=round(sum(d.cost_usd for d in series), 2),
         tokens=sum(d.tokens for d in series),
-        model_calls=sum(d.model_calls for d in series),
+        model_calls=calls,
+        priced_model_calls=priced,
+        cost_basis=cost_basis(calls, priced),
         tasks_raised=sum(d.tasks_raised for d in series),
         escalated=sum(d.escalated for d in series),
         minutes_saved=round(minutes, 1),
-        roi_usd=round(minutes / 60.0 * defn.roi_hourly_rate_usd, 2),
+        roi_usd=round(minutes / 60.0 * rate, 2),
+        roi_basis=roi_basis(
+            completed, minutes, rate, 0 if rate else completed
+        ),
         series=series,
     )
-
-
-@router.get("/{flow_id}/runs", response_model=list[RunSummary])
-def flow_runs(
-    flow_id: str,
-    limit: int = Query(default=25, ge=1, le=200),
-    principal: Principal = Depends(get_principal),
-) -> list[RunSummary]:
-    require_reader(principal)
-    return recent_runs(_get_or_404(flow_id), limit)
-
-
-@router.get("/{flow_id}/runs/{run_id}", response_model=RunDetail)
-def flow_run(
-    flow_id: str, run_id: str, principal: Principal = Depends(get_principal)
-) -> RunDetail:
-    require_reader(principal)
-    detail = find_run(_get_or_404(flow_id), run_id)
-    if detail is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Run not found (journals are kept 45 days in this prototype): {run_id}",
-        )
-    return detail
-
-
-@router.get("/{flow_id}/audit", response_model=list[AuditEntry])
-def flow_audit(
-    flow_id: str,
-    limit: int = Query(default=40, ge=1, le=200),
-    principal: Principal = Depends(get_principal),
-) -> list[AuditEntry]:
-    require_reader(principal)
-    return audit_entries(_get_or_404(flow_id), limit)
 
 
 # ---- versions --------------------------------------------------------------
@@ -589,9 +646,13 @@ def flow_recommendations(
     days: int = Query(default=30, ge=7, le=365),
     principal: Principal = Depends(get_principal),
 ) -> list[Recommendation]:
-    """Cost and performance insights derived from this definition's telemetry."""
+    """Cost and performance insights derived from this flow's own runs.
+
+    Always at least one card: the recommender states the evidence it had,
+    including — especially — when that evidence supports nothing.
+    """
     require_reader(principal)
-    _get_or_404(flow_id)
+    _in_fleet_or_404(flow_id)
     return get_flow_service().recommendations(flow_id, days)
 
 
@@ -608,10 +669,12 @@ def apply_recommendation(
 
     Applying edits governed knowledge, so it is admin-gated, human-only, and
     logged. The change lands in a draft precisely so it has to survive the
-    golden set before it becomes what runs.
+    flow's eval spec before it becomes what runs — which is a separate,
+    deliberate act at `/api/v1/evals/{spec_id}/run`, not something applying a
+    card does on the operator's behalf.
     """
     require_role(principal, "admin")
-    _require_human(principal)
+    require_human(principal, "manage flows; sign in as an admin")
     _get_or_404(flow_id)
     service = get_flow_service()
     rec = next(
@@ -632,21 +695,6 @@ def apply_recommendation(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    # Close the loop: the staged draft is immediately measured against the
-    # golden set, so the card's estimated saving becomes a verified delta.
-    # No golden set = no experiment; the response says which happened.
-    test_run_id = ""
-    try:
-        test_run = service.launch_test_run(
-            flow_id,
-            candidate_version=draft.display(),
-            baseline_version="",
-            launched_by=principal.email or principal.uid,
-            launched_for=rec.id,
-        )
-        test_run_id = test_run.id
-    except ValueError:
-        pass
     change = rec.proposed_change or {}
     return AppliedRecommendation(
         recommendation_id=rec.id,
@@ -655,327 +703,4 @@ def apply_recommendation(
             f"{change.get('field', 'setting')} on {rec.step_name or change.get('step_id', '')} "
             f"set to {change.get('to', '')} in {draft.display()}"
         ),
-        test_run_id=test_run_id,
     )
-
-
-# ---- contract & correction sets ---------------------------------------------
-
-
-@router.get("/{flow_id}/contract", response_model=ContractPublic)
-def flow_contract(
-    flow_id: str,
-    version: int | None = Query(
-        default=None, description="Version to project onto; defaults to active."
-    ),
-    principal: Principal = Depends(get_principal),
-) -> ContractPublic:
-    """The declared canonical facts, plus the derived producer map.
-
-    The facts are the stable spine labels attach to; the map is recomputed
-    per version from its topology, which is what lets the flow's shape morph
-    without relabelling a single case.
-    """
-    require_reader(principal)
-    defn = _get_or_404(flow_id)
-    target = (
-        defn.find_version(version) if version is not None else defn.active_version()
-    )
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"Version not found: v{version}")
-    return ContractPublic(
-        flow_id=flow_id,
-        version_label=target.display(),
-        facts=defn.contract.facts,
-        producer_map=producer_map(defn.contract, target.steps),
-    )
-
-
-@router.get("/{flow_id}/correction-sets", response_model=list[CorrectionSet])
-def flow_correction_sets(
-    flow_id: str, principal: Principal = Depends(get_principal)
-) -> list[CorrectionSet]:
-    """Per-ModelCall correction sets — the flywheel's auto-accumulated
-    raw→corrected pairs, the step-eval dataset."""
-    require_reader(principal)
-    return correction_sets(_get_or_404(flow_id))
-
-
-# ---- golden set ------------------------------------------------------------
-
-
-def _golden_public(flow_id: str, golden: GoldenSet) -> GoldenSetPublic:
-    return GoldenSetPublic(
-        flow_id=flow_id,
-        cases=golden.cases,
-        version=golden.version,
-        revisions=golden.revisions,
-        synced_from=golden.synced_from,
-        synced_at=golden.synced_at.isoformat() if golden.synced_at else "",
-    )
-
-
-@router.get("/{flow_id}/golden-set", response_model=GoldenSetPublic)
-def golden_set(
-    flow_id: str, principal: Principal = Depends(get_principal)
-) -> GoldenSetPublic:
-    require_reader(principal)
-    _get_or_404(flow_id)
-    return _golden_public(flow_id, get_flow_service().golden_set(flow_id))
-
-
-@router.post("/{flow_id}/golden-set", response_model=GoldenSetPublic, status_code=201)
-def add_golden_case(
-    flow_id: str,
-    payload: GoldenCaseCreate,
-    principal: Principal = Depends(get_principal),
-) -> GoldenSetPublic:
-    require_role(principal, "admin")
-    _require_human(principal)
-    defn = _get_or_404(flow_id)
-    service = get_flow_service()
-    existing = service.golden_set(flow_id).cases
-    # Promoting a run is the flywheel in miniature: the execution that needed
-    # judgment becomes the case that guards against needing it again.
-    source = payload.source
-    if payload.run_id and source == "human-authored":
-        source = "promoted-from-run"
-    case = GoldenCase(
-        id=f"gc-{len(existing) + 1:03d}-{utcnow().strftime('%H%M%S')}",
-        name=payload.name,
-        input_ref=payload.input_ref,
-        expected=payload.expected,
-        source=source,
-        added_by=principal.email or principal.uid,
-        run_id=payload.run_id,
-        payload=payload.payload,
-        document_ref=payload.document_ref,
-        assertions=payload.assertions,
-        trajectory=payload.trajectory,
-        read_set=payload.read_set,
-    )
-    # A promotion with no explicit labels is enriched from the run's journal:
-    # assertions from what it did, the read-set from what it read.
-    if payload.run_id and not payload.assertions:
-        detail = find_run(defn, payload.run_id)
-        if detail is not None:
-            template = case_from_run(defn, detail)
-            case = case.model_copy(
-                update={
-                    "assertions": template.assertions,
-                    "trajectory": template.trajectory,
-                    "read_set": template.read_set,
-                    "document_ref": case.document_ref or template.document_ref,
-                    "payload": case.payload or template.payload,
-                    "input_ref": case.input_ref or template.input_ref,
-                }
-            )
-    try:
-        golden = service.add_golden_case(flow_id, case)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    log.info(
-        "Golden case added",
-        extra={
-            "flowId": flow_id,
-            "caseId": case.id,
-            "source": source,
-            "runId": payload.run_id,
-            "actor": principal.uid,
-        },
-    )
-    return _golden_public(flow_id, golden)
-
-
-@router.post(
-    "/{flow_id}/golden-set/import",
-    response_model=GoldenSetPublic,
-    status_code=201,
-)
-def import_golden_cases(
-    flow_id: str,
-    payload: GoldenImport,
-    principal: Principal = Depends(get_principal),
-) -> GoldenSetPublic:
-    """Bulk upload: JSONL, one case per line. Many cases, one dataset revision."""
-    import json as _json
-
-    require_role(principal, "admin")
-    _require_human(principal)
-    _get_or_404(flow_id)
-    service = get_flow_service()
-    existing = len(service.golden_set(flow_id).cases)
-    actor = principal.email or principal.uid
-    cases: list[GoldenCase] = []
-    for n, line in enumerate(payload.jsonl.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = GoldenCaseCreate.model_validate(_json.loads(line))
-        except Exception as exc:
-            raise HTTPException(
-                status_code=422, detail=f"Line {n + 1}: {exc}"
-            )
-        cases.append(
-            GoldenCase(
-                id=f"gc-{existing + len(cases) + 1:03d}-"
-                f"{utcnow().strftime('%H%M%S')}",
-                name=row.name,
-                input_ref=row.input_ref,
-                expected=row.expected,
-                source=row.source,
-                added_by=actor,
-                run_id=row.run_id,
-                payload=row.payload,
-                document_ref=row.document_ref,
-                assertions=row.assertions,
-                trajectory=row.trajectory,
-                read_set=row.read_set,
-            )
-        )
-    if not cases:
-        raise HTTPException(status_code=422, detail="No cases in the upload.")
-    try:
-        golden = service.import_golden_cases(flow_id, cases, actor)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    log.info(
-        "Golden cases imported",
-        extra={"flowId": flow_id, "count": len(cases), "actor": principal.uid},
-    )
-    return _golden_public(flow_id, golden)
-
-
-@router.get(
-    "/{flow_id}/golden-set/{case_id}/document", response_model=CaseDocument
-)
-def golden_case_document(
-    flow_id: str, case_id: str, principal: Principal = Depends(get_principal)
-) -> CaseDocument:
-    """The fixture document behind a case, with grounded field regions — the
-    review screen's raw material."""
-    require_reader(principal)
-    defn = _get_or_404(flow_id)
-    case = next(
-        (c for c in get_flow_service().golden_set(flow_id).cases if c.id == case_id),
-        None,
-    )
-    if case is None:
-        raise HTTPException(status_code=404, detail=f"Golden case not found: {case_id}")
-    return case_document(defn, case)
-
-
-@router.post(
-    "/{flow_id}/golden-set/{case_id}/review", response_model=GoldenSetPublic
-)
-def review_golden_case(
-    flow_id: str,
-    case_id: str,
-    payload: CaseReview,
-    principal: Principal = Depends(get_principal),
-) -> GoldenSetPublic:
-    """A human confirmed or corrected the case's labels in the review screen.
-
-    Corrections update the assertions' expected values and move the dataset
-    version — what a pass means changed, or was vouched for. Either way the
-    review is a ledgered human decision.
-    """
-    require_role(principal, "admin")
-    _require_human(principal)
-    _get_or_404(flow_id)
-    try:
-        golden = get_flow_service().review_golden_case(
-            flow_id, case_id, payload.corrections,
-            principal.email or principal.uid,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    log.info(
-        "Golden case reviewed",
-        extra={
-            "flowId": flow_id,
-            "caseId": case_id,
-            "corrections": len(payload.corrections),
-            "actor": principal.uid,
-        },
-    )
-    return _golden_public(flow_id, golden)
-
-
-@router.delete("/{flow_id}/golden-set/{case_id}", response_model=GoldenSetPublic)
-def remove_golden_case(
-    flow_id: str, case_id: str, principal: Principal = Depends(get_principal)
-) -> GoldenSetPublic:
-    require_role(principal, "admin")
-    _require_human(principal)
-    _get_or_404(flow_id)
-    try:
-        golden = get_flow_service().remove_golden_case(flow_id, case_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    log.info(
-        "Golden case removed",
-        extra={"flowId": flow_id, "caseId": case_id, "actor": principal.uid},
-    )
-    return _golden_public(flow_id, golden)
-
-
-# ---- test harness ----------------------------------------------------------
-
-
-@router.get("/{flow_id}/test-runs", response_model=list[TestRun])
-def list_test_runs(
-    flow_id: str, principal: Principal = Depends(get_principal)
-) -> list[TestRun]:
-    require_reader(principal)
-    _get_or_404(flow_id)
-    return get_flow_service().test_runs.list_for(flow_id)
-
-
-@router.post("/{flow_id}/test-runs", response_model=TestRun, status_code=202)
-def launch_test_run(
-    flow_id: str,
-    payload: TestRunLaunch,
-    principal: Principal = Depends(get_principal),
-) -> TestRun:
-    """Kick off a golden-set evaluation. Writes suppressed by construction.
-
-    202: the harness executes case-by-case in the background; poll the test
-    run for progress. Deliberately admin-gated but *not* human-gated — kicking
-    off an eval from CI with a minted key is a legitimate machine act.
-    """
-    require_role(principal, "admin")
-    defn = _get_or_404(flow_id)
-    try:
-        run = get_flow_service().launch_test_run(
-            flow_id,
-            payload.candidate_version,
-            payload.baseline_version,
-            launched_by=principal.email or principal.uid,
-            reads=payload.reads,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    log.info(
-        "Test run launched",
-        extra={
-            "flowId": defn.id,
-            "testId": run.id,
-            "cases": run.total_cases,
-            "actor": principal.uid,
-        },
-    )
-    return run
-
-
-@router.get("/{flow_id}/test-runs/{test_id}", response_model=TestRun)
-def get_test_run(
-    flow_id: str, test_id: str, principal: Principal = Depends(get_principal)
-) -> TestRun:
-    require_reader(principal)
-    _get_or_404(flow_id)
-    run = get_flow_service().test_runs.get(test_id)
-    if run is None or run.flow_id != flow_id:
-        raise HTTPException(status_code=404, detail=f"Test run not found: {test_id}")
-    return run

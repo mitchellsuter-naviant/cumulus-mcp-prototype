@@ -42,7 +42,7 @@ _ASSETS = [
 
 @pytest.fixture()
 def wired(_client, monkeypatch):
-    monkeypatch.setattr(settings, "answer_backend", "none")
+    monkeypatch.setattr(settings, "model_backend", "none")
     service = KnowledgeService(InMemoryRepository())
     for spec in _ASSETS:
         service.create(AssetCreate(**spec))

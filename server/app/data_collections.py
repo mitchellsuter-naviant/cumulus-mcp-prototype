@@ -70,7 +70,10 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         ),
         role="knowledge", kind="documents", origin="authored",
         container="assets", authoritative=True, retention="indefinite",
-        retention_note="superseded revisions are retained, never overwritten",
+        retention_note=(
+            "an edit bumps the revision and replaces the content; superseded "
+            "revisions are not yet retained"
+        ),
         written_by=("human",),
         read_by=("expense-reimbursement", "accounts-payable", "hr-agent"),
     ),
@@ -254,6 +257,21 @@ def get(collection_id: str) -> DataCollection | None:
 
 def for_object_type(object_type: str) -> DataCollection | None:
     return next((c for c in COLLECTIONS if object_type in c.object_types), None)
+
+
+def written_by(flow_id: str) -> tuple[DataCollection, ...]:
+    """The Collections this flow is *declared* to write.
+
+    Declared, which is the whole reason it is worth reading back: what a flow
+    is said to write and what its runs actually wrote are two different facts,
+    and `flow_projection.py` puts them side by side.
+    """
+    return tuple(c for c in COLLECTIONS if flow_id in c.written_by)
+
+
+def read_by(flow_id: str) -> tuple[DataCollection, ...]:
+    """The Collections this flow is declared to read."""
+    return tuple(c for c in COLLECTIONS if flow_id in c.read_by)
 
 
 # ---------------------------------------------------------------------------

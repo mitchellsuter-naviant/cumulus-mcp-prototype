@@ -8,7 +8,7 @@ An enterprise knowledge layer for `.md`/`.txt` assets with three protocol front 
 │  Cloud Run  │   A2A agent               /a2a  (+ /.well-known/agent-card.json)
 └──────┬──────┘
        │ Firestore (assets: text + metadata) — or in-memory for local dev
-       │ In-process BM25 index, rebuilt on writes
+       │ In-process hybrid index: BM25 + vectors, updated per write
 ┌──────┴──────┐
 │ Flutter web │   admin_app/ — browse, search, create, edit, delete assets
 └─────────────┘   deployed to Firebase Hosting
@@ -23,6 +23,7 @@ Repo layout:
 | [admin_app/](admin_app/) | Flutter **web** admin UI (`admin_app/`, *not* `app/`) |
 | [deploy/](deploy/) | `deploy.sh` (one-command deploy) and `bootstrap_owner.sh` (first owner account) |
 | [.devcontainer/](.devcontainer/) | Dev container with Flutter, Python, gcloud, and Firebase CLIs — see its [README](.devcontainer/README.md) |
+| [cumulus.code-workspace](cumulus.code-workspace) | Multi-root workspace: this repo plus `cumulus-demo-ecosystem/` (the simulation engine), which the dev container bind-mounts from the sibling directory on the host — see [Two repos, one window](.devcontainer/README.md#two-repos-one-window) |
 | [firebase.json](firebase.json) | Firebase Hosting config; serves `admin_app/build/web` |
 
 ## Security posture
@@ -38,6 +39,9 @@ Every endpoint requires a credential except two deliberate exceptions:
 | User management (`/api/v1/users*`) | `admin`+; touching an admin/owner account needs `owner` |
 | Identities (`/api/v1/identities*`) | `admin`+ to read; creating, re-scoping, or deleting anything with admin authority needs `owner`. Minted keys may read but not write — see [Identities](#identities) |
 | API keys (`/api/v1/api-keys*`) | `admin`+; keys held by an admin identity need `owner`. Minted keys are refused outright — see [API keys](#api-keys) |
+| Task decisions (`POST /api/v1/tasks/{id}/decide`) | The queue must be **this persona's own work** (`require_queue`) — see [Personas](#personas-and-the-two-front-doors). Minted keys refused: a key deciding a Task would be an agent approving its own proposal |
+| Console API (`/api/ui/v1/*`) | **Human sessions only** — a minted key is refused at the door. A machine has no screens |
+| Curation ledger (`/api/v1/ledger*`) | Any authenticated role, scoped: a principal that reads beyond itself sees every entry, one confined to its own work sees the entries it was a party to — see [The Action Gateway](#the-action-gateway) |
 | MCP (`/mcp/`) | Enforced at the transport by `RequireAuthMiddleware` — covers the handshake and every tool and resource call |
 | A2A (`POST /a2a`) | Any authenticated role (`user`+) |
 
@@ -46,16 +50,18 @@ Three credential types are accepted anywhere:
 | Credential | Header | Role |
 | --- | --- | --- |
 | Firebase ID token | `Authorization: Bearer <token>` | From the `role` custom claim |
-| Minted API key | `X-API-Key: cumk_<id>_<secret>` | Inherited from the identity the key was minted for — see [Identities](#identities) |
+| Minted API key | `X-API-Key: cumk_<id>_<secret>` | Inherited from the identity the key was minted for — see [Identities](#identities). Never a persona: keys may not impersonate |
 | `ADMIN_API_KEY` | `X-API-Key: <value>` | `owner` — legacy root credential |
 
 A supplied-but-invalid `X-API-Key` is a hard 401. It never falls through to
 `AUTH_BACKEND=none` dev mode, which would otherwise silently promote a revoked
 key to owner.
 
-With `AUTH_BACKEND=none` — the local-dev default — every caller is treated as an
-owner, so nothing prompts for credentials while developing. Setting
-`AUTH_BACKEND=firebase` turns on real verification.
+With `AUTH_BACKEND=none` — the local-dev default — a session opens as the
+Naviant Engineer persona and may switch to any other with `X-Cumulus-Persona`,
+so nothing prompts for credentials while developing and every role is testable.
+Setting `AUTH_BACKEND=firebase` turns on real verification, and impersonation
+narrows to real engineers only.
 
 All three front doors resolve credentials through
 [`principal_from_headers`](server/app/auth.py), so there is one place to swap in
@@ -126,13 +132,16 @@ Local dev uses the in-memory backend and auto-seeds from [server/seed](server/se
 - REST: `GET/POST /api/v1/assets`, `GET/PUT/DELETE /api/v1/assets/{id}`, `GET /api/v1/assets/{id}/context`, `GET /api/v1/assets/tree`, `GET /api/v1/search?q=...`, `GET /api/v1/search/status`, `POST /api/v1/search/reindex`
 - Users: `GET/POST /api/v1/users`, `PUT /api/v1/users/{uid}/role`, `DELETE /api/v1/users/{uid}`, `GET /api/v1/users/me`
 - Identities: `GET/POST /api/v1/identities`, `PUT /api/v1/identities/{uid}/role`, `DELETE /api/v1/identities/{uid}`
-- Flows: `GET/POST /api/v1/flows`, `GET /api/v1/flows/stats`, `GET/PATCH/DELETE /api/v1/flows/{id}`, `GET .../usage`, `GET .../runs`, `GET .../runs/{run_id}`, `GET .../audit`, `GET/POST .../golden-set`, `DELETE .../golden-set/{case_id}`, `GET/POST .../test-runs`, `GET .../test-runs/{test_id}` — see [Flows](#flows)
+- Flows: `GET/POST /api/v1/flows`, `GET /api/v1/flows/stats`, `GET/PATCH/DELETE /api/v1/flows/{id}`, `GET .../usage`, `GET .../versions`, `GET .../versions/{v}/diff`, `GET .../recommendations`, `POST .../recommendations/{id}/apply` — see [Flows](#flows)
+- Runs: `GET /api/v1/runs`, `GET /api/v1/runs/stats`, `GET /api/v1/runs/{id}`, `GET .../steps`, `POST .../resume` — the journals every Flow number is read off
+- Evals: `GET /api/v1/evals`, `GET /api/v1/evals/{spec}`, `GET .../cases`, `GET .../result`, `POST .../run`, `GET /api/v1/evals/fixtures` — see [Evals](#evals-a-per-flow-spec-over-the-shared-model)
+- Ledger: `GET /api/v1/ledger`, `GET /api/v1/ledger/actions`, `GET /api/v1/ledger/{id}` — see [The Action Gateway](#the-action-gateway)
 - Tasks: `GET /api/v1/tasks`, `GET /api/v1/tasks/stats`, `GET /api/v1/tasks/{id}`, `POST /api/v1/tasks/{id}/decide` — see [Tasks](#tasks)
 - Reimbursements: `GET/POST /api/v1/reimbursements`, `GET .../stats`, `GET .../{id}` — see [Reimbursements](#reimbursements-the-live-flow)
 - Accounts payable: `GET/POST /api/v1/payables`, `GET .../stats`, `GET .../{id}` — see [Accounts payable](#accounts-payable-the-second-live-flow)
 - Refs: `GET /api/v1/refs/{ref}` — resolve `knowledge:{id}@rev{n}` read-set references; every asset carries a `revision` that bumps on write
 - Employee Hub: `GET /api/v1/employee/me`, `GET/POST /api/v1/employee/pto`, `POST /api/v1/employee/hr-chat` — see [Employee Hub](#employee-hub)
-- Calendars: `GET /api/v1/calendar/me`, `GET /api/v1/calendar/calendars` — read-only; the provider is the system of record — see [Calendars](#calendars-the-schedule-as-a-mirror)
+- Calendars: `GET /api/v1/calendar/me`, `GET /api/v1/calendar/calendars` — read-only; the provider is the system of record — see [Calendars](#calendars-the-schedule-as-a-mirror-serverappcalendarspy)
 - MCP: `POST /mcp/` — tools `list_docs`, `get_doc`, `search_docs`, `get_context`; resource template `kb://{doc_id}`
 - A2A: `POST /a2a` with JSON-RPC `message/send`; agent card at `/.well-known/agent-card.json`
 
@@ -140,6 +149,12 @@ Requires the **MCP Python SDK 2.x** (`mcp.server.MCPServer`). The 1.x API
 (`FastMCP`) is not compatible with [server/app/mcp_server.py](server/app/mcp_server.py).
 
 ### Environment variables
+
+**One model, one switch.** `RECEIPT_MODEL`/`ANSWER_MODEL` and
+`RECEIPT_BACKEND`/`ANSWER_BACKEND` collapsed into `MODEL`/`MODEL_BACKEND`. A
+deployment that reasons about its own cost should have one number to reason
+about, and a suite graded against two different models is measuring two
+systems.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -150,10 +165,11 @@ Requires the **MCP Python SDK 2.x** (`mcp.server.MCPServer`). The 1.x API
 | `API_KEYS_COLLECTION` | `api_keys` | Firestore collection for minted keys |
 | `API_KEY_USAGE_COLLECTION` | `api_key_usage` | Firestore collection for daily usage rollups |
 | `FLOWS_COLLECTION` | `flows` | Firestore collection for Flow definitions |
-| `GOLDEN_SETS_COLLECTION` | `flow_golden_sets` | Firestore collection for golden sets |
-| `TEST_RUNS_COLLECTION` | `flow_test_runs` | Firestore collection for harness test runs |
+| `FIXTURES_COLLECTION` | `eval_fixtures` | The named worlds eval cases run in — see [Evals](#evals-a-per-flow-spec-over-the-shared-model) |
+| `LEDGER_COLLECTION` | `curation_ledger` | The curation ledger: one entry per Action the Gateway committed or refused |
 | `TASKS_COLLECTION` | `tasks` | Firestore collection for the Task Queue |
 | `REIMBURSEMENTS_COLLECTION` | `reimbursements` | Firestore collection for the reimbursements table |
+| `PAYABLES_COLLECTION` | `payables` | Firestore collection for the AP invoices table |
 | `EMPLOYEE_COLLECTION` | `employee` | Firestore collection prefix for profiles and PTO |
 | `GRAPH_OBJECTS_COLLECTION` | `graph_objects` | Canonical Objects — the entity layer |
 | `GRAPH_LINKS_COLLECTION` | `graph_links` | Typed, reversible Links between them |
@@ -161,9 +177,10 @@ Requires the **MCP Python SDK 2.x** (`mcp.server.MCPServer`). The 1.x API
 | `DOCUMENTS_COLLECTION` | `documents` | Submitted artifacts and the regions an extraction read |
 | `DOCUMENT_MAX_BYTES` | `700000` | Refuse artifacts larger than the document-store adapter can hold |
 | `VENDOR_PROFILES_COLLECTION` | `vendor_profiles` | Derived per-vendor statistics behind the anomaly screen |
-| `RECEIPT_BACKEND` | follows `ANSWER_BACKEND` | `none` (deterministic stub) or `vertex` (multimodal receipt reading) |
-| `RECEIPT_MODEL` | `gemini-2.5-flash` | Vertex model for receipt extraction |
-| `AUTH_BACKEND` | `none` | `none` (dev: everyone is owner) or `firebase` (verify ID tokens) |
+| `MODEL_BACKEND` | `none` | One switch for every ModelCall: `none` (deterministic local readers, retrieval-only `/ask` — no credential, no network, what the tests run against) or `vertex` |
+| `MODEL` | `gemini-3.7-flash` | The model behind every ModelCall — document readers, HR agent, `/ask` planner |
+| `MODEL_LOCATION` | `global` | `gemini-3.7-flash` is served only from the `global` endpoint; a regional one 404s |
+| `AUTH_BACKEND` | `none` | `none` (dev: sessions open as the Naviant Engineer persona) or `firebase` (verify ID tokens) |
 | `USER_BACKEND` | follows `AUTH_BACKEND` | `memory` or `firebase` — where platform users live |
 | `SEED_DIR` | `server/seed` | Seed docs loaded when store is empty |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Used in the A2A agent card and the generated MCP client config |
@@ -294,7 +311,17 @@ key to `deploy/.admin_api_key` (gitignored) and reuses it on later runs.
 
 The live flows read their governed values — the expense auto-approval limit,
 the invoice auto-post limit, the PTO window — out of knowledge-layer documents
-at run time. But `seed_if_empty` only runs against an *empty* corpus, so
+at run time, and **the extraction prompts are among them**.
+`invoice-extraction-prompt` and `receipt-extraction-prompt` are `kind: prompt`
+assets read the way a threshold is, with `knowledge:{id}@rev{n}` stamped onto
+the ModelCall step that ran on them, so a decision stays explainable against
+the wording that produced it. A prompt held as a Python string literal is the
+opposite of governed: invisible to the corpus, uneditable without a deploy, and
+absent from the read-set of the call it steers. When the asset is missing the
+flow falls back to a built-in default and records the ref **unpinned** — the
+absent `@rev` is how the journal says it never got one.
+
+But `seed_if_empty` only runs against an *empty* corpus, so
 editing a file in [server/seed/](server/seed/) and redeploying does **not**
 update a deployment that already has documents: the flow keeps reading the old
 revision. Push them explicitly:
@@ -305,6 +332,16 @@ revision. Push them explicitly:
 
 Idempotent, and each update is a real revision bump — which is what a governed
 knowledge change should be. Pass filenames to push only some of them.
+
+`GET /api/v1/refs/{ref}` is the read back. It resolves a `knowledge:{id}@revN`
+ref — out of a run journal, a Task, or a fixture's read-set — to the document
+it names, and says whether the revision the run read is still the one on the
+shelf. When it is not, the text is labelled *the current text, not a record of
+what was read*, and the gap is named: superseded revisions are not retained, so
+the counter is real and the history is not. That is the whole point of
+answering rather than staying silent — a chip that served today's policy as
+though it were the rule a decision was measured against would be worse than no
+chip.
 
 ### Reshaped collections
 
@@ -382,6 +419,69 @@ stop working immediately; so is withdrawing the identity's authority.
 Unauthenticated calls get HTTP 401 with `WWW-Authenticate: Bearer` and a
 JSON-RPC error `-32001`. Against a local server with `AUTH_BACKEND=none` the
 `headers` block can be omitted.
+
+## Personas, and the two front doors
+
+### Who you are acting as
+
+A **persona** is the doctrine's platform Role made concrete
+([server/app/personas.py](server/app/personas.py)). Each is a real seeded
+employee wherever one exists, because a persona with nobody behind it opens
+onto an empty hub, an empty calendar and no history — which teaches you nothing
+about the screen you are testing.
+
+| Persona | Authority | Scope | Acts as | Queues |
+| --- | --- | --- | --- | --- |
+| Naviant Engineer | `owner` | platform | Mitchell Suter | every queue |
+| Naviant Support | `user` | platform | *nobody — not in the org chart* | none |
+| Customer Admin | `admin` | tenant | Sam Okafor | stewardship, curation, eval |
+| Tomas Berg | `user` | own | Tomas Berg | `ap-clerk` |
+| Nadia Farrell | `user` | own | Nadia Farrell | `expense-review`, `ap-clerk` |
+| Kim Reyes | `user` | own | Kim Reyes | none |
+| Rowan Ellis | `user` | own | Rowan Ellis | `expense-review` |
+
+**Two axes, because one ladder cannot say what Support is.** `authority` is a
+rung on the existing `owner > admin > user` write ladder, so every
+`require_role` call in the server is unchanged. `scope` is the orthogonal read
+reach — Naviant Support reads *more* than a Customer Admin and writes *less*,
+which is above it on one axis and below it on the other. A full capability
+matrix would express that too, and would be machinery nothing here needs.
+
+**Queue-bindings are the other half of a Role.** The ladder cannot tell an AP
+clerk from an expense approver — they sit on the same rung and own different
+work — so `require_queue` gates a Task decision on the queue actually being
+this persona's. Reading is a separate question from deciding: a
+platform-scoped principal reads every queue in order to diagnose it and still
+decides only its own.
+
+**Switching persona rewrites the `Principal` itself** — uid, email, authority,
+scope, queues — rather than travelling beside it, so everything downstream
+scopes correctly with no plumbing of its own: the hub resolves "me", the queue
+filters to yours, a claim records its author. The real operator is preserved on
+`Principal.impersonated_by`, so the ledger names both parties.
+
+Send `X-Cumulus-Persona: <id>`. Locally (`AUTH_BACKEND=none`) it is
+unrestricted — that is what local is for. Deployed, only a real
+`naviant-engineer` may impersonate. **A minted key may never impersonate**: a
+credential picking a human identity is exactly the confusion the Action Gateway
+exists to prevent.
+
+### Two APIs, deliberately different shapes
+
+| | `/api/v1` | `/api/ui/v1` |
+| --- | --- | --- |
+| For | machines — MCP, A2A, integrations, CI | this console |
+| Shape | resource-shaped, one noun per route | view-shaped, one route per screen |
+| Credentials | minted keys, ID tokens | human sessions only — **keys are refused** |
+| Contract | public; changing it costs a version | private; free to change when a screen changes |
+
+The console used to reach 84 distinct `/api/v1` endpoints directly, which meant
+every one of them had to be safe to expose to a browser, and a screen rendering
+from four resources made four requests and stitched them in Dart — putting part
+of the view's logic in the client, where it could drift. The console API
+([server/app/ui_api.py](server/app/ui_api.py)) composes once, on the server.
+`GET /api/ui/v1/session` is the whole of what the shell needs before its first
+paint: who you are, what you may do, which queues are yours, and the roster.
 
 ## Identities
 
@@ -462,18 +562,99 @@ gcloud run services logs read cumulus-knowledge --region us-central1 \
   --log-filter='jsonPayload.keyId="<key_id>"'
 ```
 
+## The Action Gateway
+
+Every governed write goes through one place:
+[`ActionGateway`](server/app/gateway.py). What the doctrine's governance spine
+draws as one control point had been three half-mechanisms in three places —
+permission at the HTTP boundary, provenance on `GraphWriter`, and no ledger at
+all — and three duties in three places is the same as none, because the hole is
+wherever they fail to overlap. A caller reaching `GraphService` directly was
+checked by nobody.
+
+It is a chokepoint, not a policy engine. Three duties, and nothing else:
+
+| Duty | What it adds |
+| --- | --- |
+| **Validate** | The ontology check already lives in `graph.py`; what the Gateway adds is that a `TBoxError` *refuses the write here* rather than being reported by a sweep three weeks later. |
+| **Permission** | Two checks per write, against the Principal named at the call site rather than at the route that led there — the rung on the write ladder, then the queue binding, because a Role confers both. |
+| **Ledger** | One append per commit **or refusal**, naming both principals when the write happened under impersonation. |
+
+`ACTIONS` is a **closed table of seven declared mutations**; a write naming
+anything else is refused before it touches the graph, because an undeclared
+Action is an ungoverned one. `GET /api/v1/ledger/actions` serves the table:
+"which writes are governed" is a question asked before any particular entry,
+and a set that can be enumerated is a set that can be reviewed.
+
+| Action | Regime | Queue |
+| --- | --- | --- |
+| `post-invoice` | decision | `ap-clerk` |
+| `record-expense` | decision | `expense-review` |
+| `link-source-record` | decision | `vendor-stewardship` |
+| `confirm-vendor` | decision | `ap-clerk` |
+| `land-source-records` | observation | — |
+| `apply-source-records` | observation | — |
+| `resolve-identities` | resolution | — |
+
+**The regime is declared, never inferred.** An observation, a decision and a
+resolution are indistinguishable by their effect on the graph — all three end
+in an upsert — so the Action carries its regime and the call site picks the
+Action. Reading it back off the shape of a write would be a guess recorded as
+an audit fact. The three are separable for the first time, which is what makes
+"a source reported this" a different row from "a person decided this".
+
+Who commits is *the human who released the last gate, or the Flow's own
+declared Principal when no gate ran* — so an invoice that auto-posts under the
+governed limit is committed by `flow:accounts-payable`, itself bound to
+`ap-clerk`, rather than being credited to whoever submitted it. Un-binding that
+queue stops auto-posting rather than exempting it from the check.
+
+The chokepoint claim is checkable rather than asserted:
+`grep "graph.writer" server/app/*.py` returns nothing outside
+[graph.py](server/app/graph.py), where it is defined,
+[gateway.py](server/app/gateway.py), and [evals.py](server/app/evals.py),
+which materializes eval fixtures deliberately outside it — a graded world's
+ledger should hold the run's writes, not the fixture's.
+
+`GET /api/v1/ledger` reads it back, newest first, filterable by regime, action,
+run, task and outcome. It is read-only and there is no way to make it
+otherwise: the store has an `append` and nothing else, and a route that could
+write an entry could write a *false* one, which is worse than no ledger.
+
+**What the ledger does not guarantee**, said rather than glossed:
+
+- **Not a redo log.** Graph writes are reconstructible because claims are
+  retained; knowledge writes are not — `service.update()` puts over the
+  document, so an entry can say *that* an asset changed and never restore it.
+- **Not transactional.** A write refused halfway leaves what already landed,
+  which is why a refused entry still carries the refs it managed to write.
+- **Not redaction-proof.** Append-only by omission — there is no update and no
+  delete to call — not by cryptography.
+- **Write-sets truncate at 500 refs**, with the exact count kept beside them
+  (calendar sync's commit wrote 1,398). An entry that fails to store is worse
+  than one that says how much of itself it is not showing.
+
+Several paths stay outside it on purpose, each named in
+[gateway.py](server/app/gateway.py): knowledge writes and PTO approval are
+decision writes to non-graph stores and need their own pass, document writes
+are artifact custody rather than core-graph mutation, and
+`supersede`/`rekey`/`reverse_link` remain callable directly.
+
 ## Flows
 
 The **Flows** nav section is the landing and management page for all
-authored logic in the enterprise. A fleet page lists every definition; opening
-one gives three views under a shared top bar (title, status, **version
-selector**, pause/test actions):
+authored logic in the enterprise. The fleet page lists **every flow that
+runs**, not every flow that has a definition — five of the seven are inbound
+sync feeds with no declarative export, and counting only the two that have one
+told the reader the enterprise had two flows while seven were writing the
+graph. Opening one gives three views under a shared top bar (title, status,
+**version selector**, pause):
 
 | Tab | What it holds |
 | --- | --- |
-| **Overview** | Five KPI tiles across the top, then the definition (metadata and governed ROI assumptions) beside one daily chart whose measure is chosen from a dropdown — runs, model spend, tokens, or human judgment. Whichever measure is on screen, hovering a day tooltips all four, so answering "and what did that day cost?" never means switching charts. |
-| **Flow canvas** | A full-bleed workbench, split down the middle. On the left, the declarative export as an interactive DAG flowing **north to south** on an infinite dotted field — pan, zoom, click, branch-labelled edges, distinct node types. (The dots are painted in viewport space from the viewer's transform, not inside the transformed child: a pattern drawn on the child stops at the graph's bounds and never repaints as you move, so the field would sit still while the graph slid over it and run out at the edges.) On the right, three tabs: **Definition** shows the selected node's exported configuration; **Runs** lists recent executions — selecting one traces its actual path through the graph (steps it never reached fade to ghosts, traversed edges light up in the accent) and collapses the list into a compact header, so clicking a step shows what went in and what came out (prompt, raw response, model, tokens, cost, rule verdict, deciding human, gateway ledger ref), with **Promote to golden set** in that header; and **Eval** paints a selected experiment onto the graph as a heatmap — each node shows the pass rate of the assertions it owns, clicking a hot node lists its failing assertions with expected-vs-actual diffs. Selecting a draft in the top-bar version selector overlays the diff instead (green glow added, red removed, amber modified). |
-| **Evaluation & optimization** | Two columns. **Datasets** on the left: the golden dataset as a *versioned* knowledge asset (revision history, provenance chips, JSONL upload, the `cumulus eval push` command — authoring lives in code; the console curates), and the per-ModelCall **correction sets** the flywheel accumulates. **Experiments** on the right: candidate vs baseline over a pinned dataset revision (pinned or live reads), a pass-rate trend, per-run **gate** verdicts, and the recommender — each card carrying its evidence and an **Apply & measure** action that stages the draft *and* auto-launches the experiment, so the estimate becomes a measured delta. |
+| **Overview** | Five KPI tiles across the top, then the definition (metadata and governed ROI assumptions) beside one daily chart whose measure is chosen from a dropdown — runs, model spend, tokens, or human judgment. Whichever measure is on screen, hovering a day tooltips all four, so answering "and what did that day cost?" never means switching charts. The recommender sits under both, because cost work reads the same telemetry the chart plots. |
+| **Flow canvas** | A full-bleed workbench, split down the middle. On the left, the declarative export as an interactive DAG flowing **north to south** on an infinite dotted field — pan, zoom, click, branch-labelled edges, distinct node types. (The dots are painted in viewport space from the viewer's transform, not inside the transformed child: a pattern drawn on the child stops at the graph's bounds and never repaints as you move, so the field would sit still while the graph slid over it and run out at the edges.) On the right, two tabs: **Definition** shows the selected node's exported configuration; **Runs** lists the stored executions — selecting one traces its actual path through the graph (steps it never reached fade to ghosts, traversed edges light up in the accent), and clicking a step then shows that step's own row of the journal: what it read, what it wrote, what it returned, the model and cost it carried, a retry count when there was one, and the human who decided it. A commit names its ledger entry in the same line. Selecting a draft in the top-bar version selector overlays the diff instead (green glow added, red removed, amber modified). |
+| **Evaluation** | The flow's spec, its cases, and one run button — see [Evals](#evals-a-per-flow-spec-over-the-shared-model). It answers three questions in order: what does this flow promise, does it still keep that promise, and how do I add a case. There is exactly one population of cases on the screen and it is never counted twice — a result annotates the declared rows rather than repeating them under a second noun. |
 
 The run-path trace is derived from the journal rather than from step status
 alone, because status is ambiguous: when a Rule branches to both an Action and
@@ -487,85 +668,93 @@ It is kept deliberately close to DOCTRINE.md:
 
 - There is **no "Agent" primitive** — the Flow *is* the agent (Lens 2).
 - There is **one kind of authored logic: a Flow.** The doctrine's original
-  Workflow/DataFlow split is retired. It was right about the physics — per-case
-  work and windowed bulk work really do behave differently — and wrong about
-  the level, putting a behavioural difference in the type system, where it
-  bought arguments about which noun a definition was rather than better
-  defaults. What differs is now read off a definition's own shape:
-  `is_windowed()` asks whether the trigger is a window or a business event, and
-  `writes_canonical()` asks whether it commits into the graph. Those two derive
-  the batching insight and the claim-resolution audit entries that the type
-  used to gate.
-- **Cost is an audit product.** Every spend number rolls up from ModelCall
-  records (model, tokens, cost) — the governed operation the doctrine requires
-  to be audited. There is no separate metering path.
+  Workflow/DataFlow split is retired — it was right that per-case and windowed
+  bulk work behave differently, and wrong to put that in the type system, where
+  it bought arguments about which noun a definition was rather than better
+  defaults. What differs is read off a definition's own shape: `is_windowed()`
+  asks whether the trigger is a window or a business event, `writes_canonical()`
+  whether it commits into the graph.
+- **Cost is an audit product**: model spend is the sum of `cost_usd` over the
+  `modelcall` steps of stored runs, never a separate meter. What is missing is
+  at the far end — the two live call sites pass a model and no cost. See below.
 - The detail page shows the **Tier-2 declarative export**: typed steps
-  (`trigger · modelcall · rule · task · action · event · transform`), each
-  with a plain-language summary — the transparency bar, not runnable code.
-- **Audit** is the run journal plus the ledger view: Task decisions (with the
-  decider), Action Gateway commits (with ledger refs), resolutions, and
-  knowledge changes.
-- Ground truth keys to the **flow contract** — the declared canonical facts a
-  flow establishes (`invoice.line_items[1].amount`), never to step ids. Each
-  version carries a *derived* producer map ({fact path → step id}, read off
-  the topology; in a real engine, off journal lineage), so grading projects
-  stable labels onto whatever the current shape is: the flow can be
-  refactored freely without relabelling a single case.
-- A **golden case** pins its whole world: the fixture document, the trigger
-  payload, fact assertions (equals / approx / one-of / judge-with-rubric),
-  trajectory assertions (actions committed, task raised, terminal state), and
-  the **read-set** — the knowledge-layer records the run read, at their
-  revisions, captured off the journal on promotion. Experiments serve those
-  reads back (`pinned`, the default), so a regression grade is reproducible
-  even when the vendor master moves; `live` reads are a visibly different
-  kind of run. The golden set itself is **versioned**, and every experiment
-  records the dataset revision it measured.
-- The **test harness** grades assertion-by-assertion with writes suppressed —
-  no Action reaches the gateway from a test run, and grading is deterministic
-  per (case, candidate) so evals reproduce. Every case is graded against the
-  baseline too, so the comparison is like-for-like, a *regression* (baseline
-  passed, candidate did not) is visible per case, and the **promotion gate**
-  is stated on the run: no regressions, pass rate at or above the baseline.
-  Failures localize to the step owning the fact, which is what the canvas
-  eval lens paints. A judge that cannot decide raises a review Task rather
-  than guessing.
-- The **review screen** (open any golden case) shows the fixture document
-  with its grounded field regions — bounding boxes over the values — beside
-  the case's labels; confirming or correcting them is a ledgered human pass
-  that moves the dataset version. It is the same surface that captures
-  corrections from live Tasks and onboards a new flow by labelling its first
-  documents.
+  (`trigger · modelcall · transform · rule · task · action · event · sync ·
+  check · resolve`), each with a plain-language summary — the transparency
+  bar, not runnable code. The declared vocabulary is the executed one, so a
+  step a run journals can always be found on the definition — which is what
+  lets an eval milestone anchor on a *kind* rather than an id.
+- **Audit** is the run journal plus the curation ledger — every Action the
+  Gateway committed or refused, naming both principals when it happened under
+  impersonation. See [The Action Gateway](#the-action-gateway).
+- What a flow **promises**, and whether it still keeps that promise, is not
+  on this page: it is one eval spec per flow, graded by executing the flow in
+  an isolated world — see
+  [Evals](#evals-a-per-flow-spec-over-the-shared-model). The golden-set
+  harness that used to live here graded with a seeded coin flip, never ran the
+  flow, and reported a cost and a duration it invented. It was deleted rather
+  than repaired: a grader that cannot fail is worse than no grader, because it
+  publishes a pass rate.
 - A **version** is a full snapshot of the declarative export, never a delta —
   a chain of deltas is exactly the opaque artifact the transparency bar rules
   out. Exactly one version is active; at most one draft is open.
-- The **recommender** derives insights from a definition's own telemetry and
-  carries the evidence on every card. Two rules keep it honest: a model
-  downgrade is proposed one rung at a time, and only when the flow is
-  already succeeding — spending less on something that is failing is not a
-  saving — and applying a card edits the **draft**, never the live version, so
-  the change has to survive the golden set before it becomes what runs.
-  Applying also auto-launches the experiment against that draft, so the card
-  reports a measured delta and a gate verdict, not just an estimate.
+- The **recommender** derives insights from a flow's own runs and carries the
+  evidence on every card. Three rules keep it honest: a model downgrade is
+  proposed one rung at a time and only when the flow is already succeeding,
+  because spending less on something that is failing is not a saving; a card
+  whose measurement was never taken is **withheld and named** rather than
+  estimated; and applying one edits the **draft**, so the change has to survive
+  the eval spec before it becomes what runs. The first card always states what
+  the list rests on and what was withheld for want of evidence, because an
+  empty list reads as a clean bill of health.
 - ROI figures derive from per-definition assumptions (`roi_minutes_per_run`,
-  `roi_hourly_rate_usd`) — governed knowledge, editable in the console,
-  logged on change.
+  `roi_hourly_rate_usd`) — governed knowledge, editable in the console, logged
+  on change — times a real completed-run count. Nothing timed a person against
+  these flows, so `roi_basis` states the derivation beside the figure: *16 of
+  24 completed run(s) × 7.12 assumed min/run × $30.00/h — an assumption, not a
+  measurement.* Runs whose flow declares no assumption are named in that count
+  rather than folded into it.
 
-**Prototype honesty:** the Flows section's run telemetry (runs, journals,
-spend, audit entries) is *synthesized deterministically* from the
-definition's seed profile — stable across restarts and identical on every
-backend. Definitions, golden sets, and test runs are real stored state
-(`flows`, `flow_golden_sets`, `flow_test_runs` collections; in-memory for
-local dev). The registry seeds **one** definition on first start:
-`expense-reimbursement`, the flow that also has a *real* execution path —
-see [Reimbursements](#reimbursements-the-live-flow). When a full engine
-lands, the synthesis functions in
-[server/app/flows.py](server/app/flows.py) (`usage_series`,
-`recent_runs`, `find_run`, `audit_entries`) are the seams to replace — the
-REST contract and the console stay as they are.
+**Nothing here is synthesized.** `GET /api/v1/flows/stats` aggregates the
+stored runs and nothing else: a freshly seeded deployment reports 27 runs over
+7 flows — 2 with a declarative export, 5 without — `$0.00` of model spend with
+`cost_basis: "unrecorded"`, and 0 tokens. Where the journals record nothing the
+answer is zero, and a day with no runs is a zero row rather than a gap; the
+shape of that series is what the old curve was hiding.
+
+Zero has two readings that point in opposite directions, so the spend figure
+travels with a `cost_basis` saying which one this is:
+
+| `cost_basis` | What the zero means |
+| --- | --- |
+| `measured` | every ModelCall was priced |
+| `partial` | some were |
+| `unrecorded` | calls happened and nobody priced them — today's answer, over 20 calls |
+| `no-model-calls` | nothing called a model: a genuine zero |
+
+Pricing the two call sites in
+[server/app/reimbursements.py](server/app/reimbursements.py) and
+[server/app/payables.py](server/app/payables.py) — `ctx.step(..., cost_usd=,
+tokens=)` — is the seam that turns the figure on; nothing else has to change.
+
+This replaces a per-definition **seed profile** that manufactured a plausible
+month of traffic — 2,748 runs, $558.56 of spend, a 99.5% success rate — over
+the same 27 stored runs, and rendered a $9,718 ROI beside it with no marking.
+A synthesized count is tolerable scaffolding and a synthesized finance figure
+is not, and on the page the two were indistinguishable. The definitions
+themselves are real stored state (`flows` collection; in-memory for local dev),
+and both have a real execution path — see
+[Reimbursements](#reimbursements-the-live-flow) and
+[Accounts payable](#accounts-payable-the-second-live-flow).
+
+The five feeds with no export are not a gap in the page but a finding it now
+reports: each earns a **Needs attention** row reading *"n run(s) with no
+declarative export to audit"*. A flow writing the graph with nothing to show a
+customer is what the transparency bar forbids, and it was invisible while the
+fleet counted definitions.
 
 Management is admin-gated, and minted API keys may read everything but never
-reshape the registry (same posture as teams); launching a test run is the one
-admin write a key *may* do, so CI can kick off evals.
+reshape the registry (same posture as teams). Launching an eval is the one
+admin write a key *may* do, so CI can grade a flow.
 
 ## Tasks
 
@@ -606,8 +795,17 @@ Two governance rules at the API boundary:
 **Prototype honesty:** tasks are real stored state (`tasks` collection;
 in-memory locally) seeded with a demo backlog tied to the seeded fleet, and a
 decision is a real, attributed write — the stand-in for the curation-ledger
-entry the doctrine requires. Nothing actually resumes yet; each task's
-`resumes` field says what would happen once a real engine lands.
+entry the doctrine requires. Deciding a task genuinely resumes the run it
+suspended: `tasks_api` wires four resume hooks (reimbursements, payables,
+employee PTO, and the steward's entity-resolution decision), each a no-op on
+tasks it does not own, and a hook failure never un-decides the task.
+
+**Deciding is gated on the queue being yours.** The doctrine's Role confers
+queue-bindings as well as permissions, and the write ladder cannot tell an AP
+clerk from an expense approver — they sit on the same rung and own different
+work. `require_queue` is that half. Reading is a separate question: a
+platform-scoped principal reads every queue in order to diagnose it and still
+decides only its own.
 
 ## The data & knowledge layer, rationalized
 
@@ -616,6 +814,17 @@ primitives are is ruled in [DOCTRINE.md](DOCTRINE.md). This section is the
 working model that everything below implements: **five concepts, two axes**.
 Nothing in the system falls outside the five; several things started as two of
 them wearing one name.
+
+It is deliberately **not** the navigation. The console's Knowledge layer is
+three tabs — Ontology, Library, Sources — and `Collection`, `TBox` and `ABox`
+were taken out of it entirely: none of the three appears anywhere in
+DOCTRINE.md, and they had been holding top-level stops. A Collection turns out
+to be a *property of a type* — the seven of them exactly partition the
+seventeen object types, nothing unclaimed and nothing claimed twice, asserted
+from both ends by a test — so the diagram draws them as the frames around its
+clusters. The TBox and the ABox are one subject at two zoom levels. A model
+earns its place by being true of the server; a navigation earns its place by
+being the questions a person arrives with, and those are different lists.
 
 ```
                         ┌─────────────────────────────┐
@@ -665,7 +874,8 @@ storage: **Role** (data: delete it and history is lost / knowledge: delete it
 and the agents get dumber) and **Origin** (authored / flywheel / derived /
 synced / flow-written). "Encoded vs. emergent" is Origin: encoded is authored
 documents plus the declarations (ontology, Mappings, Collections); emergent is
-synced claims, derived profiles, and the correction sets runs accumulate.
+synced claims, derived profiles, and the corrections a reviewer records on
+the Task they close.
 
 **Replication is safe exactly when the replica knows where it came from.**
 Three modes are legitimate: *copy custody* (bytes landed with lineage and
@@ -684,10 +894,13 @@ of two materialization strategies:
 | Row is a Link endpoint? | yes (`identified_as` needs it) | no |
 | Escalation | per-row Task possible | windowed, aggregate Task only |
 
-Vendors reify; meter readings bind. A reading's meaning is a column binding
-("`asset_id` contains Machine identifiers, keyed by asset tag") resolved
-lazily at query or rollup time — never eagerly per row. What the readings
-*teach* the entity lands as derived claims with a recipe, the
+The commerce feeds reify, because a vendor name is fuzzy and a steward rules
+on the match; the HRIS and calendar feeds bind, because a work email is exact
+and nobody adjudicates it. A bound column's meaning is a declaration
+("`owner_email` contains Employee identifiers, keyed by work email") resolved
+at read time rather than eagerly per row, and validation refuses a bind mapping
+that names a `lands_as` type so the distinction cannot blur. What a high-volume
+feed *teaches* an entity lands as derived claims with a recipe — the
 `vendor_payment_profile` pattern.
 
 ## The map: entities, runs, collections
@@ -898,31 +1111,30 @@ because a typo, a word reorder and an extra word each defeat a different one.
 
 ### Seeing the ABox (`server/app/worlds.py`)
 
-The TBox is declared in `ontology.py` and the console draws it. A good deal of
-**ABox** is declared in Python too — every eval fixture, and the demo seed's
-feed deliveries — and until now it was only ever observable through its
-effects: you could read the fixture source, or read a run's journal afterwards,
-but not look at the instance graph a fragment establishes.
+A good deal of **ABox** is declared in Python — every eval
+[fixture](#evals-a-per-flow-spec-over-the-shared-model), and the demo seed's
+feed deliveries — and it used to be observable only through its effects.
 
-`GET /api/v1/worlds` lists those fragments with where they are declared;
-`GET /api/v1/worlds/{id}` **materializes** one. Materializing is not expanding
-the payload — it builds a throwaway in-memory world, replays the fragment
-through the real sync flows, and reads the graph back. That distinction is the
-whole value: what comes back includes the work establishing it *did* — which
-vendor each source row resolved to, at what score, by what method, and the
-steward Tasks it escalated — none of which is in the fixture text. Every object
-carries both halves of the natural-key question (the key as authored and the id
-it resolves to), every claim says whether it won under precedence, and the TBox
-invariant sweep runs over the result, so a fragment that would violate the
-ontology says so before a case uses it.
+`GET /api/v1/worlds` lists them; `GET /api/v1/worlds/{id}` **materializes**
+one. Materializing is not expanding the payload: it builds a throwaway
+in-memory world, replays the deliveries through the real sync flows, and reads
+the graph back. That distinction is the whole value, because what comes back
+includes the work establishing it *did* — which vendor each source row resolved
+to, at what score, by what method, and the steward Tasks it escalated — none of
+which is in the fixture text. Every object carries both halves of the
+natural-key question (the key as authored and the id it resolves to), every
+claim says whether it won under precedence, and the TBox invariant sweep runs
+over the result, so a world that would violate the ontology says so before a
+case uses it. It is also why the fixture editor needed no building: it was
+already the world browser, and both establish a world by the same route — one
+that showed something a graded run never sees would be worse than none.
 
-`GET /api/v1/graph/instances` returns the **live** ABox in the same shape, which
-is what makes the console honest: the running graph and a declared fixture are
-peers in one renderer rather than two views that merely resemble each other. A
-`type` filter pulls in that type's one-hop neighbours too — a screen of boxes
-with no edges answers less than a smaller one showing how they join.
-
-Both are plain reads. Nothing real is touched by looking.
+`GET /api/v1/graph/instances` returns the **live** ABox in the same shape, so
+the running graph and a declared world are peers in one renderer rather than
+two views that merely resemble each other. A `type` filter pulls in that type's
+one-hop neighbours too — a screen of boxes with no edges answers less than a
+smaller one showing how they join. Both are plain reads; nothing real is
+touched by looking.
 
 ## Evals: a per-flow spec over the shared model
 
@@ -950,19 +1162,53 @@ is a document rather than an inference over fifty cases. `ignore` is as
 load-bearing as the rest and is shown, not hidden — a due date is the vendor's
 payment terms, so grading it would be grading the wrong system.
 
-**Checkpoints** are the other half. A spec evaluates the world at points *in*
-the run: after `z1` the vendor must be resolved and nothing extracted yet;
-after `a1` the Invoice, its lines and the MatchSet must exist. That works
-without snapshots because claims and links record the step that wrote them, so
-the state as of a step is the resolution of the claims whose step came no
-later — point-in-time reconstruction, and the direct payoff of recording
-provenance. Trajectory rules are scoped the same way, so `step_absent m2` at
-`z1` means "not yet" rather than "never".
+**Milestones** are the other half — *where in the run* a spec asserts. This
+used to be `after_step="z1"`, a literal step id, and that made every case a
+hostage of one flow's internal naming: rename `z1`, split a ModelCall in two,
+insert a step, and every case that mentioned the id failed without a single
+fact about the world having changed. A milestone instead says what the point
+*is*, as a predicate over the run journal resolved at grading time:
+
+| Anchor | Selector | Reads as |
+| --- | --- | --- |
+| `last_of_kind` | a step kind | "once the resolver has run" |
+| `first_of_kind` | a step kind | "the first time it stopped for a person" |
+| `wrote` | a ref prefix | "once the invoice exists" |
+| `terminal` | — | "however it ended, if it did" |
+
+Four, and each is the only way to name a point some declared case depends on: a
+resolver that links an *already known* vendor writes nothing, so the point
+after it can only be named by kind, and a suspended run has no terminal, so the
+case asserting nothing is committed before the first gate needs
+`first_of_kind`. The AP spec's four resolve against a real journal to exactly
+the places the step ids named — `vendor-settled → z1`, `invoice-retained → a1`,
+`held → k2_1`, `outcome → final`. What changed is how a point is *named*, not
+which point it is; it stays a resolver rather than a second grading path, so
+everything downstream still takes a step id and is untouched.
+
+**An unreachable milestone fails loudly.** Declaring one is itself the claim
+that the run reaches it, so there is no path through the grader on which a
+milestone quietly contributes nothing — one with no expectations at all still
+fails when it cannot be resolved, and the failure names what the run *did* do:
+
+    vendor-settled   expected  the last step of kind `resolve`
+                     actual    trigger, modelcall, action
+                     detail    this flow ran no step of kind 'resolve' —
+                               it ran: trigger, modelcall, action.
+
+That `actual` line is what lets a reader tell a changed flow from a stale
+milestone.
+
+Asserting mid-run works without snapshots because claims and links record the
+step that wrote them, so the state as of a step is the resolution of the claims
+whose step came no later — point-in-time reconstruction, and the direct payoff
+of recording provenance. Trajectory rules are scoped the same way, so
+`step_absent` at a mid-run milestone means "not yet" rather than "never".
 
 Because the flows write the graph once, at commit, a run held at a gate never
-reaches the `committed` checkpoint — so declaring it in a case *is* the
-assertion that this invoice should have posted, and a case for a held invoice
-asserts the entities are **absent** instead. That pins the rule that nothing is
+reaches `invoice-retained` — so declaring it in a case *is* the assertion that
+this invoice should have posted, and a case for a held invoice asserts the
+entities are **absent** at `held` instead. That pins the rule that nothing is
 committed until the gate is answered. (Writing entities earlier as drafts is
 the doctrine's Draft-Object status-gating, and would let a held invoice be
 visible as an entity; it is not built, and it would need the anomaly profile to
@@ -975,9 +1221,18 @@ vendor and — the one that actually matters — feed eval invoices into the
 `vendor_payment_profile` that real invoices are judged against, changing flow
 behaviour rather than a number on a screen. So every case runs in its own
 in-memory world with the corpus copied in (frozen for the run and writable, so
-nothing a graded run writes touches the real shelf), and the revisions
-it read are recorded on the result — two pass rates are only comparable when
-they measured the same knowledge.
+nothing a graded run writes touches the real shelf), and the revisions of that
+copied corpus are recorded on the result — two pass rates are only comparable
+when they were graded against the same knowledge.
+
+**A `Fixture` is a first-class, named, stored object**, and a case names the
+world it runs in rather than carrying one. It used to be an anonymous literal
+inside the one case that needed it, so two cases over one world were two copies
+of it. Nine cases now share seven fixtures — three AP worlds, three expense
+worlds, and the demo seed, which belongs to no flow — so re-authoring a world
+brings every case naming it along. `GET /api/v1/evals/fixtures` lists them;
+`GET /api/v1/worlds/{id}` materializes one, so a world is browsable before any
+case runs in it.
 
 A fixture is expressed as **the deliveries the real feeds would have made**, so
 a precondition is established the way production established it and the sync
@@ -986,8 +1241,27 @@ flows are exercised on the way in. Fixtures and expectations are written in
 it is what lets a case promoted from a real run need no rewriting. `$run` and an
 empty key cover the keys that are minted rather than authored.
 
+A fixture also declares the `read_set` it was written against
+(`knowledge:invoice-posting-policy@rev1`). That is a claim rather than an
+enforcement, and it is worth being plain about which: nothing compares it to
+what the graded run actually read, so the pin is documentation until something
+does.
+
+**`EvalResult.measured` is a fingerprint of what was graded** — a hash over the
+spec's own content plus the ids of the cases that ran. The promotion gate (no
+regressions, and at least as many cases passing as the run before it) **refuses
+to compare across a mismatch**, reporting rather than judging: declining to
+promote is right, and calling it a regression would name the wrong problem. A
+declared version says as much only when whoever edited the spec remembered to
+bump it; a hash says it either way, and folding the case ids in stops a run
+over three cases posing as the baseline for a run over all of them. Results are
+held in memory, one per spec, and deliberately not persisted — a pass rate only
+means something against the knowledge it read.
+
 The TBox invariant sweep runs per case at no authoring cost, so a structural
-bug fails a case even when no expectation named it.
+bug fails a case even when no expectation named it. The AP suite is 5 cases
+and 80 assertions over 4 milestones, and it grades by running the flow: real
+run ids, real graph refs, real gates answered by scripted decisions.
 
 `GET /api/v1/evals` lists the specs with how much of the model each grades;
 `POST /api/v1/evals/{spec}/run` runs them. Launching is `admin+` but **not**
@@ -1025,11 +1299,11 @@ twelve real runs with real journals, documents, graph objects and Task
 decisions — so a bug in the flow shows up at startup rather than on the first
 live submission.
 
-The one seeded flow, `expense-reimbursement`, is also the prototype's first
-**live** execution path. `POST /api/v1/reimbursements` runs the same steps
-the Tier-2 export declares, synchronously:
+`expense-reimbursement` is the first of the two seeded definitions and the
+prototype's first **live** execution path. `POST /api/v1/reimbursements` runs
+the same steps the Tier-2 export declares, synchronously:
 
-1. **extract-receipt (ModelCall)** — with `RECEIPT_BACKEND=vertex`, a
+1. **extract-receipt (ModelCall)** — with `MODEL_BACKEND=vertex`, a
    multimodal model reads the receipt image; locally a deterministic stub
    honors hints (`total=64.20 category=meals vendor=corner-bistro`, and the
    word `blurry` drops confidence below the floor), so the whole pipeline is
@@ -1048,8 +1322,8 @@ the Tier-2 export declares, synchronously:
 
 Every row carries its journal, so the **Expense Reimbursement** workspace
 (the reimbursements table) can show provenance per row: which policy was
-read, what the rule said, who decided. The table seeds nine decided/pending
-rows on first start; live submissions append.
+read, what the rule said, who decided. The table seeds twelve rows on first
+start — nine approved, two pending, one denied; live submissions append.
 
 ## Accounts payable (the second live flow)
 
@@ -1095,10 +1369,20 @@ world demonstrates it end to end (`run_ap_seed04` mints Meridian and a clerk
 vouches for it at the posting gate; `run_ap_seed05` links to the same object
 rather than minting a second one).
 
-The table lives in the **Accounts Payable** workspace, which also shows the
-vendor master — one row per canonical vendor carrying every source system's id
-for it. Locally the stub readers honor hints so every branch is drivable
-without a credential:
+The table lives in the **Accounts Payable** workspace, where an invoice is
+entered two ways. **Upload** a document — and with no extraction model
+configured the screen says plainly that the stub reads the filename, not the
+page. **Compose** one, and every control is a real row out of the graph: the
+vendor master (with its status and every source system's id for it, shown at
+the moment picking a vendor is the reason you care), then *that vendor's*
+purchase orders, then *that order's* lines with quantity steppers defaulting to
+what was ordered.
+
+The choices serialize to a hint string, shown live under the composer and
+labelled *what this sends* — because the hint string is not scaffolding, it is
+the **case-authoring language** of this flow. The seeded world and the eval
+triggers are written in it, and its grammar lives in exactly one place,
+`InvoiceScenario` in [server/app/payables.py](server/app/payables.py):
 
 | Hint | What it exercises |
 | --- | --- |
@@ -1112,7 +1396,19 @@ without a credential:
 | `total=9800.00` | over the auto-post limit, and an amount outlier once the vendor has history |
 | `taxid` | prints a tax id — the resolver's strongest signal |
 
-With `RECEIPT_BACKEND=vertex` the extractions are real multimodal calls.
+With `MODEL_BACKEND=vertex` the extractions are real multimodal calls.
+
+Nothing on that screen predicts the outcome. The composed total sits *beside*
+the governed value the run will read — `$9,800.00` next to `auto-post ≤
+$2,500.00 · knowledge:invoice-posting-policy@rev1` — and the run answers.
+`_posting_check` is the rule; a second implementation in a screen is a second
+rule. Submitting returns a screen rather than a sentence: where the run
+stopped, whether *this* persona may release that gate and why not ("this is in
+ap-clerk; you are bound to no queue" — `require_queue`, legible before the 403
+rather than after it), the clauses it read with the deciding one marked, the
+match, the screen and the journal — with the run, the Task and the artifact
+each one click away. It is the same widget a row in the table expands into,
+because they are the same thing seen at two moments.
 
 The AP world is seeded the same way as the expense history: four vendors
 arrive through a real `vendor-sync` delivery (plus a byte-identical
@@ -1125,13 +1421,19 @@ through the path a clerk would use.
 
 Opened from the account menu (upper right): the one-stop personal page —
 PTO balance and a request form, benefits, expense submission, and the **HR
-Agent**. Two governed behaviors worth knowing:
+Agent**. Three behaviors worth knowing:
 
+- **"Me" is the signed-in email.** An `Employee` is keyed on their email in
+  the graph, so that is the only key the hub resolves a person by — switch
+  persona and the hub is that person's, with the title, team and manager the
+  org chart holds. A principal the org chart has never heard of (Naviant
+  Support, a machine credential) is told so instead of being minted a blank
+  profile with a balance nobody accrued.
 - **PTO follows the flow pattern in miniature.** Requests of 3 working days
   or fewer auto-approve (the window is a governed value parsed from the
   `pto-policy` asset); longer requests raise a Task to the `hr` queue, and
   the HR decision resumes the request and deducts the balance.
-- **The HR Agent is grounded and cited.** With `ANSWER_BACKEND=vertex` it
+- **The HR Agent is grounded and cited.** With `MODEL_BACKEND=vertex` it
   plans with tools over the knowledge layer; locally it degrades to
   retrieval over the `people/` taxonomy plus the caller's own structured
   facts (balance, pending requests, benefits), and labels itself
@@ -1159,52 +1461,49 @@ into the layer (**Flows**) or governs who may touch it (**Identities, access &
 keys**). The Employee Hub hangs off the account avatar, since it is about you
 rather than about a workstream.
 
-The Knowledge layer itself opens on an **Overview** — the landing screen and
-the only place metrics live, because reporting on the layer as a whole is a
-different job from browsing any one plane of it. It carries two labelled
-strips (the corpus, and the model) plus a card per plane. Then four planes,
-cut by **origin** — who or what put each thing there:
+The Knowledge layer itself is **three tabs, one question each**: **Ontology**
+(what this system knows, how it relates, which flows touch it), **Library**
+(what people wrote down that agents must obey), and **Sources** (did the
+outside world deliver, and was it clean). Ontology is where the section lands,
+because the diagram *is* the model — the Overview it replaced was the tab bar
+redrawn as cards. Entering the section fires exactly three requests, one
+composed call per tab; switching between them fires none. For an own-scoped
+persona the rail stop is dropped and the section says so in words, because
+every route behind it answers 403 and a Retry button on a refusal that can
+never succeed reads as an outage.
 
-- **Library** — what people wrote: policies, standards, guidelines. The
-  authority lens applies here and only here, because authority is a property
-  of documents that argue.
-- **Ontology** — what we encoded: **Entities & Links** (the TBox as a
-  navigable table — a core-entity rail on the left, every link touching the
-  selected type on the right, both panes scrolling themselves so the schema
-  stays on screen), the **Authored ABox** fragments, the Collection
-  declarations, and the **Mappings** that bind sources in. The generated
-  exports carry a "regenerated from Python on every startup" banner and
-  refuse edits (409) rather than accepting one the next boot discards.
-- **Learned** — what the system figured out through use: vendor payment
-  profiles and the eval datasets grown from real runs. What runs produced,
-  gathered in one place instead of scattered across three.
-- **Sources** — what arrives from outside: each feed shown against its
-  declared contract (strategy, bindings, escalation shape), and the artifact
-  store.
+The diagram is the whole model in one frame: 17 types and 24 links, clustered
+into named Collection frames, composition in the accent, the identity link
+dashed, self-loops drawn as corner glyphs rather than tangles, and an instance
+count on every node. Every box and every line is a target, and hovering either
+dims everything it does not touch — which is what answers "if I change this,
+what else moves". Selecting a type and choosing **Browse instances** replaces
+the canvas with the instance explorer scoped to that type, with a back link:
+the model and what exists of it are one view at two zoom levels.
+
+The flow overlay is why the diagram is worth having rather than merely looking
+at: pick a flow and its **observed** footprint, read off its own runs, is drawn
+beside its **declared** one on the same boxes. Declared but never observed is a
+stale declaration or an untested path; observed but never declared is a
+governance gap. Both are live on the seeded data — `accounts-payable` reads
+`PurchaseOrder`, which no Collection declares it a reader of, and
+`expense-reimbursement` writes `Employee`, which only `workforce-sync` and
+people-ops are declared to write.
 
 A generated schema export is no longer filed as a `how-to` next to the Expense
 Approval Policy: assets carry `kind` (document / schema-export / prompt /
-config) and `origin` (authored / flywheel / derived), `authority_level` is
-None for anything that isn't a document, and search takes a `kind` filter so
-governed-context retrieval and generated-export listing cannot cross.
-
-The two graph lenses are deliberately separate screens rather than one
-diagram with a toggle, because they answer different questions. **Model · TBox**
-is the schema: types, fields, link types with their cardinality, and whether the
-ontology conforms. **Instances · ABox** is what actually exists, and it offers
-the live graph and all ten authored fragments as peers in one list — drawn with
-the *TBox's* geometry, so an instance sits where its type sits on the schema
-map and the two screens are readable against each other. Alongside each authored
-fragment is what establishing it did: the resolutions the sync flows performed
-and the Tasks they escalated.
+config) and `origin` (authored / flywheel / derived / synced / flow-written),
+`authority_level` is None for anything that isn't a document, and search takes
+a `kind` filter so governed-context retrieval and generated-export listing
+cannot cross.
 
 Each workspace shows the **Flow runs** list above its table: a run carries the
 gates, the read-set and the replay count, which a row cannot. Clicking a run
-opens its journal step by step. Tasks with something structured to edit open a
-**full review screen** from the queue rather than deciding in the drawer —
-correcting an amount, splitting a receipt into two lines, adding a line the
-model missed, or picking the right vendor — because doing that in a 380px
-drawer would be a worse job badly done.
+opens its journal step by step. A task with something structured to edit opens
+a **full review screen** rather than being decided from the pane beside the
+queue — correcting an amount, splitting a receipt into two lines, adding a line
+the model missed, or picking the right vendor — because doing that in a side
+panel would be a worse job badly done.
 
 Hosted build (what `deploy.sh` runs):
 
@@ -1279,10 +1578,12 @@ gcloud run services logs read cumulus-knowledge --region us-central1 --limit 50
 ## Design notes
 
 - Assets carry hierarchy metadata: taxonomy `path`, `parent`/`related` links, `supersedes`/`superseded_by`, `authority_level` (`policy > standard > guideline > how-to > note`), and `scope`. The MCP `get_context` tool and REST `context` endpoint expose ancestors/children/siblings/related.
-- Retrieval is BM25 (title/path/tags boosted) over the full corpus, rebuilt on every write — appropriate while the corpus fits in memory. Embeddings/vector search and the ingest pipeline (chunking, other doc types) are intentionally deferred.
 - The A2A agent answers with retrieved documents and citations rather than LLM synthesis; swap `_answer()` in [server/app/a2a.py](server/app/a2a.py) for a model call when synthesis is wanted.
 - Retrieval keeps an inverted index (term -> {doc_id: tf}) so a query scores
-  only documents containing a query term, and writes update a single document
-  rather than rebuilding the corpus. Callers that post-filter results must ask
-  `SearchIndex.search` for `limit=None` and truncate afterwards — truncating in
-  the index would discard candidates the filter would have kept.
+  only documents containing a query term, and a write updates a single document
+  rather than rebuilding the corpus — appropriate while the corpus fits in
+  memory. Callers that post-filter results must ask `SearchIndex.search` for
+  `limit=None` and truncate afterwards: truncating in the index would discard
+  candidates the filter would have kept. The ingest pipeline — chunking, other
+  document types — is intentionally deferred; assets are embedded whole. See
+  [Search](#search).

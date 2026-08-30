@@ -32,6 +32,7 @@ from dataclasses import dataclass
 
 from fastapi import Header, HTTPException, Request
 
+from . import personas
 from .config import settings
 
 log = logging.getLogger("cumulus.auth")
@@ -48,13 +49,92 @@ class Principal:
     # Set when the caller authenticated with a minted API key, so log lines and
     # audit trails can name the specific credential rather than just "api-key".
     key_id: str | None = None
+    # Which persona this principal is acting as (personas.py). Read reach and
+    # queue bindings come from it; `role` above stays the write ladder, so
+    # every require_role call in the server is unaffected.
+    #
+    # These default to the LEAST privilege, never to a persona. Defaulting them
+    # to the engineer meant a credential path that forgot to set them — as the
+    # Firebase and minted-key paths both did — silently granted platform read
+    # reach and every queue binding to whoever presented it. A field whose
+    # default is "trusted" is a field that fails open.
+    persona_id: str = ""
+    scope: str = "own"
+    queues: tuple[str, ...] = ()
+    # The real operator, when this principal is the product of impersonation.
+    # Every write records both, so the ledger never loses who actually acted.
+    impersonated_by: str | None = None
 
     def outranks_or_is(self, role: str) -> bool:
         return ROLES.index(self.role) <= ROLES.index(role)
 
+    @property
+    def sees_everything(self) -> bool:
+        """Whether reads may reach across the whole deployment."""
+        return self.scope == "platform"
 
-_DEV_PRINCIPAL = Principal(uid="dev", email="dev@localhost", role="owner")
-_MACHINE_PRINCIPAL = Principal(uid="api-key", email="api-key@machine", role="owner")
+    @property
+    def reads_beyond_self(self) -> bool:
+        """Whether this principal may read facts about anyone but itself.
+
+        The one rule, because three scopes read as two different binaries
+        otherwise. `platform` and `tenant` both reach past the reader — the
+        difference between them is *whose* deployment they reach into, not
+        whether they may. Only `own` is confined. Gating one surface on
+        `sees_everything` and its neighbour on `sees_only_own` put `tenant` on
+        opposite sides of the same question, which is how a customer admin
+        ended up seeing every expense row and none of the tasks about them.
+        """
+        return self.scope != "own"
+
+
+    def owns_queue(self, queue: str) -> bool:
+        return queue in self.queues
+
+
+def principal_for(persona: personas.Persona, *, by: str | None = None) -> Principal:
+    """The Principal a persona acts as.
+
+    Impersonation rewrites the principal rather than travelling beside it, so
+    everything downstream — the Employee Hub resolving "me", a queue filtering
+    to yours, a claim recording its author — scopes correctly with no plumbing.
+    """
+    return Principal(
+        uid=persona.uid,
+        email=persona.email,
+        role=persona.authority,
+        persona_id=persona.id,
+        scope=persona.scope,
+        queues=persona.queues,
+        impersonated_by=by,
+    )
+
+
+def flow_principal(flow_id: str, *queues: str) -> Principal:
+    """The Principal a Flow commits as when no human authorized the write.
+
+    The doctrine's Principal is "a human or an agent" and the Action Gateway's
+    diagram lists a Flow among the actors, so a Flow gets an identity rather
+    than an exemption. Its queues are declared at the flow: an invoice under
+    the governed auto-post limit is committed on the AP flow's own authority,
+    and removing that binding stops auto-posting rather than quietly waving it
+    through. The lowest rung on the write ladder, deliberately — a Flow should
+    reach only what its declared Actions permit.
+    """
+    return Principal(
+        uid=f"flow:{flow_id}", email=f"{flow_id}@flow", role="user",
+        scope="platform", queues=tuple(queues),
+    )
+
+
+# Local development signs in as the engineer, because the console's first job
+# is to be developed against. A machine credential is scoped to the platform
+# but belongs to no persona — it is not a person and must not appear as one.
+_DEV_PRINCIPAL = principal_for(personas.ENGINEER)
+_MACHINE_PRINCIPAL = Principal(
+    uid="api-key", email="api-key@machine", role="owner",
+    persona_id="", scope="platform", queues=(),
+)
 
 
 def _verify_firebase_token(token: str) -> Principal:
@@ -71,7 +151,12 @@ def _verify_firebase_token(token: str) -> Principal:
     role = claims.get("role", "user")
     if role not in ROLES:
         role = "user"
-    return Principal(uid=claims["uid"], email=claims.get("email", ""), role=role)
+    return Principal(
+        uid=claims["uid"],
+        email=claims.get("email", ""),
+        role=role,
+        **personas.reach_for(role),
+    )
 
 
 # Path segments that are literals in our routes; anything else is an id and gets
@@ -81,8 +166,10 @@ _PATH_LITERALS = frozenset(
     {
         "api", "v1", "assets", "tree", "search", "users", "me", "role",
         "api-keys", "usage", "identities", "teams", "members", "assets",
-        "flows", "stats", "runs", "audit", "golden-set", "test-runs",
-        "versions", "diff", "recommendations", "apply",
+        "flows", "stats", "runs", "audit", "evals", "fixtures", "preview",
+        "ledger", "actions",
+        "versions", "diff", "recommendations", "apply", "cases", "result",
+        "run",
         "mcp", "a2a", "health", "healthz", "status", "reindex",
         ".well-known",
         "agent-card.json", "agent.json",
@@ -128,11 +215,55 @@ def _verify_minted_key(token: str, path: str | None) -> Principal | None:
         email=identity.email or identity.label,
         role=identity.role,
         key_id=record.id,
+        # A key reads what its role reaches and decides nothing: `reach_for`
+        # grants no queues to any role, and `require_human` refuses keys at
+        # every decision point regardless.
+        **personas.reach_for(identity.role),
     )
 
 
+def _impersonate(real: Principal, persona_id: str) -> Principal:
+    """Apply an `X-Cumulus-Persona` header, or refuse it.
+
+    Two refusals, and both matter. A **machine credential may never
+    impersonate**: a key picking a human identity is precisely the confusion
+    the Action Gateway exists to prevent, and no integration has a reason to.
+    And in a deployed environment only a `naviant-engineer` may impersonate at
+    all — otherwise the header is a privilege escalation with a friendly name.
+    Locally (`AUTH_BACKEND=none`) it is unrestricted, because that is the whole
+    point of running locally.
+    """
+    persona = personas.get(persona_id)
+    if persona is None:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown persona '{persona_id}'"
+        )
+    if real.key_id is not None:
+        raise HTTPException(
+            status_code=403, detail="API keys cannot act as a persona."
+        )
+    if settings.auth_backend != "none" and not real.outranks_or_is("owner"):
+        log.warning(
+            "Impersonation refused",
+            extra={"uid": real.uid, "role": real.role, "persona": persona_id},
+        )
+        raise HTTPException(
+            status_code=403, detail="Only a Naviant engineer may act as a persona."
+        )
+    if persona.uid == real.uid:
+        # Naming your own persona is not impersonation. Stamping
+        # `impersonated_by` here would latch the console's "acting as" warning
+        # on after the first switch and never clear it — and a warning that is
+        # always on is not a warning.
+        return real
+    return principal_for(persona, by=real.uid)
+
+
 def principal_from_headers(
-    authorization: str | None, x_api_key: str | None, path: str | None = None
+    authorization: str | None,
+    x_api_key: str | None,
+    path: str | None = None,
+    persona_id: str | None = None,
 ) -> Principal:
     """Resolve a Principal from raw header values, or raise HTTPException(401).
 
@@ -140,6 +271,15 @@ def principal_from_headers(
     calls this directly with headers off the ASGI scope. `path` is used only to
     attribute API-key usage; omit it and usage is still counted, under "/".
     """
+    real = _resolve_credential(authorization, x_api_key, path)
+    if persona_id:
+        return _impersonate(real, persona_id)
+    return real
+
+
+def _resolve_credential(
+    authorization: str | None, x_api_key: str | None, path: str | None
+) -> Principal:
     if (
         settings.admin_api_key
         and x_api_key
@@ -164,8 +304,11 @@ def get_principal(
     request: Request,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None),
+    x_cumulus_persona: str | None = Header(default=None),
 ) -> Principal:
-    principal = principal_from_headers(authorization, x_api_key, request.url.path)
+    principal = principal_from_headers(
+        authorization, x_api_key, request.url.path, x_cumulus_persona
+    )
     # Read back by RequestContextMiddleware so each access-log line names the
     # caller (and the key id, when a minted key was used).
     request.state.principal = principal
@@ -185,6 +328,42 @@ def require_role(principal: Principal, role: str) -> Principal:
 def require_reader(principal: Principal) -> Principal:
     """Any authenticated principal may read; the lowest role is `user`."""
     return require_role(principal, "user")
+
+
+def require_human(principal: Principal, act: str) -> Principal:
+    """Refuse a minted key. `act` completes "API keys cannot {act}".
+
+    Eight modules each kept their own copy of this, which meant eight chances
+    for the rule to drift. The rule itself never differed — only the sentence.
+    """
+    if principal.key_id is not None:
+        log.warning(
+            "API key attempted a human-only act",
+            extra={"keyId": principal.key_id, "act": act},
+        )
+        raise HTTPException(status_code=403, detail=f"API keys cannot {act}.")
+    return principal
+
+
+def require_queue(principal: Principal, queue: str) -> Principal:
+    """Gate a Task decision on the queue actually being this principal's work.
+
+    The doctrine's Role confers permissions *and* queue-bindings, and this is
+    the second half. Without it "who may decide this" collapses back into the
+    write ladder, which cannot tell an AP clerk from an expense approver — they
+    sit on the same rung and own different work.
+    """
+    if principal.owns_queue(queue):
+        return principal
+    log.warning(
+        "Queue authorization denied",
+        extra={"uid": principal.uid, "persona": principal.persona_id,
+               "queue": queue, "queues": list(principal.queues)},
+    )
+    raise HTTPException(
+        status_code=403,
+        detail=f"The '{queue}' queue is not this persona's work.",
+    )
 
 
 def team_role_of(principal: Principal, slug: str) -> str | None:

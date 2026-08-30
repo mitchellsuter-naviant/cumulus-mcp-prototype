@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/task.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'ref_chips.dart';
 import 'review_screens.dart';
 import 'ui_kit.dart';
 
@@ -240,8 +241,7 @@ class _TasksSectionState extends State<TasksSection> {
                     child: _TaskRow(
                       task: visible[i],
                       selected: visible[i].id == _selectedId,
-                      onTap: () =>
-                          setState(() => _selectedId = visible[i].id),
+                      onTap: () => setState(() => _selectedId = visible[i].id),
                     ),
                   ),
                 ),
@@ -479,7 +479,13 @@ class _TaskReviewState extends State<_TaskReview> {
             const Divider(height: 1),
             const SizedBox(height: 18),
             if (task.evidence.isNotEmpty) ...[
-              const FieldLabel('Why this needs you'),
+              // Not "why this needs you" — the reason is the summary above,
+              // and these rows are the facts you decide *from*. Several are
+              // context rather than cause: an invoice held for a match
+              // variance still shows the auto-post limit, which is not why it
+              // stopped. Labelling context as cause is the wrong mistake to
+              // make on the one screen where a person commits a decision.
+              const FieldLabel('What this decision rests on'),
               Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(16),
@@ -518,28 +524,7 @@ class _TaskReviewState extends State<_TaskReview> {
             ],
             if (task.refs.isNotEmpty) ...[
               const FieldLabel('Sources it rests on'),
-              Wrap(
-                spacing: 6,
-                runSpacing: 6,
-                children: [
-                  for (final ref in task.refs)
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 9,
-                        vertical: 5,
-                      ),
-                      decoration: BoxDecoration(
-                        color: CumulusColors.surface,
-                        borderRadius: BorderRadius.circular(7),
-                        border: Border.all(color: CumulusColors.border),
-                      ),
-                      child: Text(
-                        ref,
-                        style: CumulusText.mono.copyWith(fontSize: 11.5),
-                      ),
-                    ),
-                ],
-              ),
+              RefChips(api: widget.api, refs: task.refs),
               const SizedBox(height: 18),
             ],
             if (task.proposal != null) ...[

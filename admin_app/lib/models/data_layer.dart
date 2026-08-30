@@ -1,83 +1,7 @@
-/// Collections, documents, sources, and the derived vendor profile.
-/// Mirrors `server/app/data_collections.py`, `documents.py`, `sync.py`,
-/// `anomaly.py`.
+/// The Sources screen, the artifact store, and the derived vendor profile.
+/// Mirrors `SourcesScreen` in `server/app/ui_api.py`, plus `documents.py`
+/// and `anomaly.py`.
 library;
-
-/// A Collection: the unit governance hangs off. Retention, custody and
-/// authoritativeness are properties of the *set*, not of a row.
-class DataCollection {
-  final String id;
-  final String name;
-  final String summary;
-  final String role; // knowledge | data
-  final String kind;
-  final String origin; // authored | flywheel | flow-written | derived | synced
-  final String container;
-  final String custody; // copy | reference
-  final String retention; // an ISO-8601 duration, or "indefinite"
-  final String retentionNote;
-  final bool authoritative;
-  final bool legalHold;
-  final List<String> objectTypes;
-  final List<String> writtenBy;
-  final List<String> readBy;
-
-  /// Null when the console cannot count this honestly — which is a different
-  /// thing from zero, and is shown differently.
-  final int? rows;
-  final String rowsCaption;
-  final String assetId;
-
-  const DataCollection({
-    required this.id,
-    required this.name,
-    required this.summary,
-    required this.role,
-    required this.kind,
-    required this.origin,
-    required this.container,
-    required this.custody,
-    required this.retention,
-    required this.retentionNote,
-    required this.authoritative,
-    required this.legalHold,
-    required this.objectTypes,
-    required this.writtenBy,
-    required this.readBy,
-    required this.rows,
-    required this.rowsCaption,
-    required this.assetId,
-  });
-
-  bool get isKnowledge => role == 'knowledge';
-
-  factory DataCollection.fromJson(Map<String, dynamic> json) => DataCollection(
-    id: json['id'] as String? ?? '',
-    name: json['name'] as String? ?? '',
-    summary: json['summary'] as String? ?? '',
-    role: json['role'] as String? ?? 'data',
-    kind: json['kind'] as String? ?? '',
-    origin: json['origin'] as String? ?? '',
-    container: json['container'] as String? ?? '',
-    custody: json['custody'] as String? ?? 'copy',
-    retention: json['retention'] as String? ?? 'indefinite',
-    retentionNote: json['retention_note'] as String? ?? '',
-    authoritative: json['authoritative'] as bool? ?? false,
-    legalHold: json['legal_hold'] as bool? ?? false,
-    objectTypes: (json['object_types'] as List<dynamic>? ?? const [])
-        .map((e) => '$e')
-        .toList(),
-    writtenBy: (json['written_by'] as List<dynamic>? ?? const [])
-        .map((e) => '$e')
-        .toList(),
-    readBy: (json['read_by'] as List<dynamic>? ?? const [])
-        .map((e) => '$e')
-        .toList(),
-    rows: json['rows'] as int?,
-    rowsCaption: json['rows_caption'] as String? ?? '',
-    assetId: json['asset_id'] as String? ?? '',
-  );
-}
 
 /// Where on the page a value was read from. Normalized 0–1 coordinates, so a
 /// viewer draws the box at any render size.
@@ -174,14 +98,106 @@ class StoredDocument {
   );
 }
 
-/// One inbound feed, assembled from its sync runs rather than a second store.
-class SourceStatus {
+/// The Mapping a feed lands under — the declared half of the arrangement,
+/// carried on the feed itself so health and contract are never read off two
+/// lists side by side.
+class SourceContract {
+  final String id;
+  final String system;
+  final String transport;
+  final String payload;
+
+  /// `reify` mints an object per row; `bind` declares that a column carries
+  /// identifiers of a type and resolves them lazily. A million readings must
+  /// never become a million objects, and this is where that is decided.
+  final String strategy;
+  final String landsAs;
+  final List<String> resolvesTo;
+  final String matchPolicy;
+  final String precedenceSource;
+  final String freshness;
+  final String custody; // copy | reference
+  final String collection;
+  final String escalation;
+
+  const SourceContract({
+    required this.id,
+    required this.system,
+    required this.transport,
+    required this.payload,
+    required this.strategy,
+    required this.landsAs,
+    required this.resolvesTo,
+    required this.matchPolicy,
+    required this.precedenceSource,
+    required this.freshness,
+    required this.custody,
+    required this.collection,
+    required this.escalation,
+  });
+
+  factory SourceContract.fromJson(Map<String, dynamic> json) => SourceContract(
+    id: json['id'] as String? ?? '',
+    system: json['system'] as String? ?? '',
+    transport: json['transport'] as String? ?? '',
+    payload: json['payload'] as String? ?? '',
+    strategy: json['strategy'] as String? ?? '',
+    landsAs: json['lands_as'] as String? ?? '',
+    resolvesTo: (json['resolves_to'] as List<dynamic>? ?? const [])
+        .map((e) => '$e')
+        .toList(),
+    matchPolicy: json['match_policy'] as String? ?? '',
+    precedenceSource: json['precedence_source'] as String? ?? '',
+    freshness: json['freshness'] as String? ?? '',
+    custody: json['custody'] as String? ?? 'copy',
+    collection: json['collection'] as String? ?? '',
+    escalation: json['escalation'] as String? ?? '',
+  );
+}
+
+/// An artifact a feed's run left behind, attributed through the run rather
+/// than the flow — three feeds share `vendor-sync`, so grouping by flow would
+/// credit each of them with all three feeds' documents.
+class SourceArtifact {
+  final String id;
+  final String filename;
+  final String kind;
+  final String uploadedAtIso;
+  final int regionCount;
+  final String retentionUntilIso;
+
+  const SourceArtifact({
+    required this.id,
+    required this.filename,
+    required this.kind,
+    required this.uploadedAtIso,
+    required this.regionCount,
+    required this.retentionUntilIso,
+  });
+
+  factory SourceArtifact.fromJson(Map<String, dynamic> json) => SourceArtifact(
+    id: json['id'] as String? ?? '',
+    filename: json['filename'] as String? ?? '',
+    kind: json['kind'] as String? ?? '',
+    uploadedAtIso: json['uploaded_at_iso'] as String? ?? '',
+    regionCount: json['region_count'] as int? ?? 0,
+    retentionUntilIso: json['retention_until_iso'] as String? ?? '',
+  );
+}
+
+/// One inbound feed: how it is running, what it promised, what it left behind.
+///
+/// Assembled from the sync runs themselves rather than a second bookkeeping
+/// store, so a feed with no run has never delivered and this cannot pretend
+/// otherwise.
+class SourceFeed {
   final String source;
-  final String kind; // vendors | purchase-orders | receiving-reports
+  final String kind;
   final String flowId;
   final String lastRunId;
   final String lastRunAtIso;
   final String lastStatus;
+  final String lastError;
   final String watermark;
   final int deliveries;
   final int recordsLanded;
@@ -189,15 +205,25 @@ class SourceStatus {
   final int created;
   final int awaitingSteward;
   final int unchanged;
-  final String lastError;
 
-  const SourceStatus({
+  /// Null when no Mapping claims this feed — rows arriving under no declared
+  /// contract, which is exactly the finding the screen is for.
+  final SourceContract? contract;
+
+  final List<SourceArtifact> artifacts;
+
+  /// What [artifacts] is a window onto: a feed that dropped a thousand scanned
+  /// reports should not turn a list screen into a megabyte.
+  final int artifactsTotal;
+
+  const SourceFeed({
     required this.source,
     required this.kind,
     required this.flowId,
     required this.lastRunId,
     required this.lastRunAtIso,
     required this.lastStatus,
+    required this.lastError,
     required this.watermark,
     required this.deliveries,
     required this.recordsLanded,
@@ -205,16 +231,21 @@ class SourceStatus {
     required this.created,
     required this.awaitingSteward,
     required this.unchanged,
-    required this.lastError,
+    required this.contract,
+    required this.artifacts,
+    required this.artifactsTotal,
   });
 
-  factory SourceStatus.fromJson(Map<String, dynamic> json) => SourceStatus(
+  bool get failed => lastStatus == 'failed' || lastError.isNotEmpty;
+
+  factory SourceFeed.fromJson(Map<String, dynamic> json) => SourceFeed(
     source: json['source'] as String? ?? '',
     kind: json['kind'] as String? ?? '',
     flowId: json['flow_id'] as String? ?? '',
     lastRunId: json['last_run_id'] as String? ?? '',
     lastRunAtIso: json['last_run_at_iso'] as String? ?? '',
     lastStatus: json['last_status'] as String? ?? '',
+    lastError: json['last_error'] as String? ?? '',
     watermark: json['watermark'] as String? ?? '',
     deliveries: json['deliveries'] as int? ?? 0,
     recordsLanded: json['records_landed'] as int? ?? 0,
@@ -222,7 +253,34 @@ class SourceStatus {
     created: json['created'] as int? ?? 0,
     awaitingSteward: json['awaiting_steward'] as int? ?? 0,
     unchanged: json['unchanged'] as int? ?? 0,
-    lastError: json['last_error'] as String? ?? '',
+    contract: json['contract'] == null
+        ? null
+        : SourceContract.fromJson(json['contract'] as Map<String, dynamic>),
+    artifacts: (json['artifacts'] as List<dynamic>? ?? const [])
+        .map((e) => SourceArtifact.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    artifactsTotal: json['artifacts_total'] as int? ?? 0,
+  );
+}
+
+/// Everything the Sources screen draws, in one round trip.
+class SourcesScreen {
+  final List<SourceFeed> sources;
+
+  /// Mappings naming a type or Collection that does not exist. Null — not
+  /// empty — for a tenant-scoped persona: a registry bug is a Naviant bug,
+  /// and an alarm a customer can take no action on is worse than no alarm.
+  final List<String>? problems;
+
+  const SourcesScreen({required this.sources, required this.problems});
+
+  factory SourcesScreen.fromJson(Map<String, dynamic> json) => SourcesScreen(
+    sources: (json['sources'] as List<dynamic>? ?? const [])
+        .map((e) => SourceFeed.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    problems: (json['problems'] as List<dynamic>?)
+        ?.map((e) => '$e')
+        .toList(),
   );
 }
 

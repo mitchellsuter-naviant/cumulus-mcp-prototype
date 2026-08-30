@@ -1,0 +1,50 @@
+// =============================================================================
+// Cumulus — multi-root workspace
+//
+// Two repos, one window:
+//   cumulus-mcp-prototype   this repo (FastAPI + MCP + A2A server, Flutter admin)
+//   cumulus-demo-ecosystem  the simulation engine we code against
+//
+// The dev container opens this file (see `.devcontainer/devcontainer.json`'s
+// `workspaceFolder`), and bind-mounts the second repo from the sibling directory
+// on the host to /workspaces/cumulus-demo-ecosystem. Outside the container the
+// same relative path works whenever the two repos are cloned side by side.
+//
+// Folder-scoped settings use `${workspaceFolder:<name>}` — a bare
+// `${workspaceFolder}` is ambiguous in a multi-root window.
+// =============================================================================
+{
+    "folders": [
+        {
+            "name": "cumulus-mcp-prototype",
+            "path": "."
+        },
+        {
+            "name": "cumulus-demo-ecosystem",
+            "path": "../cumulus-demo-ecosystem"
+        }
+    ],
+    "settings": {
+        // The server's venv, not the base conda interpreter.
+        "python.defaultInterpreterPath": "${workspaceFolder:cumulus-mcp-prototype}/server/.venv/bin/python",
+        "python.testing.pytestEnabled": true,
+        // Tests must run with server/ as the working directory.
+        "python.testing.pytestArgs": [
+            "${workspaceFolder:cumulus-mcp-prototype}/server"
+        ],
+        // Both trees carry build output worth keeping out of search results.
+        "search.exclude": {
+            "**/.dart_tool": true,
+            "**/.venv": true,
+            "**/build": true,
+            "**/node_modules": true,
+            "**/__pycache__": true
+        },
+        "files.watcherExclude": {
+            "**/.dart_tool/**": true,
+            "**/.venv/**": true,
+            "**/build/**": true,
+            "**/node_modules/**": true
+        }
+    }
+}

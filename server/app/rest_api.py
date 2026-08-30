@@ -424,7 +424,7 @@ def ask(
     a question whose answer is in the `owner` field and appears in no
     document's text.
 
-    Degrades rather than fails: with `ANSWER_BACKEND=none` it returns the
+    Degrades rather than fails: with `MODEL_BACKEND=none` it returns the
     ranked documents and says so in `backend`, so callers can always render
     something honest.
     """

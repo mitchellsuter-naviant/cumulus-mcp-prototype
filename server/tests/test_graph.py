@@ -253,6 +253,27 @@ def test_the_analytical_question_is_a_traversal(client, world):
     assert body["traversal"][0].startswith("Employee")
 
 
+def test_an_own_scoped_persona_may_only_walk_from_itself(client, world):
+    """The root of the traversal is a colleague's address, and anybody could
+    guess one. Scope decides which roots a persona may start from."""
+    from app.reimbursements import seed_reimbursements_if_empty
+
+    seed_reimbursements_if_empty(world.expenses)
+    kim = {"X-Cumulus-Persona": "customer-user:kim"}
+    own = client.get(
+        "/api/v1/graph/employees/kim@customer.example/expenses", headers=kim
+    )
+    assert own.status_code == 200 and own.json()["requests"] > 0
+    refused = client.get(
+        "/api/v1/graph/employees/sam@customer.example/expenses", headers=kim
+    )
+    assert refused.status_code == 403
+    # A platform-scoped persona still reads anyone's spend; that is its job.
+    assert client.get(
+        "/api/v1/graph/employees/sam@customer.example/expenses"
+    ).status_code == 200
+
+
 def test_an_unknown_employee_is_an_empty_rollup_not_an_error(client, world):
     body = client.get(
         "/api/v1/graph/employees/nobody@customer.example/expenses"

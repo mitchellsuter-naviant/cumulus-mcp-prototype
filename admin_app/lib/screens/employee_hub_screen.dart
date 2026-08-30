@@ -1,4 +1,5 @@
 import 'dart:convert';
+import '../models/graph.dart';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
@@ -36,6 +37,7 @@ class EmployeeHubSection extends StatefulWidget {
 }
 
 class _EmployeeHubSectionState extends State<EmployeeHubSection> {
+  ExpenseRollup? _rollup;
   ApiClient get _api => widget.api;
   EmployeeProfile? _profile;
   List<PtoRequest>? _pto;
@@ -52,12 +54,22 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
     try {
       final profile = await _api.employeeProfile();
       final pto = await _api.listPtoRequests();
-      final all = await _api.listReimbursements();
+      final all = await _api.listReimbursements(mine: true);
+      // The traversal, not a search: Employee --submitted--> ExpenseRequest
+      // --has_expense_line--> ExpenseLine, summed. It is the question the
+      // graph exists to make answerable, and until now nothing asked it.
+      ExpenseRollup? rollup;
+      try {
+        rollup = await _api.employeeExpenses(profile.email);
+      } on ApiException {
+        // A persona outside the org chart has nothing to traverse from.
+      }
       if (mounted) {
         setState(() {
           _profile = profile;
           _pto = pto;
-          _mine = all.where((r) => r.employee == profile.uid).toList();
+          _mine = all;
+          _rollup = rollup;
           _error = null;
         });
       }
@@ -75,7 +87,9 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
           padding: const EdgeInsets.fromLTRB(28, 20, 28, 0),
           child: PageHeading(
             eyebrow: 'Employee hub · yours',
-            title: _profile?.name.split('@').first ?? 'Your hub',
+            // A principal outside the org chart has no name to show, so the
+            // heading falls back to the address rather than rendering blank.
+            title: _hubTitle(),
             subtitle:
                 'Time off, expenses, and benefits — plus the HR Agent, which '
                 'answers from the people policies in the knowledge layer.',
@@ -137,11 +151,24 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
     );
   }
 
+  String _hubTitle() {
+    final profile = _profile;
+    if (profile == null) return 'Your hub';
+    if (profile.name.isNotEmpty) return profile.name;
+    return profile.email.isEmpty ? 'Your hub' : profile.email;
+  }
+
   Widget _leftColumn() {
     final profile = _profile!;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        _WhoThisIs(profile: profile),
+        if (_rollup != null) ...[
+          const SizedBox(height: 14),
+          _SpendRollup(rollup: _rollup!),
+        ],
+        const SizedBox(height: 14),
         StatStrip(
           tiles: [
             StatTile(
@@ -1006,6 +1033,116 @@ class _HrChatPanelState extends State<_HrChatPanel> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+
+/// Who the hub is showing, read through from the org chart.
+///
+/// The hub used to mint a blank profile for whoever asked, so it never had a
+/// person to name. Now it resolves an `Employee` by email, and a principal the
+/// org chart has never heard of — Naviant Support is the standing case — says
+/// so in a sentence rather than rendering an empty page that reads as broken.
+class _WhoThisIs extends StatelessWidget {
+  final EmployeeProfile profile;
+
+  const _WhoThisIs({required this.profile});
+
+  @override
+  Widget build(BuildContext context) {
+    if (!profile.inWorkforce) {
+      return CumulusCard(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Text(
+            profile.workforceNote.isEmpty
+                ? 'This account is not in the workforce, so there is no '
+                      'balance, manager or enrolment to show.'
+                : profile.workforceNote,
+            style: CumulusText.meta,
+          ),
+        ),
+      );
+    }
+    final line = [
+      profile.title,
+      profile.team,
+      if (profile.manager.isNotEmpty) 'reports to ${profile.manager}',
+      profile.location,
+    ].where((s) => s.isNotEmpty).join('  ·  ');
+    return CumulusCard(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(profile.name, style: CumulusText.sectionTitle),
+            const SizedBox(height: 4),
+            Text(line, style: CumulusText.meta),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+/// What this person has spent, and the path the answer came down.
+///
+/// A two-hop walk from a resolved Employee rather than a search over rows —
+/// which is the difference the graph exists to make, so the traversal is shown
+/// rather than hidden. The endpoint has existed since the entity layer landed
+/// and had no caller until now.
+class _SpendRollup extends StatelessWidget {
+  final ExpenseRollup rollup;
+
+  const _SpendRollup({required this.rollup});
+
+  @override
+  Widget build(BuildContext context) {
+    final byCategory = rollup.byCategory.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    return CumulusCard(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Your spend · last ${rollup.windowDays} days',
+              style: CumulusText.sectionTitle,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '\$${rollup.approvedUsd.toStringAsFixed(2)} approved across '
+              '${rollup.requests} request(s) and ${rollup.lines} line(s)',
+              style: CumulusText.body,
+            ),
+            if (byCategory.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  for (final e in byCategory)
+                    MetaPill(
+                      '${e.key} \$${e.value.toStringAsFixed(2)}',
+                    ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 10),
+            Text(
+              rollup.traversal.join('  '),
+              style: CumulusText.mono.copyWith(
+                fontSize: 11,
+                color: CumulusColors.inkSecondary,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

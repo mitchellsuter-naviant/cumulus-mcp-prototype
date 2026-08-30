@@ -125,6 +125,79 @@ class Asset {
   };
 }
 
+/// What a pinned read-set reference actually points at.
+///
+/// The doctrine's payoff claim is that a decision is explainable against the
+/// revision of the policy it read. That is only true if the strings a journal
+/// carries — `knowledge:invoice-posting-policy@rev1` — can be turned back into
+/// the document. This is that dereference, and the two revision numbers are
+/// the point of it: when they disagree, the record has moved out from under a
+/// decision that was already made.
+class RefResolution {
+  final String ref;
+  final String namespace;
+  final String id;
+
+  /// False for namespaces no store answers yet. The server says so rather
+  /// than 404ing, because "nothing dereferences `graph:` here" is an answer.
+  final bool resolved;
+
+  /// Null when the ref pinned no revision at all — worth saying out loud,
+  /// since such a ref promises nothing about which text was read.
+  final int? requestedRevision;
+
+  final int currentRevision;
+
+  /// The prototype counts revisions but does not retain their text, so once
+  /// the document moves on, the revision the run read can be named and not
+  /// served. Saying that is more honest than quietly showing today's text.
+  final bool pinnedAvailable;
+
+  /// The server's own account of what it could not do.
+  final String note;
+
+  /// Null whenever [resolved] is false.
+  final AssetSummary? asset;
+
+  const RefResolution({
+    required this.ref,
+    required this.namespace,
+    required this.id,
+    required this.resolved,
+    this.requestedRevision,
+    this.currentRevision = 0,
+    this.pinnedAvailable = false,
+    this.note = '',
+    this.asset,
+  });
+
+  /// The document changed after this ref was pinned.
+  bool get revisionMoved =>
+      requestedRevision != null && requestedRevision != currentRevision;
+
+  /// Whether today's text is provably the text that was read.
+  ///
+  /// Not the same as [pinnedAvailable], which the server reports as true when
+  /// nothing was pinned — vacuously, since a ref naming no revision cannot be
+  /// contradicted. Reading it as a guarantee would label the current document
+  /// "what the run read" on exactly the refs that can least support the claim.
+  bool get servesTextThatWasRead => requestedRevision != null && pinnedAvailable;
+
+  factory RefResolution.fromJson(Map<String, dynamic> json) => RefResolution(
+    ref: json['ref'] as String,
+    namespace: json['namespace'] as String,
+    id: json['id'] as String,
+    resolved: json['resolved'] as bool? ?? false,
+    requestedRevision: json['requested_revision'] as int?,
+    currentRevision: json['current_revision'] as int? ?? 0,
+    pinnedAvailable: json['pinned_available'] as bool? ?? false,
+    note: json['note'] as String? ?? '',
+    asset: json['asset'] == null
+        ? null
+        : AssetSummary.fromJson(json['asset'] as Map<String, dynamic>),
+  );
+}
+
 class SearchHit {
   final AssetSummary asset;
   final double score;

@@ -40,10 +40,11 @@ CALENDAR_SOURCE = "calendar-m365"
 PROVIDER = "microsoft-365"
 
 # Whose calendar the console shows when the signed-in principal is not in the
-# workforce — which is every local-dev session, where the principal is
-# `dev@localhost`. Named rather than "the first employee we find", so the demo
-# is stable, and surfaced in the response rather than hidden, so nobody
-# mistakes it for their own schedule.
+# workforce. Every persona but Naviant Support resolves to a real employee, so
+# this is now the exception it should always have been rather than the normal
+# path. Named rather than "the first employee we find", so the demo is stable,
+# and surfaced in the response rather than hidden, so nobody mistakes it for
+# their own schedule.
 DEMO_PERSONA = "dana@customer.example"
 
 # The firm works out of Boston; the two remote people keep their calendars in
@@ -332,7 +333,7 @@ PERSONAL: tuple[BlockSpec, ...] = (
         agenda_ref="workspace:flows",
     ),
     BlockSpec(
-        slug="ms-eval-review", title="Eval review — expense golden set",
+        slug="ms-eval-review", title="Eval review — expense cases",
         kind="task-block", day=4, start="13:30", minutes=45,
         organizer=MITCHELL, agenda_ref="queue:eval-review", weeks=(0,),
     ),
@@ -578,9 +579,9 @@ class CalendarService:
     def resolve_person(self, email: str) -> tuple[ObjectRecord | None, str]:
         """The employee to show, and why, if it is not who asked.
 
-        A principal outside the workforce — every local-dev session — gets the
-        demo persona with a note saying so. Substituting silently would make
-        the home screen quietly lie about whose day it is.
+        A principal outside the workforce — Naviant Support, or a machine
+        credential — gets the demo persona with a note saying so. Substituting
+        silently would make the home screen quietly lie about whose day it is.
         """
         person = self.employee(email)
         if person is not None:

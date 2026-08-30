@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
+from app import personas
 from app.calendars import (
     DEMO_PERSONA,
     CalendarService,
@@ -156,7 +157,10 @@ def test_the_api_serves_my_week(client, world):
     resp = client.get("/api/v1/calendar/me")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["email"] == DEMO_PERSONA
+    # The engineer persona is a real employee, so this is his own week —
+    # not the demo persona's, and not a substitution note.
+    assert body["email"] == personas.DEFAULT_PERSONA.email
+    assert body["persona_note"] == ""
     assert body["calendar"]["provider"] == "microsoft-365"
     assert body["events"]
 

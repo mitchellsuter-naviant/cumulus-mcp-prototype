@@ -1,51 +1,42 @@
-"""REST surface for authored ABoxes.
+"""`/api/v1/worlds`, aliased onto the fixture routes.
 
-Read-only, and materializing is a read: the fragment runs into a throwaway
-in-memory world and nothing outside it is touched. That is why this is `user+`
-rather than admin — looking at what a fixture asserts is not a privileged act,
-and the isolation is what makes that true rather than a promise.
+There is one concept here now — a Fixture is the world an eval case runs in
+*and* the fragment the ABox explorer browses — so there is one implementation.
+These are the same two endpoint functions from `evals_api`, mounted at the
+path the console already calls, rather than a second copy that would drift.
 
-Materializing is not free (it runs the sync flows), so it is a separate call
-from the listing: the catalog is cheap and the detail is on demand.
+The path survives because the explorer is not only about evals: it puts the
+live graph and a declared world side by side, and "worlds" is the honest name
+for that shelf. The fixture routes are the ones to build on.
 """
 
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter
 
-from . import deps, worlds
-from .auth import Principal, get_principal, require_reader
-from .worlds import AuthoredWorld, MaterializedWorld
+from .evals import FIXTURE_PAYLOAD, Fixture
+from .evals_api import list_fixtures, preview_fixture
+from .worlds import MaterializedWorld
 
 log = logging.getLogger("cumulus.worlds.api")
 
 router = APIRouter(prefix="/api/v1/worlds", tags=["worlds"])
 
-
-@router.get("", response_model=list[AuthoredWorld])
-def list_worlds(
-    principal: Principal = Depends(get_principal),
-) -> list[AuthoredWorld]:
-    """The ABox fragments declared in code — eval fixtures and the demo seed."""
-    require_reader(principal)
-    return worlds.worlds()
-
-
-@router.get("/{world_id:path}", response_model=MaterializedWorld)
-def get_world(
-    world_id: str, principal: Principal = Depends(get_principal)
-) -> MaterializedWorld:
-    """Run the fragment into a throwaway world and return what it asserts.
-
-    Materialized rather than statically expanded, so what comes back includes
-    the resolution the sync flow actually performed — which vendor it matched,
-    at what score, by what method — and any Task it escalated. A prediction
-    would show the payload; this shows the consequence.
-    """
-    require_reader(principal)
-    result = worlds.materialize(world_id, knowledge=deps.get_service())
-    if result is None:
-        raise HTTPException(status_code=404, detail=f"No such world: {world_id}")
-    return result
+router.add_api_route(
+    "",
+    list_fixtures,
+    methods=["GET"],
+    response_model=list[Fixture],
+    response_model_exclude={"__all__": FIXTURE_PAYLOAD},
+    summary="The worlds declared in code — eval fixtures and the demo seed",
+)
+router.add_api_route(
+    "/{fixture_id:path}",
+    preview_fixture,
+    methods=["GET"],
+    response_model=MaterializedWorld,
+    response_model_exclude={"world": FIXTURE_PAYLOAD},
+    summary="Run one into a throwaway world and return what it asserts",
+)

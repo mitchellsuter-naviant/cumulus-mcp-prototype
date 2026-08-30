@@ -64,7 +64,7 @@ def _answer(question: str) -> str:
     The card advertises "answers questions with cited source documents", so
     this has to be the real answering stack rather than a concatenation of the
     top three hits — otherwise the card is a promise the endpoint does not
-    keep. With ANSWER_BACKEND=none it degrades to ranked documents, and says
+    keep. With MODEL_BACKEND=none it degrades to ranked documents, and says
     so, which is still honest.
     """
     result = get_answer_service().ask(question)

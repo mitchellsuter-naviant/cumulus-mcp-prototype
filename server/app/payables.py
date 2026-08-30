@@ -27,10 +27,11 @@ What this flow proves, and the order it proves it in:
    `onboarding`; it becomes `active` when a human posts one of its invoices,
    which is the confirmation that it is real.
 
-Steps: t1 trigger → s1 store-document → m1 extract-invoice → z1 resolve-vendor
-→ (k0 confirm-vendor) → x3 project-lines → x4 gather-po-and-receiving → c1
-three-way-match → c2 anomaly-screen → x5 read-posting-policy → r2
-post-or-review → k2 review-invoice → a1 post-invoice → e1 InvoicePosted.
+Steps: t1 trigger → s1 store-document → x0 read-prompt → m1 extract-invoice →
+z1 resolve-vendor → (k0 confirm-vendor) → x3 project-lines → x4
+gather-po-and-receiving → c1 three-way-match → c2 anomaly-screen → x5
+read-posting-policy → r2 post-or-review → k2 review-invoice → a1 post-invoice →
+e1 InvoicePosted.
 """
 
 from __future__ import annotations
@@ -42,15 +43,20 @@ import logging
 import re
 import threading
 from datetime import date, timedelta
+from collections.abc import Callable
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .anomaly import AnomalyService, parse_anomaly_thresholds
+from .auth import Principal, flow_principal
+from .dispatch import Dispatcher, InMemoryEventLog
 from .documents import DOCUMENT_COLLECTION, DocumentService, Region
-from .graph import Claim, GraphService, GraphWriter, object_id
+from .gateway import ActionGateway, InMemoryLedgerStore
+from .graph import Claim, GraphService, GraphWriter, InMemoryGraphStore, object_id
 from .matching import MatchLine, MatchResult, match_invoice, parse_match_tolerances
 from .models import utcnow
+from .prompts import GovernedPrompt, read_prompt
 from .reimbursements import JournalEvent, _event  # shared journal shape
 from .resolution import ResolutionOutcome, ResolutionThresholds
 from .resolution import read_resolution_thresholds, resolve
@@ -61,7 +67,14 @@ log = logging.getLogger("cumulus.payables")
 
 FLOW_ID = "accounts-payable"
 POLICY_ASSET_ID = "invoice-posting-policy"
+PROMPT_ASSET_ID = "invoice-extraction-prompt"
 CLERK_QUEUE = "ap-clerk"
+
+#: Who posts an invoice that no person reviewed. An invoice under the governed
+#: auto-post limit is committed on the Flow's own authority, bound to the same
+#: queue a clerk would decide it from — so the Gateway asks the same question
+#: either way, and un-binding this stops auto-posting rather than exempting it.
+AP_FLOW = flow_principal(FLOW_ID, CLERK_QUEUE)
 
 PayableState = Literal["posted", "pending", "denied"]
 
@@ -69,12 +82,12 @@ PayableState = Literal["posted", "pending", "denied"]
 # ---------------------------------------------------------------------------
 # The catalog
 # ---------------------------------------------------------------------------
-# Shared by the stub extractor and the seeded purchase orders so a local
-# three-way match is a real match rather than a coincidence: the same SKUs, the
-# same descriptions, the same unit prices on both sides. A deployment with a
-# real extractor never reads this.
+# Shared by the stub extractor, the seeded purchase orders and the console's
+# composer, so a local three-way match is a real match rather than a
+# coincidence: the same SKUs, the same descriptions, the same unit prices on
+# both sides. A deployment with a real extractor never reads this.
 
-_CATALOG: tuple[tuple[str, str, float], ...] = (
+CATALOG: tuple[tuple[str, str, float], ...] = (
     ("STL-0250", "Hot-rolled steel plate, 1/4 in", 486.00),
     ("STL-0375", "Hot-rolled steel plate, 3/8 in", 712.50),
     ("FAS-M12", "Grade 8 hex bolt, M12 x 60mm, box of 100", 128.75),
@@ -195,10 +208,31 @@ class PayableStats(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# What the ModelCall runs on when the corpus has not seeded yet. The governed
+# copy is `seed/invoice-extraction-prompt.md`, whose fenced block is this text;
+# the two are expected to diverge the first time a customer edits the asset,
+# which is the whole point of the asset existing.
+DEFAULT_INVOICE_PROMPT = """\
+Extract from this invoice: vendor_name — the party that issued it, as printed,
+not normalized and not guessed at from an identifier — vendor_tax_id if one is
+printed, invoice_number, invoice_date (ISO 8601), due_date (ISO 8601),
+po_number, subtotal_usd, freight_usd, tax_usd, total_usd, currency, a short
+line_summary, your confidence 0-1, and lines: an array of the billed lines, each
+with sku, description, quantity, unit_price_usd, amount_usd and kind (goods,
+freight, tax or discount). Respond with only a JSON object with those keys."""
+
+
 class InvoiceReader(Protocol):
     def read(
-        self, image: bytes | None, filename: str, hint: str
-    ) -> InvoiceExtraction: ...
+        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+    ) -> InvoiceExtraction:
+        """`prompt` is the governed instruction the flow read for this run.
+
+        Passed in rather than held by the reader for the reason given on
+        `reimbursements.ReceiptReader`: the instruction is knowledge and the
+        reader is machinery.
+        """
+        ...
 
 
 _AP_VENDORS = (
@@ -220,93 +254,253 @@ def _name_to_slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", cleaned).strip("-")
 
 
+def _upper(value: str) -> str:
+    return value.strip().upper() if isinstance(value, str) else value
+
+
+def _lower(value: str) -> str:
+    return value.strip().lower() if isinstance(value, str) else value
+
+
+class ScenarioLine(BaseModel):
+    sku: str = Field(default="", pattern=r"^[A-Z0-9.\-]*$")
+    #: Bounded so `to_hint` never reaches `%g`'s exponent form, which the
+    #: parser's charset cannot read back.
+    quantity: float = Field(default=1.0, ge=0, le=99999)
+
+    _norm = field_validator("sku", mode="before")(_upper)
+
+
+class ScenarioTwist(BaseModel):
+    """One deviation the grammar can ask for, and what it costs.
+
+    A twist is a property of the Flow rather than of a screen, so all four
+    facts are declared together: the token has to parse, the branch has to
+    exist, and `clause_id` has to name a value this Flow actually reads. A
+    checkbox offering a branch nothing reaches, or naming a clause nothing
+    consults, would teach the wrong thing while looking right.
+    """
+
+    id: str
+    token: str
+    label: str
+    branch: str
+    clause_id: str
+
+
+#: In the order `to_hint` writes them. Declared once because three things
+#: consume them — the parser, the serializer and the console's composer — and
+#: a twist present in one and not the others would be a branch you could
+#: reach and never author, or author and never reach.
+SCENARIO_TWISTS: tuple[ScenarioTwist, ...] = (
+    ScenarioTwist(
+        id="price_variance", token="pricebump",
+        label="Bill the old price (+8% on the first line)",
+        branch="price variance", clause_id="price-variance",
+    ),
+    ScenarioTwist(
+        id="over_receipt", token="overbill",
+        label="Bill 2 more of the first line than was received",
+        branch="quantity variance", clause_id="quantity-variance",
+    ),
+    ScenarioTwist(
+        id="low_confidence", token="blurry",
+        label="A page the extractor can barely read (confidence 0.55)",
+        branch="low extraction confidence", clause_id="min-confidence",
+    ),
+    ScenarioTwist(
+        id="tax_id", token="taxid",
+        label="Print a tax id on the page",
+        branch="tax-id resolution", clause_id="resolution-auto-link",
+    ),
+)
+
+
+class InvoiceScenario(BaseModel):
+    """The case-authoring language of this Flow, as a model rather than prose.
+
+    A local run is steered by a *hint string* — `vendor=acme-industrial
+    po=PO-7741 lines=STL-0250:2,FAS-M12:3 pricebump` — and that string is not
+    debug scaffolding. It is how the seeded world is written, how the nine eval
+    cases state their triggers, and how a person submits an invoice by hand.
+    Three consumers, one vocabulary, and until now it existed only as a
+    docstring above a pile of regexes.
+
+    So the grammar lives here and everything goes through it: `parse` is the
+    only reader of the string, `to_hint` the only writer, and the console
+    composes an instance from real graph rows and shows the string assembling.
+
+    `to_hint(parse(s)) == s` for every hint the repository ships, which is the
+    property that matters: a seed hint that serialized one character
+    differently would build a different world, and the eval suite would fail
+    looking like a Flow regression.
+
+    Three fields say something an empty string cannot, so each is its own flag:
+    `no_po` (billed against no order at all) differs from an absent
+    `po_number` (the extractor invents one), and `unnamed_new_vendor` (a
+    vendor we do not know, name unspecified) differs from a named one.
+    """
+
+    #: A vendor in the master, by slug. The resolver links it.
+    vendor_slug: str = Field(default="", pattern=r"^[a-z0-9\-]*$")
+    #: A vendor the master does not hold, named. The resolver mints it
+    #: `onboarding` rather than matching it to anything.
+    new_vendor: str = Field(default="", pattern=r"^[a-z0-9\-]*$")
+    #: `newvendor` with no name: still unknown, but the extractor picks one.
+    unnamed_new_vendor: bool = False
+    #: The order this invoice bills, so the three-way match is a real match.
+    po_number: str = Field(default="", pattern=r"^(PO-\d+)?$")
+    #: Billed against no purchase order at all — the `unmatched` branch.
+    no_po: bool = False
+    invoice_number: str = Field(default="", pattern=r"^[A-Z0-9\-]*$")
+    #: SKUs from the shared catalog, so a synced PO can actually pair with it.
+    lines: list[ScenarioLine] = Field(default_factory=list)
+    #: An explicit invoice total; 0 leaves the arithmetic to the lines.
+    total_usd: float = Field(default=0.0, ge=0, le=99_999_999)
+
+    # Every field is constrained to the charset its token is spelled in, so a
+    # composed scenario round-trips by construction rather than by luck. The
+    # patterns are exactly what `parse` can read back: a value this refuses is
+    # one `to_hint` could write and `parse` could not recover, which would
+    # quietly submit a different invoice than the one on screen.
+    _upper_fields = field_validator("invoice_number", "po_number", mode="before")(_upper)
+    _lower_fields = field_validator("vendor_slug", "new_vendor", mode="before")(_lower)
+
+    @field_validator("total_usd")
+    @classmethod
+    def _to_cents(cls, value: float) -> float:
+        """`to_hint` writes two decimal places, so the model holds two."""
+        return round(value, 2)
+
+    # -- twists: each reaches one branch of the flow ------------------------
+    price_variance: bool = False
+    over_receipt: bool = False
+    low_confidence: bool = False
+    tax_id: bool = False
+
+    @classmethod
+    def parse(cls, text: str) -> "InvoiceScenario":
+        """Read a hint string. `text` is filename *and* hint, because an upload
+        with no hint still steers a stub extractor by its filename."""
+        lowered = text.lower()
+        named_new = re.search(r"newvendor[=\-_]([a-z0-9\-]+)", lowered)
+        # `vendor[=-_]` also matches inside `newvendor=…`, so a named new
+        # vendor wins outright rather than being read as both.
+        vendor = re.search(r"vendor[=\-_]([a-z0-9\-]+)", lowered)
+        po = re.search(r"po[=\-_](po-\d+)", lowered)
+        invoice = re.search(r"invoice[=\-_]([a-z0-9\-]+)", lowered)
+        pinned = re.search(r"lines[=\-_]([a-z0-9:.,\-]+)", lowered)
+        total = re.search(r"total[=\-_]\$?(\d+(?:\.\d{1,2})?)", lowered)
+
+        lines: list[ScenarioLine] = []
+        if pinned:
+            for token in pinned.group(1).split(","):
+                sku, _, quantity = token.partition(":")
+                if sku.strip():
+                    lines.append(ScenarioLine(
+                        sku=sku.strip().upper(), quantity=float(quantity or 1)
+                    ))
+        return cls(
+            vendor_slug="" if named_new else (vendor.group(1) if vendor else ""),
+            new_vendor=named_new.group(1) if named_new else "",
+            unnamed_new_vendor=named_new is None and "newvendor" in lowered,
+            po_number=po.group(1).upper() if po else "",
+            no_po="nopo" in lowered,
+            invoice_number=invoice.group(1).upper() if invoice else "",
+            lines=lines,
+            total_usd=float(total.group(1)) if total else 0.0,
+            **{t.id: t.token in lowered for t in SCENARIO_TWISTS},
+        )
+
+    def to_hint(self) -> str:
+        parts: list[str] = []
+        if self.new_vendor:
+            parts.append(f"newvendor={self.new_vendor}")
+        elif self.unnamed_new_vendor:
+            parts.append("newvendor")
+        elif self.vendor_slug:
+            parts.append(f"vendor={self.vendor_slug}")
+        if self.no_po:
+            parts.append("nopo")
+        elif self.po_number:
+            parts.append(f"po={self.po_number}")
+        if self.invoice_number:
+            parts.append(f"invoice={self.invoice_number}")
+        if self.lines:
+            parts.append("lines=" + ",".join(
+                f"{line.sku}:{line.quantity:g}" for line in self.lines
+            ))
+        if self.total_usd:
+            parts.append(f"total={self.total_usd:.2f}")
+        parts.extend(t.token for t in SCENARIO_TWISTS if getattr(self, t.id))
+        return " ".join(parts)
+
+
 class StubInvoiceReader:
     """Deterministic local-dev extractor: no credential, no network.
 
-    Steerable for demos, and the hints matter because they are how a local run
-    exercises each branch:
-
-    - `vendor=acme-industrial` names a vendor in the master, so the resolver
-      links it.
-    - `newvendor` (or an unrecognized `vendor=`) names one we do not know, so
-      the resolver mints it `onboarding`.
-    - `po=PO-7741` bills against that purchase order, using SKUs from the
-      shared catalog so the three-way match is real.
-    - `pricebump` raises a unit price 8% (price variance), `overbill` bills more
-      than was received (quantity variance), `nopo` omits the PO entirely
-      (unmatched), `blurry` drops confidence below the policy floor.
-    - `taxid` prints a tax id, which is the resolver's strongest signal.
+    Steerable by an `InvoiceScenario` — which is what a hint string parses to,
+    and where the grammar and the branch each token reaches are written down.
+    What the scenario leaves unsaid this fills in from a hash of the input, so
+    the same submission always reads the same way.
     """
 
     name = "stub"
 
     # -- m1 ---------------------------------------------------------------
     def read(
-        self, image: bytes | None, filename: str, hint: str
+        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
     ) -> InvoiceExtraction:
-        text = f"{filename} {hint}".lower()
+        scenario = InvoiceScenario.parse(f"{filename} {hint}")
         base = hashlib.sha256(
             (image or b"") + filename.encode() + hint.encode()
         ).digest()
 
-        vendor_match = re.search(r"vendor[=\-_]([a-z0-9\-]+)", text)
-        new_match = re.search(r"newvendor[=\-_]([a-z0-9\-]+)", text)
-        if new_match:
-            slug = f"{new_match.group(1)}-ltd"
-        elif vendor_match:
-            slug = vendor_match.group(1)
-        elif "newvendor" in text:
+        if scenario.new_vendor:
+            slug = f"{scenario.new_vendor}-ltd"
+        elif scenario.vendor_slug:
+            slug = scenario.vendor_slug
+        elif scenario.unnamed_new_vendor:
             slug = f"meridian-supply-{base[:2].hex()}"
         else:
             slug = _name_to_slug(_AP_VENDORS[base[3] % len(_AP_VENDORS)])
         vendor_name = _slug_to_name(slug)
 
-        po_match = re.search(r"po[=\-_](po-\d+)", text)
-        po_number = "" if "nopo" in text else (
-            po_match.group(1).upper() if po_match
-            else f"PO-{7000 + base[6] % 900}"
+        po_number = "" if scenario.no_po else (
+            scenario.po_number or f"PO-{7000 + base[6] % 900}"
         )
-        invoice_match = re.search(r"invoice[=\-_]([a-z0-9\-]+)", text)
-        invoice_number = (
-            invoice_match.group(1).upper() if invoice_match
-            else f"{slug[:4].upper()}-INV-{20000 + int.from_bytes(base[7:9], 'big') % 9000}"
+        invoice_number = scenario.invoice_number or (
+            f"{slug[:4].upper()}-INV-"
+            f"{20000 + int.from_bytes(base[7:9], 'big') % 9000}"
         )
         issued = date.today() - timedelta(days=base[10] % 21)
 
         # Lines from the shared catalog, so a synced PO can actually match.
-        # `lines=STL-0250:2,FAS-M12:3` pins them exactly, which is how a seeded
-        # invoice bills the same SKUs its purchase order ordered.
-        by_sku = {sku: (sku, description, price) for sku, description, price in _CATALOG}
-        pinned = re.search(r"lines[=\-_]([a-z0-9:.,\-]+)", text, re.IGNORECASE)
-        picks: list[tuple[str, str, float]] = []
-        pinned_quantities: list[float] = []
-        if pinned:
-            for token in pinned.group(1).split(","):
-                sku, _, quantity = token.partition(":")
-                entry = by_sku.get(sku.strip().upper())
-                if entry is None:
-                    continue
-                picks.append(entry)
-                pinned_quantities.append(float(quantity or 1))
+        # A pinned SKU the catalog does not hold is dropped rather than
+        # invented: there would be no PO line for it to pair against.
+        by_sku = {sku: (sku, description, price) for sku, description, price in CATALOG}
+        picks: list[tuple[tuple[str, str, float], float]] = [
+            (by_sku[line.sku], line.quantity)
+            for line in scenario.lines if line.sku in by_sku
+        ]
         if not picks:
-            count = 2 + base[11] % 2
             picks = [
-                _CATALOG[(base[12 + i] + i) % len(_CATALOG)] for i in range(count)
+                (
+                    CATALOG[(base[12 + i] + i) % len(CATALOG)],
+                    float(1 + (base[15 + i] % 4)),
+                )
+                for i in range(2 + base[11] % 2)
             ]
         seen: set[str] = set()
         lines: list[InvoiceLineExtract] = []
-        for index, (sku, description, unit_price) in enumerate(picks):
+        for index, ((sku, description, unit_price), quantity) in enumerate(picks):
             if sku in seen:
                 continue
             seen.add(sku)
-            quantity = (
-                pinned_quantities[index] if index < len(pinned_quantities)
-                else float(1 + (base[15 + index] % 4))
-            )
-            if "overbill" in text and index == 0:
+            if scenario.over_receipt and index == 0:
                 quantity += 2
             price = unit_price
-            if "pricebump" in text and index == 0:
+            if scenario.price_variance and index == 0:
                 price = round(unit_price * 1.08, 2)
             lines.append(InvoiceLineExtract(
                 sku=sku, description=description, quantity=quantity,
@@ -314,7 +508,6 @@ class StubInvoiceReader:
                 amount_usd=round(quantity * price, 2), kind="goods",
             ))
 
-        total_match = re.search(r"total[=\-_]\$?(\d+(?:\.\d{1,2})?)", text)
         subtotal = round(sum(line.amount_usd for line in lines), 2)
         freight = round(48 + base[20] % 90, 2)
         if freight > 0:
@@ -323,17 +516,16 @@ class StubInvoiceReader:
                 unit_price_usd=freight, amount_usd=freight, kind="freight",
             ))
         total = round(subtotal + freight, 2)
-        if total_match:
+        if scenario.total_usd:
             # An explicit total wins and the freight line absorbs the
             # difference, so the demo's arithmetic still adds up.
-            wanted = float(total_match.group(1))
-            freight = round(max(wanted - subtotal, 0), 2)
+            freight = round(max(scenario.total_usd - subtotal, 0), 2)
             if lines and lines[-1].kind == "freight":
                 lines[-1].unit_price_usd = freight
                 lines[-1].amount_usd = freight
             total = round(subtotal + freight, 2)
 
-        confidence = 0.55 if "blurry" in text else 0.93
+        confidence = 0.55 if scenario.low_confidence else 0.93
         invoice_date_text = issued.isoformat()
         due = (issued + timedelta(days=30)).isoformat()
 
@@ -341,7 +533,7 @@ class StubInvoiceReader:
             vendor_name=vendor_name, vendor_slug=_name_to_slug(vendor_name),
             vendor_tax_id=(
                 f"98-{int.from_bytes(base[5:7], 'big') % 10000000:07d}"
-                if "taxid" in text else ""
+                if scenario.tax_id else ""
             ),
             invoice_number=invoice_number, invoice_date=invoice_date_text,
             due_date=due, po_number=po_number,
@@ -380,9 +572,10 @@ class VertexInvoiceReader:
     """Multimodal extraction on Vertex AI via google-genai.
 
     Same client and credentials as the embedder and the answer backend. One
-    prompt, one call: the vendor as printed plus the commercial content. The
-    prompt deliberately asks for the name *as printed* and forbids guessing an
-    identifier — naming the entity is the resolver's job, against the master.
+    prompt, one call: the vendor as printed plus the commercial content. That
+    prompt arrives from the flow, which read it out of the corpus — so the
+    instruction that forbids guessing an identifier is a governed value a
+    customer can see and revise, not a literal buried here.
     """
 
     name = "vertex"
@@ -421,21 +614,12 @@ class VertexInvoiceReader:
         return json.loads(response.text or "{}")
 
     def read(
-        self, image: bytes | None, filename: str, hint: str
+        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
     ) -> InvoiceExtraction:
-        prompt = (
-            "Extract from this invoice: vendor_name — the party that issued "
-            "it, as printed, not normalized and not guessed at from an "
-            "identifier — vendor_tax_id if one is printed, invoice_number, "
-            "invoice_date (ISO 8601), due_date (ISO 8601), po_number, "
-            "subtotal_usd, freight_usd, tax_usd, total_usd, currency, a short "
-            "line_summary, your confidence 0-1, and lines: an array of the "
-            "billed lines, each with sku, description, quantity, "
-            "unit_price_usd, amount_usd and kind (goods, freight, tax or "
-            "discount). Respond with only a JSON object with those keys."
-            + (f"\n\nContext: {hint}" if hint else "")
+        text = (prompt or DEFAULT_INVOICE_PROMPT) + (
+            f"\n\nContext: {hint}" if hint else ""
         )
-        data = self._generate(self._parts(image, filename, prompt), 0.0)
+        data = self._generate(self._parts(image, filename, text), 0.0)
         lines = [
             InvoiceLineExtract(
                 sku=str(item.get("sku", "") or ""),
@@ -498,6 +682,111 @@ def parse_posting_policy(content: str) -> PostingPolicy:
     if confidence:
         values.min_confidence = float(confidence.group(1))
     return values
+
+
+class PolicyClause(BaseModel):
+    """One governed value this Flow reads, named where a person can see it.
+
+    The console shows these beside what a person composed and stops there.
+    "$9,800.00" next to "auto-post ≤ $2,500.00" lets the reader draw the
+    conclusion; drawing it here would be a second implementation of
+    `_posting_check`, and two implementations of one rule is one too many.
+    """
+
+    id: str
+    label: str
+    value: str
+    #: The governed document, at the revision it was read.
+    ref: str
+    #: A fragment the posting rule's own reason contains when this clause is
+    #: the one that held the invoice. Attribution of a sentence the Rule
+    #: already wrote — never a re-derivation of it.
+    cites: str = ""
+    deciding: bool = False
+
+
+def read_policy_clauses(knowledge) -> list[PolicyClause]:
+    """Every governed value the accounts-payable flow reads, at its revision.
+
+    Two documents, because the flow reads two: the posting policy governs the
+    limit, the match and the screen; the entity-resolution policy governs
+    whether a printed name becomes a link or a new vendor.
+
+    Only what a run actually consults is listed. A screen that showed the
+    whole document would be a document viewer — the Library is that — and one
+    that showed a curated subset would drift from what the flow reads.
+    """
+    asset = knowledge.repo.get(POLICY_ASSET_ID) if knowledge else None
+    content = asset.content if asset is not None else ""
+    ref = _knowledge_ref(asset) if asset is not None else f"knowledge:{POLICY_ASSET_ID}"
+    posting = parse_posting_policy(content)
+    match = parse_match_tolerances(content, ref)
+    screen = parse_anomaly_thresholds(content, ref)
+    resolution = read_resolution_thresholds(knowledge)
+    return [
+        PolicyClause(
+            id="auto-post-limit", label="Auto-post limit",
+            value=f"${posting.limit_usd:,.2f}", ref=ref,
+            cites="auto-post limit",
+        ),
+        PolicyClause(
+            id="min-confidence", label="Minimum extraction confidence",
+            value=f"{posting.min_confidence:.2f}", ref=ref,
+            cites="extraction confidence",
+        ),
+        PolicyClause(
+            id="price-variance", label="Price variance tolerance",
+            value=f"{match.price_variance_pct:.1f}%", ref=ref,
+            cites="off the PO's",
+        ),
+        PolicyClause(
+            id="quantity-variance", label="Quantity variance tolerance",
+            value=f"{match.quantity_variance:.1f} units", ref=ref,
+            cites="was received on",
+        ),
+        PolicyClause(
+            id="unmatched-lines", label="Unmatched line tolerance",
+            value=f"{match.unmatched_line_tolerance} lines", ref=ref,
+            cites="nothing on the purchase order resembles",
+        ),
+        PolicyClause(
+            id="freight-allowance", label="Freight and tax allowance",
+            value=f"${match.freight_allowance_usd:,.2f}", ref=ref,
+        ),
+        PolicyClause(
+            id="receiving-required", label="Receiving report required above",
+            value=f"${match.receiving_required_above_usd:,.2f}", ref=ref,
+            cites="not booked in yet",
+        ),
+        PolicyClause(
+            id="amount-outlier", label="Amount outlier multiple",
+            value=f"{screen.outlier_multiple:.1f}× the vendor's median", ref=ref,
+            cites="anomaly (amount-outlier)",
+        ),
+        PolicyClause(
+            id="duplicate-window", label="Duplicate window",
+            value=f"{screen.duplicate_window_days} days", ref=ref,
+            cites="anomaly (duplicate-suspect)",
+        ),
+        PolicyClause(
+            id="resolution-auto-link", label="Vendor auto-link at or above",
+            value=f"{resolution.auto_link_at:.2f}", ref=resolution.source_ref,
+        ),
+    ]
+
+
+def clauses_cited_by(clauses: list[PolicyClause], reason: str) -> list[PolicyClause]:
+    """Mark the clauses this run's verdict reason names.
+
+    A copy, so the registry stays a description of the corpus rather than of
+    one invoice.
+    """
+    return [
+        clause.model_copy(update={
+            "deciding": bool(clause.cites) and clause.cites in reason
+        })
+        for clause in clauses
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +872,8 @@ class PayableService:
         graph: GraphService | None = None,
         documents: DocumentService | None = None,
         anomaly: AnomalyService | None = None,
+        gateway: ActionGateway | None = None,
+        dispatcher: Dispatcher | None = None,
     ) -> None:
         self.directory = directory
         self.reader = reader
@@ -592,23 +883,63 @@ class PayableService:
         self.graph = graph
         self.documents = documents
         self.anomaly = anomaly
+        # Never None. A service wired without a Gateway still writes through
+        # one: falling back to a bare GraphWriter would open a hole exactly
+        # where the chokepoint belongs. A ledger nobody reads is a wiring bug;
+        # an ungoverned write is a governance one.
+        self.gateway = gateway or ActionGateway(
+            graph or GraphService(InMemoryGraphStore()), InMemoryLedgerStore()
+        )
+        # Never bypassed, for the Gateway's reason one line up: a service
+        # wired without a Dispatcher still starts its runs through one, into a
+        # log nobody reads. A log nobody reads is a wiring bug; a run nothing
+        # recorded a cause for is a governance one.
+        self.dispatcher = dispatcher or (
+            Dispatcher(engine, InMemoryEventLog()) if engine is not None else None
+        )
         if engine is not None:
             engine.register(FLOW_ID, self._body)
 
     # -- reads --------------------------------------------------------------
 
-    def list(self, state: PayableState | None = None) -> list[InvoiceRecord]:
+    def visible_to(self, principal: Principal) -> Callable[[InvoiceRecord], bool]:
+        """Which invoices this principal may see. `submitted_by` is the owner.
+
+        The rule, and why it is not `reads_beyond_self`, lives in
+        `TaskService.workspace_scope`.
+        """
+        allowed = self.tasks.workspace_scope(principal, CLERK_QUEUE)
+        return lambda r: allowed(r.submitted_by, r.task_id)
+
+    def list(
+        self,
+        state: PayableState | None = None,
+        principal: Principal | None = None,
+    ) -> list[InvoiceRecord]:
+        """The table. `principal=None` is unscoped, for seeding and internals —
+        every caller that serves a request passes one."""
         items = self.directory.list()
         if state is not None:
             items = [r for r in items if r.state == state]
+        if principal is not None:
+            visible = self.visible_to(principal)
+            items = [r for r in items if visible(r)]
         return sorted(items, key=lambda r: r.submitted_at_iso, reverse=True)
 
     def get(self, record_id: str) -> InvoiceRecord | None:
         return self.directory.get(record_id)
 
-    def stats(self) -> PayableStats:
+    def stats(self, principal: Principal | None = None) -> PayableStats:
+        """Totals over exactly the rows `list` would return.
+
+        Counted *from* `list` rather than beside it, so the strip and the table
+        under it cannot be computed over different slices. That bug was already
+        caught once on the task badge, where the per-queue breakdown was
+        filtered and the headline count was not; a stat strip arguing with the
+        table below it is worse than no strip at all.
+        """
         stats = PayableStats()
-        for r in self.directory.list():
+        for r in self.list(principal=principal):
             stats.total += 1
             if r.match_verdict == "matched":
                 stats.matched += 1
@@ -636,6 +967,9 @@ class PayableService:
         values.source_ref = _knowledge_ref(asset)
         return values
 
+    def read_prompt(self) -> GovernedPrompt:
+        return read_prompt(self.knowledge, PROMPT_ASSET_ID, DEFAULT_INVOICE_PROMPT)
+
     def _policy_asset_content(self) -> tuple[str, str]:
         asset = self.knowledge.repo.get(POLICY_ASSET_ID)
         if asset is None:
@@ -654,7 +988,7 @@ class PayableService:
         run_id: str | None = None,
         submitted_at_iso: str = "",
     ) -> InvoiceRecord:
-        if self.engine is None:
+        if self.dispatcher is None:
             raise RuntimeError("Payable service has no run engine wired")
         inputs = {
             "submitted_by": submitted_by,
@@ -663,19 +997,33 @@ class PayableService:
             "hint": hint,
             "submitted_at_iso": submitted_at_iso or utcnow().isoformat(),
         }
-        record = self.engine.start(
-            FLOW_ID, inputs, actor=submitted_by, run_id=run_id
-        )
+        # The fact, not the run: an invoice arriving is what happened, and
+        # which response that starts is the Trigger's answer rather than this
+        # call site's. `one()` is what makes the answer available to a caller
+        # that has a row to return.
+        record = self.dispatcher.emit(
+            "InvoiceReceived", inputs, actor=submitted_by, run_id=run_id,
+        ).one()
         return self._project(record)
 
-    def resume_for_task(self, task: Task) -> InvoiceRecord | None:
+    def resume_for_task(
+        self, task: Task, principal: Principal | None = None
+    ) -> InvoiceRecord | None:
+        """`principal` is the human who decided, carried to the commit.
+
+        The Gateway checks the committer at the write, so the deciding human
+        has to reach it — a uid recovered from `decided_by` afterwards would
+        name the right person and prove nothing about their authority.
+        """
         if task.flow_id != FLOW_ID or self.engine is None:
             return None
-        record = self.engine.resume_for_task(task.id)
+        record = self.engine.resume_for_task(task.id, principal=principal)
         return self._project(record) if record else None
 
-    def apply_task_decision(self, task: Task) -> InvoiceRecord | None:
-        return self.resume_for_task(task)
+    def apply_task_decision(
+        self, task: Task, principal: Principal | None = None
+    ) -> InvoiceRecord | None:
+        return self.resume_for_task(task, principal)
 
     # -- the flow body ------------------------------------------------------
 
@@ -704,10 +1052,26 @@ class PayableService:
         )
         document_id = slot["document_id"]
 
+        # -- x0: the governed read the ModelCall runs on -------------------
+        # A prompt is knowledge, so it is read here at a revision rather than
+        # compiled in, and the revision travels onto the extraction step.
+        prompt = GovernedPrompt.model_validate(ctx.step(
+            "x0", "read-prompt", "transform",
+            fn=lambda: self.read_prompt().model_dump(),
+            summary=lambda out: (
+                f"{out['source_ref']}: {len(out['text'])} characters"
+                + ("" if out["found_asset"]
+                   else " — not in the corpus, running on the built-in default")
+            ),
+        ))
+        ctx.note_refs(prompt.source_ref)
+
         # -- m1: one call reads the whole document ------------------------
         extraction = InvoiceExtraction.model_validate(ctx.step(
             "m1", "extract-invoice", "modelcall",
-            fn=lambda: self._extract(image, filename, hint, document_id).model_dump(),
+            fn=lambda: self._extract(
+                image, filename, hint, document_id, prompt.text
+            ).model_dump(),
             summary=lambda out: (
                 f"{out['model']}: {out['vendor_name'] or 'unnamed vendor'} · "
                 f"{out['invoice_number']} · ${out['total_usd']:,.2f} · "
@@ -715,22 +1079,25 @@ class PayableService:
                 f"confidence {out['confidence']:.2f}"
             ),
             model=getattr(self.reader, "name", ""),
-            refs=[f"document:{document_id}"],
+            refs=[f"document:{document_id}", prompt.source_ref],
             retries=1, escalate_queue=CLERK_QUEUE,
         ))
 
         # -- z1: the printed name becomes one canonical vendor ------------
-        vendor_writer = (
-            self.graph.writer(ctx.record.id, "z1") if self.graph else None
+        # A resolution, not a decision: the resolver picked a winner among
+        # candidates by the governed thresholds and nobody was asked. Automatic
+        # like an observation, ledgered like a decision — which is exactly what
+        # the doctrine asks of the third regime.
+        resolve_act = self.gateway.action(
+            "resolve-identities", flow_principal(FLOW_ID),
+            run=ctx.record, step_id="z1",
         )
         resolution_raw = ctx.step(
             "z1", "resolve-vendor", "resolve",
-            fn=lambda: self._resolve_vendor(
-                extraction, ctx.record.id, vendor_writer
+            fn=lambda: resolve_act.commit(
+                lambda w: self._resolve_vendor(extraction, ctx.record.id, w)
             ),
-            writes=lambda _out: (
-                vendor_writer.refs if vendor_writer is not None else []
-            ),
+            writes=lambda _out: resolve_act.writes,
             summary=lambda out: (
                 f"{out['disposition']}: {out['label'] or '—'} "
                 f"({out['method']} {out['score']:.2f}) — {out['reason']}"
@@ -749,18 +1116,20 @@ class PayableService:
                     ctx.record, extraction, resolution_raw, submitted_by
                 ),
             )
-            decision_writer = (
-                self.graph.writer(ctx.record.id, "a0") if self.graph else None
+            # The clerk named a vendor: a decision, and a consequential one —
+            # posting against the wrong company is not a recoverable mistake.
+            confirm = self.gateway.action(
+                "confirm-vendor", ctx.principal or AP_FLOW,
+                run=ctx.record, step_id="a0",
+                task_id=f"task_{ctx.record.id}_k0",
+                decided_by=decision.decided_by,
             )
             chosen = ctx.step(
                 "a0", "apply-vendor-decision", "action",
-                fn=lambda: self._apply_vendor_decision(
-                    extraction, resolution_raw, decision, ctx.record.id,
-                    decision_writer,
-                ),
-                writes=lambda _out: (
-                    decision_writer.refs if decision_writer is not None else []
-                ),
+                fn=lambda: confirm.commit(lambda w: self._apply_vendor_decision(
+                    extraction, resolution_raw, decision, ctx.record.id, w,
+                )),
+                writes=lambda _out: confirm.writes,
                 summary=lambda out: (
                     f"{out['action']} {out['label']} by {out['decided_by']}"
                 ),
@@ -934,8 +1303,9 @@ class PayableService:
         filename: str,
         hint: str,
         document_id: str,
+        prompt: str,
     ) -> InvoiceExtraction:
-        extraction = self.reader.read(image, filename, hint)
+        extraction = self.reader.read(image, filename, hint, prompt=prompt)
         if self.documents is not None and extraction.regions:
             self.documents.set_regions(document_id, extraction.regions)
         return extraction
@@ -1219,8 +1589,7 @@ class PayableService:
                 TaskEvidence(label="Total", value=f"${extraction.total_usd:,.2f}"),
                 TaskEvidence(label="Auto-post limit",
                              value=f"${policy.limit_usd:,.2f} (governed)"),
-                TaskEvidence(label="Three-way match",
-                             value=f"{match.verdict} — {match.summary()}"),
+                TaskEvidence(label="Three-way match", value=match.summary()),
                 TaskEvidence(label="Anomaly basis", value=str(screen.get("basis", ""))),
                 TaskEvidence(label="Submitted by", value=submitted_by),
                 TaskEvidence(label="Review round", value=str(round_number)),
@@ -1308,15 +1677,26 @@ class PayableService:
             ),
         )
 
-        post_writer = self.graph.writer(ctx.record.id, "a1") if self.graph else None
+        # The commit, through the Gateway. Who commits it is the human who
+        # released the last gate; when the invoice cleared the governed
+        # auto-post limit with no gate at all, nobody decided, so the Flow
+        # commits on its own authority and the ledger says so rather than
+        # crediting the submitter with a judgment they never made.
+        post = self.gateway.action(
+            "post-invoice", ctx.principal or AP_FLOW,
+            run=ctx.record, step_id="a1",
+            task_id=record.task_id, decided_by=decided_by,
+        )
         written = ctx.step(
             "a1", "post-invoice", "action",
-            fn=lambda: self._write_graph(record, match, ctx.record.id, post_writer),
-            writes=lambda _out: post_writer.refs if post_writer is not None else [],
+            fn=lambda: post.commit(
+                lambda w: self._write_graph(record, match, ctx.record.id, w)
+            ),
+            writes=lambda _out: post.writes,
             summary=lambda out: (
                 f"{record.state} · ${record.total_usd:,.2f} · {out['objects']} "
                 f"object(s) and {out['links']} link(s) written · ledger "
-                f"led_{record.id[-6:]}"
+                f"{post.entry.id}"
             ),
         )
         record.graph_ref = written.get("invoice_ref", "")
@@ -1768,6 +2148,8 @@ def build_payable_service(
     graph: GraphService | None = None,
     documents: DocumentService | None = None,
     anomaly: AnomalyService | None = None,
+    gateway: ActionGateway | None = None,
+    dispatcher: Dispatcher | None = None,
 ) -> PayableService:
     directory: PayableDirectory
     if backend == "firestore":
@@ -1775,7 +2157,8 @@ def build_payable_service(
     else:
         directory = InMemoryPayableDirectory()
     return PayableService(
-        directory, reader, knowledge, tasks, engine, graph, documents, anomaly
+        directory, reader, knowledge, tasks, engine, graph, documents, anomaly,
+        gateway, dispatcher,
     )
 
 
@@ -1871,7 +2254,7 @@ def _seed_vendor_deliveries() -> list[dict]:
 
 def _seed_po_delivery() -> dict:
     def lines(po_number: str) -> list[dict]:
-        catalog = {sku: (description, price) for sku, description, price in _CATALOG}
+        catalog = {sku: (description, price) for sku, description, price in CATALOG}
         out = []
         for sku, quantity in _SEED_CATALOG_LINES[po_number]:
             description, price = catalog[sku]
@@ -1910,7 +2293,7 @@ def _seed_po_delivery() -> dict:
 
 
 def _seed_receiving_delivery() -> dict:
-    catalog = {sku: (description, price) for sku, description, price in _CATALOG}
+    catalog = {sku: (description, price) for sku, description, price in CATALOG}
 
     def lines(po_number: str, shortfall: dict | None = None) -> list[dict]:
         out = []

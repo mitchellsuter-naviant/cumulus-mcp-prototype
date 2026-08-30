@@ -76,6 +76,97 @@ def test_editing_the_policy_changes_the_flow_without_code(world):
     assert again.policy_ref.endswith("@rev2")
 
 
+# ---- the prompt is governed knowledge too ---------------------------------
+
+
+def test_the_extraction_prompt_is_an_asset_read_at_a_revision(world):
+    """The ModelCall's instruction lives in the corpus, not in a string literal.
+
+    Doctrine's claim is specific: a customer editing a prompt in the shell is
+    editing the map, "not application code — which is what makes it safe." That
+    is only true if the flow reads the asset, and only auditable if the run says
+    which revision it read. Both halves are checked here.
+    """
+    asset = world.knowledge.repo.get("receipt-extraction-prompt")
+    assert asset is not None
+    assert asset.kind == "prompt"
+    # A prompt never argues with a policy, so it carries no authority.
+    assert asset.authority_level is None
+
+    prompt = world.expenses.read_prompt()
+    assert prompt.found_asset
+    assert prompt.source_ref == "knowledge:receipt-extraction-prompt@rev1"
+    # The instruction, not the page. The asset also explains itself to whoever
+    # is editing it, and the model has no use for that half.
+    assert prompt.text.startswith("Extract from this receipt:")
+    assert "governed knowledge" not in prompt.text
+
+
+def test_the_modelcall_records_the_prompt_revision_it_ran_on(world):
+    """The point of the exercise: a decision explainable against the prompt.
+
+    The policy's revision has always been in the read-set of the Rule that
+    consumed it. The prompt's is now in the read-set of the ModelCall it
+    steered, which is the same guarantee one step earlier.
+    """
+    request = world.expenses.submit(
+        "pat@customer.example", documents=[_doc(hint="total=64.20 category=meals")],
+        commentary="Team lunch after the Acme Phase 1 review.",
+    )
+    run = world.engine.get(request.run_id)
+    [model_step] = [s for s in run.steps if s.kind == "modelcall"]
+    assert "knowledge:receipt-extraction-prompt@rev1" in model_step.refs
+    # And it is on the run's roll-up, so the flow's projection onto the
+    # ontology counts the prompt among the knowledge this flow reads.
+    assert "knowledge:receipt-extraction-prompt@rev1" in run.refs
+
+
+def test_editing_the_prompt_changes_what_the_modelcall_runs_on(world):
+    """The same claim the policy test makes, for the prompt: an edit in the
+    shell is a behaviour change with no deploy, and the new revision is what
+    the next run records."""
+    world.knowledge.update(
+        "receipt-extraction-prompt",
+        AssetUpdate(content=(
+            "# Receipt prompt\n\n```text\nRead the tip as its own charge.\n```\n"
+        )),
+    )
+    prompt = world.expenses.read_prompt()
+    assert prompt.text == "Read the tip as its own charge."
+    assert prompt.source_ref == "knowledge:receipt-extraction-prompt@rev2"
+
+    request = world.expenses.submit(
+        "pat@customer.example", documents=[_doc(hint="total=64.20 category=meals")],
+        commentary="Team lunch after the Acme Phase 1 review.",
+    )
+    run = world.engine.get(request.run_id)
+    [model_step] = [s for s in run.steps if s.kind == "modelcall"]
+    assert "knowledge:receipt-extraction-prompt@rev2" in model_step.refs
+
+
+def test_a_corpus_without_the_prompt_still_extracts():
+    """A deployment whose corpus has not seeded yet must still run.
+
+    Same degradation as the policy read, and for the same reason: the built-in
+    default carries the run, and the *unpinned* ref left in the journal is how
+    the run says it never got a revision.
+    """
+    world = test_world.fresh(seed_corpus=False)
+    prompt = world.expenses.read_prompt()
+    assert not prompt.found_asset
+    assert prompt.source_ref == "knowledge:receipt-extraction-prompt"
+
+    request = world.expenses.submit(
+        "pat@customer.example", documents=[_doc(hint="total=64.20 category=meals")],
+        commentary="Team lunch after the Acme Phase 1 review.",
+    )
+    assert request.state == "approved"
+    assert len(request.lines) == 1
+    run = world.engine.get(request.run_id)
+    [model_step] = [s for s in run.steps if s.kind == "modelcall"]
+    assert "knowledge:receipt-extraction-prompt" in model_step.refs
+
+
 # ---- documents are not facts ----------------------------------------------
 
 
@@ -402,6 +493,33 @@ def test_api_submit_accepts_documents_and_commentary(client, world):
     assert body["run_id"]
 
 
+def test_a_submission_is_filed_under_the_submitter_s_email(client, world):
+    """The row's `employee` is the graph's natural key for a person, so the
+    row and the `Employee` object it writes are the same person."""
+    body = client.post(
+        "/api/v1/reimbursements",
+        json={"documents": [{"hint": "total=21.00 category=meals"}]},
+        headers={"X-Cumulus-Persona": "customer-user:kim"},
+    ).json()
+    assert body["employee"] == "kim@customer.example"
+
+
+def test_an_own_scoped_persona_only_ever_sees_its_own(client, world):
+    """`mine=true` and the bare list are one answer for somebody whose reach
+    is their own work. Unasked, this endpoint used to hand every submitter's
+    receipts to anybody who was signed in."""
+    seed_reimbursements_if_empty(world.expenses)
+    kim = {"X-Cumulus-Persona": "customer-user:kim"}
+    mine = client.get(
+        "/api/v1/reimbursements", params={"mine": True}, headers=kim
+    ).json()
+    assert mine and {r["employee"] for r in mine} == {"kim@customer.example"}
+    assert client.get("/api/v1/reimbursements", headers=kim).json() == mine
+
+    everyone = client.get("/api/v1/reimbursements").json()
+    assert len({r["employee"] for r in everyone}) > 1
+
+
 def test_a_minted_key_may_read_but_not_submit(client, monkeypatch, world):
     """Asking to be paid back is a human act; a credential cannot do it."""
     import app.deps as deps
@@ -482,3 +600,113 @@ def test_a_suspended_run_shows_the_newest_facts(world):
     )
     assert final.state == "approved"
     assert final.human_override is True
+
+
+# ---- who the expense table belongs to --------------------------------------
+#
+# Nadia is the whole point of this block. She owns the `expense-review` queue,
+# has three open tasks sitting in it, and — because the old rule narrowed an
+# own-scoped principal to `principal.email` and she has submitted nothing
+# herself — the table those tasks are about came back empty. The approver of a
+# queue could not see the queue.
+#
+# One sentence, shared with the AP workspace: your own rows, plus the rows of
+# any run whose Task sits in a queue you own.
+
+#: Rows each persona reaches over the seeded expense world, and why.
+EXPENSE_VISIBLE = {
+    # Platform scope: the deployment is theirs to diagnose.
+    "naviant-engineer": 12,
+    "naviant-support": 12,
+    # Tenant scope: the customer's own map, whole, by design.
+    "customer-admin": 12,
+    # Bound to `expense-review`, the queue this flow routes to, so the whole
+    # workspace is theirs — the six that stopped for a decision and the six
+    # that auto-approved. Lens 4 calls a Workspace impersonal: you watch how
+    # a workstream runs, not only the parts that stopped for you.
+    "customer-user:nadia": 12,
+    "customer-user:rowan": 12,
+    # Submits and owns no queue: her own four, and this is what she saw
+    # before too — she is the persona that was already scoped correctly.
+    "customer-user:kim": 4,
+    # Bound to `ap-clerk` only, and has never filed an expense.
+    "customer-user:ap": 0,
+}
+
+
+@pytest.mark.parametrize("persona,expected", sorted(EXPENSE_VISIBLE.items()))
+def test_the_expense_table_shows_the_work_you_are_accountable_for(
+    client, world, persona, expected
+):
+    seed_reimbursements_if_empty(world.expenses)
+    rows = client.get(
+        "/api/v1/reimbursements", headers={"X-Cumulus-Persona": persona}
+    ).json()
+    assert len(rows) == expected
+
+
+@pytest.mark.parametrize("persona,expected", sorted(EXPENSE_VISIBLE.items()))
+def test_the_expense_strip_counts_the_table_under_it(
+    client, world, persona, expected
+):
+    """The same agreement the AP strip owes its table, for the same reason."""
+    seed_reimbursements_if_empty(world.expenses)
+    headers = {"X-Cumulus-Persona": persona}
+    rows = client.get("/api/v1/reimbursements", headers=headers).json()
+    stats = client.get("/api/v1/reimbursements/stats", headers=headers).json()
+    assert stats["total"] == len(rows) == expected
+    assert stats["approved"] + stats["pending"] + stats["denied"] == len(rows)
+
+
+def test_the_approver_of_a_queue_can_open_the_queue_s_rows(client, world):
+    """The defect, named. Nadia owns `expense-review` and has filed nothing
+    herself, so narrowing her to `principal.email` emptied the very table her
+    open tasks are about."""
+    seed_reimbursements_if_empty(world.expenses)
+    nadia = {"X-Cumulus-Persona": "customer-user:nadia"}
+    rows = client.get("/api/v1/reimbursements", headers=nadia).json()
+    assert rows and "nadia@customer.example" not in {r["employee"] for r in rows}
+
+    # Owning the queue this flow routes to makes the whole workstream hers —
+    # the requests that stopped for her decision *and* the ones that never
+    # needed one. An approver shown only the exceptions has no baseline to
+    # judge them against, and Lens 4 calls a Workspace impersonal for exactly
+    # this reason: you watch how the work runs, not only the parts aimed at you.
+    assert {r["id"] for r in rows} == {r.id for r in world.expenses.list()}
+    # Including the ones still waiting on a decision from her.
+    assert any(r["state"] == "pending" for r in rows)
+    # And the ones that auto-approved and asked her nothing.
+    assert any(r["state"] == "approved" and not r.get("task_id") for r in rows)
+
+
+def test_mine_stays_a_real_filter_for_an_approver(client, world):
+    """"My expenses" and "the queue I approve" are two questions, and an
+    approver asks both. Collapsing them would hide Nadia's own receipts inside
+    the queue she reviews."""
+    seed_reimbursements_if_empty(world.expenses)
+    nadia = {"X-Cumulus-Persona": "customer-user:nadia"}
+    assert client.get(
+        "/api/v1/reimbursements", params={"mine": True}, headers=nadia
+    ).json() == []
+    # For a submitter who owns no queue the two answers coincide, as before.
+    kim = {"X-Cumulus-Persona": "customer-user:kim"}
+    assert (
+        client.get("/api/v1/reimbursements", params={"mine": True}, headers=kim).json()
+        == client.get("/api/v1/reimbursements", headers=kim).json()
+    )
+
+
+def test_a_request_outside_your_slice_is_missing_not_forbidden(client, world):
+    """404 rather than 403: a 403 confirms the id exists, which is the one bit
+    an unauthorized caller should not get back."""
+    seed_reimbursements_if_empty(world.expenses)
+    request_id = "run_er_seed11"  # Sam's, pending in expense-review
+    assert client.get(
+        f"/api/v1/reimbursements/{request_id}",
+        headers={"X-Cumulus-Persona": "customer-user:nadia"},
+    ).status_code == 200
+    refused = client.get(
+        f"/api/v1/reimbursements/{request_id}",
+        headers={"X-Cumulus-Persona": "customer-user:kim"},
+    )
+    assert refused.status_code == 404

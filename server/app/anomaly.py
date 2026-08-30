@@ -378,7 +378,7 @@ class AnomalyService:
                 "detail": (
                     f"${total_usd:,.2f} is a round hundred; only "
                     f"{profile.round_number_rate:.0%} of this vendor's invoices "
-                    "are"
+                    "are round numbers."
                 ),
             })
 

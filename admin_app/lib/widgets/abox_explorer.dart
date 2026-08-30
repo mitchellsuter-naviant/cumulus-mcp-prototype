@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../models/asset.dart' show AskAnswer;
-import '../models/data_layer.dart' show DataCollection;
 import '../models/graph.dart';
 import '../models/world.dart';
 import '../services/api_client.dart';
@@ -26,18 +25,12 @@ import 'ui_kit.dart';
 /// a fragment is an isolated world it cannot see.
 class ABoxExplorer extends StatefulWidget {
   final ApiClient api;
-  final Ontology? ontology;
 
-  /// The Collection registry, used to tell business entities from
-  /// infrastructure — the same split the Entities & Links rail makes.
-  final List<DataCollection> collections;
+  /// The type to land on, when you arrived by clicking a box on the model.
+  /// Null means land on whichever type this world holds most of.
+  final String? initialType;
 
-  const ABoxExplorer({
-    super.key,
-    required this.api,
-    required this.ontology,
-    this.collections = const [],
-  });
+  const ABoxExplorer({super.key, required this.api, this.initialType});
 
   @override
   State<ABoxExplorer> createState() => _ABoxExplorerState();
@@ -45,9 +38,13 @@ class ABoxExplorer extends StatefulWidget {
 
 enum _View { table, graph }
 
+/// The one Collection whose rows are staging rather than subject matter.
+const _landingCollection = 'source-landing';
+
 class _ABoxExplorerState extends State<ABoxExplorer> {
   static const _live = 'live';
 
+  Ontology? _ontology;
   List<AuthoredWorld> _worlds = const [];
   String _worldId = _live;
   MaterializedWorld? _world;
@@ -76,25 +73,27 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
   // -- ontology helpers ---------------------------------------------------------
 
   OntologyObjectType? _declared(String name) {
-    for (final t in widget.ontology?.objects ?? const <OntologyObjectType>[]) {
+    for (final t in _ontology?.objects ?? const <OntologyObjectType>[]) {
       if (t.name == name) return t;
     }
     return null;
   }
 
   String _natureOf(String linkType) {
-    for (final l in widget.ontology?.links ?? const <OntologyLinkType>[]) {
+    for (final l in _ontology?.links ?? const <OntologyLinkType>[]) {
       if (l.name == linkType) return l.nature;
     }
     return 'association';
   }
 
-  bool _isInfrastructure(OntologyObjectType t) {
-    for (final c in widget.collections) {
-      if (c.id == t.collection) return c.kind == 'landing';
-    }
-    return false;
-  }
+  /// Landing rows are what a feed delivered, before anything resolved them
+  /// to an entity — staging rather than subject matter, so the rail lists them
+  /// under their own heading. Read off the collection each type declares
+  /// rather than from a second registry call: `source-landing` is the only
+  /// Collection of that kind, and one screen's grouping is not worth a round
+  /// trip that says so.
+  bool _isInfrastructure(OntologyObjectType t) =>
+      t.collection == _landingCollection;
 
   bool _matchesRailFilter(OntologyObjectType t) {
     if (_activeTags.isNotEmpty &&
@@ -110,8 +109,7 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
 
   List<OntologyObjectType> get _rootTypes {
     final types = [
-      for (final t
-          in widget.ontology?.objects ?? const <OntologyObjectType>[])
+      for (final t in _ontology?.objects ?? const <OntologyObjectType>[])
         if (!t.isPart) t,
     ]..sort((a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()));
     return types;
@@ -134,6 +132,15 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
   }
 
   Future<void> _loadWorlds() async {
+    // The schema is what makes the instances readable — which fields a type
+    // declares, which links are composition — so it is fetched here rather
+    // than handed down. A world without it renders as untyped rows.
+    try {
+      final ontology = await widget.api.ontology();
+      if (mounted) setState(() => _ontology = ontology);
+    } on ApiException {
+      // The rail falls back to whatever types the world itself contains.
+    }
     try {
       final worlds = await widget.api.listWorlds();
       if (mounted) setState(() => _worlds = worlds);
@@ -165,8 +172,22 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
       setState(() {
         _world = world;
         _loadingWorld = false;
-        // Land on the busiest core type this world actually has.
+        // Land on the type you arrived from; otherwise on the busiest core
+        // type this world actually has.
         final counts = world.byType;
+        // A part is identified through its owner and is not offered in the
+        // rail on its own, so arriving on one lands on the owner — the same
+        // resolution a `graph:` ref gets.
+        final clicked = widget.initialType;
+        final arrived = clicked == null
+            ? null
+            : (_declared(clicked)?.isPart ?? false)
+                  ? _declared(clicked)!.ownerType
+                  : clicked;
+        if (arrived != null && (counts[arrived] ?? 0) > 0) {
+          _type = arrived;
+          return;
+        }
         final candidates = _rootTypes
             .where((t) => (counts[t.name] ?? 0) > 0)
             .toList()

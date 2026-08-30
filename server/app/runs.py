@@ -38,6 +38,7 @@ from typing import Any, Callable, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
+from .auth import Principal
 from .models import utcnow
 from .tasks import Task, TaskDecision, TaskService
 
@@ -96,9 +97,16 @@ class StepRecord(BaseModel):
     # Set on gate steps: the Task raised, and the decision that released it.
     task_id: str = ""
     decision: dict | None = None
-    # Model accounting, on modelcall steps — the governed operation.
+    # Model accounting, on modelcall steps — the governed operation. These
+    # are the *only* record of what a model call cost: the rollups the console
+    # shows sum these fields and nothing else, so a call site that leaves them
+    # at zero produces a zero on the page. That is the intended behaviour —
+    # an unpriced call must read as unpriced, never as cheap — and it is why
+    # `flows.cost_basis` counts how many calls carried a price rather than
+    # only summing what they carried.
     model: str = ""
     cost_usd: float = 0.0
+    tokens: int = 0
 
 
 class RunRecord(BaseModel):
@@ -107,6 +115,10 @@ class RunRecord(BaseModel):
     status: RunStatus = "running"
     case_ref: str = ""
     actor: str = ""
+    # The Event whose Triggers started this run, named by the Dispatcher
+    # before the run existed. Empty means nobody said why it began — a direct
+    # `engine.start` — which is a thing to be able to see, not to hide.
+    caused_by: str = ""
     inputs: dict = Field(default_factory=dict)
     outputs: dict = Field(default_factory=dict)
     steps: list[StepRecord] = Field(default_factory=list)
@@ -229,11 +241,22 @@ class RunContext:
         store: RunStore,
         tasks: TaskService,
         resume_input: dict | None = None,
+        principal: Principal | None = None,
+        emit: Callable[[str, str, RunRecord], Any] | None = None,
     ) -> None:
         self.record = record
         self._store = store
         self._tasks = tasks
+        self._emit = emit
         self.resume_input = resume_input or {}
+        # Who drove *this pass* of the run, when a live caller drove it: the
+        # human whose Task decision released the gate. It travels rather than
+        # being looked up from `decided_by` afterwards, because re-deriving
+        # authority from a name recorded earlier is a boundary check wearing a
+        # write check's clothes — and it would lose `impersonated_by`, which
+        # is the one thing an audit reader cannot reconstruct. None on a start
+        # or a seeded resume; the Flow commits on its own authority then.
+        self.principal = principal
         # Steps replayed on this pass, for the log line at the end.
         self.replayed = 0
 
@@ -250,6 +273,7 @@ class RunContext:
         refs: list[str] | None = None,
         model: str = "",
         cost_usd: float = 0.0,
+        tokens: int = 0,
         retries: int = 0,
         escalate_queue: str = "",
         writes: Callable[[Any], list[str]] | None = None,
@@ -319,6 +343,15 @@ class RunContext:
                     resumes=f"this run resumes at {step_id}",
                     created_at_iso=utcnow().isoformat(),
                 ))
+                # The failed step has to name the Task it escalated into.
+                # Without this the journal records the failure and loses the
+                # handoff, so nothing can get from "this step broke" to "and
+                # here is the person it was given to" — and a rollup counting
+                # raised Tasks off the journal would miss every escalation.
+                failed_step = self.record.step(step_id)
+                if failed_step is not None:
+                    failed_step.task_id = task.id
+                    self._persist()
                 raise RunSuspended(task.id, step_id)
             raise StepFailed(step_id, last_error)
 
@@ -327,19 +360,30 @@ class RunContext:
             step_id=step_id, name=name, kind=kind, status="done",
             summary=text, output=output, refs=refs or [], attempts=attempts,
             duration_ms=int((time.monotonic() - started) * 1000),
-            model=model, cost_usd=cost_usd,
+            model=model, cost_usd=cost_usd, tokens=tokens,
             writes=list(writes(output) or []) if writes is not None else [],
         ))
         return output
 
     def event(self, step_id: str, name: str, summary: str, kind: StepKind = "event") -> None:
-        """A journal entry with no output — an emitted Event, a trigger."""
+        """A journal entry with no output — an emitted Event, a trigger.
+
+        An `event` row also *leaves* the run: it is appended to the event log
+        (`dispatch.Dispatcher.record`), which is what makes an emitted fact
+        readable by something other than this one journal. A `trigger` row is
+        not — the Dispatcher logged that fact before the run existed, and
+        appending it again from in here would record one causation twice, in
+        the wrong order. The replay guard above covers both: a resumed run
+        replays the row and appends nothing.
+        """
         if self.record.step(step_id) is not None:
             self.replayed += 1
             return
         self._record_step(StepRecord(
             step_id=step_id, name=name, kind=kind, status="done", summary=summary,
         ))
+        if kind == "event" and self._emit is not None:
+            self._emit(name, summary, self.record)
 
     # -- gates --------------------------------------------------------------
 
@@ -439,6 +483,12 @@ class RunEngine:
         self.store = store
         self.tasks = tasks
         self._bodies: dict[str, FlowBody] = {}
+        # Where an Event a running flow emits goes, beyond its own journal.
+        # Set by `dispatch.Dispatcher`, which registers itself: a structural
+        # attribute rather than an import, because `dispatch` imports this
+        # module and the engine must not import it back. None leaves the
+        # journal as the only record, which is what it was before.
+        self.emit: Callable[[str, str, RunRecord], Any] | None = None
 
     def register(self, flow_id: str, body: FlowBody) -> None:
         self._bodies[flow_id] = body
@@ -461,6 +511,17 @@ class RunEngine:
 
     def get(self, run_id: str) -> RunRecord | None:
         return self.store.get(run_id)
+
+    def registered(self) -> list[str]:
+        """Every flow id with a body in this process.
+
+        The engine is where a flow announces itself, and an inbound sync feed
+        announces itself exactly the way the two authored flows do. So this is
+        the only list that has all of them without someone maintaining a
+        second one alongside the registry — which would be a list of the
+        flows somebody remembered to add.
+        """
+        return sorted(self._bodies)
 
     def find_by_case(self, case_ref: str) -> RunRecord | None:
         matches = [r for r in self.store.list() if r.case_ref == case_ref]
@@ -485,6 +546,8 @@ class RunEngine:
         case_ref: str = "",
         actor: str = "",
         run_id: str | None = None,
+        principal: Principal | None = None,
+        caused_by: str = "",
     ) -> RunRecord:
         body = self._bodies.get(flow_id)
         if body is None:
@@ -492,12 +555,17 @@ class RunEngine:
         rid = run_id or self.mint_run_id(flow_id, inputs, actor)
         record = RunRecord(
             id=rid, flow_id=flow_id, case_ref=case_ref or rid,
-            actor=actor, inputs=inputs,
+            actor=actor, inputs=inputs, caused_by=caused_by,
         )
         self.store.put(record)
-        return self._drive(record, body, resume_input=None)
+        return self._drive(record, body, resume_input=None, principal=principal)
 
-    def resume(self, run_id: str, resume_input: dict | None = None) -> RunRecord | None:
+    def resume(
+        self,
+        run_id: str,
+        resume_input: dict | None = None,
+        principal: Principal | None = None,
+    ) -> RunRecord | None:
         record = self.store.get(run_id)
         if record is None:
             return None
@@ -515,20 +583,31 @@ class RunEngine:
         record.open_task_id = ""
         record.suspended_at_step = ""
         self.store.put(record)
-        return self._drive(record, body, resume_input=resume_input)
+        return self._drive(
+            record, body, resume_input=resume_input, principal=principal
+        )
 
     def resume_for_task(
-        self, task_id: str, resume_input: dict | None = None
+        self,
+        task_id: str,
+        resume_input: dict | None = None,
+        principal: Principal | None = None,
     ) -> RunRecord | None:
         run = self.find_by_task(task_id)
-        return self.resume(run.id, resume_input) if run else None
+        return self.resume(run.id, resume_input, principal) if run else None
 
     # -- the loop -----------------------------------------------------------
 
     def _drive(
-        self, record: RunRecord, body: FlowBody, resume_input: dict | None
+        self,
+        record: RunRecord,
+        body: FlowBody,
+        resume_input: dict | None,
+        principal: Principal | None = None,
     ) -> RunRecord:
-        ctx = RunContext(record, self.store, self.tasks, resume_input)
+        ctx = RunContext(
+            record, self.store, self.tasks, resume_input, principal, self.emit
+        )
         try:
             outputs = body(ctx, record.inputs) or {}
             record.status = "succeeded"

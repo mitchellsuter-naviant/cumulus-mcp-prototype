@@ -19,6 +19,7 @@ from typing import Literal
 from .auth import (
     Principal,
     get_principal,
+    require_human,
     require_any_team_admin,
     require_role,
     require_team_admin,
@@ -64,18 +65,6 @@ def _require_can_touch(principal: Principal, role: str) -> None:
         require_role(principal, "owner")
 
 
-def _require_human(principal: Principal) -> None:
-    """A key may not reshape the identity graph it is authenticated against."""
-    if principal.key_id is not None:
-        log.warning(
-            "API key attempted identity management", extra={"keyId": principal.key_id}
-        )
-        raise HTTPException(
-            status_code=403,
-            detail="API keys cannot manage identities; sign in as an admin.",
-        )
-
-
 @router.get("", response_model=list[Identity])
 def list_identities(principal: Principal = Depends(get_principal)) -> list[Identity]:
     # Team admins need the roster to pick who to add to their team; membership
@@ -88,7 +77,7 @@ def list_identities(principal: Principal = Depends(get_principal)) -> list[Ident
 def create_machine_identity(
     payload: MachineIdentityCreate, principal: Principal = Depends(get_principal)
 ) -> Identity:
-    _require_human(principal)
+    require_human(principal, "manage identities; sign in as an admin")
     if payload.team:
         # Self-service path: a team admin may register a client for their own
         # team without platform-wide rights.
@@ -141,7 +130,7 @@ def change_identity_role(
     uid: str, payload: RoleChange, principal: Principal = Depends(get_principal)
 ) -> Identity:
     require_role(principal, "admin")
-    _require_human(principal)
+    require_human(principal, "manage identities; sign in as an admin")
     if uid == principal.uid:
         raise HTTPException(status_code=400, detail="You cannot change your own role")
     service = get_identity_service()
@@ -172,7 +161,7 @@ def change_identity_role(
 def delete_identity(uid: str, principal: Principal = Depends(get_principal)) -> None:
     """Deleting an identity revokes every key it holds, in that order."""
     require_role(principal, "admin")
-    _require_human(principal)
+    require_human(principal, "manage identities; sign in as an admin")
     if uid == principal.uid:
         raise HTTPException(status_code=400, detail="You cannot delete yourself")
     service = get_identity_service()

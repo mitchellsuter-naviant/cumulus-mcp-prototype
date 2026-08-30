@@ -1,20 +1,22 @@
-"""Flows: the registry, its telemetry contract, and the test harness.
+"""Flows: the registry, its versions, and its telemetry contract.
 
-Telemetry is synthesized deterministically from each definition's seed
-profile, so the interesting assertions are about the *contract*: rollups agree
-with their series, journals agree with their summaries, and the governance
-gates (admin writes, human-only management, no deleting active definitions)
-hold.
+Grading is not here — `test_evals.py` owns that. What is left is the registry:
+definitions, the version history a candidate is staged into, and the rollups
+the console reads.
 
-The seeded fleet is two flows — expense-reimbursement (the workhorse most
-behavioural tests exercise) and accounts-payable (a branching, match-and-screen
-definition that keeps the fleet-level rollups honest). Shape-derived
-behaviours neither seed exhibits (windowed triggering, canonical-graph writes)
-are covered by synthetic definitions constructed inline, because the behaviour
-belongs to the shape, not to any particular seed.
+Telemetry used to be synthesized from a per-definition seed profile, and these
+tests asserted against those manufactured magnitudes — thousands of runs, a
+99.5% success rate, dollars of spend. All of it is now read off stored runs,
+so the assertions are about *agreement with the journals*: the fleet count is
+the run count, a flow with no runs reports zeroes rather than a distribution,
+and a $0.00 spend tile can say whether it means "nothing ran" or "nobody
+recorded what it cost".
+
+The fleet is seven flows and two definitions. Five inbound sync feeds have no
+`FlowDefinition` and run anyway, which is why the registry cannot be the list
+of what exists.
 """
 
-import time
 from datetime import timedelta
 
 import pytest
@@ -22,22 +24,31 @@ import pytest
 import app.deps as deps
 from app.flows import (
     FlowStep,
-    InMemoryGoldenSetDirectory,
-    InMemoryTestRunDirectory,
     InMemoryFlowDirectory,
     FlowService,
     seed_flows_if_empty,
 )
+from app.models import utcnow
+from app.reimbursements import SubmittedDocument
+from app.runs import RunRecord
+from tests import world as test_world
+
+# The seven flows that run: two authored definitions and five inbound feeds.
+SYNC_FLOWS = {
+    "vendor-sync", "purchase-order-sync", "receiving-sync",
+    "workforce-sync", "calendar-sync",
+}
 
 
 @pytest.fixture()
-def client(_client):
-    deps._flow_service = FlowService(
-        InMemoryFlowDirectory(),
-        InMemoryGoldenSetDirectory(),
-        InMemoryTestRunDirectory(),
-        test_seconds_per_case=0.001,
-    )
+def world():
+    """A fresh world: seven registered flow bodies, no runs, no tasks."""
+    return test_world.fresh()
+
+
+@pytest.fixture()
+def client(_client, world):
+    deps._flow_service = FlowService(InMemoryFlowDirectory())
     seed_flows_if_empty(deps._flow_service)
     return _client
 
@@ -51,18 +62,75 @@ def owner(monkeypatch):
     return {"X-API-Key": "root-sekret"}
 
 
+def submit_expenses(world, count: int, hint: str = "total=42.00 category=meals"):
+    """Real runs of the real flow — the only kind this module measures now."""
+    for index in range(count):
+        world.expenses.submit(
+            "pat@customer.example",
+            documents=[SubmittedDocument(filename=f"r{index}.jpg", hint=hint)],
+            commentary="Team lunch with the Acme delivery crew.",
+        )
+
+
+def priced_runs(
+    world,
+    flow_id: str,
+    count: int,
+    *,
+    cost_usd: float = 0.10,
+    tokens: int = 5200,
+    fail_every: int = 0,
+) -> None:
+    """Runs whose ModelCall step actually carries a price.
+
+    The two real ModelCall sites pass a model and no cost, so nothing in the
+    live world exercises the measured-spend path. Registering a body that
+    records one is how these tests reach the branches that only fire when
+    somebody wrote the number down.
+    """
+
+    def body(ctx, inputs):
+        if fail_every and inputs["i"] % fail_every == 0:
+            ctx.step("m1", "extract-receipt", "modelcall",
+                     fn=lambda: (_ for _ in ()).throw(RuntimeError("reader down")),
+                     model="gemini-3.7-flash", cost_usd=cost_usd, tokens=tokens)
+        ctx.step("m1", "extract-receipt", "modelcall", fn=lambda: {"ok": True},
+                 model="gemini-3.7-flash", cost_usd=cost_usd, tokens=tokens)
+        return {}
+
+    world.engine.register(flow_id, body)
+    for index in range(count):
+        world.engine.start(flow_id, {"i": index}, run_id=f"run_{flow_id}_{index}")
+
+
 # ---- registry ----
 
 
-def test_seeded_fleet_lists(client):
+def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
+    """The list used to be the registry, so it showed two flows in a system
+    that runs seven. Five inbound sync feeds have no `FlowDefinition`, write
+    the graph, and were invisible — a definition-less row is honest, hiding
+    the row is not."""
+    submit_expenses(world, 2)
     rows = client.get("/api/v1/flows").json()
-    assert {r["id"] for r in rows} == {"expense-reimbursement", "accounts-payable"}
+    by_id = {r["id"]: r for r in rows}
+    assert SYNC_FLOWS < set(by_id)
+    assert {"expense-reimbursement", "accounts-payable"} < set(by_id)
+    assert len(rows) == 7
+
+    # A definition-less row says so, rather than borrowing a lifecycle state
+    # it has no definition to hold.
+    feed = by_id["vendor-sync"]
+    assert feed["has_definition"] is False
+    assert feed["status"] == "undeclared"
+    assert feed["version"] == 0
+    assert by_id["expense-reimbursement"]["has_definition"] is True
+
     # One kind of authored logic: nothing in the payload types a flow.
     assert not any("kind" in r for r in rows)
-    # Sorted by 30-day spend, descending — the list doubles as the cost report.
-    costs = [r["cost_30d_usd"] for r in rows]
-    assert costs == sorted(costs, reverse=True)
-    assert all(c > 0 for c in costs)
+    # Busiest first — the flow that actually ran leads the list.
+    assert rows[0]["id"] == "expense-reimbursement"
+    assert rows[0]["runs_30d"] == 2
 
 
 def test_list_filters(client):
@@ -70,13 +138,32 @@ def test_list_filters(client):
     assert {r["id"] for r in hits} == {"expense-reimbursement"}
     invoices = client.get("/api/v1/flows", params={"q": "invoice"}).json()
     assert {r["id"] for r in invoices} == {"accounts-payable"}
+    # Filtering by a definition's lifecycle state excludes the feeds, which
+    # have no definition to be in a state.
     active = client.get("/api/v1/flows", params={"status": "active"}).json()
-    assert active and all(r["status"] == "active" for r in active)
-    # Both seeds belong to finance-ops, so the team filter returns the fleet.
+    assert {r["id"] for r in active} == {"expense-reimbursement", "accounts-payable"}
+    undeclared = client.get("/api/v1/flows", params={"status": "undeclared"}).json()
+    assert {r["id"] for r in undeclared} == SYNC_FLOWS
     team = client.get("/api/v1/flows", params={"team": "finance-ops"}).json()
     assert {r["id"] for r in team} == {"expense-reimbursement", "accounts-payable"}
     none = client.get("/api/v1/flows", params={"team": "no-such-team"}).json()
     assert none == []
+
+
+def test_a_definition_less_flow_can_still_be_opened(client, world):
+    """A row the fleet list shows must open. The feed has runs and no map,
+    and saying that is better than a 404 or an invented definition."""
+    submit_expenses(world, 1)
+    detail = client.get("/api/v1/flows/vendor-sync").json()
+    assert detail["has_definition"] is False
+    assert detail["steps"] == []
+    assert detail["status"] == "undeclared"
+    usage = client.get("/api/v1/flows/vendor-sync/usage").json()
+    assert usage["has_definition"] is False
+    # Editing and versioning still need a definition — there is nothing there
+    # to version, and inventing one would be the same lie in a new place.
+    assert client.get("/api/v1/flows/vendor-sync/versions").status_code == 404
+    assert client.get("/api/v1/flows/no-such-flow").status_code == 404
 
 
 def test_behaviour_is_derived_from_shape_not_a_type(client):
@@ -112,18 +199,6 @@ def test_behaviour_is_derived_from_shape_not_a_type(client):
         ],
     )
     assert is_windowed(windowed) and writes_canonical(windowed)
-
-    # And the audit trail follows the derived signal, not a type: a per-case
-    # flow ledgers decisions and gateway commits, never claim resolutions.
-    # Enough history that one busy morning of automatic commits cannot crowd
-    # every human decision out of the window — the assertion is about which
-    # kinds the ledger carries, not about the newest page.
-    entries = client.get(
-        "/api/v1/flows/expense-reimbursement/audit?limit=200"
-    ).json()
-    kinds = {e["kind"] for e in entries}
-    assert "decision" in kinds and "action" in kinds
-    assert "resolution" not in kinds
 
 
 def test_detail_carries_declarative_steps(client):
@@ -228,169 +303,153 @@ def test_writes_require_admin_role(client, monkeypatch):
 # ---- telemetry contract ----
 
 
-def test_fleet_stats_agree_with_series(client):
+def test_the_fleet_run_count_is_the_real_run_count(client, world):
+    """The number this whole stage exists for. The header said 2,748 with 27
+    runs stored, because the count was drawn from a seed profile rather than
+    counted. It is now `len(engine.list())` and nothing else."""
+    submit_expenses(world, 5)
+    stored = world.engine.list()
     stats = client.get("/api/v1/flows/stats", params={"days": 30}).json()
-    assert stats["definitions"] == 2
-    # The rollup sums across the whole fleet, and its series agrees with it.
+
+    assert stats["runs"] == len(stored) == 5
     assert stats["runs"] == sum(day["runs"] for day in stats["series"])
     assert len(stats["series"]) == 30
-    assert stats["model_spend_usd"] > 0
-    assert 0 < stats["success_rate"] <= 1
-    # ROI is derived from governed per-definition assumptions.
-    assert stats["hours_returned"] > 0 and stats["roi_usd"] > 0
-    # The fleet number is the sum of the per-flow rollups, nothing more.
+    # And the fleet is exactly the sum of its flows, feeds included.
     per_flow = [
-        client.get(f"/api/v1/flows/{fid}/usage", params={"days": 30}).json()
-        for fid in ("expense-reimbursement", "accounts-payable")
+        client.get(f"/api/v1/flows/{row['id']}/usage", params={"days": 30}).json()
+        for row in client.get("/api/v1/flows").json()
     ]
     assert stats["runs"] == sum(u["runs"] for u in per_flow)
+    assert stats["flows"] == 7
+    assert stats["definitions"] == 2
+    assert stats["without_definition"] == 5
 
 
-def test_usage_rollup_matches_series_and_is_deterministic(client):
-    first = client.get(
+def test_a_flow_with_no_runs_reports_zero_rather_than_a_series(client):
+    """Nothing has run. The old rollup answered with a month of plausible
+    daily traffic anyway; the honest answer is thirty zeroes."""
+    usage = client.get(
+        "/api/v1/flows/accounts-payable/usage", params={"days": 30}
+    ).json()
+    assert usage["runs"] == 0
+    assert len(usage["series"]) == 30
+    assert all(d["runs"] == 0 for d in usage["series"])
+    assert usage["cost_usd"] == 0.0 and usage["tokens"] == 0
+    # No finished runs is not a 0% success rate — it is no evidence.
+    assert usage["success_rate"] is None
+    assert usage["cost_basis"] == "no-model-calls"
+    assert usage["roi_usd"] == 0.0 and usage["minutes_saved"] == 0.0
+
+    stats = client.get("/api/v1/flows/stats").json()
+    assert stats["runs"] == 0 and stats["success_rate"] is None
+    assert stats["hours_returned"] == 0.0 and stats["roi_usd"] == 0.0
+
+
+def test_runs_outside_the_window_are_not_folded_into_it(client, world):
+    """A forty-day-old run is not this month's traffic. It drops out of a
+    thirty-day window rather than piling onto the edge day, so the series
+    always sums to the headline over the same window."""
+    submit_expenses(world, 2)
+    world.engine.store.put(RunRecord(
+        id="run_old", flow_id="expense-reimbursement", status="succeeded",
+        started_at_iso=(utcnow() - timedelta(days=40)).isoformat(),
+    ))
+    month = client.get(
+        "/api/v1/flows/expense-reimbursement/usage", params={"days": 30}
+    ).json()
+    assert month["runs"] == 2
+    assert month["runs"] == sum(d["runs"] for d in month["series"])
+    year = client.get(
+        "/api/v1/flows/expense-reimbursement/usage", params={"days": 60}
+    ).json()
+    assert year["runs"] == 3
+
+
+def test_usage_rollup_matches_its_own_series(client, world):
+    submit_expenses(world, 4)
+    usage = client.get(
         "/api/v1/flows/expense-reimbursement/usage", params={"days": 14}
     ).json()
-    again = client.get(
-        "/api/v1/flows/expense-reimbursement/usage", params={"days": 14}
+    assert usage["runs"] == sum(d["runs"] for d in usage["series"])
+    assert usage["completed"] == sum(d["completed"] for d in usage["series"])
+    assert usage["model_calls"] == sum(d["model_calls"] for d in usage["series"])
+    # Every run is accounted for exactly once.
+    assert usage["completed"] + usage["failed"] + usage["in_flight"] == usage["runs"]
+
+
+def test_cost_distinguishes_unrecorded_spend_from_zero_spend(client, world):
+    """The field this stage adds. A $0.00 tile has two readings that point in
+    opposite directions, and the console has to be able to tell them apart."""
+    submit_expenses(world, 3)
+    expense = client.get(
+        "/api/v1/flows/expense-reimbursement/usage", params={"days": 30}
     ).json()
-    assert first == again  # synthesized, but stable
-    assert first["runs"] == sum(d["runs"] for d in first["series"])
-    assert first["completed"] <= first["runs"]
-    assert first["tokens"] > 0
+    # Models ran. Nobody wrote down what they cost, so the zero is a hole.
+    assert expense["model_calls"] > 0
+    assert expense["priced_model_calls"] == 0
+    assert expense["cost_usd"] == 0.0
+    assert expense["cost_basis"] == "unrecorded"
 
+    # A feed calls no model at all, so *its* zero is a fact about spending.
+    feed = client.get("/api/v1/flows/vendor-sync/usage", params={"days": 30}).json()
+    assert feed["model_calls"] == 0
+    assert feed["cost_basis"] == "no-model-calls"
 
-def test_run_journal_matches_summary(client):
-    runs = client.get(
-        "/api/v1/flows/expense-reimbursement/runs", params={"limit": 10}
+    # And a priced call reads as measured — the same field, a third answer.
+    priced_runs(world, "accounts-payable", 3, cost_usd=0.25, tokens=900)
+    measured = client.get(
+        "/api/v1/flows/accounts-payable/usage", params={"days": 30}
     ).json()
-    assert runs
-    run = runs[0]
-    detail = client.get(
-        f"/api/v1/flows/expense-reimbursement/runs/{run['id']}"
+    assert measured["cost_basis"] == "measured"
+    assert measured["priced_model_calls"] == measured["model_calls"] == 3
+    assert measured["cost_usd"] == 0.75 and measured["tokens"] == 2700
+
+
+def test_roi_says_it_is_an_assumption_times_a_count(client, world):
+    """The least honest thing on the page was a dollar ROI figure with no
+    marking. The count under it is now real; the minutes over it never were,
+    and the derivation travels with the number."""
+    submit_expenses(world, 4)
+    stats = client.get("/api/v1/flows/stats", params={"days": 30}).json()
+    basis = stats["roi_basis"]
+
+    completed = stats["completed"]
+    assert basis["completed_runs"] == completed
+    assert basis["modelled_runs"] == completed  # all from a defined flow
+    assert basis["assumed_minutes_per_run"] == 6.0  # the definition's own value
+    assert basis["hourly_rate_usd"] == 30.0
+    assert "assumption, not a measurement" in basis["statement"]
+    # And the figure is exactly that arithmetic, not a separate meter.
+    minutes = completed * 6.0
+    assert stats["hours_returned"] == round(minutes / 60.0, 1)
+    assert stats["roi_usd"] == round(minutes / 60.0 * 30.0, 2)
+
+
+def test_runs_of_a_flow_with_no_roi_assumption_return_no_hours(client, world):
+    """A sync feed has no definition and so no `roi_minutes_per_run`. Its runs
+    are real and its modelled hours are zero — counting them at some default
+    would put invented value back into the figure by the side door."""
+    priced_runs(world, "vendor-sync", 4)
+    stats = client.get("/api/v1/flows/stats", params={"days": 30}).json()
+    assert stats["runs"] == 4 and stats["completed"] == 4
+    assert stats["hours_returned"] == 0.0 and stats["roi_usd"] == 0.0
+    assert stats["roi_basis"]["modelled_runs"] == 0
+    assert "no modelled time returned" in stats["roi_basis"]["statement"]
+
+
+def test_success_rate_is_taken_over_finished_runs(client, world):
+    """A run suspended on a human decision is not a failure. Counting it as
+    one is the easiest way to make this number move without anything
+    changing."""
+    submit_expenses(world, 2)                      # under the limit: approved
+    submit_expenses(world, 1, hint="total=900.00 category=meals")  # elevated
+    usage = client.get(
+        "/api/v1/flows/expense-reimbursement/usage", params={"days": 30}
     ).json()
-    assert detail["id"] == run["id"]
-    assert detail["status"] == run["status"]
-    # Every ModelCall in the journal is an audited record with model + tokens.
-    assert len(detail["calls"]) >= 1
-    for call in detail["calls"]:
-        assert call["model"] and call["input_tokens"] > 0 and call["cost_usd"] > 0
-    step_types = {s["type"] for s in detail["steps"]}
-    assert "trigger" in step_types and "modelcall" in step_types
-    assert (
-        client.get(
-            "/api/v1/flows/expense-reimbursement/runs/run_000000"
-        ).status_code
-        == 404
-    )
-
-
-def test_audit_trail_names_actors_and_ledger(client):
-    entries = client.get("/api/v1/flows/expense-reimbursement/audit").json()
-    assert entries
-    kinds = {e["kind"] for e in entries}
-    assert "action" in kinds  # gateway commits always appear
-    for entry in entries:
-        assert entry["actor"] and entry["summary"]
-    actions = [e for e in entries if e["kind"] == "action"]
-    assert all(e["ledger_ref"] for e in actions)
-
-
-# ---- golden set + harness ----
-
-
-def test_golden_set_add_and_remove(client, owner):
-    before = client.get(
-        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
-    ).json()
-    # The set names the repository file its seeded half came from, so the
-    # console never implies it is the only source of golden cases.
-    assert before["synced_from"].endswith("expense-reimbursement.json")
-    assert before["synced_at"]
-
-    added = client.post(
-        "/api/v1/flows/expense-reimbursement/golden-set",
-        json={"name": "Zero-total receipt", "expected": "rejected · no Action"},
-        headers=owner,
-    )
-    assert added.status_code == 201
-    cases = added.json()["cases"]
-    assert len(cases) == len(before["cases"]) + 1
-    new_case = cases[-1]
-    assert new_case["source"] == "human-authored"
-
-    removed = client.delete(
-        f"/api/v1/flows/expense-reimbursement/golden-set/{new_case['id']}",
-        headers=owner,
-    )
-    assert removed.status_code == 200
-    assert len(removed.json()["cases"]) == len(before["cases"])
-    assert (
-        client.delete(
-            "/api/v1/flows/expense-reimbursement/golden-set/gc-does-not-exist",
-            headers=owner,
-        ).status_code
-        == 404
-    )
-
-
-def test_accounts_payable_golden_set_is_seeded_and_synced(client, owner):
-    golden = client.get(
-        "/api/v1/flows/accounts-payable/golden-set", headers=owner
-    ).json()
-    assert golden["synced_from"].endswith("accounts-payable.json")
-    assert golden["synced_at"]
-    # Six cases — deliberately under the coverage bar, like the expense seed.
-    assert len(golden["cases"]) == 6
-    by_ref = {c["input_ref"]: c for c in golden["cases"]}
-    # The clean-scan fixture carries structured labels: facts on invoice.*
-    # paths, a trajectory naming the terminal commit, and a pinned world.
-    clean = by_ref["ap-fixture-001"]
-    paths = {a["path"] for a in clean["assertions"]}
-    assert {"invoice.total_usd", "invoice.match_verdict", "invoice.verdict"} <= paths
-    assert all(a["path"].startswith("invoice.") for a in clean["assertions"])
-    committed = next(
-        t for t in clean["trajectory"] if t["kind"] == "action_committed"
-    )
-    assert committed["expected"] == "post-to-ap"
-    refs = {r["ref"] for r in clean["read_set"]}
-    assert "knowledge:entity-resolution-policy@rev1" in refs
-    assert "knowledge:invoice-posting-policy@rev1" in refs
-    # First contact: the resolver mints rather than matches, and a human
-    # vouches for the vendor at the posting gate.
-    first_contact = by_ref["ap-fixture-007"]
-    assert {r["ref"] for r in first_contact["read_set"]} == {
-        "knowledge:entity-resolution-policy@rev1",
-        "knowledge:invoice-posting-policy@rev1",
-    }
-    assert any(
-        a["path"] == "invoice.vendor_id" and a["expected"] == "vendor:meridian-supply"
-        for a in first_contact["assertions"]
-    )
-
-
-def test_promoting_a_run_tags_the_case_and_keeps_the_pointer(client, owner):
-    run = client.get(
-        "/api/v1/flows/expense-reimbursement/runs",
-        params={"limit": 1},
-        headers=owner,
-    ).json()[0]
-    added = client.post(
-        "/api/v1/flows/expense-reimbursement/golden-set",
-        json={
-            "name": f"Promoted {run['case_ref']}",
-            "expected": "matches the recorded outcome",
-            "run_id": run["id"],
-            "payload": '{"case_ref": "%s"}' % run["case_ref"],
-        },
-        headers=owner,
-    )
-    assert added.status_code == 201
-    case = added.json()["cases"][-1]
-    # A promoted case is tagged as such and keeps a pointer back to the
-    # execution that motivated it, so a failing eval is traceable.
-    assert case["source"] == "promoted-from-run"
-    assert case["run_id"] == run["id"]
-    assert case["payload"]
+    assert usage["runs"] == 3
+    assert usage["in_flight"] == 1 and usage["failed"] == 0
+    assert usage["success_rate"] == 1.0
+    assert usage["tasks_raised"] == 1
 
 
 # ---- versions ----
@@ -480,27 +539,6 @@ def test_an_equal_or_older_definition_leaves_the_stored_one_alone(client):
     ]
 
 
-def test_an_upgrade_keeps_a_golden_set_a_human_has_edited(client, owner):
-    """A re-sync must not discard curation. An untouched set is republished
-    from code; one someone has added a case to is left exactly as it is."""
-    from app.flows import seed_flows_if_empty
-
-    service = deps._flow_service
-    created = client.post(
-        "/api/v1/flows/accounts-payable/golden-set",
-        json={"name": "A case a human wrote", "expected": "posts"},
-        headers=owner,
-    )
-    assert created.status_code == 201, created.text
-
-    stored = service.require("accounts-payable")
-    service.update(stored.model_copy(update={"version": stored.version - 1}))
-    seed_flows_if_empty(service)
-
-    golden = service.golden_set("accounts-payable")
-    assert any(c.name == "A case a human wrote" for c in golden.cases)
-
-
 def test_accounts_payable_history_has_no_open_draft(client, owner):
     """A draft is an open piece of work, not furniture every flow ships with:
     accounts-payable seeds two archived revisions and the active one, only."""
@@ -567,27 +605,70 @@ def test_diff_keeps_removed_steps_as_ghosts():
 # ---- recommendations ----
 
 
-def test_recommendations_carry_evidence_and_apply_to_a_draft(client, owner):
+def test_the_recommender_states_its_basis_when_evidence_is_thin(client, world, owner):
+    """The consequence of re-pointing at real runs, made deliberate.
+
+    Every cost card was priced off synthesized spend. With the real journals
+    recording no cost, those cards have no basis — and a recommender with no
+    basis has exactly one acceptable behaviour. Not carrying on (a downgrade
+    proposed on zero measured spend is fabricated confidence). Not vanishing
+    either, because an empty list renders as a clean bill of health.
+    """
+    submit_expenses(world, 3)
     recs = client.get(
         "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
     ).json()
-    assert recs
+
+    # The basis leads, always.
+    assert recs[0]["kind"] == "evidence"
+    basis = recs[0]
+    assert "3 run(s) / 30d" in basis["evidence"]
+    assert "none carrying a cost" in basis["evidence"]
+    assert "model downgrade on extract-receipt (no measured spend)" in basis["detail"]
+    assert "budget check (no measured cost per run)" in basis["detail"]
+
+    # And nothing priced off spend that was never recorded survives.
+    kinds = {r["kind"] for r in recs}
+    assert "model-downgrade" not in kinds and "budget" not in kinds
+    assert "prompt-cache" not in kinds and "batching" not in kinds
+    # Coverage needs no spend — both halves are counted, not modelled.
+    assert "coverage" in kinds
     for rec in recs:
         assert rec["title"] and rec["detail"] and rec["evidence"]
-    # Sorted by the money at stake.
-    savings = [r["estimated_monthly_savings_usd"] for r in recs]
+
+
+def test_the_recommender_does_not_go_silent_with_no_runs_at_all(client, owner):
+    recs = client.get(
+        "/api/v1/flows/accounts-payable/recommendations", headers=owner
+    ).json()
+    assert [r["kind"] for r in recs] == ["evidence"]
+    assert "0 run(s) / 30d" in recs[0]["evidence"]
+
+
+def test_measured_spend_earns_the_cards_it_used_to_be_given(client, world, owner):
+    """The gates are about evidence, not about withholding on principle.
+
+    Record real costs on real runs and the cost cards come back — which is
+    what makes their absence above a statement rather than a policy.
+    """
+    priced_runs(world, "expense-reimbursement", 250, cost_usd=0.14, tokens=5200)
+    recs = client.get(
+        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
+    ).json()
+    kinds = {r["kind"] for r in recs}
+    assert {"evidence", "model-downgrade", "prompt-cache", "coverage"} == kinds
+    assert recs[0]["kind"] == "evidence"
+    assert "all priced" in recs[0]["evidence"]
+    assert "Nothing was withheld" in recs[0]["detail"]
+    # Money sorts what follows the basis card.
+    savings = [r["estimated_monthly_savings_usd"] for r in recs[1:]]
     assert savings == sorted(savings, reverse=True)
 
-    # With ~1,400 runs/30d at ~$0.14 on one claude-sonnet-5 call and a 99%+
-    # success rate, the telemetry earns exactly these three cards: a one-rung
-    # downgrade, a standing-prompt cache, and thin golden coverage (6 < 8).
-    assert {r["kind"] for r in recs} == {
-        "model-downgrade", "prompt-cache", "coverage"
-    }
-
     downgrade = next(r for r in recs if r["kind"] == "model-downgrade")
-    assert downgrade["proposed_change"]["from"] == "claude-sonnet-5"
-    assert downgrade["proposed_change"]["to"] == "claude-haiku-4-5"
+    assert downgrade["proposed_change"]["from"] == "gemini-3.7-flash"
+    assert downgrade["proposed_change"]["to"] == "gemini-3.5-flash-lite"
+    # Its evidence is the arithmetic it was derived from, not a magnitude.
+    assert "$35.00 attributed to this step" in downgrade["evidence"]
 
     applied = client.post(
         f"/api/v1/flows/expense-reimbursement/recommendations/{downgrade['id']}/apply",
@@ -600,93 +681,49 @@ def test_recommendations_carry_evidence_and_apply_to_a_draft(client, owner):
     step = next(
         s for s in draft["steps"] if s["id"] == downgrade["proposed_change"]["step_id"]
     )
-    assert step["config"]["model"] == "claude-haiku-4-5"
+    assert step["config"]["model"] == "gemini-3.5-flash-lite"
     live = client.get("/api/v1/flows/expense-reimbursement", headers=owner).json()
     active_step = next(
         s for s in live["steps"] if s["id"] == downgrade["proposed_change"]["step_id"]
     )
-    assert active_step["config"]["model"] == "claude-sonnet-5"
+    assert active_step["config"]["model"] == "gemini-3.7-flash"
 
 
-def test_accounts_payable_recommendations_follow_its_own_telemetry(client, owner):
-    """Cards are derived per flow: accounts-payable has one ModelCall, so it
-    earns a prompt cache on it, a one-rung downgrade on it (claude-sonnet-5
-    has a cheaper rung), and the thin-coverage advisory (6 < 8). Spend per run
-    sits under its $0.60 budget and the trigger is per-invoice, so neither the
-    budget nor the batching card fires."""
-    recs = client.get(
-        "/api/v1/flows/accounts-payable/recommendations", headers=owner
-    ).json()
-    assert {r["kind"] for r in recs} == {
-        "model-downgrade", "prompt-cache", "coverage"
-    }
-    downgrades = [r for r in recs if r["kind"] == "model-downgrade"]
-    assert {r["step_id"] for r in downgrades} == {"m1"}
-    for card in downgrades:
-        assert card["proposed_change"]["from"] == "claude-sonnet-5"
-        assert card["proposed_change"]["to"] == "claude-haiku-4-5"
-    cache = next(r for r in recs if r["kind"] == "prompt-cache")
-    assert cache["step_id"] == "m1"
-    # Every card still carries its evidence, and money sorts the list.
-    assert all(r["evidence"] for r in recs)
-    savings = [r["estimated_monthly_savings_usd"] for r in recs]
-    assert savings == sorted(savings, reverse=True)
-
-
-def test_downgrade_is_withheld_while_the_flow_is_failing():
+def test_downgrade_is_withheld_while_the_flow_is_failing(client, world, owner):
     """Spending less on something that is not working is not a saving.
 
-    A flow on an expensive model is the obvious downgrade candidate on cost
-    alone — but below the success bar the right move is to fix quality, so
-    the card is deliberately not offered. The seeded flow succeeds, so the
-    failing shape is constructed synthetically.
+    A flow on an expensive model with measured spend is the obvious downgrade
+    candidate on cost alone — but below the success bar the right move is to
+    fix quality. The card is withheld, and the basis card says which of the
+    two reasons withheld it, because "no evidence" and "the evidence says no"
+    are different answers.
     """
-    from app.flows import (
-        FlowDefinition,
-        FlowStep,
-        SeedProfile,
-        recommendations,
-        usage_series,
+    priced_runs(
+        world, "expense-reimbursement", 200, cost_usd=0.30, fail_every=5,
     )
-    from app.models import utcnow
-
-    failing = FlowDefinition(
-        id="counterparty-paper-review",
-        name="Counterparty paper review",
-        status="active",
-        created_at=utcnow() - timedelta(days=90),
-        profile=SeedProfile(
-            base_runs=7, cost_per_run=2.40, tokens_per_run=48000,
-            task_rate=0.42, escalate_rate=0.045, fail_rate=0.03,
-            active_seconds=210,
-        ),
-        steps=[
-            FlowStep(
-                id="t1", type="trigger", name="PaperUploaded",
-                config={"event": "PaperUploaded"}, next=["m1"],
-            ),
-            FlowStep(
-                id="m1", type="modelcall", name="risk-review",
-                config={"model": "claude-sonnet-5"}, next=["a1"],
-            ),
-            FlowStep(id="a1", type="action", name="file-summary",
-                     config={"target": "deal-room"}),
-        ],
-    )
-    usage = usage_series(failing, 30)
-    runs = sum(d.runs for d in usage)
-    completed = sum(d.completed for d in usage)
-    assert completed / runs < 0.97  # genuinely below the bar
-    recs = recommendations(failing, usage, golden_cases=6)
-    assert recs  # other insights still surface
-    assert not [r for r in recs if r.kind == "model-downgrade"]
-
-
-def test_advisory_recommendation_cannot_be_applied(client, owner):
     recs = client.get(
         "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
     ).json()
-    # The coverage card is advisory: adding golden cases is judgment work,
+    assert not [r for r in recs if r["kind"] == "model-downgrade"]
+    assert "below the bar to spend less" in recs[0]["detail"]
+    # Other insights still surface — the spend was measured, after all.
+    assert len(recs) > 1
+
+
+def test_a_flow_with_no_definition_says_so_rather_than_recommending(client, world, owner):
+    priced_runs(world, "vendor-sync", 3)
+    recs = client.get("/api/v1/flows/vendor-sync/recommendations", headers=owner).json()
+    assert recs[0]["kind"] == "evidence"
+    assert "no declarative export" in recs[0]["detail"]
+    assert not [r for r in recs if r["proposed_change"]]
+
+
+def test_advisory_recommendation_cannot_be_applied(client, world, owner):
+    submit_expenses(world, 2)
+    recs = client.get(
+        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
+    ).json()
+    # The coverage card is advisory: adding eval cases is judgment work,
     # not a mechanical edit the console can stage into a draft.
     advisory = next(r for r in recs if r["kind"] == "coverage")
     assert advisory["proposed_change"] is None
@@ -698,359 +735,21 @@ def test_advisory_recommendation_cannot_be_applied(client, owner):
     assert "advisory" in resp.json()["detail"].lower()
 
 
+def test_the_basis_card_is_a_statement_not_a_proposal(client, world, owner):
+    submit_expenses(world, 1)
+    recs = client.get(
+        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
+    ).json()
+    resp = client.post(
+        f"/api/v1/flows/expense-reimbursement/recommendations/{recs[0]['id']}/apply",
+        headers=owner,
+    )
+    assert resp.status_code == 409
+
+
 def test_unknown_recommendation_is_404(client, owner):
     resp = client.post(
         "/api/v1/flows/expense-reimbursement/recommendations/nope/apply",
         headers=owner,
     )
     assert resp.status_code == 404
-
-
-def test_test_run_executes_against_golden_set(client, owner):
-    launched = client.post(
-        "/api/v1/flows/expense-reimbursement/test-runs",
-        json={"candidate_version": "v10-draft"},
-        headers=owner,
-    )
-    assert launched.status_code == 202, launched.text
-    run = launched.json()
-    assert run["writes_suppressed"] is True
-    assert run["total_cases"] > 0
-
-    # The simulated harness runs case-by-case in the background.
-    for _ in range(100):
-        run = client.get(
-            f"/api/v1/flows/expense-reimbursement/test-runs/{run['id']}",
-            headers=owner,
-        ).json()
-        if run["status"] == "completed":
-            break
-        time.sleep(0.05)
-    assert run["status"] == "completed"
-    assert len(run["results"]) == run["total_cases"]
-    assert run["passed"] == sum(1 for r in run["results"] if r["passed"])
-    assert run["cost_usd"] > 0
-
-    listed = client.get(
-        "/api/v1/flows/expense-reimbursement/test-runs", headers=owner
-    ).json()
-    assert any(r["id"] == run["id"] for r in listed)
-
-    # Same candidate, same golden set -> same verdicts (evals must reproduce).
-    rerun = client.post(
-        "/api/v1/flows/expense-reimbursement/test-runs",
-        json={"candidate_version": "v10-draft"},
-        headers=owner,
-    ).json()
-    for _ in range(100):
-        rerun = client.get(
-            f"/api/v1/flows/expense-reimbursement/test-runs/{rerun['id']}",
-            headers=owner,
-        ).json()
-        if rerun["status"] == "completed":
-            break
-        time.sleep(0.05)
-    assert rerun["passed"] == run["passed"]
-
-
-def test_test_run_compares_candidate_against_baseline(client, owner):
-    """Every case is graded twice, so the comparison is like-for-like."""
-    launched = client.post(
-        "/api/v1/flows/expense-reimbursement/test-runs",
-        json={"candidate_version": "v10-draft", "baseline_version": "v9"},
-        headers=owner,
-    ).json()
-    run = launched
-    for _ in range(200):
-        run = client.get(
-            f"/api/v1/flows/expense-reimbursement/test-runs/{run['id']}",
-            headers=owner,
-        ).json()
-        if run["status"] == "completed":
-            break
-        time.sleep(0.05)
-    assert run["status"] == "completed"
-    for result in run["results"]:
-        assert result["baseline_passed"] is not None
-        assert result["baseline_cost_usd"] > 0
-    assert run["baseline_passed"] == sum(
-        1 for r in run["results"] if r["baseline_passed"]
-    )
-    assert run["cost_delta_usd"] == round(
-        run["cost_usd"] - run["baseline_cost_usd"], 3
-    )
-    # A regression is a case the baseline passed and the candidate did not.
-    assert run["regressions"] == sum(
-        1 for r in run["results"] if r["baseline_passed"] and not r["passed"]
-    )
-
-
-def test_applied_downgrade_shows_up_as_a_cost_saving(client, owner):
-    """The recommender loop has to close: apply, run, see the delta."""
-    recs = client.get(
-        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
-    ).json()
-    downgrade = next(r for r in recs if r["kind"] == "model-downgrade")
-    client.post(
-        f"/api/v1/flows/expense-reimbursement/recommendations/{downgrade['id']}/apply",
-        headers=owner,
-    )
-    run = client.post(
-        "/api/v1/flows/expense-reimbursement/test-runs", json={}, headers=owner
-    ).json()
-    # Launching with no explicit versions picks up the draft and the live one.
-    assert run["candidate_version"] == "v10-draft"
-    assert run["baseline_version"] == "v9"
-    for _ in range(200):
-        run = client.get(
-            f"/api/v1/flows/expense-reimbursement/test-runs/{run['id']}",
-            headers=owner,
-        ).json()
-        if run["status"] == "completed":
-            break
-        time.sleep(0.05)
-    assert run["status"] == "completed"
-    # The draft names a cheaper model, so the candidate must cost less.
-    assert run["cost_delta_usd"] < 0
-    assert run["cost_usd"] < run["baseline_cost_usd"]
-
-
-def test_test_run_refused_without_golden_set(client, owner):
-    # A freshly registered definition has no golden cases yet.
-    created = client.post(
-        "/api/v1/flows",
-        json={"id": "receipt-archiver", "name": "Receipt archiver"},
-        headers=owner,
-    )
-    assert created.status_code == 201
-    resp = client.post(
-        "/api/v1/flows/receipt-archiver/test-runs", json={}, headers=owner
-    )
-    assert resp.status_code == 409
-    assert "golden set" in resp.json()["detail"].lower()
-
-
-# ---- flow contract + producer map ----
-
-
-def test_contract_facts_and_derived_producer_map(client):
-    contract = client.get("/api/v1/flows/expense-reimbursement/contract").json()
-    paths = {f["path"] for f in contract["facts"]}
-    assert "receipt.total_usd" in paths
-    assert "reimbursement.verdict" in paths
-    # The producer map is derived per version: extraction facts land on the
-    # ModelCall, verdicts on the Rule, commits on the Action.
-    pmap = contract["producer_map"]
-    assert pmap["receipt.total_usd"] == "m1"
-    assert pmap["reimbursement.verdict"] == "r1"
-    assert pmap["reimbursement.recorded"] == "a1"
-
-    # Projecting the same contract onto the draft (which inserts a transform
-    # ahead of extraction) re-derives the map — no label moved.
-    draft = client.get(
-        "/api/v1/flows/expense-reimbursement/contract", params={"version": 10}
-    ).json()
-    assert draft["version_label"] == "v10-draft"
-    assert draft["producer_map"]["receipt.total_usd"] == "m1"
-
-
-def test_correction_sets_per_modelcall(client):
-    sets = client.get(
-        "/api/v1/flows/expense-reimbursement/correction-sets"
-    ).json()
-    # One ModelCall in the flow, so exactly one auto-accumulated set.
-    assert [s["step_id"] for s in sets] == ["m1"]
-    only = sets[0]
-    assert only["step_name"] == "extract-receipt"
-    assert only["model"] == "claude-sonnet-5"
-    assert only["pairs"] > 0 and only["sample"]
-    # Correction pairs key to contract fact paths, never to step internals.
-    contract_paths = {
-        "receipt.vendor", "receipt.date", "receipt.total_usd", "receipt.category"
-    }
-    assert {p["field"] for p in only["sample"]} <= contract_paths
-
-
-# ---- dataset versioning ----
-
-
-def test_golden_set_is_versioned_and_mutations_bump_it(client, owner):
-    before = client.get(
-        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
-    ).json()
-    assert before["version"] == 1
-    assert before["revisions"][0]["note"].startswith("seeded")
-
-    added = client.post(
-        "/api/v1/flows/expense-reimbursement/golden-set",
-        json={"name": "Zero-total receipt", "expected": "rejected"},
-        headers=owner,
-    ).json()
-    assert added["version"] == 2
-    assert added["revisions"][-1]["note"].startswith("added")
-
-    case_id = added["cases"][-1]["id"]
-    removed = client.delete(
-        f"/api/v1/flows/expense-reimbursement/golden-set/{case_id}",
-        headers=owner,
-    ).json()
-    assert removed["version"] == 3
-
-
-def test_bulk_import_is_one_revision(client, owner):
-    lines = "\n".join(
-        [
-            '{"name": "Batch case A", "expected": "approved",'
-            ' "assertions": [{"path": "reimbursement.verdict", "expected": "approve"}]}',
-            '{"name": "Batch case B", "expected": "elevated",'
-            ' "trajectory": [{"kind": "task_raised", "expected": "true"}]}',
-        ]
-    )
-    before = client.get(
-        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
-    ).json()
-    out = client.post(
-        "/api/v1/flows/expense-reimbursement/golden-set/import",
-        json={"jsonl": lines},
-        headers=owner,
-    )
-    assert out.status_code == 201, out.text
-    golden = out.json()
-    assert len(golden["cases"]) == len(before["cases"]) + 2
-    assert golden["version"] == before["version"] + 1
-    assert "imported 2 cases" in golden["revisions"][-1]["note"]
-    # A malformed line names its line number.
-    bad = client.post(
-        "/api/v1/flows/expense-reimbursement/golden-set/import",
-        json={"jsonl": '{"name": "ok"}\n{"nope": true}'},
-        headers=owner,
-    )
-    assert bad.status_code == 422
-    assert "Line 2" in bad.json()["detail"]
-
-
-# ---- review screen raw material ----
-
-
-def test_case_document_grounds_the_asserted_facts(client, owner):
-    golden = client.get(
-        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
-    ).json()
-    case = next(c for c in golden["cases"] if c["input_ref"] == "exp-fixture-001")
-    doc = client.get(
-        f"/api/v1/flows/expense-reimbursement/golden-set/{case['id']}/document",
-        headers=owner,
-    ).json()
-    assert doc["kind"] == "expense"
-    assert doc["lines"]
-    region_paths = {r["path"] for r in doc["regions"]}
-    assert "receipt.total_usd" in region_paths
-    assert "receipt.vendor" in region_paths
-    for region in doc["regions"]:
-        x, y, w, h = region["box"]
-        assert 0 <= x <= 1 and 0 <= y <= 1 and w > 0 and h > 0
-
-
-def test_review_corrects_labels_and_bumps_the_dataset(client, owner):
-    golden = client.get(
-        "/api/v1/flows/expense-reimbursement/golden-set", headers=owner
-    ).json()
-    case = next(c for c in golden["cases"] if c["input_ref"] == "exp-fixture-001")
-    out = client.post(
-        f"/api/v1/flows/expense-reimbursement/golden-set/{case['id']}/review",
-        json={"corrections": {"receipt.total_usd": "65.10"}},
-        headers=owner,
-    ).json()
-    assert out["version"] == golden["version"] + 1
-    reviewed = next(c for c in out["cases"] if c["id"] == case["id"])
-    assert reviewed["reviewed_by"]
-    fixed = next(
-        a for a in reviewed["assertions"] if a["path"] == "receipt.total_usd"
-    )
-    assert fixed["expected"] == "65.10"
-
-
-# ---- assertion-level grading ----
-
-
-def _finish(client, owner, flow_id, run):
-    for _ in range(200):
-        run = client.get(
-            f"/api/v1/flows/{flow_id}/test-runs/{run['id']}", headers=owner
-        ).json()
-        if run["status"] == "completed":
-            return run
-        time.sleep(0.05)
-    raise AssertionError("test run never completed")
-
-
-def test_experiment_localizes_failures_and_states_its_gate(client, owner):
-    launched = client.post(
-        "/api/v1/flows/expense-reimbursement/test-runs",
-        json={"candidate_version": "v10-draft"},
-        headers=owner,
-    ).json()
-    # The experiment pins the dataset revision it measures.
-    assert launched["dataset_version"] == 1
-    assert launched["reads"] == "pinned"
-    run = _finish(client, owner, "expense-reimbursement", launched)
-
-    # Every case grades assertion-by-assertion, each localized to the step
-    # that owns the fact in the candidate's producer map.
-    result = run["results"][0]
-    assert result["assertions"]
-    fact_steps = {
-        a["step_id"] for a in result["assertions"] if a["kind"] == "fact"
-    }
-    assert fact_steps <= {"m1", "r1", "a1", ""}
-    # Step aggregates exist for the heatmap, and the gate is stated.
-    assert run["step_stats"]
-    stat = next(s for s in run["step_stats"] if s["step_id"] == "m1")
-    assert stat["passed"] + stat["failed"] > 0
-    assert run["gate"] is not None
-    expected_gate = run["regressions"] == 0 and run["passed"] >= run["baseline_passed"]
-    assert run["gate"]["passed"] == expected_gate
-
-
-def test_apply_recommendation_auto_launches_the_experiment(client, owner):
-    recs = client.get(
-        "/api/v1/flows/expense-reimbursement/recommendations", headers=owner
-    ).json()
-    downgrade = next(r for r in recs if r["kind"] == "model-downgrade")
-    applied = client.post(
-        f"/api/v1/flows/expense-reimbursement/recommendations/{downgrade['id']}/apply",
-        headers=owner,
-    ).json()
-    # The loop closes: apply stages the draft AND measures it.
-    assert applied["test_run_id"]
-    run = client.get(
-        f"/api/v1/flows/expense-reimbursement/test-runs/{applied['test_run_id']}",
-        headers=owner,
-    ).json()
-    assert run["launched_for"] == downgrade["id"]
-    assert run["candidate_version"] == applied["draft"]["label"]
-    run = _finish(client, owner, "expense-reimbursement", run)
-    # The draft names a cheaper model, so the measured delta is a saving.
-    assert run["cost_delta_usd"] < 0
-
-
-def test_promoting_a_run_captures_labels_and_the_pinned_world(client, owner):
-    run = client.get(
-        "/api/v1/flows/expense-reimbursement/runs",
-        params={"limit": 1},
-        headers=owner,
-    ).json()[0]
-    added = client.post(
-        "/api/v1/flows/expense-reimbursement/golden-set",
-        json={"name": f"Promoted {run['case_ref']}", "run_id": run["id"]},
-        headers=owner,
-    ).json()
-    case = added["cases"][-1]
-    assert case["source"] == "promoted-from-run"
-    # Enriched from the journal: fact assertions against the contract, a
-    # trajectory, and the reads the run made at their revisions.
-    paths = {a["path"] for a in case["assertions"]}
-    assert "receipt.total_usd" in paths
-    assert any(t["kind"] == "task_raised" for t in case["trajectory"])
-    assert case["read_set"] and "@" in case["read_set"][0]["ref"]
-    assert case["payload"]

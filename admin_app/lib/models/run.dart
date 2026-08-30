@@ -153,10 +153,6 @@ class FlowRun {
 }
 
 /// A run as a list row: enough to triage without loading the journal.
-///
-/// Named `FlowRunSummary` to keep it distinct from the synthesized `RunSummary`
-/// in `flow.dart`, which the Flows section still uses for its telemetry seams.
-/// These are the real ones; that one is derived from a SeedProfile.
 class FlowRunSummary {
   final String id;
   final String flowId;
