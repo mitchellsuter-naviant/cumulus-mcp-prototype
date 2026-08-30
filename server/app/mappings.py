@@ -540,6 +540,31 @@ def steward_queue_for(source: str) -> str:
     )
 
 
+def steward_queue_for_type(object_type: str) -> str:
+    """Which desk judges identity for this *book*, read off the Mappings.
+
+    `steward_queue_for` answers per feed, which is right where a row is
+    escalating: the row came from somewhere. Two callers have no feed to ask
+    with — the fallback on a steward decision whose Task recorded no queue, and
+    the cross-source sweep, which is looking at entities rather than at rows —
+    and both used to answer from a constant sitting next to the Mapping that
+    already knew. One rebind should move both, so both read it here.
+
+    The feeds that resolve into a book agree about its desk by construction:
+    `crm-book` and `erp-sales` both write Company and both name
+    `data-stewardship`; `erp-vendors` writes Vendor and names
+    `vendor-stewardship`. `validate_mappings` fails a disagreement at
+    declaration time rather than letting the first match win quietly.
+    """
+    return next(
+        (
+            m.steward_queue for m in MAPPINGS
+            if object_type in m.resolves_to and m.escalation == "per-row task"
+        ),
+        Mapping.__dataclass_fields__["steward_queue"].default,
+    )
+
+
 def validate_mappings(
     mappings: tuple[Mapping, ...] = MAPPINGS,
 ) -> list[str]:
@@ -583,6 +608,25 @@ def validate_mappings(
             problems.append(
                 f"{where}: precedence source `{m.precedence_source}` is not "
                 "in the ontology precedence order"
+            )
+    # One book, one desk. `steward_queue_for_type` answers "who judges identity
+    # for a Company" by finding the first feed that writes one, which is only
+    # honest while every feed that writes one agrees — so a disagreement is a
+    # declaration-time failure rather than a coin toss resolved by tuple order.
+    desks: dict[str, dict[str, list[str]]] = {}
+    for m in mappings:
+        if m.escalation != "per-row task":
+            continue
+        for t in m.resolves_to:
+            desks.setdefault(t, {}).setdefault(m.steward_queue, []).append(m.id)
+    for object_type, by_queue in desks.items():
+        if len(by_queue) > 1:
+            named = "; ".join(
+                f"`{queue}` ({', '.join(ids)})" for queue, ids in sorted(by_queue.items())
+            )
+            problems.append(
+                f"type `{object_type}`: feeds disagree about its steward "
+                f"queue — {named}. One book, one desk"
             )
     return problems
 

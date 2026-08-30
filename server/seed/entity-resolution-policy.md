@@ -35,6 +35,51 @@ run time; editing them changes what the flows do with no code change.
 4. An existing identity link from the same source system. A source that has
    already told us its id for an entity is believed again without re-scoring.
 
+## Cross-source merge proposals
+
+The thresholds above judge one arriving record against the book. These judge
+two entities the book already holds — the ERP customer created in 2019 under
+an old trading name, the contact re-typed off a trade-show list — which no
+single feed can see, because a feed scores its own rows and never scores the
+book against itself. The `identity-sweep` flow reads these values at run time.
+
+- Propose a merge at or above: 0.55. A typed identity link is written between
+  the two entities at `status = in_review`, carrying its confidence, the
+  signals that produced it, and what an un-merge restores. **Nothing merges.**
+  No canonical object changes, and the Action Gateway refuses to act on the
+  proposal until a human confirms it.
+- Ask a steward below: 0.80. A proposal under this raises a `merge_review`
+  Task in the queue the Mapping names, with the evidence written out. At or
+  above it the proposal waits in the identity workbench without paging anybody.
+- Consider a pair on names alone at or above: 0.55. Below that similarity a
+  pair is only looked at when a domain or a phone number joins it — which is
+  how a trading name (`GSF Logistics` for Granite State Freight) gets
+  considered at all.
+- Never propose above: 0.95. A machine does not get to claim certainty about
+  an identity nobody has confirmed.
+
+### Evidence, and what it is worth
+
+Weights are per pair kind, because the same fact means different things about
+an organization and about a person: two people sharing an email domain are
+colleagues, which is a precondition for being the same person and nowhere near
+proof of it.
+
+| Signal | Organizations | People |
+|---|---|---|
+| Shared internet domain | +0.55 | — (see shared employer) |
+| Identical phone number | +0.45 | +0.45 |
+| Same area code, different number | +0.08 | +0.08 |
+| Different area code | −0.20 | −0.20 |
+| Different internet domain | −0.35 | — |
+| Same anchor word (first word of a company, surname of a person) | +0.20 | +0.20 |
+| Shared employer (same company, or the same mail domain) | — | +0.25 |
+| Blended name similarity | ×0.80 | ×0.80 |
+
+A pair of people is only considered when a shared employer is established.
+Two humans who share a name are two humans; what makes them candidates is
+being in the same place.
+
 ## Reversal
 
 Every identity link is reversible. A steward who withdraws one writes an end to

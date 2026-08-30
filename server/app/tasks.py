@@ -37,7 +37,18 @@ from .models import utcnow
 
 log = logging.getLogger("cumulus.tasks")
 
-TaskKind = Literal["decision", "match_review", "curation", "eval_review", "exception"]
+#: `match_review` is one arriving row against the book — approve and it links,
+#: reject and it mints. `merge_review` is two entities the book already holds:
+#: nothing arrived, nothing mints, and the answer flips a proposal that is
+#: already in the graph at `in_review`. Two kinds rather than one, because the
+#: screens differ (a landed row and its candidates, against two canonical
+#: objects and the evidence joining them) and because a decision hook that had
+#: to tell them apart from the payload would guess wrong the first time the two
+#: shapes converged.
+TaskKind = Literal[
+    "decision", "match_review", "merge_review", "curation", "eval_review",
+    "exception",
+]
 TaskStatus = Literal["open", "done"]
 TaskVerdict = Literal["approved", "rejected", "corrected"]
 TaskPriority = Literal["normal", "high"]

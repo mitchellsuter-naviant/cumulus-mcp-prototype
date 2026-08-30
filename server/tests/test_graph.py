@@ -816,13 +816,31 @@ def test_a_link_name_declared_twice_is_refused():
     names = [link.name for link in ONTOLOGY.links]
     assert len(names) == len(set(names))
     identity = {
-        link.name: link.from_type
+        link.name: (link.from_type, link.to_type)
         for link in ONTOLOGY.links if link.identity
     }
+    # Two families of identity edge, and the split is load-bearing. The three
+    # that end at a SourceRecord answer "which external row is this entity" —
+    # they are what `Ontology.source_identity_link` looks up, and the resolver
+    # would silently lose its strongest signal if a type had none. The four
+    # that join two canonical objects answer "are these two entities one
+    # party", which no source can say, and are proposals until a human rules.
     assert identity == {
-        "identified_as": "Vendor",
-        "company_identified_as": "Company",
-        "person_identified_as": "Person",
+        "identified_as": ("Vendor", "SourceRecord"),
+        "company_identified_as": ("Company", "SourceRecord"),
+        "person_identified_as": ("Person", "SourceRecord"),
+        "company_same_as": ("Company", "Company"),
+        "company_same_as_vendor": ("Company", "Vendor"),
+        "vendor_same_as": ("Vendor", "Vendor"),
+        "person_same_as": ("Person", "Person"),
+    }
+    assert {
+        name: ONTOLOGY.source_identity_link(name).name
+        for name in ("Vendor", "Company", "Person")
+    } == {
+        "Vendor": "identified_as",
+        "Company": "company_identified_as",
+        "Person": "person_identified_as",
     }
 
 

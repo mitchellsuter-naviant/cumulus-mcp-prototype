@@ -108,6 +108,62 @@ def read_resolution_thresholds(knowledge) -> ResolutionThresholds:
     return values
 
 
+class SweepThresholds(BaseModel):
+    """Where the cross-source sweep's lines fall, parsed from the same asset.
+
+    Same document as the per-record thresholds above, because a steward tuning
+    "how alike is alike" should not have to find out that identity is governed
+    in two places. Different values, because they answer a different question:
+    the resolver decides whether an *arriving row* joins an entity, and these
+    decide whether two entities we already hold are worth a human's attention.
+    Nothing here can merge anything — `propose_at` is the floor for recording a
+    proposal at all, and `steward_task_below` is the confidence under which the
+    sweep stops assuming somebody will get to it and asks.
+    """
+
+    #: Below this, the pair is not even recorded. A workbench full of 0.4s is
+    #: a workbench nobody opens.
+    propose_at: float = 0.55
+    #: A proposal under this raises a `merge_review` Task; one at or above it
+    #: waits in the workbench without paging anybody.
+    steward_task_below: float = 0.80
+    #: The name-similarity floor a pair must clear to be *considered* on names
+    #: alone. A shared domain or an identical phone gets a pair considered
+    #: whatever its names say — which is the whole point of a trading name.
+    name_floor: float = 0.55
+    #: The most confidence a machine may claim. A proposal is a proposal.
+    ceiling: float = 0.95
+    source_ref: str = f"knowledge:{RESOLUTION_ASSET_ID}"
+    found_asset: bool = False
+
+
+def parse_sweep_policy(content: str) -> SweepThresholds:
+    values = SweepThresholds(found_asset=True)
+    for pattern, field in (
+        (r"propose a merge at or above:?\s*(\d+(?:\.\d+)?)", "propose_at"),
+        (r"ask a steward below:?\s*(\d+(?:\.\d+)?)", "steward_task_below"),
+        (r"consider a pair on names alone at or above:?\s*(\d+(?:\.\d+)?)",
+         "name_floor"),
+        (r"never propose above:?\s*(\d+(?:\.\d+)?)", "ceiling"),
+    ):
+        found = re.search(pattern, content, re.I)
+        if found:
+            setattr(values, field, float(found.group(1)))
+    return values
+
+
+def read_sweep_thresholds(knowledge) -> SweepThresholds:
+    asset = knowledge.repo.get(RESOLUTION_ASSET_ID) if knowledge else None
+    if asset is None:
+        log.warning("Entity-resolution policy missing; using sweep defaults")
+        return SweepThresholds(found_asset=False)
+    values = parse_sweep_policy(asset.content)
+    values.source_ref = (
+        f"knowledge:{RESOLUTION_ASSET_ID}@rev{getattr(asset, 'revision', 1)}"
+    )
+    return values
+
+
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
@@ -166,8 +222,18 @@ def score_candidates(
     source: str = "",
     source_external_id: str = "",
     graph: GraphService | None = None,
+    identity_link: str = "",
 ) -> list[MatchCandidate]:
-    """Rank known entities against the inbound signals, best first."""
+    """Rank known entities against the inbound signals, best first.
+
+    `identity_link` is the edge signal 1 walks. It is a parameter and not the
+    constant it used to be: `identified_as` is the Vendor's edge, and a Company
+    or a Person hangs its landed rows off a sibling declaration, so hardcoding
+    one name meant the source-link signal — the strongest of the four, and the
+    one that makes a re-delivery free — was dead for two of the three books
+    that use this resolver. Callers get it from the ontology (`resolve` below);
+    an empty value simply skips the signal rather than guessing a name.
+    """
     candidates: list[MatchCandidate] = []
     clean_names = [n for n in names if (n or "").strip()]
 
@@ -177,8 +243,8 @@ def score_candidates(
         best: MatchCandidate | None = None
 
         # 1. A source that has already told us its id for this entity.
-        if source and source_external_id and graph is not None:
-            for link, other in graph.neighbors(record.id, "identified_as", "out"):
+        if source and source_external_id and graph is not None and identity_link:
+            for link, other in graph.neighbors(record.id, identity_link, "out"):
                 if (
                     other.props.get("source") == source
                     and str(other.props.get("external_id")) == str(source_external_id)
@@ -261,9 +327,11 @@ def resolve(
 ) -> ResolutionOutcome:
     """Decide: link to an existing entity, ask a steward, or mint a new one."""
     known = graph.find(object_type)
+    declared = graph.ontology.source_identity_link(object_type)
     candidates = score_candidates(
         names, tax_id, known,
         source=source, source_external_id=source_external_id, graph=graph,
+        identity_link=declared.name if declared is not None else "",
     )[:limit]
     top = candidates[0] if candidates else None
     outcome = ResolutionOutcome(

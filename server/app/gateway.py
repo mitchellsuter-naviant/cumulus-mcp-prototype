@@ -102,6 +102,25 @@ ACTIONS: dict[str, Action] = {a.id: a for a in (
     Action(id="link-company-record", target="entity-layer",
            queue="data-stewardship"),
     Action(id="confirm-vendor", target="entity-layer", queue="ap-clerk"),
+    # A cross-source merge *proposal*, and the steward's answer to one. Two
+    # Actions, because they are not the same act and an auditor must not have
+    # to read the payload to tell them apart: the first writes an assertion
+    # nothing may act on (`status=in_review`) and the second is the judgment
+    # that makes it actionable.
+    #
+    # The proposer carries **no queue** and the confirmation carries the
+    # steward's. That is the queue doing its job rather than a gap: a queue
+    # binding says whose *work* an Action is, proposing is nobody's work —
+    # the Flow does it on its own authority, unasked — and deciding is the
+    # counterparty book's steward's alone. A queue on the proposer would also
+    # refuse the Flow outright, since a Flow principal owns only the queues
+    # its declaration binds it to.
+    #
+    # `decision` and not `resolution`: a Rule picking the winner is what
+    # `resolution` means, and nothing here picks a winner.
+    Action(id="propose-identity-link", target="entity-layer"),
+    Action(id="confirm-identity-link", target="entity-layer",
+           queue="data-stewardship"),
     # observations — a source reported this; audited by lineage, not approval
     Action(id="land-source-records", target="source-landing",
            regime="observation"),

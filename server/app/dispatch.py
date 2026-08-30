@@ -139,6 +139,14 @@ TRIGGERS: dict[str, Trigger] = {t.id: t for t in (
             starts="employment-event-sync", wakes="window"),
     Trigger(id="documents-delivered", event="DocumentsDelivered",
             starts="dms-sync", wakes="window"),
+    # The first windowed Trigger that is not a delivery. Nothing arrived; a
+    # window closed over the book we already hold, and the response reads the
+    # whole counterparty book against itself. It is windowed for the same
+    # reason the feeds are — the unit of work is a pass, not a row — and it is
+    # here rather than called directly so the sweep's causation is logged
+    # before the run exists, like everything else.
+    Trigger(id="identity-window-closed", event="IdentityWindowClosed",
+            starts="identity-sweep", wakes="window"),
 )}
 
 #: The trigger index. The doctrine keeps it in a fast key-value store for O(1)

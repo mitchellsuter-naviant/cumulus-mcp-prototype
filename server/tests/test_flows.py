@@ -12,9 +12,10 @@ the run count, a flow with no runs reports zeroes rather than a distribution,
 and a $0.00 spend tile can say whether it means "nothing ran" or "nobody
 recorded what it cost".
 
-The fleet is twelve flows and twelve definitions: two authored, and ten inbound
+The fleet is thirteen flows and thirteen definitions: two authored, ten inbound
 feeds that every one of them now carries a declarative export for — down from
-the five with no map the workplan opened with, and no undeclared feed left. The
+the five with no map the workplan opened with, and no undeclared feed left —
+and the identity sweep, the one windowed flow no source pushes. The
 registry still cannot be the list of what exists, and the tests below read the
 fleet off the engine either way: a definition is a *map*, a run is the
 territory, and the day the two disagree is the day this module has to be able
@@ -37,8 +38,8 @@ from app.reimbursements import SubmittedDocument
 from app.runs import RunRecord
 from tests import world as test_world
 
-# The ten inbound feeds that write the graph. With the two authored flows below
-# they are the twelve the fleet holds.
+# The ten inbound feeds that write the graph. With the two authored flows and
+# the identity sweep below they are the thirteen the fleet holds.
 SYNC_FLOWS = {
     "vendor-sync", "purchase-order-sync", "receiving-sync",
     "workforce-sync", "calendar-sync", "crm-sync", "sales-sync",
@@ -47,14 +48,17 @@ SYNC_FLOWS = {
 }
 #: Every feed now carries its Tier-2 declarative export — the carried debt
 #: reached zero, so the UNDECLARED_FEEDS set that tracked it is gone.
+#: `identity-sweep` is neither a feed nor an authored per-case flow: it is
+#: windowed like the feeds and reads the book they wrote, and it carries its
+#: export like everything else.
 DECLARED_FLOWS = SYNC_FLOWS | {
-    "expense-reimbursement", "accounts-payable",
+    "expense-reimbursement", "accounts-payable", "identity-sweep",
 }
 
 
 @pytest.fixture()
 def world():
-    """A fresh world: twelve registered flow bodies, no runs, no tasks."""
+    """A fresh world: thirteen registered flow bodies, no runs, no tasks."""
     return test_world.fresh()
 
 
@@ -151,8 +155,9 @@ def probe_flow(client, owner, flow_id: str) -> None:
 
 def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
     """The list used to be the registry, so it showed two flows in a system
-    that runs twelve. Ten inbound sync feeds write the graph and all of them
-    now have a `FlowDefinition` — but the list is still read off the engine,
+    that runs thirteen. Ten inbound sync feeds write the graph, an eleventh
+    windowed flow proposes edges across it, and all of them now have a
+    `FlowDefinition` — but the list is still read off the engine,
     because the two agreeing today is a fact about today. A body registered
     with no map still has to appear, so one is registered here to prove the
     list is not quietly back to being the registry."""
@@ -162,7 +167,7 @@ def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
     by_id = {r["id"]: r for r in rows}
     assert SYNC_FLOWS < set(by_id)
     assert {"expense-reimbursement", "accounts-payable"} < set(by_id)
-    assert len(rows) == 13  # twelve declared flows, plus the unmapped probe
+    assert len(rows) == 14  # thirteen declared flows, plus the unmapped probe
 
     # A definition-less row says so, rather than borrowing a lifecycle state
     # it has no definition to hold.
@@ -375,8 +380,8 @@ def test_the_fleet_run_count_is_the_real_run_count(client, world):
         for row in client.get("/api/v1/flows").json()
     ]
     assert stats["runs"] == sum(u["runs"] for u in per_flow)
-    assert stats["flows"] == 12
-    assert stats["definitions"] == 12
+    assert stats["flows"] == 13
+    assert stats["definitions"] == 13
     # The carried debt reached zero: every flow that runs carries its export.
     assert stats["without_definition"] == 0
 
