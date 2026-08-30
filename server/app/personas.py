@@ -39,6 +39,11 @@ ALL_QUEUES: tuple[str, ...] = (
     "expense-review",       # reimbursements.REVIEW_QUEUE
     "ap-clerk",             # payables.CLERK_QUEUE
     "vendor-stewardship",   # sync.STEWARD_QUEUE
+    # sync.DATA_STEWARD_QUEUE — the counterparty book. Separate from vendor
+    # stewardship because the two answer different questions: one decides who
+    # Cumulus pays, the other decides who Cumulus thinks it is dealing with,
+    # and the desks are not interchangeable even where one person sits at both.
+    "data-stewardship",
     "hr",                   # employee.HR_QUEUE
     "knowledge-curation",
     "eval-review",
@@ -119,7 +124,8 @@ CUSTOMER_ADMIN = Persona(
     label="Customer Admin",
     authority="admin",
     scope="tenant",
-    queues=("vendor-stewardship", "knowledge-curation", "eval-review"),
+    queues=("vendor-stewardship", "data-stewardship", "knowledge-curation",
+            "eval-review"),
     email="sam@customer.example",
     uid="persona_customer_admin",
     person="Sam Okafor",

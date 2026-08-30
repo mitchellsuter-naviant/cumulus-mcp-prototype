@@ -34,7 +34,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -50,8 +51,10 @@ from .graph import (
     normalize_key,
     object_id,
 )
+from .mappings import steward_queue_for
 from .matching import parse_match_tolerances
 from .models import utcnow
+from .ontology import ONTOLOGY
 from .resolution import (
     ResolutionOutcome,
     ResolutionThresholds,
@@ -68,7 +71,16 @@ PO_FLOW_ID = "purchase-order-sync"
 RECEIVING_FLOW_ID = "receiving-sync"
 WORKFORCE_FLOW_ID = "workforce-sync"
 CALENDAR_FLOW_ID = "calendar-sync"
+CRM_FLOW_ID = "crm-sync"
+SALES_FLOW_ID = "sales-sync"
 STEWARD_QUEUE = "vendor-stewardship"
+#: Counterparties and the humans in them are not the AP steward's work: an
+#: ambiguous Company is a master-data question, and the person who answers it
+#: is not the person who decides whether an invoice gets paid. Which queue a
+#: feed escalates into is declared per Mapping (`Mapping.steward_queue`) so
+#: C4 can rebind it without touching a flow; this is the default for the
+#: counterparty book.
+DATA_STEWARD_QUEUE = "data-stewardship"
 
 # The fact each feed shape reports. One name per shape rather than a single
 # `SourceDelivered`, because a name bound to five Triggers would start five
@@ -79,11 +91,28 @@ PO_EVENT = "PurchaseOrdersDelivered"
 RECEIVING_EVENT = "ReceivingReportsDelivered"
 WORKFORCE_EVENT = "WorkforceDelivered"
 CALENDAR_EVENT = "CalendarsDelivered"
+CRM_EVENT = "CrmBookDelivered"
+SALES_EVENT = "SalesRecordsDelivered"
 
 SyncKind = Literal[
     "vendors", "purchase-orders", "receiving-reports", "workforce",
-    "calendars",
+    "calendars", "crm-book", "sales-records",
 ]
+
+#: Every sync flow, and the kind its runs report under in the Sources lens.
+#: Declared here beside the event names rather than inside `sources()`, because
+#: a feed that is invisible on the Sources screen until somebody remembers to
+#: edit a dict a thousand lines down is a feed nobody can see is broken. One
+#: place a feed registers; `sources()` reads this and nothing else.
+FEED_FLOWS: dict[str, SyncKind] = {
+    VENDOR_FLOW_ID: "vendors",
+    PO_FLOW_ID: "purchase-orders",
+    RECEIVING_FLOW_ID: "receiving-reports",
+    WORKFORCE_FLOW_ID: "workforce",
+    CALENDAR_FLOW_ID: "calendars",
+    CRM_FLOW_ID: "crm-book",
+    SALES_FLOW_ID: "sales-records",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +242,106 @@ class CalendarEventRecord(BaseModel):
     notes: str = ""
 
 
+class AccountRecord(BaseModel):
+    """One organization as the CRM holds it — the sales side of a company."""
+
+    external_id: str
+    name: str
+    industry: str = ""
+    website: str = ""
+    phone: str = ""
+
+
+class ContactRecord(BaseModel):
+    """One human at a customer, as the CRM holds them.
+
+    `email` is the natural key and is deliberately the *only* thing identity
+    turns on. A contact with no address mints under `source:external_id`
+    instead of being matched on a spelling: two Tom Bergs at two companies are
+    two people, and a book of counterparties that quietly merged them would be
+    worse than one that holds a duplicate a steward can see.
+    """
+
+    external_id: str
+    first_name: str = ""
+    last_name: str = ""
+    title: str = ""
+    email: str = ""
+    phone: str = ""
+    # Bind column: the account this contact belongs to, by the CRM's own id.
+    account_external_id: str = ""
+
+
+class OpportunityRecord(BaseModel):
+    """One deal in the pipeline, as the CRM holds it."""
+
+    external_id: str
+    name: str
+    account_external_id: str = ""
+    stage: str = ""
+    amount: float = 0.0
+    close_date: str = ""
+
+
+class CustomerRecord(BaseModel):
+    """One organization as the ERP holds it — the billing side of a company.
+
+    The same firms the CRM knows, under their legal spellings: `Northwind
+    Traders` in the CRM is `Northwind Traders Inc.` here. Both claims are kept
+    and precedence resolves; the ERP outranks the CRM on commercial facts,
+    which is why `payment_terms` arrives on this shape and not on the account.
+    """
+
+    external_id: str
+    name: str
+    email: str = ""
+    phone: str = ""
+    payment_terms: str = ""
+
+
+class ItemRecord(BaseModel):
+    """One catalogue entry. The SKU is the natural key.
+
+    `external_id` is the source's *internal* record id, which is what order
+    lines reference — deliberately not the SKU. Keeping both is what lets a
+    line resolve to an item at all: the line names the id, the ontology keys
+    on the SKU, and this row is the only place the two meet.
+    """
+
+    external_id: str
+    sku: str
+    display_name: str = ""
+    item_type: str = ""
+    base_price: float = 0.0
+
+
+class SalesOrderLineRecord(BaseModel):
+    """One sold line, as the ERP holds it — item by internal id, never SKU."""
+
+    item_external_id: str = ""
+    quantity: float = 0.0
+    rate: float = 0.0
+    amount: float = 0.0
+
+
+class SalesOrderRecord(BaseModel):
+    """One commitment to sell, with its lines.
+
+    `order_number` is the ERP's human transaction id (`tranId`) and the natural
+    key; `external_id` is its internal record id, kept because that is what the
+    write-back Action in S2b will have to name.
+    """
+
+    external_id: str
+    order_number: str
+    customer_external_id: str = ""
+    ordered_date: str = ""
+    status: str = ""
+    memo: str = ""
+    total: float = 0.0
+    lines: list[SalesOrderLineRecord] = Field(default_factory=list)
+
+
 class SyncRequest(BaseModel):
     """One delivery from one source system.
 
@@ -236,6 +365,17 @@ class SyncRequest(BaseModel):
     # landed yet.
     calendars: list[CalendarRecord] = Field(default_factory=list)
     calendar_events: list[CalendarEventRecord] = Field(default_factory=list)
+    # The CRM's book travels together: a contact names its account and an
+    # opportunity names the company it is being pursued with, so splitting
+    # them across deliveries would strand both edges.
+    accounts: list[AccountRecord] = Field(default_factory=list)
+    contacts: list[ContactRecord] = Field(default_factory=list)
+    opportunities: list[OpportunityRecord] = Field(default_factory=list)
+    # The ERP's sell side, for the same reason: an order line names an item by
+    # the id only the item row translates, and an order names its customer.
+    customers: list[CustomerRecord] = Field(default_factory=list)
+    items: list[ItemRecord] = Field(default_factory=list)
+    sales_orders: list[SalesOrderRecord] = Field(default_factory=list)
 
 
 class SourceStatus(BaseModel):
@@ -261,6 +401,76 @@ def _payload_hash(payload: dict) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, default=str).encode()
     ).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# What a steward's decision writes into
+# ---------------------------------------------------------------------------
+
+
+class MatchedRecord(BaseModel):
+    """The part of a landed row a steward's decision needs.
+
+    A read of the payload rather than a second declaration of the wire: extra
+    fields are ignored, so a vendor row, a CRM account and an ERP customer all
+    answer the same three questions — what is it called, what did the source
+    call it, and is there a hard identifier on it.
+    """
+
+    external_id: str = ""
+    name: str = ""
+    email: str = ""
+    first_name: str = ""
+    last_name: str = ""
+    tax_id: str = ""
+
+    @property
+    def display(self) -> str:
+        return (
+            self.name
+            or " ".join(filter(None, (self.first_name, self.last_name)))
+            or self.email
+            or self.external_id
+        )
+
+
+@dataclass(frozen=True)
+class MatchTarget:
+    """Where a decision on one landed row lands, keyed by its `record_kind`."""
+
+    object_type: str
+    #: The identity Link that carries it. Three declarations rather than one
+    #: widened edge (see `ontology.py`) — so this table is where a kind meets
+    #: its own.
+    identity_link: str
+    #: The governed Action the decision commits under. Per book, because the
+    #: Action carries the queue that may commit it, and the two desks are not
+    #: interchangeable.
+    action_id: str
+    #: Whose authority commits the write when no live principal carried one,
+    #: and which queue the Task sat in.
+    flow_id: str
+    queue: str
+    #: The natural key a *rejected* match mints under. Names for the two
+    #: counterparty books; an address for a human, because two people who
+    #: share a name are two people.
+    key: Callable[[MatchedRecord], str]
+
+
+MATCH_TARGETS: dict[str, MatchTarget] = {
+    "vendor": MatchTarget(
+        "Vendor", "identified_as", "link-source-record",
+        VENDOR_FLOW_ID, STEWARD_QUEUE, lambda r: r.name,
+    ),
+    "company": MatchTarget(
+        "Company", "company_identified_as", "link-company-record",
+        CRM_FLOW_ID, DATA_STEWARD_QUEUE, lambda r: r.name,
+    ),
+    "person": MatchTarget(
+        "Person", "person_identified_as", "link-company-record",
+        CRM_FLOW_ID, DATA_STEWARD_QUEUE, lambda r: r.email.strip().lower(),
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +507,15 @@ class SyncService:
             engine.register(RECEIVING_FLOW_ID, self._receiving_body)
             engine.register(WORKFORCE_FLOW_ID, self._workforce_body)
             engine.register(CALENDAR_FLOW_ID, self._calendar_body)
+            # The commerce bodies live in their own module — this file is
+            # already long enough that a reader looking for the vendor flow
+            # should not have to scroll past the counterparty book to find it
+            # — and they register here so `SyncService` stays the one place
+            # that knows which flows exist. Deferred because they import this
+            # module for its wire shapes.
+            from . import sync_commerce
+
+            sync_commerce.register(self)
 
     def _act(self, ctx: RunContext, action_id: str, step_id: str) -> PendingAction:
         """A sync write, committed by the Flow that is running.
@@ -338,10 +557,14 @@ class SyncService:
             plan.append((WORKFORCE_EVENT, []))
         if request.calendars or request.calendar_events:
             plan.append((CALENDAR_EVENT, []))
-        # The two multi-shape feeds carry their records in named lists rather
-        # than one `records` column, so they are exempt from the emptiness
-        # check and build their own inputs below.
-        multi_shape = (WORKFORCE_EVENT, CALENDAR_EVENT)
+        if request.accounts or request.contacts or request.opportunities:
+            plan.append((CRM_EVENT, []))
+        if request.customers or request.items or request.sales_orders:
+            plan.append((SALES_EVENT, []))
+        # The multi-shape feeds carry their records in named lists rather than
+        # one `records` column, so they are exempt from the emptiness check
+        # and build their own inputs below.
+        multi_shape = (WORKFORCE_EVENT, CALENDAR_EVENT, CRM_EVENT, SALES_EVENT)
         for event, records in plan:
             if event not in multi_shape and not records:
                 continue
@@ -364,6 +587,26 @@ class SyncService:
                     "calendars": [c.model_dump() for c in request.calendars],
                     "events": [
                         e.model_dump() for e in request.calendar_events
+                    ],
+                }
+            elif event == CRM_EVENT:
+                inputs = {
+                    "source": request.source,
+                    "watermark": request.watermark,
+                    "accounts": [a.model_dump() for a in request.accounts],
+                    "contacts": [c.model_dump() for c in request.contacts],
+                    "opportunities": [
+                        o.model_dump() for o in request.opportunities
+                    ],
+                }
+            elif event == SALES_EVENT:
+                inputs = {
+                    "source": request.source,
+                    "watermark": request.watermark,
+                    "customers": [c.model_dump() for c in request.customers],
+                    "items": [i.model_dump() for i in request.items],
+                    "sales_orders": [
+                        o.model_dump() for o in request.sales_orders
                     ],
                 }
             run_id = None
@@ -607,7 +850,10 @@ class SyncService:
                 "it to the top candidate, reject to mint a new vendor, or "
                 "correct with the id of the right one."
             ),
-            queue=STEWARD_QUEUE,
+            # Declared per feed, not per flow: the same vendor body serves
+            # three contracts, and which desk answers an ambiguous row is a
+            # property of the contract.
+            queue=steward_queue_for(source),
             priority="normal",
             flow_id=VENDOR_FLOW_ID,
             run_id=run_id,
@@ -1328,65 +1574,92 @@ class SyncService:
         It carries no run — a batch feed does not suspend for one row — so the
         Gateway is the only thing that records it happened, which is precisely
         why it goes through the Gateway rather than straight at the graph.
+
+        **Which book it writes into is read off the landed row**, not off the
+        Task: `record_kind` is the only thing that survives from the flow that
+        landed it, and inferring a type from the payload's shape would be a
+        guess that gets a company filed as a vendor the first time the two
+        wire shapes look alike. (`MATCH_TARGETS` covers the three kinds that
+        reify identities today; B5 owns the general form, which is the same
+        table read out of the Mapping.)
         """
         if task.kind != "match_review" or task.decision is None:
             return None
         source_record = self.graph.get(task.case_ref)
         if source_record is None:
             return None
+        target = MATCH_TARGETS.get(
+            str(source_record.props.get("record_kind") or "vendor")
+        )
+        if target is None:
+            return None
         payload = json.loads(str(source_record.props.get("payload") or "{}"))
-        record = VendorRecord.model_validate(payload) if payload else None
+        record = MatchedRecord.model_validate(payload) if payload else None
         if record is None:
             return None
         act = self.gateway.action(
-            "link-source-record",
+            target.action_id,
             # The steward, when a live caller carried one. A seed or a test
             # that did not is committing on the Flow's declared authority, and
             # `decided_by` on the entry still names whose judgment it was.
-            principal or flow_principal(VENDOR_FLOW_ID, STEWARD_QUEUE),
+            principal or flow_principal(
+                task.flow_id or target.flow_id, target.queue
+            ),
             step_id="steward-decision", task_id=task.id,
             decided_by=task.decision.decided_by, target=source_record.ref(),
         )
-        return act.commit(
-            lambda w: self._assert_steward_decision(task, record, source_record, w)
-        )
+        return act.commit(lambda w: self._assert_steward_decision(
+            task, record, source_record, target, w
+        ))
 
     def _assert_steward_decision(
         self,
         task: Task,
-        record: VendorRecord,
+        record: MatchedRecord,
         source_record,
+        target: "MatchTarget",
         graph: GraphWriter,
     ) -> dict | None:
         verdict = task.decision.verdict
         target_id = str(task.decision.payload.get("object_id") or "")
         if verdict == "approved" and not target_id:
+            prefix = f"graph:{target.object_type}/"
             target_id = next(
                 (
                     ref.split("/", 1)[1] for ref in task.refs
-                    if ref.startswith("graph:Vendor/")
+                    if ref.startswith(prefix)
                 ),
                 "",
             )
         claim_source = f"human:{task.decision.decided_by}"
+        # Only fields the type actually declares: a Person has no `aliases`,
+        # because an address is not a spelling and a second name for one is
+        # evidence of a second person rather than of a nickname.
+        declared = {
+            f.name for f in (ONTOLOGY.object_type(target.object_type).fields)
+        }
 
         if verdict in ("approved", "corrected") and target_id:
-            vendor = self.graph.get(target_id)
-            if vendor is None:
+            entity = self.graph.get(target_id)
+            if entity is None:
                 return None
+            claims = [Claim(
+                field="name",
+                value=str(entity.props.get("name") or entity.label),
+                source=claim_source,
+            )]
+            if "aliases" in declared and record.display:
+                claims.append(Claim(
+                    field="aliases", value=[record.display], source=claim_source
+                ))
             graph.upsert(
-                "Vendor", vendor.natural_key,
-                [
-                    Claim(field="aliases", value=[record.name], source=claim_source),
-                    Claim(field="name", value=str(vendor.props.get("name") or vendor.label),
-                          source=claim_source),
-                ],
-                label=vendor.label,
+                target.object_type, entity.natural_key, claims,
+                label=entity.label,
             )
             link = graph.link(
-                "identified_as", vendor.id, source_record.id,
+                target.identity_link, entity.id, source_record.id,
                 props={
-                    "source": record and str(source_record.props.get("source")),
+                    "source": str(source_record.props.get("source") or ""),
                     "external_id": record.external_id,
                     "decided_by": task.decision.decided_by,
                 },
@@ -1396,34 +1669,63 @@ class SyncService:
             log.info(
                 "Steward linked a source record",
                 extra={
-                    "taskId": task.id, "vendorId": vendor.id,
+                    "taskId": task.id, "objectId": entity.id,
+                    "objectType": target.object_type,
                     "linkId": link.id, "actor": task.decision.decided_by,
                 },
             )
-            return {"action": "linked", "vendor_id": vendor.id, "link_id": link.id}
+            return {
+                "action": "linked", "object_type": target.object_type,
+                "object_id": entity.id, "vendor_id": entity.id,
+                "link_id": link.id,
+            }
 
-        vendor = graph.upsert(
-            "Vendor", record.name,
-            [
-                Claim(field="name", value=record.name, source=claim_source),
-                Claim(field="status", value="onboarding", source=claim_source),
-                Claim(field="tax_id", value=record.tax_id, source=claim_source),
-            ],
-            label=record.name,
+        # Rejected: this is not any of the candidates, so it is its own entity.
+        # Keyed the way its type declares — a name for the two counterparty
+        # books, an address for a human, and the landed row's own key when the
+        # source carried no address at all.
+        key = target.key(record) or source_record.natural_key
+        claims = [Claim(field="name", value=record.display, source=claim_source)]
+        if "status" in declared and target.object_type == "Vendor":
+            # An entity nobody has vouched for yet, in the one book whose
+            # status vocabulary has a word for that.
+            claims.append(Claim(
+                field="status", value="onboarding", source=claim_source
+            ))
+        if "tax_id" in declared and record.tax_id:
+            claims.append(Claim(
+                field="tax_id", value=record.tax_id, source=claim_source
+            ))
+        if "email" in declared and record.email:
+            claims.append(Claim(
+                field="email", value=record.email.lower(), source=claim_source
+            ))
+        entity = graph.upsert(
+            target.object_type, key, claims,
+            label=record.display or key,
             provenance=f"minted by steward decision on {task.id}",
         )
         graph.link(
-            "identified_as", vendor.id, source_record.id,
+            target.identity_link, entity.id, source_record.id,
             props={"external_id": record.external_id,
                    "decided_by": task.decision.decided_by},
             confidence=1.0, method="human",
-            provenance=f"steward said this is a new vendor ({task.id})",
+            provenance=(
+                f"steward said this is a new {target.object_type.lower()} "
+                f"({task.id})"
+            ),
         )
         log.info(
-            "Steward minted a new vendor",
-            extra={"taskId": task.id, "vendorId": vendor.id},
+            "Steward minted an entity",
+            extra={
+                "taskId": task.id, "objectId": entity.id,
+                "objectType": target.object_type,
+            },
         )
-        return {"action": "created", "vendor_id": vendor.id}
+        return {
+            "action": "created", "object_type": target.object_type,
+            "object_id": entity.id, "vendor_id": entity.id,
+        }
 
     # -- the Sources lens ---------------------------------------------------
 
@@ -1437,14 +1739,7 @@ class SyncService:
         if self.engine is None:
             return []
         by_key: dict[tuple[str, str], SourceStatus] = {}
-        flows = {
-            VENDOR_FLOW_ID: "vendors",
-            PO_FLOW_ID: "purchase-orders",
-            RECEIVING_FLOW_ID: "receiving-reports",
-            WORKFORCE_FLOW_ID: "workforce",
-            CALENDAR_FLOW_ID: "calendars",
-        }
-        for flow_id, kind in flows.items():
+        for flow_id, kind in FEED_FLOWS.items():
             for run in sorted(
                 self.engine.list(flow_id=flow_id), key=lambda r: r.started_at_iso
             ):

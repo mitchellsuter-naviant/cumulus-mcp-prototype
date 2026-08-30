@@ -2265,7 +2265,7 @@ def _seed_po_delivery() -> dict:
         return out
 
     return {
-        "source": "erp-purchasing",
+        "source": "erp-purchase-orders",
         "watermark": "2026-08-05T00:00:00Z",
         "idempotency_key": "erp-po-001",
         "purchase_orders": [

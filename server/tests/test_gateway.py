@@ -272,8 +272,8 @@ def test_the_ledger_route_scopes_reads_and_lists_the_closed_action_set(
     actions = client.get("/api/v1/ledger/actions").json()
     assert {a["id"] for a in actions} == {
         "post-invoice", "record-expense", "link-source-record",
-        "confirm-vendor", "land-source-records", "apply-source-records",
-        "resolve-identities",
+        "link-company-record", "confirm-vendor", "land-source-records",
+        "apply-source-records", "resolve-identities",
     }
     # Every Action names one of the three regimes and nothing else.
     assert {a["regime"] for a in actions} == {

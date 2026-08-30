@@ -77,6 +77,12 @@ class Mapping:
     custody: Literal["copy", "reference"] = "copy"
     collection: str = ""  # the Collection landed rows belong to
     escalation: Literal["per-row task", "windowed aggregate"] = "per-row task"
+    # Where an ambiguous row goes for a human answer. Declared per feed
+    # because the person who can say whether two Northwinds are one company is
+    # not the person who decides whether an invoice gets paid; the default
+    # keeps every feed that predates the counterparty book exactly where it
+    # was, and C4 rebinds it without touching a flow.
+    steward_queue: str = "vendor-stewardship"
     notes: str = ""
 
 
@@ -84,13 +90,13 @@ MAPPINGS: tuple[Mapping, ...] = (
     Mapping(
         id="erp-vendors",
         source="erp-vendors",
-        system="ERP vendor master export",
+        system="ERP vendor master (the estate's finance system)",
         summary=(
-            "The ERP's vendor list, pushed on change. The ERP remains the "
+            "The ERP's vendor list, pulled on a delta. The ERP remains the "
             "system of record for its own rows; Cumulus mints the canonical "
             "Vendor and owns the identity mapping between the two."
         ),
-        transport="push",
+        transport="pull",
         payload="VendorRecord",
         strategy="reify",
         lands_as="SourceRecord",
@@ -101,11 +107,17 @@ MAPPINGS: tuple[Mapping, ...] = (
         ),
         precedence_source="erp",
         match_policy="knowledge:entity-resolution-policy",
+        freshness="pull, delta by updatedAt watermark",
+        custody="copy",
         collection="source-landing",
         escalation="per-row task",
         notes=(
             "Byte-identical redeliveries are suppressed by payload hash; a "
-            "re-landed row is an update, not a conflict."
+            "re-landed row is an update, not a conflict. The ERP carries no "
+            "tax id on a vendor, so the decisive identity signal this "
+            "contract could use is simply absent and matching falls to the "
+            "name — stated because it is why a vendor here can reach a "
+            "steward that an ERP with tax ids would have resolved outright."
         ),
     ),
     Mapping(
@@ -156,15 +168,15 @@ MAPPINGS: tuple[Mapping, ...] = (
         escalation="per-row task",
     ),
     Mapping(
-        id="erp-purchasing",
-        source="erp-purchasing",
-        system="ERP purchasing module",
+        id="erp-purchase-orders",
+        source="erp-purchase-orders",
+        system="ERP purchasing (the estate's finance system)",
         summary=(
-            "Purchase orders with their lines. Each PO binds to the Vendor it "
-            "was cut against; the three-way match reads these legs out of the "
-            "graph rather than re-fetching."
+            "Purchase orders with their lines, pulled on a delta. Each PO "
+            "binds to the Vendor it was cut against; the three-way match "
+            "reads these legs out of the graph rather than re-fetching."
         ),
-        transport="push",
+        transport="pull",
         payload="PurchaseOrderRecord",
         strategy="reify",
         lands_as="PurchaseOrder",
@@ -177,11 +189,19 @@ MAPPINGS: tuple[Mapping, ...] = (
         ),
         precedence_source="erp",
         match_policy="knowledge:entity-resolution-policy",
+        freshness="pull, delta by updatedAt watermark",
+        custody="copy",
         collection="source-landing",
         escalation="windowed aggregate",
         notes=(
             "A batch feed: unresolved vendors escalate as one aggregate Task "
-            "per delivery, never per row."
+            "per delivery, never per row. Declared-key dereferences, named "
+            "because the connector is otherwise mechanical: a PO row carries "
+            "`vendorId` and its lines carry an internal `itemId`, while this "
+            "contract keys a vendor by legal name and a line by SKU — so the "
+            "vendor row is read for `companyName` and the item row for its "
+            "SKU and display name. Both are memoized for the whole pull, so a "
+            "delta of forty orders against four vendors costs four GETs."
         ),
     ),
     Mapping(
@@ -328,7 +348,112 @@ MAPPINGS: tuple[Mapping, ...] = (
         collection="source-landing",
         escalation="windowed aggregate",
     ),
+    Mapping(
+        id="crm-book",
+        source="crm-book",
+        system="CRM (the estate's sales system)",
+        summary=(
+            "The sales book: accounts, the people in them, and the deals "
+            "being pursued. Accounts and contacts **reify**, because this is "
+            "the feed the whole identity story runs through — the CRM spells "
+            "a counterparty the way a rep typed it (`Northwind Traders`) "
+            "while the ERP spells it the way a contract does (`Northwind "
+            "Traders Inc.`), and a steward has to be able to rule on *that "
+            "row*. Opportunities bind instead: a CRM opportunity id is exact "
+            "and nobody adjudicates a deal's identity, only its stage."
+        ),
+        transport="pull",
+        payload="AccountRecord + ContactRecord + OpportunityRecord",
+        strategy="reify",
+        lands_as="SourceRecord",
+        resolves_to=("Company", "Person", "Opportunity"),
+        identity=(
+            IdentityBinding(column="name", object_type="Company",
+                            key="normalized legal name"),
+            IdentityBinding(column="email", object_type="Person",
+                            key="lowercased email"),
+            IdentityBinding(column="account_external_id", object_type="Company",
+                            key="the CRM's own account id, via its landed row"),
+        ),
+        precedence_source="crm",
+        match_policy="knowledge:entity-resolution-policy",
+        freshness="pull, delta by updatedAt watermark",
+        custody="copy",
+        collection="source-landing",
+        escalation="per-row task",
+        steward_queue="data-stewardship",
+        notes=(
+            "No dereference: every reference in this family is an id the "
+            "flow resolves against a row the same feed landed, so the "
+            "connector never leaves the page it pulled. A contact with no "
+            "address mints under `source:external id` rather than matching on "
+            "a name — the duplicate that produces is the point, and B5 "
+            "proposes the merge with evidence a human can read."
+        ),
+    ),
+    Mapping(
+        id="erp-sales",
+        source="erp-sales",
+        system="ERP order-to-cash (the estate's finance system)",
+        summary=(
+            "The sell side of the ERP: customers, the catalogue, and sales "
+            "orders with their lines. Customers **reify** onto the same "
+            "counterparty book the CRM writes into — this is the second voice "
+            "on the same companies, and where the two disagree about a "
+            "commercial fact both claims are kept and the ERP's precedence "
+            "resolves it. Items and orders bind: a SKU and an order number "
+            "are exact, and nothing about them needs a steward."
+        ),
+        transport="pull",
+        payload="CustomerRecord + ItemRecord + SalesOrderRecord",
+        strategy="reify",
+        lands_as="SourceRecord",
+        resolves_to=("Company", "Item", "SalesOrder", "SalesOrderLine"),
+        identity=(
+            IdentityBinding(column="name", object_type="Company",
+                            key="normalized legal name"),
+            IdentityBinding(column="customer_external_id", object_type="Company",
+                            key="the ERP's own customer id, via its landed row"),
+            IdentityBinding(column="sku", object_type="Item", key="SKU"),
+            IdentityBinding(column="item_external_id", object_type="Item",
+                            key="the ERP's internal item id"),
+            IdentityBinding(column="order_number", object_type="SalesOrder",
+                            key="order number (tranId)"),
+        ),
+        precedence_source="erp",
+        match_policy="knowledge:entity-resolution-policy",
+        freshness="pull, delta by updatedAt watermark",
+        custody="copy",
+        collection="source-landing",
+        escalation="windowed aggregate",
+        steward_queue="data-stewardship",
+        notes=(
+            "No dereference: an order line names an item by the ERP's "
+            "internal id, and the item row this feed carries is the only "
+            "thing that translates it to a SKU — so items travel with the "
+            "orders and the flow resolves in-batch first, falling back to the "
+            "`external_id` already claimed on a known Item. A line whose item "
+            "neither answers is counted, never minted: inventing a catalogue "
+            "entry out of an id would put a SKU-less Item in the book that "
+            "the next real one could never merge with."
+        ),
+    ),
 )
+
+
+def steward_queue_for(source: str) -> str:
+    """Which queue this feed's ambiguous rows go to for a human answer.
+
+    A lookup rather than a constant in the flow, because the queue is part of
+    the contract: a Mapping that changes hands changes where its judgment
+    lands, and a flow that hardcoded a queue name would quietly ignore that.
+    A feed with no declared Mapping falls back to the field's own default,
+    which is where every such row went before this existed.
+    """
+    return next(
+        (m.steward_queue for m in MAPPINGS if m.source == source),
+        Mapping.__dataclass_fields__["steward_queue"].default,
+    )
 
 
 def validate_mappings(
@@ -428,7 +553,9 @@ def mappings_markdown(mappings: tuple[Mapping, ...] = MAPPINGS) -> str:
             lines.append(f"- Match policy: {m.match_policy}")
         if m.collection:
             lines.append(f"- Landed rows governed by Collection `{m.collection}`")
-        lines.append(f"- Escalation: {m.escalation}")
+        lines.append(
+            f"- Escalation: {m.escalation}, to the `{m.steward_queue}` queue"
+        )
         if m.notes:
             lines.append(f"- {m.notes}")
         lines.append("")

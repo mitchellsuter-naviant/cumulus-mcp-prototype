@@ -587,7 +587,10 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("payload", "string", "the row, as JSON"),
             FieldSpec("payload_hash", "string",
                       "what makes a byte-identical redelivery recognizable"),
-            FieldSpec("record_kind", "enum", "vendor | po | rr"),
+            FieldSpec("record_kind", "enum",
+                      "vendor | po | rr | company | person — which book a "
+                      "steward's decision on this row writes into, and the "
+                      "only thing that survives from the flow that landed it"),
             FieldSpec("landed_at", "date"),
         ),
         collection="source-landing",
@@ -791,8 +794,13 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("external_id", "string", "the ERP's internal record id"),
             FieldSpec("ordered_date", "date"),
             FieldSpec("status", "enum",
-                      "pending-approval | approved | fulfilled | billed | "
-                      "closed | cancelled"),
+                      "pending-approval | pending-fulfillment | "
+                      "partially-fulfilled | fulfilled | billed | closed | "
+                      "cancelled — the ERP's own vocabulary, slugified. It "
+                      "was declared shorter than this before a real order had "
+                      "been read; a mirror's enum is whatever the mirrored "
+                      "system says, and pretending otherwise would make every "
+                      "partially-fulfilled order unclassifiable"),
             FieldSpec("total_usd", "money"),
             FieldSpec("currency", "string"),
             FieldSpec("memo", "string"),

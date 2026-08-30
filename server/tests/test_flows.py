@@ -12,9 +12,10 @@ the run count, a flow with no runs reports zeroes rather than a distribution,
 and a $0.00 spend tile can say whether it means "nothing ran" or "nobody
 recorded what it cost".
 
-The fleet is seven flows and two definitions. Five inbound sync feeds have no
-`FlowDefinition` and run anyway, which is why the registry cannot be the list
-of what exists.
+The fleet is nine flows and six definitions. Three inbound sync feeds still
+have no `FlowDefinition` and run anyway, which is why the registry cannot be
+the list of what exists — and is why the count above will keep moving as the
+remaining feeds get their exports.
 """
 
 from datetime import timedelta
@@ -33,16 +34,21 @@ from app.reimbursements import SubmittedDocument
 from app.runs import RunRecord
 from tests import world as test_world
 
-# The seven flows that run: two authored definitions and five inbound feeds.
+# The nine flows that run: two authored definitions and seven inbound feeds.
 SYNC_FLOWS = {
     "vendor-sync", "purchase-order-sync", "receiving-sync",
-    "workforce-sync", "calendar-sync",
+    "workforce-sync", "calendar-sync", "crm-sync", "sales-sync",
 }
+#: The feeds that still write the graph with no declarative export to audit.
+#: Four of the seven have one now; these three are the carried debt that is
+#: left, and this set is meant to shrink to nothing rather than to be
+#: maintained.
+UNDECLARED_FEEDS = {"receiving-sync", "workforce-sync", "calendar-sync"}
 
 
 @pytest.fixture()
 def world():
-    """A fresh world: seven registered flow bodies, no runs, no tasks."""
+    """A fresh world: nine registered flow bodies, no runs, no tasks."""
     return test_world.fresh()
 
 
@@ -139,19 +145,20 @@ def probe_flow(client, owner, flow_id: str) -> None:
 
 def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
     """The list used to be the registry, so it showed two flows in a system
-    that runs seven. Five inbound sync feeds have no `FlowDefinition`, write
-    the graph, and were invisible — a definition-less row is honest, hiding
-    the row is not."""
+    that runs nine. Seven inbound sync feeds write the graph; four of them
+    have a `FlowDefinition` now and three still do not, and every one of them
+    is on this list either way — a definition-less row is honest, hiding the
+    row is not."""
     submit_expenses(world, 2)
     rows = client.get("/api/v1/flows").json()
     by_id = {r["id"]: r for r in rows}
     assert SYNC_FLOWS < set(by_id)
     assert {"expense-reimbursement", "accounts-payable"} < set(by_id)
-    assert len(rows) == 7
+    assert len(rows) == 9
 
     # A definition-less row says so, rather than borrowing a lifecycle state
     # it has no definition to hold.
-    feed = by_id["vendor-sync"]
+    feed = by_id["receiving-sync"]
     assert feed["has_definition"] is False
     assert feed["status"] == "undeclared"
     assert feed["version"] == 0
@@ -172,9 +179,12 @@ def test_list_filters(client):
     # Filtering by a definition's lifecycle state excludes the feeds, which
     # have no definition to be in a state.
     active = client.get("/api/v1/flows", params={"status": "active"}).json()
-    assert {r["id"] for r in active} == {"expense-reimbursement", "accounts-payable"}
+    assert {r["id"] for r in active} == {
+        "expense-reimbursement", "accounts-payable",
+        "vendor-sync", "purchase-order-sync", "crm-sync", "sales-sync",
+    }
     undeclared = client.get("/api/v1/flows", params={"status": "undeclared"}).json()
-    assert {r["id"] for r in undeclared} == SYNC_FLOWS
+    assert {r["id"] for r in undeclared} == UNDECLARED_FEEDS
     team = client.get("/api/v1/flows", params={"team": "finance-ops"}).json()
     assert {r["id"] for r in team} == {"expense-reimbursement", "accounts-payable"}
     none = client.get("/api/v1/flows", params={"team": "no-such-team"}).json()
@@ -185,15 +195,15 @@ def test_a_definition_less_flow_can_still_be_opened(client, world):
     """A row the fleet list shows must open. The feed has runs and no map,
     and saying that is better than a 404 or an invented definition."""
     submit_expenses(world, 1)
-    detail = client.get("/api/v1/flows/vendor-sync").json()
+    detail = client.get("/api/v1/flows/receiving-sync").json()
     assert detail["has_definition"] is False
     assert detail["steps"] == []
     assert detail["status"] == "undeclared"
-    usage = client.get("/api/v1/flows/vendor-sync/usage").json()
+    usage = client.get("/api/v1/flows/receiving-sync/usage").json()
     assert usage["has_definition"] is False
     # Editing and versioning still need a definition — there is nothing there
     # to version, and inventing one would be the same lie in a new place.
-    assert client.get("/api/v1/flows/vendor-sync/versions").status_code == 404
+    assert client.get("/api/v1/flows/receiving-sync/versions").status_code == 404
     assert client.get("/api/v1/flows/no-such-flow").status_code == 404
 
 
@@ -351,9 +361,9 @@ def test_the_fleet_run_count_is_the_real_run_count(client, world):
         for row in client.get("/api/v1/flows").json()
     ]
     assert stats["runs"] == sum(u["runs"] for u in per_flow)
-    assert stats["flows"] == 7
-    assert stats["definitions"] == 2
-    assert stats["without_definition"] == 5
+    assert stats["flows"] == 9
+    assert stats["definitions"] == 6
+    assert stats["without_definition"] == 3
 
 
 def test_a_flow_with_no_runs_reports_zero_rather_than_a_series(client):
@@ -460,7 +470,7 @@ def test_runs_of_a_flow_with_no_roi_assumption_return_no_hours(client, world):
     """A sync feed has no definition and so no `roi_minutes_per_run`. Its runs
     are real and its modelled hours are zero — counting them at some default
     would put invented value back into the figure by the side door."""
-    priced_runs(world, "vendor-sync", 4)
+    priced_runs(world, "receiving-sync", 4)
     stats = client.get("/api/v1/flows/stats", params={"days": 30}).json()
     assert stats["runs"] == 4 and stats["completed"] == 4
     assert stats["hours_returned"] == 0.0 and stats["roi_usd"] == 0.0
@@ -748,8 +758,10 @@ def test_downgrade_is_withheld_while_the_flow_is_failing(client, world, owner):
 
 
 def test_a_flow_with_no_definition_says_so_rather_than_recommending(client, world, owner):
-    priced_runs(world, "vendor-sync", 3)
-    recs = client.get("/api/v1/flows/vendor-sync/recommendations", headers=owner).json()
+    priced_runs(world, "receiving-sync", 3)
+    recs = client.get(
+        "/api/v1/flows/receiving-sync/recommendations", headers=owner
+    ).json()
     assert recs[0]["kind"] == "evidence"
     assert "no declarative export" in recs[0]["detail"]
     assert not [r for r in recs if r["proposed_change"]]
