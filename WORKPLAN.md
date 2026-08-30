@@ -284,6 +284,35 @@ Every subagent is spawned with `model: opus` (Opus 5) — decision 14.
   allow it; purge/reseed/pulse wait behind the deploy, then the capstone
   full-estate sync. Ontology decisions queued: Mailbox→Employee owner
   link; Office `showAs` dropped fact.
+- **2026-08-30 (Wave 4 lands — C2, C3, A4, the PSA feed)** — C2
+  (`e77b851`): the Counterparty identity workspace — a third Workspace,
+  not a governance lens, because a steward's worklist is work; merge
+  review with evidence tables; ALSO-KNOWN-AS on entity detail. Fixer
+  (`4755711`): every proposal now raises a Task (ratifications in a new
+  low band); vendor-desk commits derive from the Task's queue; hook
+  failures reopen the Task (all mutation-verified). C3 (`b80ddde`): the
+  System state dashboard — four panels composed from existing surfaces,
+  each tile linked to its rows; found the vendor natural-key collapse
+  (14 rows → 13-vendor book) and the dms-sync→Document declaration gap.
+  A4 (ecosystem): the PSA app live — functions deployed, 13 clients / 18
+  projects / 266 time entries seeded, `project_delivery` in the pulse,
+  hosting released with a placeholder UI so the /api rewrite works
+  (the Flutter UI waits on the SDK bump). PSA feed (`4fe3289`): tenth
+  feed, `Project`+`ProjectPhase` (tasks deliberately not mirrored, time
+  entries summed never landed), `delivery-records` collection, `psa`
+  authority — and the **`conflicting-contact` signal**, added because the
+  Apex bait was structurally identical to a must-link pair without it
+  (bait 0.82→0.47, mutation-proven). Fleet **14 flows / 14 definitions**;
+  **922 passed / 1 skipped**, 100 Dart tests. Live capstone: 10/10 feeds
+  delivered, 1,483 objects / 1,755 links, 10 identity proposals standing
+  (six PSA cross-spelling joins at 0.95 exact), all with Tasks.
+  Queued decisions: dms-sync→Document declaration (reference-custody rows
+  under a copy-custody type's collection); Mailbox→Employee owner link;
+  Office showAs fact; CEO persona scope (own vs tenant — C3 found the
+  "org-read" blurb over-promises); ABoxExplorer's 1200-row truncation;
+  IdentityBook.objects vs map count diverge once anything is superseded;
+  ecosystem Dart SDK bump (admin + PSA UIs, melos gates); operator in the
+  estate HRIS.
 - **2026-08-30 (Wave 3 lands — B4, B5, A3)** — B4 (`025f18f`): the mock
   world is gone (server −1,585 lines); personas are real Naviant people
   verified against the live HRIS (Nathan Pryce admin, Raymond Fitzgerald
