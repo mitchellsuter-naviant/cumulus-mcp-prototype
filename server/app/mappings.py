@@ -522,6 +522,81 @@ MAPPINGS: tuple[Mapping, ...] = (
             "aggregate rather than filed at the root."
         ),
     ),
+    Mapping(
+        id="psa-book",
+        source="psa-book",
+        system="PSA (the estate's project delivery system)",
+        summary=(
+            "What the delivery organization is doing for the customers the "
+            "sell side booked: engagements, their phases, and the hours logged "
+            "against them. Clients **reify** onto the same counterparty book "
+            "the CRM and the ERP write into — the third voice on those "
+            "companies and by far the most informal, because a PSA client name "
+            "is what a coordinator typed after a phone call (`Apex Mfg`, "
+            "`Kestrel CU`) rather than anything a system issued. Projects and "
+            "phases bind: an `ENG-` code is exact and nobody adjudicates a "
+            "project's identity. Time entries are neither: they are summed "
+            "onto the phase and the project and never stored as rows."
+        ),
+        transport="pull",
+        payload=(
+            "PsaClientRecord + ProjectRecord + ProjectPhaseRecord + "
+            "ProjectTaskRecord + TimeEntryRecord"
+        ),
+        strategy="reify",
+        lands_as="SourceRecord",
+        resolves_to=("Company", "Project", "ProjectPhase"),
+        identity=(
+            IdentityBinding(column="name", object_type="Company",
+                            key="normalized legal name"),
+            IdentityBinding(column="client_external_id", object_type="Company",
+                            key="the PSA's own client id, via its landed row"),
+            IdentityBinding(column="project_code", object_type="Project",
+                            key="source + project code (ENG-0100)"),
+            IdentityBinding(column="project_external_id", object_type="Project",
+                            key="the PSA's internal project id"),
+            IdentityBinding(column="phase_external_id",
+                            object_type="ProjectPhase",
+                            key="project id + the PSA's phase id"),
+        ),
+        # Last among the systems in the precedence order, and the contract is
+        # where that is visible: this feed's name claims are retained and lose
+        # to every other system that holds a record for the same company.
+        precedence_source="psa",
+        match_policy="knowledge:entity-resolution-policy",
+        freshness="pull, delta by updatedAt watermark per resource",
+        custody="copy",
+        collection="source-landing",
+        # Per row, like the two feeds it shares the counterparty book with: an
+        # ambiguous client raises a `match_review` Task and asserts nothing.
+        escalation="per-row task",
+        steward_queue="data-stewardship",
+        notes=(
+            "**Two whole column sets are refused at the wire.** A task's name, "
+            "assignee, status, due date and estimate never leave the estate: "
+            "no type holds a task, the rows travel as a three-column lookup so "
+            "an hour booked against one can be attributed to its phase, and "
+            "nothing about them survives the run. A time entry's `notes` never "
+            "leaves either — the same custody line the mail feed draws at "
+            "`bodyPreview`, and for the same reason: a column that never "
+            "reaches the wire cannot be landed by a flow written later. "
+            "**People are display names all the way in.** `S. Hoffmann` and "
+            "`Curt Boyd` are what a coordinator typed; the PSA holds no "
+            "employee id and neither does anything here, so those strings land "
+            "as `project_manager` and `contributors` claims — observations "
+            "awaiting promotion — and the join to the HRIS is a fuzzy match "
+            "with a steward at the end of it, never a batch feed's to assert. "
+            "**Hours have a window.** `actual_hours` is the PSA's own running "
+            "total, served whole on every project read and claimed as it "
+            "arrived; the billable and per-phase sums are computed from the "
+            "entries a delivery carried, and are written only for the projects "
+            "it carried any for — so a delta about one renamed project cannot "
+            "overwrite a total with the zero it happened to see. On a full "
+            "pull they are the totals; on a delta they are that window. No "
+            "dereference: every reference in the family is an id the flow "
+            "resolves against a row this same feed landed."
+        ),
+    ),
 )
 
 

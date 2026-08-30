@@ -84,6 +84,7 @@ SALES_FLOW_ID = "sales-sync"
 MAIL_FLOW_ID = "mail-sync"
 EMPLOYMENT_EVENT_FLOW_ID = "employment-event-sync"
 DMS_FLOW_ID = "dms-sync"
+PSA_FLOW_ID = "psa-sync"
 #: Which desk an ambiguous row or a proposed merge goes to is declared per
 #: Mapping (`Mapping.steward_queue`) and read back through
 #: `mappings.steward_queue_for` (per feed) and `steward_queue_for_type` (per
@@ -106,11 +107,12 @@ SALES_EVENT = "SalesRecordsDelivered"
 MAIL_EVENT = "MailDelivered"
 EMPLOYMENT_EVENT_EVENT = "EmploymentEventsDelivered"
 DOCUMENTS_EVENT = "DocumentsDelivered"
+PSA_EVENT = "PsaBookDelivered"
 
 SyncKind = Literal[
     "vendors", "purchase-orders", "receiving-reports", "workforce",
     "calendars", "crm-book", "sales-records", "mail", "employment-events",
-    "documents",
+    "documents", "psa-book",
 ]
 
 #: Every sync flow, and the kind its runs report under in the Sources lens.
@@ -129,6 +131,7 @@ FEED_FLOWS: dict[str, SyncKind] = {
     MAIL_FLOW_ID: "mail",
     EMPLOYMENT_EVENT_FLOW_ID: "employment-events",
     DMS_FLOW_ID: "documents",
+    PSA_FLOW_ID: "psa-book",
 }
 
 
@@ -504,6 +507,105 @@ class DmsDocumentRecord(BaseModel):
     storage_ref: str = ""
 
 
+class PsaClientRecord(BaseModel):
+    """One customer as the delivery system holds them — a nickname and a name.
+
+    The thinnest counterparty row on this wire, and the most interesting one
+    for that reason: the PSA carries no legal name, no website, no phone and no
+    id anybody else would recognize. What it has is what a coordinator typed
+    (`Apex Mfg`, `Kestrel CU`) and, usually, the address of the person they
+    talk to — which is the only hard identifier this feed contributes and the
+    reason both contact columns travel. A client with neither is a name and
+    nothing else, and the sweep can only ever judge it on a spelling.
+    """
+
+    external_id: str
+    name: str
+    contact_name: str = ""
+    contact_email: str = ""
+
+
+class ProjectRecord(BaseModel):
+    """One engagement, as the delivery system holds it.
+
+    `project_code` is the PSA's human transaction id (`ENG-0100`) and the
+    natural key's second half; `external_id` is the internal record id the
+    phases, tasks and time entries all reference.
+
+    `project_manager` is a *display name* and stays one all the way in. The PSA
+    knows nothing about the HRIS and cheerfully stores `S. Hoffmann`; a shape
+    that called this column `manager_email` would be promising a join nobody
+    can make from the row.
+    """
+
+    external_id: str
+    project_code: str = ""
+    client_external_id: str = ""
+    name: str = ""
+    status: str = ""
+    project_manager: str = ""
+    start_date: str = ""
+    target_end_date: str = ""
+    budget_hours: float = 0.0
+    #: The PSA's own sum over its time entries, carried as it was served. Kept
+    #: beside the sum this feed computes because they can legitimately differ:
+    #: the source totals the whole project, a delta carries one window of it.
+    actual_hours: float = 0.0
+
+
+class ProjectPhaseRecord(BaseModel):
+    """One stage of one project."""
+
+    external_id: str
+    project_external_id: str = ""
+    name: str = ""
+    sequence: int = 0
+    status: str = ""
+    target_date: str = ""
+
+
+class ProjectTaskRecord(BaseModel):
+    """A task's *placement*, and deliberately nothing else about it.
+
+    This is the shape that carries the least of what its source holds, and the
+    absences are the design. The PSA serves a task's name, assignee, status,
+    due date and estimate on every row; none of them are here, because no type
+    in the ontology holds a task and inventing one to hold them would be
+    modelling the feed. What survives is the two ids that let an hour booked
+    against a task be attributed to the phase that task belongs to — the same
+    role `ItemRecord` plays for an order line, except that nothing is kept at
+    the end of it. Custody stated at the earliest point it can be: a column
+    that never reaches the wire cannot be landed by accident later.
+    """
+
+    external_id: str
+    project_external_id: str = ""
+    phase_external_id: str = ""
+
+
+class TimeEntryRecord(BaseModel):
+    """One booked day, carried to be summed and not to be kept.
+
+    No `notes` column, on the same reasoning as `MailMessageRecord`'s missing
+    `body`: the estate serves a free-text note on every row ("On site — Verona
+    plant"), the flow adds these up and stores totals, and a field that never
+    reaches the wire cannot become a store of what a technician wrote about a
+    customer's site.
+
+    `person` is a display name like the project manager's, and travels for the
+    aggregate rather than for a join: `Curt Boyd` is Curtis Boyd in the HRIS
+    and nothing in either system says so.
+    """
+
+    external_id: str
+    project_external_id: str = ""
+    task_external_id: str = ""
+    person: str = ""
+    work_date: str = ""
+    hours: float = 0.0
+    billable: bool = True
+
+
 class SyncRequest(BaseModel):
     """One delivery from one source system.
 
@@ -551,6 +653,15 @@ class SyncRequest(BaseModel):
     # do — a document cannot be filed under a folder that has not landed.
     folders: list[FolderRecord] = Field(default_factory=list)
     documents: list[DmsDocumentRecord] = Field(default_factory=list)
+    # The delivery book travels as one thing for the reason the CRM's does, and
+    # then some: a phase names its project, a task names its phase, and an hour
+    # names a task. Split across deliveries, every hour would arrive with
+    # nowhere to land and every phase with no project to be part of.
+    psa_clients: list[PsaClientRecord] = Field(default_factory=list)
+    projects: list[ProjectRecord] = Field(default_factory=list)
+    project_phases: list[ProjectPhaseRecord] = Field(default_factory=list)
+    project_tasks: list[ProjectTaskRecord] = Field(default_factory=list)
+    time_entries: list[TimeEntryRecord] = Field(default_factory=list)
 
 
 class SourceStatus(BaseModel):
@@ -709,11 +820,12 @@ class SyncService:
             # — and they register here so `SyncService` stays the one place
             # that knows which flows exist. Deferred because they import this
             # module for its wire shapes.
-            from . import sync_commerce, sync_dms, sync_office
+            from . import sync_commerce, sync_dms, sync_office, sync_psa
 
             sync_commerce.register(self)
             sync_office.register(self)
             sync_dms.register(self)
+            sync_psa.register(self)
             # Not a feed: it reads the book the feeds wrote. It registers here
             # with them because this service is the one place that knows which
             # flow bodies exist, and because the steward decision it produces
@@ -771,12 +883,17 @@ class SyncService:
             plan.append((MAIL_EVENT, []))
         if request.folders or request.documents:
             plan.append((DOCUMENTS_EVENT, []))
+        if (
+            request.psa_clients or request.projects or request.project_phases
+            or request.project_tasks or request.time_entries
+        ):
+            plan.append((PSA_EVENT, []))
         # The multi-shape feeds carry their records in named lists rather than
         # one `records` column, so they are exempt from the emptiness check
         # and build their own inputs below.
         multi_shape = (
             WORKFORCE_EVENT, CALENDAR_EVENT, CRM_EVENT, SALES_EVENT, MAIL_EVENT,
-            DOCUMENTS_EVENT,
+            DOCUMENTS_EVENT, PSA_EVENT,
         )
         for event, records in plan:
             if event not in multi_shape and not records:
@@ -837,6 +954,18 @@ class SyncService:
                     "watermark": request.watermark,
                     "folders": [f.model_dump() for f in request.folders],
                     "documents": [d.model_dump() for d in request.documents],
+                }
+            elif event == PSA_EVENT:
+                inputs = {
+                    "source": request.source,
+                    "watermark": request.watermark,
+                    "clients": [c.model_dump() for c in request.psa_clients],
+                    "projects": [p.model_dump() for p in request.projects],
+                    "phases": [p.model_dump() for p in request.project_phases],
+                    "tasks": [t.model_dump() for t in request.project_tasks],
+                    "time_entries": [
+                        t.model_dump() for t in request.time_entries
+                    ],
                 }
             run_id = None
             if request.idempotency_key:
@@ -2252,6 +2381,13 @@ def _authority(source: str) -> str:  # noqa: D401
     # wrong reason.
     if "dms" in lowered or "sharepoint" in lowered or "documentum" in lowered:
         return "dms"
+    # NAMING HAZARD, stated once and only here: `psa` (the delivery system) and
+    # `pas` (an insurance policy administration system) are one transposition
+    # apart. They never co-occur in a namespace, and this branch matches the
+    # first spelling only — a feed named `pas-policies` falls through to `flow`
+    # rather than being quietly filed under Delivery's authority.
+    if "psa" in lowered or "kantata" in lowered or "openair" in lowered:
+        return "psa"
     return "flow"
 
 

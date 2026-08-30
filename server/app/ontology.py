@@ -577,6 +577,16 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
             FieldSpec("website", "string"),
             FieldSpec("phone", "string"),
             FieldSpec("email", "string"),
+            FieldSpec("domain", "string",
+                      "the mail domain the counterparty is reachable at, where "
+                      "that is the only reachability a source holds. The "
+                      "delivery system keeps no website and no switchboard — "
+                      "it keeps the address of the person somebody talks to — "
+                      "and the host out of that address is the one hard "
+                      "identifier an informal client list contributes. Derived "
+                      "in the flow and claimed as itself rather than filed "
+                      "under `email`, because a named person's address is not "
+                      "the company's"),
             FieldSpec("payment_terms", "string",
                       "a commercial fact, so the ERP outranks the CRM here — "
                       "both claims are kept and precedence picks"),
@@ -1015,6 +1025,104 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         collection="correspondence",
     ),
+    ObjectType(
+        name="Project",
+        label="Project",
+        summary=(
+            "One engagement the delivery organization is running for a "
+            "counterparty: what was promised, how far along it is, and what it "
+            "has cost in hours against what was budgeted. It earns a type "
+            "because delivery is the half of the business no other feed can "
+            "see — a sales order says what was sold and an invoice says what "
+            "was billed, and neither says whether the work is happening. It "
+            "is also where the deal-to-order disagreement is visible from the "
+            "far end: a project sitting `on-hold` because its funding order "
+            "is still Pending Approval is the same fact the ERP and the CRM "
+            "are arguing about, seen by the people who cannot start."
+        ),
+        natural_key=(
+            "source + the PSA's own project code (`ENG-0100`) — source-scoped "
+            "for the reason an opportunity id is: two delivery systems can "
+            "both issue `ENG-0100` and mean different engagements"
+        ),
+        fields=(
+            FieldSpec("project_code", "string",
+                      "the user-facing code the PSA prints on everything"),
+            FieldSpec("external_id", "string", "the PSA's internal record id"),
+            FieldSpec("source", "string",
+                      "the feed that landed it — the key is source-scoped, so "
+                      "the lookup that places a phase has to be too"),
+            FieldSpec("name", "string"),
+            FieldSpec("status", "enum",
+                      "planned | active | on-hold | completed | cancelled — "
+                      "the PSA's own vocabulary, slugified"),
+            FieldSpec("project_manager", "string",
+                      "the manager as the PSA holds them: a free-typed display "
+                      "name (`S. Hoffmann`), never an id. An observation "
+                      "awaiting promotion and deliberately not a Link — "
+                      "joining that string to an HRIS Employee is a fuzzy "
+                      "match with a steward at the end of it, not something a "
+                      "batch feed may assert"),
+            FieldSpec("contributors", "string",
+                      "the display names that have logged time, on the same "
+                      "terms and for the same reason — Delivery's workload, "
+                      "as far as it can honestly be read"),
+            FieldSpec("start_date", "date"),
+            FieldSpec("target_end_date", "date"),
+            FieldSpec("budget_hours", "number"),
+            FieldSpec("actual_hours", "number",
+                      "hours logged against the whole project, as the PSA sums "
+                      "them"),
+            FieldSpec("billable_hours", "number",
+                      "the billable share of them, summed on the way in"),
+            FieldSpec("company_name", "string",
+                      "denormalized from delivered_for, for cheap reads"),
+        ),
+        # The PSA is the book of record for delivery; we mirror it, and a
+        # status corrected here would be corrected in the wrong place.
+        authoritative=False,
+        collection="delivery-records",
+        tags=("delivery", "projects", "commerce"),
+        competency_questions=(
+            "Who is {label} for, and is it burning its budget?",
+            "Which order and which deal is {label} the delivery of?",
+            "Who is working on {label}, and on which phase?",
+        ),
+    ),
+    ObjectType(
+        name="ProjectPhase",
+        label="Project phase",
+        summary=(
+            "One stage of a project — Discovery, Scan, QC, Go-live — and a "
+            "**part** of it in the strict sense: a phase named `QC` means "
+            "nothing outside the engagement that has one, and it dies with the "
+            "project. It is the smallest unit worth mirroring, and the line is "
+            "drawn here deliberately: the PSA's *tasks* are not modelled. A "
+            "task list is how a coordinator organizes a week, it is abandoned "
+            "the moment a project closes (the estate's finished projects carry "
+            "none), and every question Cumulus has of the delivery org — is "
+            "this engagement on track, where are the hours going, who is on it "
+            "— is answered a level up. Mirroring 48 task rows to answer none "
+            "of them would be modelling the feed instead of the business."
+        ),
+        natural_key="project id + the PSA's own phase id",
+        fields=(
+            FieldSpec("external_id", "string", "the PSA's id for this phase"),
+            FieldSpec("name", "string"),
+            FieldSpec("sequence", "number", "where it falls in the plan"),
+            FieldSpec("status", "enum",
+                      "not-started | in-progress | complete"),
+            FieldSpec("target_date", "date"),
+            FieldSpec("logged_hours", "number",
+                      "hours attributed to this phase — summed on the way in "
+                      "from the time entries, through the task each one names. "
+                      "Time booked straight to the project reaches no phase "
+                      "and is counted on the run rather than spread"),
+            FieldSpec("billable_hours", "number"),
+            FieldSpec("project_code", "string", "denormalized from the parent"),
+        ),
+        collection="delivery-records",
+    ),
 )
 
 LINK_TYPES: tuple[LinkType, ...] = (
@@ -1166,6 +1274,15 @@ LINK_TYPES: tuple[LinkType, ...] = (
              "the addressing and not about either end"),
     LinkType("addressed_to_employee", "MailMessage", "Employee", "many-to-many",
              "an internal recipient, on the same terms"),
+    LinkType("delivered_for", "Project", "Company", "many-to-one",
+             "the counterparty an engagement is being delivered for. The "
+             "third edge into the counterparty book, beside `sold_to` and "
+             "`pursued_with`, and the one that completes the arc: pursued, "
+             "sold, delivered. One company, because a project the PSA "
+             "reparented is a correction and not two customers sharing an "
+             "engagement"),
+    LinkType("has_phase", "Project", "ProjectPhase", "one-to-many",
+             "the project's stages, in plan order", nature="composition"),
     # ---- proposed identity: two canonical objects, one real-world party ----
     #
     # The `*_identified_as` edges above answer "which source row is this
@@ -1250,13 +1367,25 @@ LINK_TYPES: tuple[LinkType, ...] = (
 # its own the DMS would fall through `_authority` to `flow`, and a filing
 # system's own tree would have been recorded as something Cumulus guessed.
 #
+# `psa` sits directly below `dms` on the same argument, and it is the weakest
+# system voice in the list. The delivery system is unopposed on the one kind of
+# fact it owns first-hand — which engagements exist, what phase they are in,
+# how many hours went into them — so its rank is almost never exercised, which
+# is the point. Where it *is* opposed it should lose to everything: a PSA
+# client name is not a record of a company, it is what a coordinator typed
+# after a phone call (`Apex Mfg`, `Kestrel CU`), never synced from the CRM or
+# the ERP and never validated against anything. That is thinner evidence than a
+# filename, which is at least written down when a document is filed. It ranks
+# above `procurement` only because `procurement`'s rows are second-hand
+# supplier records from systems this estate does not run.
+#
 # Both claims are always retained, so this order is a read-time decision: the
 # CRM/ERP disagreement the demo turns on is visible *because* neither claim was
 # discarded, and reordering this tuple re-resolves history rather than
 # rewriting it.
 PRECEDENCE: tuple[str, ...] = (
-    "human", "erp", "hris", "crm", "calendar", "office", "dms", "procurement",
-    "flow", "model",
+    "human", "erp", "hris", "crm", "calendar", "office", "dms", "psa",
+    "procurement", "flow", "model",
 )
 
 ONTOLOGY = Ontology(objects=OBJECT_TYPES, links=LINK_TYPES, precedence=PRECEDENCE)

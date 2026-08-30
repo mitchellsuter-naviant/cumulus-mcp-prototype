@@ -139,6 +139,8 @@ TRIGGERS: dict[str, Trigger] = {t.id: t for t in (
             starts="employment-event-sync", wakes="window"),
     Trigger(id="documents-delivered", event="DocumentsDelivered",
             starts="dms-sync", wakes="window"),
+    Trigger(id="psa-book-delivered", event="PsaBookDelivered",
+            starts="psa-sync", wakes="window"),
     # The first windowed Trigger that is not a delivery. Nothing arrived; a
     # window closed over the book we already hold, and the response reads the
     # whole counterparty book against itself. It is windowed for the same

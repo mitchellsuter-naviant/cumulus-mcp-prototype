@@ -75,12 +75,17 @@ from .sync import (
     MailboxRecord,
     MailMessageRecord,
     OpportunityRecord,
+    ProjectPhaseRecord,
+    ProjectRecord,
+    ProjectTaskRecord,
+    PsaClientRecord,
     PurchaseOrderLineRecord,
     PurchaseOrderRecord,
     SalesOrderLineRecord,
     SalesOrderRecord,
     SyncRequest,
     TeamRecord,
+    TimeEntryRecord,
     VendorRecord,
 )
 
@@ -108,6 +113,11 @@ OFFICE_MAIL = "office-mail"
 OFFICE_PROVIDER = "microsoft-365"
 HRIS_EMPLOYMENT_EVENTS = "hris-employment-events"
 DMS_LIBRARY = "dms-library"
+#: The delivery system. `psa`, and not `pas` — the estate ships an insurance
+#: policy-administration app one transposition away, and the two never appear
+#: in one namespace, which is exactly the condition under which a typo goes
+#: unnoticed.
+PSA_BOOK = "psa-book"
 
 #: Records per delivery. The estate does not page, so this is the only bound on
 #: how large one POST gets; a chunk is cut on an `updatedAt` boundary, never
@@ -790,6 +800,90 @@ def _build_dms_library(
     )
 
 
+def _build_psa_book(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest:
+    """PSA clients/projects/phases/tasks/timeEntries → the delivery shapes.
+
+    Renames, and no dereference: every reference in this family (`clientId`,
+    `projectId`, `phaseId`, `taskId`) is an id the flow resolves against a row
+    this same feed landed, so the connector never leaves the page it pulled.
+
+    Two columns are read and two whole sets of columns are not, and both are
+    decisions rather than omissions. A **task** arrives as three ids and
+    nothing else — its name, assignee, status, due date and estimate are served
+    on every row and dropped here — because no type holds a task and the row
+    is only here to say which phase an hour belongs to. A **time entry**
+    arrives without its `notes`, the same custody line `_build_office_mail`
+    draws at `bodyPreview`: a field that never reaches the wire cannot be
+    landed by a flow written later.
+
+    `actualHours` is the one server-computed number the estate sends, and it
+    travels as it arrived. The connector has no opinion about whether it agrees
+    with the entries beside it; whether they can agree at all is a question
+    about the delivery window, and the flow is where that is answered.
+    """
+    return SyncRequest(
+        source=PSA_BOOK,
+        psa_clients=[
+            PsaClientRecord(
+                external_id=_text(c, "id"),
+                name=_text(c, "name"),
+                contact_name=_text(c, "contactName"),
+                contact_email=_text(c, "contactEmail"),
+            )
+            for c in rows.get("clients", [])
+        ],
+        projects=[
+            ProjectRecord(
+                external_id=_text(p, "id"),
+                project_code=_text(p, "projectCode"),
+                client_external_id=_text(p, "clientId"),
+                name=_text(p, "name"),
+                status=_text(p, "status"),
+                project_manager=_text(p, "projectManager"),
+                start_date=_text(p, "startDate"),
+                target_end_date=_text(p, "targetEndDate"),
+                budget_hours=_number(p, "budgetHours"),
+                actual_hours=_number(p, "actualHours"),
+            )
+            for p in rows.get("projects", [])
+        ],
+        project_phases=[
+            ProjectPhaseRecord(
+                external_id=_text(p, "id"),
+                project_external_id=_text(p, "projectId"),
+                name=_text(p, "name"),
+                sequence=int(_number(p, "sequence")),
+                status=_text(p, "status"),
+                target_date=_text(p, "targetDate"),
+            )
+            for p in rows.get("phases", [])
+        ],
+        project_tasks=[
+            ProjectTaskRecord(
+                external_id=_text(t, "id"),
+                project_external_id=_text(t, "projectId"),
+                phase_external_id=_text(t, "phaseId"),
+            )
+            for t in rows.get("tasks", [])
+        ],
+        time_entries=[
+            TimeEntryRecord(
+                external_id=_text(t, "id"),
+                project_external_id=_text(t, "projectId"),
+                task_external_id=_text(t, "taskId"),
+                person=_text(t, "person"),
+                work_date=_text(t, "workDate"),
+                hours=_number(t, "hours"),
+                # The estate defaults it to true and sends it as a real
+                # boolean, so the flag is read rather than assumed — a
+                # non-billable day is the fact a utilization question turns on.
+                billable=bool(t.get("billable")),
+            )
+            for t in rows.get("timeEntries", [])
+        ],
+    )
+
+
 def _storage_ref(deref: Deref, row: dict) -> str:
     """The customer-resolvable address of one file's current revision.
 
@@ -886,6 +980,16 @@ FEEDS: tuple[FeedSpec, ...] = (
         # once that folder has landed.
         resources=("folders", "documents"),
         build=_build_dms_library,
+    ),
+    FeedSpec(
+        feed=PSA_BOOK,
+        app="psa",
+        # The longest family in the registry, and every step of it is a
+        # reference the next one needs: a project names a client, a phase names
+        # a project, a task names a phase, an hour names a task. One feed
+        # rather than five, for the reason teams and employees are one.
+        resources=("clients", "projects", "phases", "tasks", "timeEntries"),
+        build=_build_psa_book,
     ),
 )
 

@@ -1808,6 +1808,67 @@ def _seed_definitions() -> list[FlowDefinition]:
                          config={"event": "IdentityMergesProposed"}),
             ],
         ),
+        FlowDefinition(
+            id="psa-sync",
+            name="Delivery book sync",
+            description=(
+                "The delivery organization's own week: engagements, the "
+                "phases they are broken into, and the hours booked against "
+                "them. Clients reify onto the counterparty book through the "
+                "same resolution the CRM and ERP feeds use — the third voice "
+                "on those companies, and the informal one, since a PSA client "
+                "name is what a coordinator typed after a phone call. "
+                "Projects and phases bind; time entries are summed onto both "
+                "and never stored as rows. Two things this flow deliberately "
+                "does not do: it does not mirror the PSA's tasks (their rows "
+                "arrive as a three-column lookup so an hour can find its "
+                "phase, and nothing about them survives), and it does not "
+                "resolve a person — `S. Hoffmann` lands as a string, because "
+                "joining that to the HRIS is a fuzzy match with a steward at "
+                "the end of it."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "psa", "delivery", "projects", "counterparties"],
+            queues=["data-stewardship"],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(1),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="PsaBookDelivered",
+                         summary="one run per delivery, woken by a window",
+                         config={"event": "PsaBookDelivered"}, next=["x1"]),
+                FlowStep(id="x1", type="transform", name="read-resolution-policy",
+                         summary="gathers the governed thresholds the counterparty match runs under — the same policy the CRM and the ERP resolve against, so three systems cannot disagree about what counts as one company",
+                         config={"source": "knowledge:entity-resolution-policy"},
+                         next=["s1"]),
+                FlowStep(id="s1", type="sync", name="land-records",
+                         summary="the client list as delivered, under the nicknames Delivery uses; only the clients land, because a project code is exact and has nothing to adjudicate",
+                         config={"target": "source-landing", "gateway": "action-gateway"},
+                         next=["z1"]),
+                FlowStep(id="z1", type="resolve", name="resolve-records",
+                         summary="scores each client against the counterparty book — `Apex Mfg` against the `Apex Manufacturing` the CRM minted; a nickname usually falls below the floor and mints, which is what leaves the join for the identity sweep to propose with evidence",
+                         config={"entity": "Company",
+                                 "source": "knowledge:entity-resolution-policy"},
+                         next=["a1"]),
+                FlowStep(id="a1", type="action", name="apply-resolutions",
+                         summary="guarded write of the PSA's name claim onto known counterparties and its identity links back to each landed row, plus the contact's mail domain — the one hard identifier an informal client list carries; an ambiguous client raises a Task and asserts nothing",
+                         config={"target": "company-master", "gateway": "action-gateway",
+                                 "queue": "data-stewardship"},
+                         next=["a2"]),
+                FlowStep(id="a2", type="action", name="apply-delivery-book",
+                         summary="guarded write of the projects, their phases, the counterparty edge and the hours — summed onto each phase through the task an entry names, with time booked past every phase counted rather than spread",
+                         config={"target": "delivery-records", "gateway": "action-gateway"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="PsaBookSynced",
+                         summary="emitted on commit",
+                         config={"event": "PsaBookSynced"}),
+            ],
+        ),
     ]
 
 

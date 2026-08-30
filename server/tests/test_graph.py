@@ -735,11 +735,12 @@ def test_part_ness_is_derived_never_declared():
     # outlives every line that sold it.
     assert ONTOLOGY.owner_of("Item") is None
     assert ONTOLOGY.owner_of("Folder") is None
+    assert ONTOLOGY.owner_of("ProjectPhase") == "Project"
     assert [o.name for o in ONTOLOGY.roots()] == [
         "Employee", "Team", "Capability", "Calendar", "ExpenseRequest",
         "Document", "Folder", "Vendor", "Company", "Person", "SourceRecord",
         "Invoice", "PurchaseOrder", "ReceivingReport", "Opportunity",
-        "SalesOrder", "Item", "Mailbox",
+        "SalesOrder", "Item", "Mailbox", "Project",
     ]
 
 
@@ -770,12 +771,16 @@ def test_precedence_is_an_ordered_argument_not_a_set():
     from app.ontology import ONTOLOGY
 
     assert ONTOLOGY.precedence == (
-        "human", "erp", "hris", "crm", "calendar", "office", "dms",
+        "human", "erp", "hris", "crm", "calendar", "office", "dms", "psa",
         "procurement", "flow", "model",
     )
     assert ONTOLOGY.precedence.index("erp") < ONTOLOGY.precedence.index("crm")
     assert ONTOLOGY.precedence.index("calendar") < ONTOLOGY.precedence.index("office")
     assert ONTOLOGY.precedence.index("office") < ONTOLOGY.precedence.index("dms")
+    # The delivery system is the weakest system voice there is: it is
+    # unopposed on the engagements it owns, and everything else it appears to
+    # say is a nickname somebody typed after a phone call.
+    assert ONTOLOGY.precedence.index("dms") < ONTOLOGY.precedence.index("psa")
     # A Flow's own inference stays below every system that observed something.
     assert ONTOLOGY.precedence[-2:] == ("flow", "model")
 
