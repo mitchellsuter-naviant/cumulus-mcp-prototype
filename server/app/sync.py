@@ -53,7 +53,11 @@ from .graph import (
     object_id,
     parse_ref,
 )
-from . import identity_sweep
+from . import disagreement_sweep, identity_sweep
+from .disagreement_sweep import (
+    DISAGREEMENT_SWEEP_FLOW_ID,
+    STATE_WINDOW_EVENT,
+)
 from .identity_sweep import (
     IDENTITY_SWEEP_FLOW_ID,
     IDENTITY_WINDOW_EVENT,
@@ -859,6 +863,10 @@ class SyncService:
             # flow bodies exist, and because the steward decision it produces
             # is applied a few hundred lines below, beside its sibling.
             identity_sweep.register(self)
+            # Its sibling, and downstream of it in the only way that matters:
+            # what the identity sweep has confirmed is what this one is allowed
+            # to join across. Registered beside it for the same reason.
+            disagreement_sweep.register(self)
 
     def _act(self, ctx: RunContext, action_id: str, step_id: str) -> PendingAction:
         """A sync write, committed by the Flow that is running.
@@ -2192,6 +2200,30 @@ class SyncService:
             IDENTITY_WINDOW_EVENT,
             {"window": window or "the whole counterparty book"},
             actor=actor or f"flow:{IDENTITY_SWEEP_FLOW_ID}",
+        ).one()
+        return {
+            "flow_id": record.flow_id, "run_id": record.id,
+            "status": record.status, **(record.outputs or {}),
+        }
+
+    def sweep_disagreements(self, actor: str = "", window: str = "") -> dict:
+        """Close a state window. The Dispatcher decides what responds.
+
+        `sweep_identities`' shape, for `sweep_identities`' reason — the caller
+        states a fact, the Trigger table says what starts — and deliberately a
+        second entry point rather than a flag on the first. The two passes ask
+        different questions, read different policies, raise Tasks to different
+        desks and will run on different schedules: identity settles once a book
+        stops churning, where a disagreement is a fact about today that has to
+        be re-asked every day. Folding them into one call would tie the second
+        one's cadence to the first one's.
+        """
+        if self.engine is None or self.dispatcher is None:
+            raise RuntimeError("Sync service has no run engine wired")
+        record = self.dispatcher.emit(
+            STATE_WINDOW_EVENT,
+            {"window": window or "every held order in the book"},
+            actor=actor or f"flow:{DISAGREEMENT_SWEEP_FLOW_ID}",
         ).one()
         return {
             "flow_id": record.flow_id, "run_id": record.id,

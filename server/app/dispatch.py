@@ -149,6 +149,13 @@ TRIGGERS: dict[str, Trigger] = {t.id: t for t in (
     # before the run exists, like everything else.
     Trigger(id="identity-window-closed", event="IdentityWindowClosed",
             starts="identity-sweep", wakes="window"),
+    # The second, and the sibling of the first. Same shape and the same
+    # reason — a window closed over the book, nothing arrived — asking the
+    # other question a pass over the whole estate can answer: not "are these
+    # two rows one party" but "are these two systems, having agreed on the
+    # party, saying compatible things about what was committed to".
+    Trigger(id="state-window-closed", event="StateWindowClosed",
+            starts="disagreement-sweep", wakes="window"),
 )}
 
 #: The trigger index. The doctrine keeps it in a fast key-value store for O(1)

@@ -270,9 +270,11 @@ def seeded():
         world.sync.deliver(
             build(rows, _access), actor="system:test"
         )
-    # And the one flow no source pushes: it reads the book the deliveries
-    # above wrote, so it goes last.
+    # And the two flows no source pushes: both read the book the deliveries
+    # above wrote, so they go last — the identity pass first, because what it
+    # confirms is what the disagreement pass is allowed to join across.
     world.sync.sweep_identities(actor="system:test")
+    world.sync.sweep_disagreements(actor="system:test")
     return world
 
 
@@ -297,12 +299,23 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
         "dms-sync",
         "psa-sync",
         "identity-sweep",
+        "disagreement-sweep",
     }
-    # Eleven of the fourteen are inbound syncs. They all have FlowDefinitions now,
+    # Eleven of the fifteen are inbound syncs. They all have FlowDefinitions now,
     # but the projection is still drawn from the engine and from stored runs:
     # a definition says what a flow is *meant* to touch, and this module is
     # about what it did.
     for projection in projections.values():
+        if projection.flow_id == "disagreement-sweep":
+            # The one flow that legitimately wrote nothing, and the recording
+            # is why: this estate's only held order is Blue Harbor's SO5003,
+            # whose deal never closed. A disagreement needs two ends and that
+            # is one, so the honest projection is `ran_but_wrote_nothing` — and
+            # asserting it here rather than excusing the flow is what would
+            # catch a sweep that started inventing findings to look busy.
+            assert projection.state == "ran_but_wrote_nothing"
+            assert projection.writes == [] and projection.establishes == []
+            continue
         assert projection.state == "observed", projection.flow_id
         if projection.flow_id == "employment-event-sync":
             # The one flow that establishes no link, and the projection is

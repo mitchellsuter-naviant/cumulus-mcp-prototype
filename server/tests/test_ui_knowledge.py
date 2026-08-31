@@ -51,12 +51,15 @@ ROUTES = (ONTOLOGY_ROUTE, SOURCES_ROUTE, LIBRARY_ROUTE)
 #: engine, so the test states the expected answer: eleven of them are inbound
 #: syncs, every one now carrying a FlowDefinition — stated because a
 #: selector built from the registry alone would have lost the undeclared
-#: ones while they existed. `identity-sweep` is the one that reaches the graph
-#: without any source having pushed anything: it reads the book the other
-#: twelve wrote and proposes edges across it.
+#: ones while they existed. `identity-sweep` and `disagreement-sweep` are the
+#: two that reach the graph without any source having pushed anything: both
+#: read the book the other twelve wrote and draw edges across it — one between
+#: entities that are the same party, the other between rows whose systems
+#: disagree.
 GRAPH_FLOWS = {
     "accounts-payable",
     "identity-sweep",
+    "disagreement-sweep",
     "calendar-sync",
     "crm-sync",
     "dms-sync",
