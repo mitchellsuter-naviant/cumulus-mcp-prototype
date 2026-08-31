@@ -284,6 +284,25 @@ Every subagent is spawned with `model: opus` (Opus 5) — decision 14.
   allow it; purge/reseed/pulse wait behind the deploy, then the capstone
   full-estate sync. Ontology decisions queued: Mailbox→Employee owner
   link; Office `showAs` dropped fact.
+- **2026-08-31 (the arc closes — clarity pass applied)** — the clarity
+  critic walked the live console as three Naviant personas: 34 findings,
+  all fixed at `7ad3a20` (932 server / 111 Dart tests). Highlights:
+  flows' "Awaiting judgment" now reads the same queue slice as My Tasks;
+  received-vs-landed distinguished on every feed row; the AP/expense
+  workspaces and the command palette gated by the same predicates as the
+  rail (an AE could previously reach the vendor master and the submit
+  route); the three-way-match copy stopped claiming a receiving report
+  this estate does not have. Follow-ups queued: `/api/v1/search` still
+  answers own-scope with corpus summaries (the assets-LIST gate is
+  console-consistency, not a closed boundary); user-role minted keys
+  lost the corpus LIST (integrations that list assets now need an admin
+  identity — deliberate, documented in api_docs); the AE's own expense
+  rows now live only in the Employee Hub (the workspace is the queue
+  owner's Seeing Space); seeding receiving reports in the estate is a
+  Track A decision (the ERP's Partially Received statuses are the raw
+  material). The critic's "worth keeping" list confirms the house voice:
+  the access-boundary sentence, the no-Retry 403, consequence-stating
+  controls, the stub disclosure, the assumption-labelled ROI.
 - **2026-08-30 (Wave 4 lands — C2, C3, A4, the PSA feed)** — C2
   (`e77b851`): the Counterparty identity workspace — a third Workspace,
   not a governance lens, because a steward's worklist is work; merge
