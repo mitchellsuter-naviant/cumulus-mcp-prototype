@@ -407,6 +407,52 @@ void main() {
       expect(find.text('Resolution — two records ruled one'), findsOneWidget);
     });
 
+    testWidgets('a write that broke is named apart from one that was refused',
+        (tester) async {
+      // The two are different news. A refusal is the Gateway saying no and
+      // nothing happened; a failure is a write it allowed that then broke,
+      // which is the only ending where nobody can say what landed. Folding
+      // them into one number would file an outage as governance working.
+      await _pump(tester, JudgmentPanel(
+        judgment: _judgment(
+          ledger: const LedgerWindow(
+            days: 30,
+            scanned: 8,
+            inWindow: 8,
+            refused: 1,
+            failed: 1,
+            byRegime: [
+              RegimeCount(regime: 'observation', committed: 3, refused: 0),
+              RegimeCount(
+                regime: 'decision',
+                committed: 2,
+                refused: 1,
+                failed: 1,
+              ),
+              RegimeCount(regime: 'resolution', committed: 1, refused: 0),
+            ],
+          ),
+        ),
+      ));
+
+      // Every part is named, and the three add to the 4 the bar draws.
+      expect(
+        find.text(
+          '2 committed · 1 refused at the write · '
+          '1 failed after the Gateway allowed it',
+        ),
+        findsOneWidget,
+      );
+      // A regime nothing broke in says so by omission, not by a "0 failed"
+      // that reads as a category of trouble — and its line still adds up.
+      expect(find.text('3 committed'), findsOneWidget);
+      // And the tile above the bars carries the same fact.
+      expect(
+        find.textContaining('8 governed operations, 1 refused, 1 failed'),
+        findsOneWidget,
+      );
+    });
+
     testWidgets('an empty ledger window states the three regimes exist anyway',
         (tester) async {
       await _pump(tester, JudgmentPanel(

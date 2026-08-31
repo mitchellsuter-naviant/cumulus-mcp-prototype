@@ -748,7 +748,13 @@ class JudgmentPanel extends StatelessWidget {
                 caption: decisions == 0
                     ? 'nothing has been committed through the Gateway'
                     : '$decisions governed operations, ${ledger.refused} '
-                          'refused — one commit writes a batch, not a row',
+                          'refused'
+                          // Named only when there are some, and never folded
+                          // into the refusals: a write that broke is not a
+                          // write the Gateway stopped, and one number for both
+                          // would hide an outage behind the spine working.
+                          '${ledger.failed > 0 ? ', ${ledger.failed} failed' : ''}'
+                          ' — one commit writes a batch, not a row',
               ),
               StatTile(
                 label: 'Standing proposals',
@@ -867,6 +873,25 @@ String regimeLabel(String regime) => switch (regime) {
   _ => regime,
 };
 
+/// How one regime's writes ended, in words, adding up to the bar above it.
+///
+/// Built by parts rather than by cases, so the sum stays honest as endings are
+/// added: every bucket that holds anything names itself, and the three of them
+/// add to `total` — which is what the bar above draws. A zero is left out
+/// rather than hidden: "0 failed" beside a regime nothing broke in invents a
+/// category of trouble, and a bucket holding nothing takes nothing off the
+/// bar, so the sentence and the picture still agree.
+String _outcomeLine(RegimeCount regime) {
+  final parts = <String>['${regime.committed} committed'];
+  if (regime.refused > 0) {
+    parts.add('${regime.refused} refused at the write');
+  }
+  if (regime.failed > 0) {
+    parts.add('${regime.failed} failed after the Gateway allowed it');
+  }
+  return parts.join(' · ');
+}
+
 class _LedgerWindowView extends StatelessWidget {
   final LedgerWindow ledger;
 
@@ -901,12 +926,17 @@ class _LedgerWindowView extends StatelessWidget {
           ),
           const SizedBox(height: 2),
           Text(
-            regime.refused == 0
-                ? '${regime.committed} committed'
-                : '${regime.committed} committed · ${regime.refused} refused '
-                      'at the write',
+            _outcomeLine(regime),
             style: CumulusText.meta.copyWith(
-              color: regime.refused > 0 ? CumulusColors.warn : null,
+              // A failure outranks a refusal for the colour, because they are
+              // not the same news: refusing is the spine working, and a write
+              // that broke after the Gateway allowed it is something to go
+              // and look at.
+              color: regime.failed > 0
+                  ? CumulusColors.danger
+                  : regime.refused > 0
+                  ? CumulusColors.warn
+                  : null,
             ),
           ),
           const SizedBox(height: 6),

@@ -7,7 +7,7 @@ can ask a human twice.
 
 import pytest
 
-from app.runs import InMemoryRunStore, RunEngine, StepFailed
+from app.runs import InMemoryRunStore, ModelUsage, RunEngine, StepFailed
 from app.tasks import InMemoryTaskDirectory, Task, TaskService
 
 
@@ -135,6 +135,87 @@ def test_a_run_records_its_read_set_and_model_calls(engine):
     assert set(record.refs) == {
         "knowledge:policy@rev2", "graph:Vendor/vendor_abc@rev1"
     }
+
+
+def test_a_metered_step_takes_its_accounting_off_its_own_output(engine):
+    """`meter` is `writes` for model accounting, and for the same reason.
+
+    The numbers do not exist until the call has been made, and the frame that
+    made it is several below the one declaring the step — so the step declares
+    a callable and the engine resolves it against the output afterwards. All
+    three fields come from the one `ModelUsage`, because a model id from one
+    place and a token count from another is how a backend name gets filed as a
+    model.
+    """
+    def body(ctx, inputs):
+        ctx.step(
+            "m1", "call", "modelcall",
+            fn=lambda: {"text": "ok", "model": "gemini-2.5-flash",
+                        "in": 1200, "out": 300},
+            meter=lambda out: ModelUsage(
+                model=out["model"],
+                input_tokens=out["in"], output_tokens=out["out"],
+            ),
+        )
+        return {}
+
+    engine.register("f", body)
+    record = engine.start("f", {}, run_id="run_8")
+    step = record.step("m1")
+    assert step.model == "gemini-2.5-flash"
+    assert step.tokens == 1500
+    # Unpriced, and it has to read as unpriced rather than as cheap: the rate
+    # is not the reader's to know, so the meter leaves it and whoever prices
+    # the call fills it in.
+    assert step.cost_usd == 0.0
+    assert record.model_calls == 1
+
+
+def test_a_step_without_a_meter_records_what_the_call_site_declared(engine):
+    """The additive half. Every existing call site passes literals and none of
+    them changes behaviour by the arrival of a parameter they do not use."""
+    def body(ctx, inputs):
+        ctx.step(
+            "m1", "call", "modelcall", fn=lambda: {"ok": True},
+            model="stub", cost_usd=0.002, tokens=42,
+        )
+        return {}
+
+    engine.register("f", body)
+    record = engine.start("f", {}, run_id="run_9")
+    step = record.step("m1")
+    assert (step.model, step.cost_usd, step.tokens) == ("stub", 0.002, 42)
+
+
+def test_a_replayed_step_does_not_meter_again(engine):
+    """The property the whole accounting rests on: a run driven three times
+    reports one call. Replay returns above the step body, so the meter is
+    never re-resolved and the rollup is never re-added."""
+    metered = {"n": 0}
+
+    def body(ctx, inputs):
+        def meter(_output):
+            metered["n"] += 1
+            return ModelUsage(
+                model="gemini-2.5-flash", input_tokens=100, output_tokens=20,
+                cost_usd=0.004,
+            )
+
+        ctx.step("m1", "call", "modelcall", fn=lambda: {"ok": True}, meter=meter)
+        ctx.gate("k1", "gate", build_task=lambda: _task())
+        return {}
+
+    engine.register("f", body)
+    record = engine.start("f", {}, run_id="run_10")
+    assert record.status == "suspended"
+
+    engine.tasks.decide(record.open_task_id, "approved", "someone@example.com")
+    resumed = engine.resume("run_10")
+    assert resumed.status == "succeeded"
+    assert metered["n"] == 1
+    assert resumed.model_calls == 1
+    assert resumed.cost_usd == pytest.approx(0.004)
+    assert resumed.step("m1").tokens == 120
 
 
 def test_journal_is_a_projection_of_the_steps(engine):

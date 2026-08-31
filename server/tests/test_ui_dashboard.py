@@ -680,17 +680,45 @@ def test_the_window_counts_governed_writes_by_the_regime_they_declared(
     assert ledger["scanned"] == 7
     assert ledger["truncated"] is False
     assert by_regime["observation"] == {
-        "regime": "observation", "committed": 3, "refused": 0,
+        "regime": "observation", "committed": 3, "refused": 0, "failed": 0,
     }
     assert by_regime["decision"] == {
-        "regime": "decision", "committed": 2, "refused": 1,
+        "regime": "decision", "committed": 2, "refused": 1, "failed": 0,
     }
     assert by_regime["resolution"] == {
-        "regime": "resolution", "committed": 1, "refused": 0,
+        "regime": "resolution", "committed": 1, "refused": 0, "failed": 0,
     }
     assert ledger["refused"] == 1
+    assert ledger["failed"] == 0
     assert ledger["newest_at_iso"]
     assert ledger["days"] == ui_api.DASHBOARD_WINDOW_DAYS
+
+
+def test_a_refused_write_and_a_broken_one_are_counted_apart(ledgered):
+    """Two endings, two buckets, and the reason they must not be one.
+
+    A refusal is the spine working — a principal without the desk, a write the
+    ontology rejects — and nothing happened. A failure is a write the Gateway
+    allowed that then broke, which is the only ending where nobody can say
+    what landed. Summing them would file an outage as governance.
+    """
+    gateway = deps.get_action_gateway()
+    with pytest.raises(RuntimeError):
+        gateway.action(
+            "post-invoice", principal_for(personas.get("naviant-engineer")),
+        ).commit(lambda _w: (_ for _ in ()).throw(RuntimeError("the ERP hung up")))
+
+    ledger = _body(ledgered)["judgment"]["ledger"]
+    by_regime = {r["regime"]: r for r in ledger["by_regime"]}
+    assert by_regime["decision"] == {
+        "regime": "decision", "committed": 2, "refused": 1, "failed": 1,
+    }
+    assert ledger["refused"] == 1 and ledger["failed"] == 1
+    # And the row still adds up to the entries behind it, which is what the
+    # console's bar draws.
+    assert sum(
+        r["committed"] + r["refused"] + r["failed"] for r in ledger["by_regime"]
+    ) == ledger["in_window"] == 8
 
 
 def test_a_regime_nothing_used_is_reported_as_zero_rather_than_omitted(
@@ -702,7 +730,10 @@ def test_a_regime_nothing_used_is_reported_as_zero_rather_than_omitted(
     assert [r["regime"] for r in ledger["by_regime"]] == [
         "observation", "decision", "resolution",
     ]
-    assert all(r["committed"] == r["refused"] == 0 for r in ledger["by_regime"])
+    assert all(
+        r["committed"] == r["refused"] == r["failed"] == 0
+        for r in ledger["by_regime"]
+    )
     assert ledger["in_window"] == 0 and ledger["newest_at_iso"] == ""
 
 

@@ -72,6 +72,33 @@ class StepFailed(Exception):
         self.message = message
 
 
+class ModelUsage(BaseModel):
+    """What one model call actually consumed, as the caller can report it.
+
+    Its own small type, and it lives here because `StepRecord` is what it
+    fills. Three facts travel together or none of them are trustworthy: a
+    token count with no model id cannot be priced, and a model id with no
+    tokens is a label. `cost_usd` is left to whoever knows the rate — the
+    reader that made the call rarely does — and zero means *unpriced*, never
+    cheap, which is the rule the fields below already state.
+    """
+
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+
+    @property
+    def tokens(self) -> int:
+        """Both directions, because that is the shape `StepRecord` keeps.
+
+        The split is worth carrying this far — the two sides price
+        differently — and worth collapsing at the journal, which is a record
+        of what a run did rather than an invoice.
+        """
+        return self.input_tokens + self.output_tokens
+
+
 class StepRecord(BaseModel):
     step_id: str
     name: str
@@ -277,6 +304,7 @@ class RunContext:
         retries: int = 0,
         escalate_queue: str = "",
         writes: Callable[[Any], list[str]] | None = None,
+        meter: Callable[[Any], ModelUsage | None] | None = None,
     ) -> Any:
         """Run a step once, ever. On replay, hand back what it returned.
 
@@ -292,6 +320,17 @@ class RunContext:
         the caller is in the middle of has not happened yet — typically it
         reads the accumulated refs off a `graph.GraphWriter` the step wrote
         through.
+
+        `meter` is `writes` for model accounting, and it exists for the same
+        reason: the token counts do not exist until the call has been made,
+        and the frame that made it is several below the one declaring the
+        step. A `ModelUsage` it returns is authoritative for all three of
+        `model`/`tokens`/`cost_usd` together — the alternative is a step whose
+        model id came from one place and whose token count came from another,
+        which is how a backend name ("vertex") ends up filed as a model. It
+        returns None when there was nothing to meter, and then the literals
+        below stand. A replayed step never calls it: replay returns above,
+        which is what keeps a resumed run from counting one model call twice.
         """
         existing = self.record.step(step_id)
         if existing is not None and existing.status == "done":
@@ -356,11 +395,14 @@ class RunContext:
             raise StepFailed(step_id, last_error)
 
         text = summary(output) if callable(summary) else summary
+        usage = meter(output) if meter is not None else None
         self._record_step(StepRecord(
             step_id=step_id, name=name, kind=kind, status="done",
             summary=text, output=output, refs=refs or [], attempts=attempts,
             duration_ms=int((time.monotonic() - started) * 1000),
-            model=model, cost_usd=cost_usd, tokens=tokens,
+            model=usage.model if usage is not None else model,
+            cost_usd=usage.cost_usd if usage is not None else cost_usd,
+            tokens=usage.tokens if usage is not None else tokens,
             writes=list(writes(output) or []) if writes is not None else [],
         ))
         return output

@@ -354,24 +354,34 @@ class QueueState {
 /// Governed writes under one regime, split by how they ended. A refusal is
 /// counted beside a commit because a write the Gateway stopped is the spine
 /// doing its job.
+///
+/// [failed] is the third ending and not a shade of the second: [refused] is
+/// the Gateway saying no, and nothing happened; [failed] is a write it allowed
+/// that then broke — a graph write that raised, a system that did not answer.
+/// One reads as governance working, the other as something to go and look at.
 class RegimeCount {
   final String regime;
   final int committed;
   final int refused;
+  final int failed;
 
   const RegimeCount({
     required this.regime,
     required this.committed,
     required this.refused,
+    this.failed = 0,
   });
 
   factory RegimeCount.fromJson(Map<String, dynamic> json) => RegimeCount(
     regime: json['regime'] as String? ?? '',
     committed: json['committed'] as int? ?? 0,
     refused: json['refused'] as int? ?? 0,
+    failed: json['failed'] as int? ?? 0,
   );
 
-  int get total => committed + refused;
+  /// Every entry under this regime. The bar draws this, so the line under it
+  /// has to name all three parts or the picture and the sentence disagree.
+  int get total => committed + refused + failed;
 }
 
 class LedgerWindow {
@@ -381,6 +391,7 @@ class LedgerWindow {
   final int inWindow;
   final List<RegimeCount> byRegime;
   final int refused;
+  final int failed;
   final String newestAtIso;
 
   const LedgerWindow({
@@ -390,6 +401,7 @@ class LedgerWindow {
     this.inWindow = 0,
     this.byRegime = const [],
     this.refused = 0,
+    this.failed = 0,
     this.newestAtIso = '',
   });
 
@@ -402,6 +414,7 @@ class LedgerWindow {
         .map((e) => RegimeCount.fromJson(e as Map<String, dynamic>))
         .toList(),
     refused: json['refused'] as int? ?? 0,
+    failed: json['failed'] as int? ?? 0,
     newestAtIso: json['newest_at_iso'] as String? ?? '',
   );
 }

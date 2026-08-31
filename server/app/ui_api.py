@@ -1518,6 +1518,13 @@ DASHBOARD_WINDOW_DAYS = 30
 #: the one list here that grows without bound.
 LEDGER_SCAN = 1000
 
+#: How a governed write can have ended, which is what the window counts. Named
+#: once rather than spelled out at each bucket: the shape this replaced wrote
+#: `{"committed": 0, "refused": 0}` at every use and counted `entry.outcome in
+#: bucket`, so an outcome the Gateway had begun writing was dropped by all of
+#: them without a word. `pending` is the stub state and is never stored.
+LEDGER_OUTCOMES: tuple[str, ...] = ("committed", "refused", "failed")
+
 
 def _age_seconds(iso: str) -> int | None:
     """How long ago, or `None` when there is no timestamp to subtract.
@@ -1857,11 +1864,17 @@ class RegimeCount(BaseModel):
     regime and this counts what the Actions said. A refusal is counted beside
     a commit because a write the Gateway stopped is the spine doing its job —
     reporting only the commits would make a refusing deployment look idle.
+
+    The third bucket is the one nobody wants and everybody needs: `refused` is
+    the Gateway saying no and nothing happened, `failed` is a write it allowed
+    that then broke. Summing them into one "not committed" would put the
+    spine's successes and its outages behind the same number.
     """
 
     regime: str
     committed: int
     refused: int
+    failed: int = 0
 
 
 class LedgerWindow(BaseModel):
@@ -1874,6 +1887,7 @@ class LedgerWindow(BaseModel):
     in_window: int
     by_regime: list[RegimeCount]
     refused: int
+    failed: int = 0
     newest_at_iso: str
 
 
@@ -1966,13 +1980,11 @@ def _ledger_window(days: int) -> LedgerWindow:
     cutoff = (utcnow() - timedelta(days=days)).isoformat()
     in_window = [e for e in entries if e.at_iso >= cutoff]
     counts = {
-        regime: {"committed": 0, "refused": 0}
+        regime: dict.fromkeys(LEDGER_OUTCOMES, 0)
         for regime in ("observation", "decision", "resolution")
     }
     for entry in in_window:
-        bucket = counts.setdefault(
-            entry.regime, {"committed": 0, "refused": 0}
-        )
+        bucket = counts.setdefault(entry.regime, dict.fromkeys(LEDGER_OUTCOMES, 0))
         if entry.outcome in bucket:
             bucket[entry.outcome] += 1
     return LedgerWindow(
@@ -1981,10 +1993,14 @@ def _ledger_window(days: int) -> LedgerWindow:
         truncated=len(entries) >= LEDGER_SCAN and len(in_window) == len(entries),
         in_window=len(in_window),
         by_regime=[
-            RegimeCount(regime=regime, committed=c["committed"], refused=c["refused"])
+            RegimeCount(
+                regime=regime, committed=c["committed"],
+                refused=c["refused"], failed=c["failed"],
+            )
             for regime, c in counts.items()
         ],
         refused=sum(c["refused"] for c in counts.values()),
+        failed=sum(c["failed"] for c in counts.values()),
         newest_at_iso=entries[0].at_iso if entries else "",
     )
 

@@ -28,9 +28,9 @@ committed it under what authority, what authorized it, and which refs it
 touched — not how to undo it. The entity layer retains claims, so a graph write
 is reconstructible from them; `service.py`'s asset `update()` overwrites
 destructively, so a ledgered knowledge change could name the asset and never
-restore its text. Nothing here is transactional either: a write refused halfway
-leaves what landed before it, which is why a refused entry still records the
-refs it managed to write.
+restore its text. Nothing here is transactional either: a write refused or
+broken halfway leaves what landed before it, which is why an entry that did not
+commit still records the refs it managed to write.
 """
 
 from __future__ import annotations
@@ -167,7 +167,15 @@ class LedgerEntry(BaseModel):
     target: str = ""
     # `pending` is the stub state and never reaches the store. An outcome
     # defaulting to "committed" would be a field that fails open.
-    outcome: Literal["pending", "committed", "refused"] = "pending"
+    #
+    # `refused` and `failed` are two different accusations and the ledger must
+    # not blur them: refused is *the Gateway* saying no — a principal without
+    # the desk, a write the ontology rejects — and nothing happened. Failed is
+    # the world saying no, after the Gateway had already allowed it: a graph
+    # write that raised halfway, or an outbound call to a system that did not
+    # answer. The first is governance working; the second is a write whose
+    # effect nobody can be sure of, which is the entry an auditor most needs.
+    outcome: Literal["pending", "committed", "refused", "failed"] = "pending"
     principal_uid: str = ""
     principal_email: str = ""
     principal_role: str = ""
@@ -186,6 +194,11 @@ class LedgerEntry(BaseModel):
     writes: list[str] = Field(default_factory=list)
     write_count: int = 0
     refusal: str = ""
+    #: What raised, when the outcome is `failed`. Its own field rather than
+    #: `refusal` reworded: a reader filtering on refusals is asking which
+    #: writes the spine stopped, and an exception text sitting in that field
+    #: would answer with writes it did not stop.
+    failure: str = ""
 
 
 class LedgerStore(Protocol):
@@ -306,31 +319,55 @@ class PendingAction:
         second, by catching what a strict `GraphService` raises: the Gateway's
         job is that the violation *stops* here, not that it keep a second copy
         of the check `graph.py` already owns.
+
+        And *anything else* third. This used to let an unexpected exception
+        leave through `write()` with the append still ahead of it, so a write
+        that raised for any reason but the ontology appended nothing at all —
+        the one shape of governed write with no ledger row. Tolerable while
+        every Action ended in a graph upsert, a hole the moment one ends in an
+        HTTP call to somebody else's system: the write may well have landed
+        there, and the entry saying so is exactly what was being skipped. So
+        the entry is written *before* the exception continues on its way,
+        carrying the refs that did land, and the outcome keeps the two apart
+        — `refused` is the Gateway saying no, `failed` is the world.
         """
         refusal = _refusal(self._action, self._principal)
         result: Any = None
+        failure: Exception | None = None
         if not refusal:
             try:
                 result = write(self.writer)
             except TBoxError as exc:
                 refusal = f"does not conform to the ontology — {exc}"
+            except Exception as exc:  # noqa: BLE001 — ledgered, then re-raised
+                failure = exc
         refs = list(self.writer.refs)
         self.entry.writes = refs[:MAX_WRITES]
         self.entry.write_count = len(refs)
-        self.entry.outcome = "refused" if refusal else "committed"
+        self.entry.outcome = (
+            "failed" if failure is not None
+            else "refused" if refusal else "committed"
+        )
         self.entry.refusal = refusal
+        self.entry.failure = (
+            "" if failure is None else f"{type(failure).__name__}: {failure}"
+        )
         self._ledger.append(self.entry)
         log.log(
-            logging.WARNING if refusal else logging.INFO,
-            "Action refused" if refusal else "Action committed",
+            logging.ERROR if failure is not None
+            else logging.WARNING if refusal else logging.INFO,
+            "Action failed" if failure is not None
+            else "Action refused" if refusal else "Action committed",
             extra={
                 "ledgerId": self.entry.id, "action": self._action.id,
                 "regime": self._action.regime, "uid": self._principal.uid,
                 "impersonatedBy": self.entry.impersonated_by,
                 "runId": self.entry.run_id, "writes": self.entry.write_count,
-                "refusal": refusal,
+                "refusal": refusal, "failure": self.entry.failure,
             },
         )
+        if failure is not None:
+            raise failure
         if refusal:
             raise Refused(self._action.id, refusal)
         return result

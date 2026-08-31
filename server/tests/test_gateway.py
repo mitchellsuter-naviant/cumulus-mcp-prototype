@@ -6,6 +6,8 @@ makes that was previously unfalsifiable:
 - a decision write is refused at the *write* when its principal may not make
   it, even when the HTTP boundary that normally checks was never involved;
 - a write that violates the ontology is refused rather than landed;
+- a write that *breaks* is ledgered before the exception leaves, and is
+  `failed` rather than `refused` — the Gateway said yes and the world said no;
 - every commit appends exactly one ledger entry, and a replayed step appends
   none;
 - an impersonated commit names both principals — the persona and the operator;
@@ -15,6 +17,7 @@ makes that was previously unfalsifiable:
   commit naming the human who decided it.
 """
 
+import httpx
 import pytest
 
 from app import personas
@@ -127,6 +130,67 @@ def test_a_tbox_invalid_write_is_refused_rather_than_landed(world):
     assert entry.outcome == "refused" and "ontology" in entry.refusal
     # A refused entry still says what it managed to write — here, nothing.
     assert entry.writes == []
+
+
+def test_a_write_that_raises_is_ledgered_before_the_exception_leaves(world):
+    """The hole this closes: a governed write with no ledger row at all.
+
+    `commit` used to catch `TBoxError` and nothing else, with the append
+    sitting *after* `write()` — so a write raising for any other reason left
+    through the gap with the append still ahead of it and appended nothing.
+    Survivable while every Action ended in a graph upsert; a governance hole
+    the moment one ends in an HTTP call, because that is precisely the case
+    where the write may have landed in somebody else's system and the only
+    record of the attempt is the entry that was being skipped.
+
+    So: the entry exists, it carries the refs that did land before the raise,
+    it is `failed` rather than `refused` — the Gateway allowed this one — and
+    the exception still travels, because a step that broke must not report
+    success just because its failure was written down.
+    """
+    act = world.gateway.action("apply-source-records", flow_principal("test-flow"))
+
+    def half_a_write(writer):
+        writer.upsert(
+            "Vendor", "Halfway Supply",
+            [Claim(field="status", value="active", source="erp:test")],
+        )
+        raise httpx.ConnectError("the estate did not answer")
+
+    with pytest.raises(httpx.ConnectError):
+        act.commit(half_a_write)
+
+    [entry] = world.gateway.ledger.list()
+    assert entry.outcome == "failed"
+    assert "ConnectError" in entry.failure
+    # `refused` is the Gateway saying no and this was not that, so the field an
+    # auditor filters refusals on stays empty.
+    assert entry.refusal == ""
+    # And what landed before the raise is on the entry, which is the whole
+    # point: the graph moved and the ledger says by how much.
+    assert entry.write_count == 1
+    assert entry.writes[0].startswith("graph:Vendor/")
+    assert world.graph.get(object_id("Vendor", "Halfway Supply")) is not None
+
+
+def test_the_ledger_tells_a_refusal_and_a_failure_apart(world):
+    """Two entries, same Action, two different accusations.
+
+    Collapsing them into one "not committed" bucket would put the spine
+    working and the spine's outages behind the same number — and the two ask
+    for opposite responses.
+    """
+    with pytest.raises(Refused):
+        world.gateway.action("post-invoice", principal_for(NO_QUEUES)).commit(
+            lambda _w: None
+        )
+    with pytest.raises(RuntimeError):
+        world.gateway.action("post-invoice", principal_for(CLERK)).commit(
+            lambda _w: (_ for _ in ()).throw(RuntimeError("the ERP hung up"))
+        )
+
+    outcomes = {e.outcome for e in _entries(world, action="post-invoice")}
+    assert outcomes == {"refused", "failed"}
 
 
 # ---- the ledger ------------------------------------------------------------
