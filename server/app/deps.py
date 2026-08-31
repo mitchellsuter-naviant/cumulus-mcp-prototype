@@ -15,6 +15,7 @@ from .evals import EvalService, FixtureStore, build_fixture_store
 from .eval_specs import DeclaredSpecStore, seed_fixtures_if_empty
 from .dispatch import Dispatcher, build_dispatcher
 from .estate import EstateConnector, build_estate_connector
+from .estate_writes import EstateWriter, build_estate_writer
 from .gateway import ActionGateway, build_action_gateway
 from .graph import GraphService, build_graph_service
 from .runs import RunEngine, build_run_engine
@@ -59,6 +60,7 @@ _run_engine: RunEngine | None = None
 _anomaly_service: AnomalyService | None = None
 _sync_service: SyncService | None = None
 _estate_connector: EstateConnector | None = None
+_estate_writer: EstateWriter | None = None
 _calendar_service: CalendarService | None = None
 _eval_service: EvalService | None = None
 _fixture_store: FixtureStore | None = None
@@ -376,6 +378,29 @@ def get_estate_connector() -> EstateConnector:
             if _estate_connector is None:
                 _estate_connector = connector
     return _estate_connector
+
+
+def get_estate_writer() -> EstateWriter:
+    """The one component allowed to change a customer's system of record.
+
+    Shares the connector's addresses and nothing else — its own journal, its
+    own collection, its own switch. Constructed here even when writes are
+    disabled, because a writer that is off is a real object that says so; what
+    it does not construct in that case is any way to reach a network.
+    """
+    global _estate_writer
+    if _estate_writer is None:
+        writer = build_estate_writer(
+            get_estate_connector(),
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.estate_write_journal_collection,
+            enabled=settings.estate_writes_enabled,
+        )
+        with _lock:
+            if _estate_writer is None:
+                _estate_writer = writer
+    return _estate_writer
 
 
 def get_calendar_service() -> CalendarService:

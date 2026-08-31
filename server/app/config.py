@@ -156,6 +156,25 @@ class Settings:
         # (AUTH_BACKEND=none makes everyone an owner).
         self.connector_api_key: str = os.environ.get("CONNECTOR_API_KEY", "")
 
+        # ---- The estate write plane -----------------------------------------
+        # Whether this deployment may change a customer's system of record at
+        # all. Off everywhere it is not deliberately set, and off means
+        # *unwired*: `EstateWriter` holds no callable that could reach a
+        # network rather than a polite refusal in front of one that could.
+        # One of the three independent reasons a test or eval run cannot write
+        # to a live estate (the others: an injected fake wire, and the import
+        # boundary on estate_writes.py).
+        self.estate_writes_enabled: bool = os.environ.get(
+            "ESTATE_WRITES_ENABLED", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        # What Cumulus told which of the customer's records to do, and how it
+        # turned out. Machinery state like the connector cursor, and like it
+        # deliberately absent from data_collections.COLLECTIONS — but with a
+        # longer life: a cursor is disposable and a write is evidence.
+        self.estate_write_journal_collection: str = os.environ.get(
+            "ESTATE_WRITE_JOURNAL_COLLECTION", "estate_write_journal"
+        )
+
         # ---- Semantic search ------------------------------------------------
         # "none" (default): lexical BM25 only — no credentials, no network, and
         # what the tests run against. "vertex": Vertex AI embeddings. "hash": a

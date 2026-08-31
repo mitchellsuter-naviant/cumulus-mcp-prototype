@@ -16,6 +16,7 @@ only thing faked is the network.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 # The discovery document, verbatim — two namespaces, and `naviant` running the
@@ -2311,6 +2312,122 @@ class EstateDown(Exception):
     """What the fake raises where the network would fail."""
 
 
+class EstateRefused(Exception):
+    """What the fake raises where the estate's API answers with a status.
+
+    `status` and `message` are `namespaces.ApiError`'s pair, verbatim: the
+    estate's own sentence is what an operator ends up reading on the Task a
+    refused write raises, so a paraphrase here would be a paraphrase there.
+    """
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(f"{status}: {message}")
+        self.status = status
+        self.message = message
+
+
+#: `erp.py`'s picklists, verbatim (functions/erp.py:49-69) — the only
+#: validation standing between a caller and a stored value.
+TERMS = ["Due on receipt", "Net 15", "Net 30", "Net 45", "Net 60"]
+SALES_ORDER_STATUSES = [
+    "Pending Approval", "Pending Fulfillment", "Partially Fulfilled",
+    "Pending Billing", "Billed", "Closed",
+]
+PURCHASE_ORDER_STATUSES = [
+    "Pending Approval", "Pending Receipt", "Partially Received",
+    "Pending Billing", "Fully Billed", "Closed",
+]
+
+#: Server-owned fields. Sent in a body they are **ignored rather than
+#: rejected**, so a caller can round-trip a record it just read.
+PATCH_READ_ONLY = ["id", "tranId", "total", "createdAt", "updatedAt"]
+
+#: `erp.py`'s ENTITIES (functions/erp.py:88-142) narrowed to what a PATCH can
+#: reach: the settable field names, and the picklists that gate them. Three
+#: entities rather than all five — the two transactions, so a status change
+#: the write table refuses can be shown landing here anyway, and one master
+#: record, so these rules are visibly per-entity and not a hardcoded `status`.
+PATCH_SPECS: dict[tuple[str, str], dict] = {
+    ("erp", "salesOrders"): {
+        "fields": ["customerId", "lines", "tranDate", "status", "memo"],
+        "picklists": {"status": SALES_ORDER_STATUSES},
+    },
+    ("erp", "purchaseOrders"): {
+        "fields": ["vendorId", "lines", "tranDate", "status", "memo"],
+        "picklists": {"status": PURCHASE_ORDER_STATUSES},
+    },
+    ("erp", "customers"): {
+        "fields": ["companyName", "email", "phone", "terms"],
+        "picklists": {"terms": TERMS},
+    },
+}
+
+
+def _singular(entity: str) -> str:
+    """'salesOrders' -> 'sales order', the way erp.py spells it in a 404."""
+    words: list[str] = []
+    for char in entity[:-1]:
+        if char.isupper():
+            words.append(" ")
+            char = char.lower()
+        words.append(char)
+    return "".join(words)
+
+
+def _clean(spec: dict, body: dict) -> dict:
+    """`erp.py`'s `_clean(..., partial=True)` over the scalar fields.
+
+    Same order of business as the original: unknown fields first (a 400 naming
+    them), then per field — strip, empty becomes null, non-strings refused,
+    picklist last. The server-owned fields never appear because they are not
+    in `fields`, which is precisely how the real one ignores them.
+    """
+    unknown = sorted(set(body) - set(spec["fields"]) - set(PATCH_READ_ONLY))
+    if unknown:
+        raise EstateRefused(400, f"unknown fields: {', '.join(unknown)}")
+    fields: dict = {}
+    for key in spec["fields"]:
+        if key not in body:
+            continue
+        if key == "lines":
+            # Out of scope on purpose: rates and the order total come from
+            # `_clean_lines` and the item catalogue. Nothing in the write
+            # plane sends lines, and a test that wants to should say so here
+            # rather than get a quietly wrong total.
+            raise NotImplementedError("the fake estate does not edit order lines")
+        value = body[key]
+        if isinstance(value, str):
+            value = value.strip()
+        if value in (None, ""):
+            fields[key] = None
+            continue
+        if not isinstance(value, str):
+            raise EstateRefused(400, f"'{key}' must be a string")
+        choices = spec.get("picklists", {}).get(key)
+        if choices and value not in choices:
+            raise EstateRefused(
+                400, f"'{key}' must be one of: {', '.join(choices)}"
+            )
+        fields[key] = value
+    return fields
+
+
+def _bumped(previous: str) -> str:
+    """A fresh `updatedAt`, guaranteed later than the one it replaces.
+
+    The estate stamps server time; these rows were recorded on a fixed date,
+    and a suite that ever runs with a frozen clock would otherwise write a
+    timestamp that does not move. The watermark logic is ordered strictly, so
+    "later" is the property that matters, not "now".
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        was = datetime.fromisoformat(previous)
+    except (TypeError, ValueError):
+        return now.isoformat()
+    return max(now, was + timedelta(microseconds=1)).isoformat()
+
+
 class FakeEstate:
     """The estate's list and single-record routes, over the recorded rows.
 
@@ -2368,3 +2485,81 @@ class FakeEstate:
         """Every call touching one resource, so a test can read the watermark
         it asked with and count the dereferences it made."""
         return [u for u in self.calls if f"/v1/{resource}" in u]
+
+    # -- the write route ----------------------------------------------------
+
+    def patch(self, url: str, body: dict) -> dict:
+        """`erp.py`'s PATCH route: `_update` over `_clean(partial=True)`.
+
+        Faithful where it matters and deliberately not tidy. It refuses an
+        unknown field with a 400, checks the picklist and the string-ness of a
+        value, *ignores* the server-owned fields rather than rejecting them,
+        refuses an empty body, bumps `updatedAt`, and offers no `If-Match`
+        because the estate offers none.
+
+        What it does **not** do is validate the transition. `Pending Approval`
+        straight to `Closed` is a legal PATCH here because it is a legal PATCH
+        there (functions/erp.py:275-322 — a picklist check and nothing else),
+        and that is the whole reason `estate_writes.WRITABLE` exists. A tidier
+        fake would test a system nothing serves, and would have quietly hidden
+        the only argument for the write table.
+        """
+        self.calls.append(f"PATCH {url}")
+        parsed = urlparse(url)
+        app = parsed.netloc.split(".")[0].rsplit("-", 1)[-1]
+        parts = [p for p in parsed.path.split("/") if p]
+        resource = parts[3] if len(parts) > 3 else ""
+        record_id = parts[4] if len(parts) > 4 else ""
+        if (app, resource) in self.fails:
+            raise EstateDown(f"PATCH {url} → 503")
+        spec = PATCH_SPECS.get((app, resource))
+        if spec is None or not record_id:
+            raise EstateRefused(404, f"no route for PATCH {parsed.path}")
+        row = self._row(app, resource, record_id)
+        if row is None:
+            raise EstateRefused(
+                404, f"{_singular(resource)} {record_id} not found"
+            )
+        updates = _clean(spec, body)
+        if not updates:
+            raise EstateRefused(400, "nothing to update — send at least one field")
+        updates["updatedAt"] = _bumped(str(row.get("updatedAt", "")))
+        return self._replace(app, resource, record_id, updates)
+
+    def record(self, app: str, resource: str, record_id: str) -> dict:
+        """One row as the fake currently holds it — a test's window on what a
+        write actually did, as opposed to what the door said about it."""
+        row = self._row(app, resource, record_id)
+        if row is None:
+            raise EstateRefused(
+                404, f"{_singular(resource)} {record_id} not found"
+            )
+        return dict(row)
+
+    def _row(self, app: str, resource: str, record_id: str) -> dict | None:
+        for row in self.resources.get((app, resource), []):
+            if row.get("id") == record_id:
+                return row
+        off = self.off_page.get((app, resource))
+        return off if off is not None and off.get("id") == record_id else None
+
+    def _replace(
+        self, app: str, resource: str, record_id: str, updates: dict
+    ) -> dict:
+        """Copy-on-write, and not as a style preference.
+
+        `RESOURCES` holds module-level lists that every other test in the
+        suite reads. Mutating a row in place would make one test's write
+        visible to the next test's pull, which is the exact bug an isolated
+        fixture exists to make impossible.
+        """
+        rows = [dict(r) for r in self.resources.get((app, resource), [])]
+        for index, row in enumerate(rows):
+            if row.get("id") == record_id:
+                rows[index] = {**row, **updates}
+                self.resources[(app, resource)] = rows
+                return dict(rows[index])
+        off = dict(self.off_page.get((app, resource)) or {})
+        off.update(updates)
+        self.off_page[(app, resource)] = off
+        return dict(off)
