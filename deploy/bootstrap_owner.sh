@@ -9,7 +9,11 @@ REGION="${3:-us-central1}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 ADMIN_API_KEY="$(cat "$REPO_ROOT/deploy/.admin_api_key")"
-SERVICE_URL="$(gcloud run services describe cumulus-knowledge --region "$REGION" --format='value(status.url)')"
+# The direct Cloud Run URL is not publicly invokable on a project with the
+# `iam.allowedPolicyMemberDomains` org policy (see deploy.sh) — Firebase
+# Hosting's rewrite is the reachable path, same as everything else public.
+PROJECT_ID="$(python3 -c "import json; print(json.load(open('$REPO_ROOT/.firebaserc'))['projects']['default'])")"
+SERVICE_URL="https://$PROJECT_ID.web.app"
 
 curl -sS -X POST "$SERVICE_URL/api/v1/users" \
   -H "X-API-Key: $ADMIN_API_KEY" \

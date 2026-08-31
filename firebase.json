@@ -10,6 +10,26 @@
         ],
         "rewrites": [
             {
+                "source": "/api/**",
+                "run": { "serviceId": "cumulus-knowledge", "region": "us-central1" }
+            },
+            {
+                "source": "/mcp/**",
+                "run": { "serviceId": "cumulus-knowledge", "region": "us-central1" }
+            },
+            {
+                "source": "/a2a",
+                "run": { "serviceId": "cumulus-knowledge", "region": "us-central1" }
+            },
+            {
+                "source": "/.well-known/**",
+                "run": { "serviceId": "cumulus-knowledge", "region": "us-central1" }
+            },
+            {
+                "source": "/healthz",
+                "run": { "serviceId": "cumulus-knowledge", "region": "us-central1" }
+            },
+            {
                 "source": "**",
                 "destination": "/index.html"
             }

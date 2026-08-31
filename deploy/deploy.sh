@@ -209,11 +209,22 @@ gcloud run deploy "$SERVICE" \
   --quiet
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"
-echo "==> Service URL: $SERVICE_URL"
+echo "==> Service URL: $SERVICE_URL (direct — not the public entry point, see below)"
+
+# The org's `iam.allowedPolicyMemberDomains` policy refuses `allUsers` on a
+# Cloud Run service, so `--allow-unauthenticated` above is best-effort and, on
+# a project with that constraint, silently does not take: the direct URL 404s
+# at Google's edge for every caller, including this deployment's own
+# connector and the scheduler below. Firebase Hosting reaches Cloud Run
+# through its own delegated identity, which the policy does not gate, so the
+# Hosting domain — routed to this service by the rewrites in firebase.json —
+# is the actual public entry point. Every self-referential URL below points
+# there, never at the direct one.
+HOSTING_URL="https://$PROJECT_ID.web.app"
 
 echo "==> Updating PUBLIC_BASE_URL env var"
 gcloud run services update "$SERVICE" --region "$REGION" \
-  --update-env-vars "PUBLIC_BASE_URL=$SERVICE_URL" --quiet
+  --update-env-vars "PUBLIC_BASE_URL=$HOSTING_URL" --quiet
 
 # ---- Scheduling, sourced ----------------------------------------------------
 #
@@ -231,22 +242,28 @@ if [[ -n "$ESTATE_PROJECT" ]]; then
 
   schedule_job() {
     local name="$1" cron="$2" path="$3" description="$4"
-    local args=(
+    # `create` and `update` take the same header pair under different flag
+    # names (`--headers` vs. `--update-headers`) — the one place this command
+    # is not symmetric, and worth a comment since it fails silently under
+    # `set -e` otherwise: an unrecognized flag is a usage error, the job is
+    # never touched, and nothing downstream notices until the job doesn't fire.
+    local common_args=(
       --location="$REGION"
       --schedule="$cron"
       --time-zone="Etc/UTC"
-      --uri="$SERVICE_URL$path"
+      --uri="$HOSTING_URL$path"
       --http-method=POST
-      --update-headers="X-API-Key=$ADMIN_API_KEY"
       --description="$description"
       --attempt-deadline=600s
       --quiet
     )
     if gcloud scheduler jobs describe "$name" --location="$REGION" >/dev/null 2>&1; then
-      gcloud scheduler jobs update http "$name" "${args[@]}" >/dev/null
+      gcloud scheduler jobs update http "$name" "${common_args[@]}" \
+        --update-headers="X-API-Key=$ADMIN_API_KEY" >/dev/null
       echo "    updated $name ($cron)"
     else
-      gcloud scheduler jobs create http "$name" "${args[@]}" >/dev/null
+      gcloud scheduler jobs create http "$name" "${common_args[@]}" \
+        --headers="X-API-Key=$ADMIN_API_KEY" >/dev/null
       echo "    created $name ($cron)"
     fi
   }
@@ -269,8 +286,12 @@ fi
 flutterfire configure --project="$PROJECT_ID" --platforms=web --yes
 
 echo "==> Building Flutter web app"
+# Same-origin, deliberately: the browser cannot reach the direct Cloud Run URL
+# either (see the HOSTING_URL note above), so the built app calls relative
+# paths and firebase.json's rewrites carry them to the service from whichever
+# origin actually served the page.
 flutter build web --release \
-  --dart-define=API_BASE_URL="$SERVICE_URL"
+  --dart-define=API_BASE_URL=""
 
 echo "==> Deploying to Firebase Hosting"
 cd "$REPO_ROOT"
@@ -286,8 +307,11 @@ firebase deploy --only hosting,firestore:rules --project "$PROJECT_ID"
 echo
 echo "=========================================================="
 echo "Deployed."
-echo "  API + MCP:   $SERVICE_URL   (MCP endpoint: $SERVICE_URL/mcp/)"
-echo "  Admin app:   https://$PROJECT_ID.web.app"
+echo "  Admin app:   $HOSTING_URL"
+echo "  API + MCP:   $HOSTING_URL/api/v1   (MCP endpoint: $HOSTING_URL/mcp/)"
+echo "               served through Firebase Hosting's rewrite in firebase.json —"
+echo "               the direct Cloud Run URL ($SERVICE_URL) is not"
+echo "               publicly invokable under this project's org policy."
 if [[ -n "$ESTATE_PROJECT" ]]; then
   echo "  Estate:      $ESTATE_PROJECT / $ESTATE_NAMESPACE"
   echo "               writes $ESTATE_WRITES_ENABLED · pull every 15m · sweeps hourly"
