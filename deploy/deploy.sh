@@ -120,11 +120,17 @@ MODEL_BACKEND="${MODEL_BACKEND:-vertex}"
 # text-embedding-005.
 VERTEX_MODEL_LOCATION="${VERTEX_MODEL_LOCATION:-global}"
 
+# The default compute service account, computed once: it runs the container
+# (so it is the identity Vertex calls go out under) and, below, it is also the
+# identity the scheduler authenticates *as* to call the container back in —
+# two unrelated grants on one principal, not because they are related, but
+# because it is the one service account already on every revision.
+RUNTIME_SA="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com"
+
 if [[ "$EMBEDDING_BACKEND" == "vertex" || "$MODEL_BACKEND" == "vertex" ]]; then
   echo "==> Enabling Vertex AI (embeddings: $EMBEDDING_BACKEND, models: $MODEL_BACKEND, endpoint: $VERTEX_MODEL_LOCATION)"
   gcloud services enable aiplatform.googleapis.com --quiet
 
-  RUNTIME_SA="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com"
   echo "==> Granting aiplatform.user to $RUNTIME_SA"
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:$RUNTIME_SA" \
@@ -201,10 +207,16 @@ GENERATION_ENV="$GENERATION_ENV,EVENTS_COLLECTION=events_$COLLECTION_GENERATION"
 
 echo "==> Pinning reshaped collections to generation $COLLECTION_GENERATION"
 
+# 600s, not the 300s default: a full estate pull walks every registered feed
+# in one request, and the identity/disagreement sweeps scan the whole book.
+# This is Cloud Run's own timeout, and it is the reason the three bulk jobs
+# below call this URL directly rather than through Hosting — Hosting's rewrite
+# proxy carries a fixed ~60s cap that nothing in firebase.json can raise.
 gcloud run deploy "$SERVICE" \
   --source "$REPO_ROOT/server" \
   --region "$REGION" \
   --allow-unauthenticated \
+  --timeout=600 \
   --set-env-vars "STORAGE_BACKEND=firestore,AUTH_BACKEND=firebase,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ADMIN_API_KEY=$ADMIN_API_KEY,EMBEDDING_BACKEND=$EMBEDDING_BACKEND,EMBEDDING_LOCATION=$VERTEX_MODEL_LOCATION,MODEL_BACKEND=$MODEL_BACKEND,MODEL_LOCATION=$VERTEX_MODEL_LOCATION,$GENERATION_ENV,$ESTATE_ENV" \
   --quiet
 
@@ -240,6 +252,19 @@ if [[ -n "$ESTATE_PROJECT" ]]; then
   echo "==> Enabling Cloud Scheduler"
   gcloud services enable cloudscheduler.googleapis.com --quiet
 
+  # These three calls go straight to the direct Cloud Run URL, not through
+  # Hosting: a full estate pull or a sweep over the whole book can run past
+  # Hosting's fixed ~60s rewrite-proxy timeout (measured: a cold pull 502'd at
+  # exactly 60.09s), and that cap is not configurable. Cloud Run's own
+  # timeout is, and is set to 600s above. Bypassing Hosting means bypassing
+  # the org policy Hosting exists to route around, so the scheduler
+  # authenticates as a specific principal instead: `run.invoker` for a
+  # single named service account is a grant `iam.allowedPolicyMemberDomains`
+  # allows (verified directly), unlike `allUsers`.
+  echo "==> Granting run.invoker to $RUNTIME_SA (so the scheduler can call the service directly)"
+  gcloud run services add-iam-policy-binding "$SERVICE" --region="$REGION" \
+    --member="serviceAccount:$RUNTIME_SA" --role=roles/run.invoker --quiet >/dev/null
+
   schedule_job() {
     local name="$1" cron="$2" path="$3" description="$4"
     # `create` and `update` take the same header pair under different flag
@@ -251,8 +276,10 @@ if [[ -n "$ESTATE_PROJECT" ]]; then
       --location="$REGION"
       --schedule="$cron"
       --time-zone="Etc/UTC"
-      --uri="$HOSTING_URL$path"
+      --uri="$SERVICE_URL$path"
       --http-method=POST
+      --oidc-service-account-email="$RUNTIME_SA"
+      --oidc-token-audience="$SERVICE_URL"
       --description="$description"
       --attempt-deadline=600s
       --quiet
