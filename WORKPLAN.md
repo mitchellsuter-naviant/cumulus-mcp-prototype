@@ -286,6 +286,26 @@ Every subagent is spawned with `model: opus` (Opus 5) — decision 14.
   allow it; purge/reseed/pulse wait behind the deploy, then the capstone
   full-estate sync. Ontology decisions queued: Mailbox→Employee owner
   link; Office `showAs` dropped fact.
+- **2026-08-31 (S2-S EXECUTED — the demo script is complete)** — The user
+  reauthed gcloud and authorized going live. S2-C1 (`17398c1`) and S2-E
+  (`f64374f`) merged first: 1,084 server / 131 Dart tests, 12 graded
+  write-plane cases, the app-side FakeErp with its no-drift test. Then the
+  live sequence, every step verified: ten-feed sync → Voss merge confirmed
+  (the delivery-engagement signal admitted, confidence 0.9196→0.95) → the
+  sweep found TWO standing disagreements (SO5037 + pulse-born SO5038 —
+  the estate grew one overnight, as designed) → Raymond Fitzgerald
+  approved SO5037's release → **the live ERP moved Pending Approval →
+  Pending Fulfillment** (verified by re-read; total/memo untouched) →
+  two ledger entries (decision by raymond.fitzgerald@naviant.com,
+  observation by flow:order-release) → the next sync delivered exactly
+  one record with `echoes: 1` — Cumulus recognized its own write coming
+  home. SO5038 left standing for the console (or external resolution —
+  both stories are live now). ALSO: Vertex verified live at last —
+  aiplatform API enabled on the dev project; a real /ask ran
+  gemini-3.5-flash-lite as a governed answer-question run: 1 model call,
+  metered tokens, cost $0.000733 priced off knowledge:model-pricing.
+  Decision 12's verification is closed. Every stage of WORKPLAN-S2.md is
+  done.
 - **2026-08-31 (S2 built end to end; the live write awaits the user)** —
   All seven S2 stages landed and merged: S2-0 (the Gateway ledgers failed
   writes; ctx.step meters), S2a (the sweep: Voss found at 0.9196, three
