@@ -160,6 +160,8 @@ Accepted implementation plan: **WORKPLAN-TRACK-B.md** (stages 1–6, file-level)
 
 ## Stage 2 — the write plane
 
+Accepted implementation plan: **WORKPLAN-S2.md** (stages S2-0 through S2-S).
+
 - **S2a · Disagreement detection.** Cross-system state conflicts (the CRM
   Closed Won / ERP Pending Approval window is designed into deal_to_order)
   detected by a windowed Flow and raised as Tasks with evidence.
