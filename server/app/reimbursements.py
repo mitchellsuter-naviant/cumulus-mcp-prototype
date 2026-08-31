@@ -53,8 +53,9 @@ from .documents import DOCUMENT_COLLECTION, DocumentService, Region
 from .gateway import ActionGateway, InMemoryLedgerStore
 from .graph import Claim, GraphService, GraphWriter, InMemoryGraphStore
 from .models import utcnow
+from .flows import read_model_rates
 from .prompts import GovernedPrompt, read_prompt
-from .runs import RunContext, RunEngine, RunRecord
+from .runs import ModelUsage, RunContext, RunEngine, RunRecord
 from .tasks import Task, TaskEvidence, TaskProposal, TaskService
 
 log = logging.getLogger("cumulus.reimbursements")
@@ -121,6 +122,13 @@ class ReceiptExtraction(BaseModel):
     category: str = "other"
     confidence: float = 0.0
     model: str = ""
+    # What the call consumed, as the reader that made it can report it. Zero
+    # means *unmeasured*, never free: a reader with no model behind it leaves
+    # these alone, and `flows.cost_basis` is what stops the resulting $0.00
+    # from reading as "cheap" on a console page. The reader deliberately does
+    # not price them — it knows the tokens and never the rate.
+    input_tokens: int = 0
+    output_tokens: int = 0
     note: str = ""
     lines: list[ExtractedLine] = Field(default_factory=list)
     regions: list[Region] = Field(default_factory=list)
@@ -490,6 +498,7 @@ class VertexReceiptReader:
                 category=str(data.get("category", "other")), amount_usd=total,
                 confidence=confidence,
             )]
+        usage = ModelUsage.from_vertex(self._model, response)
         return ReceiptExtraction(
             vendor=str(data.get("vendor", "")),
             date=str(data.get("date", "")),
@@ -497,6 +506,8 @@ class VertexReceiptReader:
             category=str(data.get("category", "other")),
             confidence=confidence,
             model=self._model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
             lines=lines,
         )
 
@@ -900,6 +911,13 @@ class ReimbursementService:
         ))
         ctx.note_refs(prompt.source_ref)
 
+        # The price sheet the extractions below are metered against. Read once
+        # for the run rather than per document, and carried onto each ModelCall
+        # step's read-set: the rates do not change what the flow *does*, only
+        # what its journal says a call cost, so this is a ref on the metered
+        # step rather than a governed read a Rule consumes.
+        rates = read_model_rates(self.knowledge)
+
         # m{i} · ModelCall — one step per document, so a retry, a correction or
         # a cost lands on the document it belongs to.
         extractions: list[ReceiptExtraction] = []
@@ -912,8 +930,19 @@ class ReimbursementService:
                     f"{out['category']} · {len(out['lines'])} line(s) · "
                     f"confidence {out['confidence']:.2f}"
                 ),
-                model=getattr(self.reader, "name", ""),
-                refs=[f"document:{slot.document_id}", prompt.source_ref],
+                # The extraction already knows which model read the receipt,
+                # so the step takes its accounting off the output rather than
+                # off the reader's name — which is the backend ("vertex"), not
+                # a model, and was being filed as one.
+                meter=lambda out: rates.priced(ModelUsage(
+                    model=str(out.get("model") or ""),
+                    input_tokens=int(out.get("input_tokens") or 0),
+                    output_tokens=int(out.get("output_tokens") or 0),
+                )),
+                refs=[
+                    f"document:{slot.document_id}", prompt.source_ref,
+                    rates.source_ref,
+                ],
                 retries=1,
                 escalate_queue=REVIEW_QUEUE,
             )

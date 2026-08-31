@@ -98,6 +98,43 @@ class ModelUsage(BaseModel):
         """
         return self.input_tokens + self.output_tokens
 
+    def __add__(self, other: "ModelUsage") -> "ModelUsage":
+        """Sum two turns of one call. The model id has to agree or it is lost.
+
+        A planner answering one question takes several turns, and the fleet
+        counts *questions*, not turns — so the turns are summed before they
+        reach a step. Summing across two different models would produce a
+        token count attributable to neither, so the id only survives when both
+        sides agree; the empty left-hand side of an accumulator is the normal
+        case and adopts whatever the first turn reported.
+        """
+        model = self.model or other.model
+        if self.model and other.model and self.model != other.model:
+            model = "mixed"
+        return ModelUsage(
+            model=model,
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cost_usd=round(self.cost_usd + other.cost_usd, 6),
+        )
+
+    @classmethod
+    def from_vertex(cls, model: str, response: Any) -> "ModelUsage":
+        """Read `usage_metadata` off a google-genai response.
+
+        Duck-typed rather than imported: every Vertex reader in the system
+        discards the same two fields today, and one place that knows their
+        names is better than three that each learn them separately. A response
+        without the block reports zero, which is `cost_basis`'s `unrecorded`
+        and not a claim that the call was free.
+        """
+        meta = getattr(response, "usage_metadata", None)
+        return cls(
+            model=model,
+            input_tokens=int(getattr(meta, "prompt_token_count", 0) or 0),
+            output_tokens=int(getattr(meta, "candidates_token_count", 0) or 0),
+        )
+
 
 class StepRecord(BaseModel):
     step_id: str

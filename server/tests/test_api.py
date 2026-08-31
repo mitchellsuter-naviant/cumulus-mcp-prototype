@@ -23,17 +23,20 @@ def client(_client):
 def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    # 9 seed documents + 2 seeded extraction prompts + 4 generated
+    # 10 seed documents + 2 seeded extraction prompts + 4 generated
     # schema-exports (ontology, collections, mappings, eval specs) — the
     # fixture publishes them like startup does.
-    assert resp.json()["assets"] == 16
+    # fixture publishes them like startup does. The tenth document is
+    # `model-pricing`: what a model call costs is governed knowledge now, so
+    # it sits in the Library beside the policies rather than in a dict.
+    assert resp.json()["assets"] == 17
 
 
 def test_list_and_prefix_filter(client):
-    assert len(client.get("/api/v1/assets").json()) == 16
+    assert len(client.get("/api/v1/assets").json()) == 17
     # The kind filter carves the Library out of the corpus: documents only.
     docs = client.get("/api/v1/assets", params={"kind": "document"}).json()
-    assert len(docs) == 10
+    assert len(docs) == 11
     assert all(a["kind"] == "document" for a in docs)
     # And it carves out the governed prompts, which are knowledge without being
     # documents: they instruct a ModelCall rather than arguing with a policy.

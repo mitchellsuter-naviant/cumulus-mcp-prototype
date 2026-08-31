@@ -464,6 +464,9 @@ def ask(
         request.question,
         scope_asset_id=request.scope_asset_id,
         include_drafts=request.include_drafts,
+        # The run's actor. A question is now a Flow with a journal, and a
+        # journal whose actor column is blank cannot answer "who asked this".
+        asked_by=principal.uid,
     )
     # A citation is the strongest usage signal there is: the document did not
     # merely match, it backed a claim in an answer.

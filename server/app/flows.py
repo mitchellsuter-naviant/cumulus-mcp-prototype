@@ -41,6 +41,7 @@ admitting the hole is exactly the failure being removed here.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from collections.abc import Collection
 from datetime import date, datetime, timedelta
@@ -50,7 +51,7 @@ from pydantic import BaseModel, Field
 
 from . import dispatch
 from .models import utcnow
-from .runs import RunRecord
+from .runs import ModelUsage, RunRecord
 
 log = logging.getLogger("cumulus.flows")
 
@@ -618,8 +619,14 @@ def diff_versions(
 # Cost & performance recommender
 # ---------------------------------------------------------------------------
 
-_MODEL_RATES = {
-    # $/M input, $/M output — display-plausible, not a price sheet.
+MODEL_PRICING_ASSET_ID = "model-pricing"
+
+#: The built-in copy of the governed table, for a deployment whose corpus does
+#: not hold the asset yet. Same posture as the extraction prompts: the seed
+#: file `seed/model-pricing.md` is the governing copy and its table is these
+#: rows, and a missing asset degrades to the default rather than to no price at
+#: all. $/M input, $/M output — display-plausible, not a contract.
+_DEFAULT_RATES: dict[str, tuple[float, float]] = {
     "gemini-3.7-flash": (0.30, 2.50),
     "gemini-3.5-flash-lite": (0.10, 0.40),
     "claude-fable-5": (5.0, 25.0),
@@ -628,11 +635,24 @@ _MODEL_RATES = {
     "claude-haiku-4-5": (1.0, 5.0),
 }
 
+#: How the two rates blend into the one number the downgrade ladder compares:
+#: roughly an extraction workload, where the document is long and the JSON is
+#: short. Only ever used as a ratio between two models, so the absolute number
+#: never reaches a page.
+_INPUT_WEIGHT = 0.6
+
 # Cheaper substitutes, in descending capability. A downgrade is only ever
 # proposed one rung at a time: two rungs is a different flow, not a saving.
 # Cross-vendor rungs are deliberately absent — swapping vendors changes what
 # the prompt means, which is a migration to evaluate, not a cost saving to
 # apply from a card.
+#
+# This stays code while the rates became a document, and the split is the
+# point: a rate is a fact about a vendor's price list that a steward should
+# correct from an invoice, and a rung is a claim that two models are close
+# enough in capability to swap after an eval. The asset says so out loud, so
+# nobody reads a table pricing both vendors side by side as an invitation to
+# trade one for the other.
 _DOWNGRADE_PATH = {
     "gemini-3.7-flash": "gemini-3.5-flash-lite",
     "claude-opus-5": "claude-sonnet-5",
@@ -640,10 +660,101 @@ _DOWNGRADE_PATH = {
     "claude-sonnet-5": "claude-haiku-4-5",
 }
 
+#: One row of the asset's rate table: `| model-id | 0.30 | 2.50 |`. The header
+#: and the `|---|` separator fail it — a model id starts lower-case and both
+#: rates have to parse as numbers.
+_RATE_ROW = re.compile(
+    r"^\s*\|\s*([a-z][a-z0-9.\-]*)\s*\|\s*\$?\s*(\d+(?:\.\d+)?)\s*\|"
+    r"\s*\$?\s*(\d+(?:\.\d+)?)\s*\|",
+    re.MULTILINE,
+)
 
-def _blended_rate(model: str) -> float:
-    rate_in, rate_out = _MODEL_RATES.get(model, (3.0, 15.0))
-    return rate_in * 0.6 + rate_out * 0.4
+
+class ModelRates(BaseModel):
+    """The governed price sheet, at the revision it was read.
+
+    A model with no row prices to **zero**, and zero means *unpriced*. That is
+    the one decision in here worth arguing about, and the alternative is worse:
+    a fallback rate would put a plausible dollar figure on a call nobody knows
+    the price of, which is the same confident-number-over-a-hole failure
+    `cost_basis` exists to prevent. An unpriced call has to reach the console
+    as unpriced.
+    """
+
+    rates: dict[str, tuple[float, float]] = Field(
+        default_factory=lambda: dict(_DEFAULT_RATES)
+    )
+    source_ref: str = f"knowledge:{MODEL_PRICING_ASSET_ID}"
+    found_asset: bool = False
+
+    def price_usd(self, model: str, input_tokens: int, output_tokens: int) -> float:
+        """What this call cost, or 0.0 for "the sheet does not price it"."""
+        row = self.rates.get(model)
+        if row is None:
+            return 0.0
+        rate_in, rate_out = row
+        return round(
+            (input_tokens * rate_in + output_tokens * rate_out) / 1_000_000, 6
+        )
+
+    def priced(self, usage: ModelUsage) -> ModelUsage:
+        """The same usage with `cost_usd` filled in from this sheet.
+
+        The seam between "what the call consumed" and "what that cost" — the
+        reader that made the call knows the first and never the second, so it
+        reports tokens and this puts a price on them.
+        """
+        return usage.model_copy(update={
+            "cost_usd": self.price_usd(
+                usage.model, usage.input_tokens, usage.output_tokens
+            )
+        })
+
+    def blended(self, model: str) -> float:
+        """One number per model, for comparing two rungs of the ladder."""
+        rate_in, rate_out = self.rates.get(model, (0.0, 0.0))
+        return rate_in * _INPUT_WEIGHT + rate_out * (1 - _INPUT_WEIGHT)
+
+
+def parse_model_pricing(content: str) -> ModelRates:
+    """Read the asset's rate table. An empty table leaves the defaults."""
+    parsed = {
+        match.group(1): (float(match.group(2)), float(match.group(3)))
+        for match in _RATE_ROW.finditer(content)
+    }
+    values = ModelRates(found_asset=True)
+    if parsed:
+        values.rates = parsed
+    return values
+
+
+def read_model_rates(knowledge) -> ModelRates:
+    """The price sheet as governed knowledge, stamped with its revision."""
+    asset = knowledge.repo.get(MODEL_PRICING_ASSET_ID) if knowledge else None
+    if asset is None:
+        log.warning("Model pricing asset missing; using the built-in rates")
+        return ModelRates(found_asset=False)
+    values = parse_model_pricing(asset.content)
+    values.source_ref = (
+        f"knowledge:{MODEL_PRICING_ASSET_ID}@rev{getattr(asset, 'revision', 1)}"
+    )
+    return values
+
+
+def fleet_model_rates() -> ModelRates:
+    """The price sheet for a caller with no knowledge handle of its own.
+
+    Deferred import for the reason `flow_runs` defers its own: `deps` builds
+    this module's service. Guarded, because the recommender must degrade to
+    the built-in rates rather than fail a console page over a price sheet.
+    """
+    try:
+        from .deps import get_service
+
+        return read_model_rates(get_service())
+    except Exception:  # noqa: BLE001 — a page must not 500 over a rate card
+        log.exception("Could not read the model price sheet; using defaults")
+        return ModelRates(found_asset=False)
 
 
 def eval_case_count(flow_id: str) -> int:
@@ -724,6 +835,7 @@ def recommendations(
     usage: list[UsageDay],
     eval_cases: int,
     days: int | None = None,
+    rates: ModelRates | None = None,
 ) -> list[Recommendation]:
     """Insight cards derived from this flow's own execution telemetry.
 
@@ -736,7 +848,13 @@ def recommendations(
     downgrade sized off spend nobody recorded is not a cautious estimate, it
     is a number invented to fill a card — and a card is a thing an admin
     clicks Apply on.
+
+    `rates` is read **now**, not at the revision the priced runs were priced
+    at, and that is deliberate: a downgrade card is a claim about what a future
+    run would cost, so it belongs on today's price sheet. The opposite rule
+    governs a journal entry — see `ModelRates.priced`.
     """
+    rates = rates if rates is not None else fleet_model_rates()
     out: list[Recommendation] = []
     withheld: list[str] = []
     days = days if days is not None else max(1, len(usage))
@@ -790,7 +908,17 @@ def recommendations(
         # there is too little at stake to be worth a card.
         if per_step_spend < 5:
             continue
-        ratio = _blended_rate(cheaper) / _blended_rate(model)
+        # A rung the sheet does not price is a rung with no saving to claim:
+        # the ratio would be a guess, and a guess with a dollar sign on it is
+        # the one thing this recommender is not allowed to produce.
+        current_rate = rates.blended(model)
+        if not current_rate:
+            withheld.append(
+                f"model downgrade on {step.name} "
+                f"({model} is not in {rates.source_ref})"
+            )
+            continue
+        ratio = rates.blended(cheaper) / current_rate
         savings = per_step_spend * (1 - ratio) * monthly
         if savings < 1:
             continue
@@ -1940,6 +2068,55 @@ def _seed_definitions() -> list[FlowDefinition]:
                 FlowStep(id="e1", type="event", name="PsaBookSynced",
                          summary="emitted on commit",
                          config={"event": "PsaBookSynced"}),
+            ],
+        ),
+        FlowDefinition(
+            id="answer-question",
+            name="Answer a question",
+            description=(
+                "The last ungoverned ModelCall in the system, brought inside. "
+                "Every question asked of the corpus — the console's /ask, the "
+                "A2A front door, the Employee Hub's HR agent — is a fact "
+                "(`QuestionAsked`, or `HrQuestionAsked` carrying the "
+                "employee's own context) that starts one run, and the planner "
+                "loop runs inside it unchanged. **One ModelCall step per "
+                "question, not per turn**: a planner that calls four tools "
+                "makes five model turns to answer once, and five rows would "
+                "make the fleet's call count a fact about the planner's "
+                "verbosity rather than about how often anybody asked. The "
+                "turns are summed into that one step's usage. With no "
+                "generative backend configured the run still happens and the "
+                "step is a transform, because a `modelcall` row for a call "
+                "nobody made would inflate the very count this flow exists to "
+                "make truthful."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["knowledge", "answering", "a2a", "hr-agent",
+                  "governed-knowledge"],
+            queues=[],
+            roi_minutes_per_run=0.0,
+            # A governed assumption, and a small one: the planner's budget is
+            # already bounded by `answer_max_steps`, so this is the tile that
+            # notices when a question costs more than a question should.
+            model_budget_usd_per_run=0.05,
+            authored_by="fde:m.suter",
+            created_at=_ago(1),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="QuestionAsked",
+                         summary="one run per question, from any surface — the HR agent's `HrQuestionAsked` binds the same flow and differs only in the context it carries",
+                         config={"event": "QuestionAsked"}, next=["m1"]),
+                FlowStep(id="m1", type="modelcall", name="answer-question",
+                         summary="the planner loop over the two retrieval planes: document text and corpus metadata, every claim cited to an asset id it actually read — one step, however many turns it took",
+                         config={"model": "gemini-3.5-flash-lite",
+                                 "prompt": "answering.SYSTEM_INSTRUCTION",
+                                 "budget": "answer_max_steps turns"},
+                         next=["e1"]),
+                FlowStep(id="e1", type="event", name="QuestionAnswered",
+                         summary="emitted with the backend that answered — `retrieval` when nothing generated, which the console renders differently on purpose",
+                         config={"event": "QuestionAnswered"}),
             ],
         ),
     ]

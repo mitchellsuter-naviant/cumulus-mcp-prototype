@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from . import personas
 from .graph import GraphService, object_id
-from .models import AssetFilter, utcnow
+from .models import AskAnswer, AssetFilter, utcnow
 from .tasks import Task, TaskEvidence, TaskProposal, TaskService
 
 log = logging.getLogger("cumulus.employee")
@@ -242,15 +242,20 @@ class EmployeeService:
         knowledge,  # KnowledgeService — duck-typed to avoid an import cycle
         tasks: TaskService,
         graph: GraphService,
-        answer_backend=None,
         teams=None,
+        dispatcher=None,
     ) -> None:
         self.directory = directory
         self.knowledge = knowledge
         self.tasks = tasks
         self.graph = graph
-        self.answer_backend = answer_backend
         self.teams = teams
+        # The hub used to hold an answer backend and call it directly, which
+        # is what made the HR agent an ungoverned ModelCall: a planner ran, a
+        # bill accrued, and no run recorded either. It emits a fact now and the
+        # `answer-question` Flow owns the call — one loop, one journal, one
+        # place the cost lands, whichever door the question came through.
+        self.dispatcher = dispatcher
 
     # -- profile --------------------------------------------------------------
 
@@ -429,6 +434,22 @@ class EmployeeService:
         )
         return facts
 
+    def _hr_context(self, facts: list[str]) -> str:
+        """What makes this the HR desk rather than the corpus front door.
+
+        The same planner, the same tools, the same Flow — and an employee's own
+        balance, holidays and enrollments prepended, which is the whole of the
+        difference and the reason `HrQuestionAsked` is its own event name.
+        """
+        return (
+            "You are the HR Agent inside the Cumulus Employee Hub. "
+            "Answer only from the employee facts below and the documents you "
+            "retrieve with your tools; cite document ids in square brackets "
+            "like [pto-policy]. If neither covers the question, say so and "
+            "name who to ask.\n\n"
+            "Employee facts:\n- " + "\n- ".join(facts)
+        )
+
     def chat(self, email: str, message: str) -> HrChatReply:
         """Grounded HR answer: the employee's own facts + cited HR knowledge."""
         facts = self._employee_facts(email)
@@ -444,32 +465,41 @@ class EmployeeService:
             for h in hits
         ]
 
-        if self.answer_backend is not None:
-            from .answering import Toolbox
+        # The fact is that somebody asked HR something. Emitted whether or not
+        # a generative backend exists, because a question asked is a question
+        # asked: with none configured the run still happens, records no model
+        # call and no cost, and the reply below is the honest degraded one.
+        answer = None
+        if self.dispatcher is not None:
+            # Deferred like the `Toolbox` import it replaces: the hub is
+            # reachable from the answering stack's own wiring, and this module
+            # has stayed importable on its own.
+            from .answering import HR_QUESTION_EVENT
 
             try:
-                context = (
-                    "You are the HR Agent inside the Cumulus Employee Hub. "
-                    "Answer only from the employee facts below and the "
-                    "documents you retrieve with your tools; cite document "
-                    "ids in square brackets like [pto-policy]. If neither "
-                    "covers the question, say so and name who to ask.\n\n"
-                    "Employee facts:\n- " + "\n- ".join(facts)
-                )
-                toolbox = Toolbox(self.knowledge, self.teams)
-                reply, _steps = self.answer_backend.answer(
-                    message, context, toolbox
-                )
-                cited = [
-                    {"id": aid, "title": title}
-                    for aid, title in toolbox.touched.items()
-                ] or citations
-                return HrChatReply(
-                    reply=reply, citations=cited, grounded_on=facts,
-                    backend=self.answer_backend.name,
-                )
+                run = self.dispatcher.emit(
+                    HR_QUESTION_EVENT,
+                    {
+                        "question": message,
+                        "context": self._hr_context(facts),
+                        "event": HR_QUESTION_EVENT,
+                    },
+                    actor=email,
+                ).one()
+                produced = run.outputs.get("answer")
+                if produced:
+                    answer = AskAnswer.model_validate(produced)
             except Exception:
-                log.exception("HR answer backend failed; degrading to retrieval")
+                log.exception("HR answer flow failed; degrading to retrieval")
+
+        if answer is not None and answer.backend != "retrieval" and answer.answer:
+            cited = [
+                {"id": c.asset_id, "title": c.title} for c in answer.citations
+            ] or citations
+            return HrChatReply(
+                reply=answer.answer, citations=cited, grounded_on=facts,
+                backend=answer.backend,
+            )
 
         # Degraded mode: structured facts + retrieval, honestly labelled.
         lines = []
@@ -507,8 +537,8 @@ def build_employee_service(
     knowledge,
     tasks: TaskService,
     graph: GraphService,
-    answer_backend=None,
     teams=None,
+    dispatcher=None,
 ) -> EmployeeService:
     directory: EmployeeDirectory
     if backend == "firestore":
@@ -516,5 +546,5 @@ def build_employee_service(
     else:
         directory = InMemoryEmployeeDirectory()
     return EmployeeService(
-        directory, knowledge, tasks, graph, answer_backend, teams
+        directory, knowledge, tasks, graph, teams, dispatcher
     )

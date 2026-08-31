@@ -54,13 +54,14 @@ from .dispatch import Dispatcher, InMemoryEventLog
 from .documents import DOCUMENT_COLLECTION, DocumentService, Region
 from .gateway import ActionGateway, InMemoryLedgerStore
 from .graph import Claim, GraphService, GraphWriter, InMemoryGraphStore, object_id
+from .flows import read_model_rates
 from .matching import MatchLine, MatchResult, match_invoice, parse_match_tolerances
 from .models import utcnow
 from .prompts import GovernedPrompt, read_prompt
 from .reimbursements import JournalEvent, _event  # shared journal shape
 from .resolution import ResolutionOutcome, ResolutionThresholds
 from .resolution import read_resolution_thresholds, resolve
-from .runs import RunContext, RunEngine, RunRecord
+from .runs import ModelUsage, RunContext, RunEngine, RunRecord
 from .tasks import Task, TaskEvidence, TaskProposal, TaskService
 
 log = logging.getLogger("cumulus.payables")
@@ -130,6 +131,11 @@ class InvoiceExtraction(BaseModel):
     line_summary: str = ""
     confidence: float = 0.0
     model: str = ""
+    # What the call consumed, reported by the reader that made it and priced
+    # by the flow that declared the step. Zero means *unmeasured*, never free —
+    # see the same pair on `ReceiptExtraction`.
+    input_tokens: int = 0
+    output_tokens: int = 0
     lines: list[InvoiceLineExtract] = Field(default_factory=list)
     regions: list[Region] = Field(default_factory=list)
 
@@ -601,7 +607,13 @@ class VertexInvoiceReader:
         parts.append(types.Part(text=prompt))
         return parts
 
-    def _generate(self, parts, temperature: float) -> dict:
+    def _generate(self, parts, temperature: float) -> tuple[dict, ModelUsage]:
+        """The parsed JSON *and* what the call consumed.
+
+        The token counts arrive on the same response as the answer and used to
+        be dropped on the floor here, which is why every AP run's ModelCall
+        step reported a cost of zero.
+        """
         from google.genai import types
 
         response = self._client.models.generate_content(
@@ -611,7 +623,10 @@ class VertexInvoiceReader:
                 response_mime_type="application/json", temperature=temperature
             ),
         )
-        return json.loads(response.text or "{}")
+        return (
+            json.loads(response.text or "{}"),
+            ModelUsage.from_vertex(self._model, response),
+        )
 
     def read(
         self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
@@ -619,7 +634,7 @@ class VertexInvoiceReader:
         text = (prompt or DEFAULT_INVOICE_PROMPT) + (
             f"\n\nContext: {hint}" if hint else ""
         )
-        data = self._generate(self._parts(image, filename, text), 0.0)
+        data, usage = self._generate(self._parts(image, filename, text), 0.0)
         lines = [
             InvoiceLineExtract(
                 sku=str(item.get("sku", "") or ""),
@@ -648,6 +663,8 @@ class VertexInvoiceReader:
             line_summary=str(data.get("line_summary", "") or ""),
             confidence=float(data.get("confidence", 0) or 0),
             model=self._model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
             lines=lines,
         )
 
@@ -1066,6 +1083,12 @@ class PayableService:
         ))
         ctx.note_refs(prompt.source_ref)
 
+        # The price sheet this run's one ModelCall is metered against. See the
+        # same read in `reimbursements`: a ref on the metered step rather than
+        # a governed read a Rule consumes, because the rates change what the
+        # journal records the call cost and nothing about what the flow does.
+        rates = read_model_rates(self.knowledge)
+
         # -- m1: one call reads the whole document ------------------------
         extraction = InvoiceExtraction.model_validate(ctx.step(
             "m1", "extract-invoice", "modelcall",
@@ -1078,8 +1101,17 @@ class PayableService:
                 f"{len(out['lines'])} line(s) · "
                 f"confidence {out['confidence']:.2f}"
             ),
-            model=getattr(self.reader, "name", ""),
-            refs=[f"document:{document_id}", prompt.source_ref],
+            # Off the extraction, not off the reader's name. `getattr(reader,
+            # "name")` was the backend — "vertex" — filed in the column an
+            # auditor reads as the model that made the claim.
+            meter=lambda out: rates.priced(ModelUsage(
+                model=str(out.get("model") or ""),
+                input_tokens=int(out.get("input_tokens") or 0),
+                output_tokens=int(out.get("output_tokens") or 0),
+            )),
+            refs=[
+                f"document:{document_id}", prompt.source_ref, rates.source_ref,
+            ],
             retries=1, escalate_queue=CLERK_QUEUE,
         ))
 

@@ -300,8 +300,14 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
         "psa-sync",
         "identity-sweep",
         "disagreement-sweep",
+        # The sixteenth, and the only one here that touches no graph at all:
+        # a question asked of the corpus is a Flow now, so the engine can name
+        # it. It is projected like everything else and its projection is
+        # empty in both directions, which is the honest read — see the
+        # explicit case below.
+        "answer-question",
     }
-    # Eleven of the fifteen are inbound syncs. They all have FlowDefinitions now,
+    # Eleven of the sixteen are inbound syncs. They all have FlowDefinitions now,
     # but the projection is still drawn from the engine and from stored runs:
     # a definition says what a flow is *meant* to touch, and this module is
     # about what it did.
@@ -315,6 +321,14 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
             # catch a sweep that started inventing findings to look busy.
             assert projection.state == "ran_but_wrote_nothing"
             assert projection.writes == [] and projection.establishes == []
+            continue
+        if projection.flow_id == "answer-question":
+            # Registered, never run in this world, and it would write nothing
+            # if it had: answering reads the corpus and returns prose. The
+            # projection says `declared` rather than `observed` because no run
+            # was ever read, which is the distinction this module exists for.
+            assert projection.writes == []
+            assert projection.establishes == []
             continue
         assert projection.state == "observed", projection.flow_id
         if projection.flow_id == "employment-event-sync":
@@ -345,9 +359,14 @@ def test_the_ap_projection_matches_what_its_runs_did(seeded):
         "billed_against", "evidenced_by_document", "has_invoice_line",
         "issued", "matched_by", "matches_invoice_line",
     ]
-    # Both governed reads the flow makes, and the prompt is one of them: the
+    # Every governed read the flow makes, and the prompt is one of them: the
     # instruction the ModelCall ran on is knowledge like the posting policy is.
-    assert ap.knowledge == ["invoice-extraction-prompt", "invoice-posting-policy"]
+    # So is the price sheet — the run really did read it to say what its model
+    # call cost, and a read-set that omitted it would leave the cost on the
+    # journal with nothing behind it to check the arithmetic against.
+    assert ap.knowledge == [
+        "invoice-extraction-prompt", "invoice-posting-policy", "model-pricing",
+    ]
     # The bare `graph:PurchaseOrder/PO-7741` form, end to end: a parser that
     # required `@rev` would leave this list empty and nothing would fail.
     assert ap.reads == ["PurchaseOrder"]

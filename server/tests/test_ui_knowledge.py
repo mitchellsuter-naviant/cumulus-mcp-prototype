@@ -297,7 +297,13 @@ def test_the_selector_offers_every_flow_that_writes_the_graph(client):
     picker is built from runs, so a flow that lost its export would stay
     attributable."""
     body = client.get(ONTOLOGY_ROUTE).json()
-    assert {f["id"] for f in body["flows"]} == GRAPH_FLOWS
+    # Every graph-writing flow, plus `answer-question`, which is offered
+    # because the picker is the engine's list and answering is a Flow now.
+    # Selecting it draws an empty overlay, and that is the right answer rather
+    # than a missing option: "this flow touches no type" is a fact about it,
+    # and a picker that silently omitted it would be back to being a curated
+    # list of the flows somebody remembered.
+    assert {f["id"] for f in body["flows"]} == GRAPH_FLOWS | {"answer-question"}
     # Named from the engine, not the registry.
     assert all(f["label"] and f["label"] != f["id"] for f in body["flows"])
 
@@ -313,8 +319,10 @@ def test_the_overlay_ships_both_halves_of_the_diff(client):
     assert overlay["writes"] == [
         "Document", "Invoice", "InvoiceLine", "MatchSet", "Vendor",
     ]
+    # Three governed reads now: the extraction prompt, the posting policy, and
+    # the price sheet the run metered its ModelCall against.
     assert overlay["knowledge"] == [
-        "invoice-extraction-prompt", "invoice-posting-policy",
+        "invoice-extraction-prompt", "invoice-posting-policy", "model-pricing",
     ]
     assert overlay["scanned_runs"] == overlay["total_runs"] > 0
 

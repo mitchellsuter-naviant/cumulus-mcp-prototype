@@ -58,7 +58,7 @@ def _extract_text(message: dict) -> str:
     return " ".join(t for t in texts if t).strip()
 
 
-def _answer(question: str) -> str:
+def _answer(question: str, asked_by: str = "") -> str:
     """One answer path shared with the console's /ask endpoint.
 
     The card advertises "answers questions with cited source documents", so
@@ -66,8 +66,13 @@ def _answer(question: str) -> str:
     top three hits — otherwise the card is a promise the endpoint does not
     keep. With MODEL_BACKEND=none it degrades to ranked documents, and says
     so, which is still honest.
+
+    Governance comes free with that sharing: `ask` emits `QuestionAsked`, so a
+    question arriving through the A2A door produces the same run, the same
+    journal and the same cost line as one typed into the console. An external
+    agent's model spend was the least visible in the system and now is not.
     """
-    result = get_answer_service().ask(question)
+    result = get_answer_service().ask(question, asked_by=asked_by)
     # Generated answers only — the retrieval fallback lists its top hits as
     # citations, and counting those would turn an impression into the system's
     # strongest usage signal. See the same guard in rest_api.ask.
@@ -120,7 +125,7 @@ async def a2a_endpoint(
         "role": "agent",
         "messageId": str(uuid.uuid4()),
         "contextId": message.get("contextId") or str(uuid.uuid4()),
-        "parts": [{"kind": "text", "text": _answer(question)}],
+        "parts": [{"kind": "text", "text": _answer(question, principal.uid)}],
     }
     return JSONResponse({"jsonrpc": "2.0", "id": rpc_id, "result": reply})
 

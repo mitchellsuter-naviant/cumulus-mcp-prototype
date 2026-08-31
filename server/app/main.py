@@ -36,6 +36,7 @@ from .deps import (
     get_calendar_service,
     get_asset_usage,
     get_anomaly_service,
+    get_answer_service,
     get_dispatcher,
     get_document_service,
     get_estate_connector,
@@ -97,6 +98,10 @@ async def lifespan(app: FastAPI):
     get_sync_service()  # registers the four inbound sync bodies
     get_reimbursement_service()  # hydrate the table (and seed decided history)
     get_payable_service()  # hydrate the AP world (vendors, POs, invoices)
+    # Registers `answer-question`. Built here rather than on the first /ask so
+    # a question arriving at the HR agent — which emits into the same flow and
+    # holds no AnswerService of its own — cannot find the body missing.
+    get_answer_service()
     # Last of the seeds: calendars hang off the employees the workforce seed
     # (which rides along with payables) has just landed.
     get_calendar_service()

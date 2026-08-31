@@ -23,6 +23,7 @@ from typing import Any, Callable
 from pydantic import BaseModel, Field
 
 from .anomaly import AnomalyService, InMemoryProfileStore
+from .answering import AnswerService
 from .calendars import CalendarService
 from .dispatch import Dispatcher, InMemoryEventLog
 from .documents import DocumentService, InMemoryDocumentStore
@@ -54,6 +55,12 @@ class EvalWorld(BaseModel):
     expenses: Any
     payables: Any
     calendars: Any = None
+    #: The answering stack, with no generative backend — building it is what
+    #: registers the `answer-question` body, so every world can start the flow
+    #: a question becomes. A world whose backend is None still runs it and
+    #: still records that a question was asked; what it does not record is a
+    #: model call, because none was made.
+    answers: Any = None
     knowledge_revisions: dict[str, int] = Field(default_factory=dict)
 
 
@@ -115,11 +122,19 @@ def build_world(source_knowledge=None, *, seed_dir: str | None = None) -> EvalWo
         engine, graph, documents, anomaly, gateway, dispatcher,
     )
     calendars = CalendarService(graph)
+    # No backend: a graded run must never reach a live model, and a test world
+    # has no credential. The Flow is registered either way, so `answer-question`
+    # is a flow this world can start rather than one only production has.
+    answers = AnswerService(
+        knowledge, None, None, graph=graph,
+        dispatcher=dispatcher, engine=engine,
+    )
     return EvalWorld(
         knowledge=knowledge, tasks=tasks, engine=engine, graph=graph,
         gateway=gateway, dispatcher=dispatcher, documents=documents,
         anomaly=anomaly, sync=sync,
         expenses=expenses, payables=payables, calendars=calendars,
+        answers=answers,
         knowledge_revisions=revisions,
     )
 

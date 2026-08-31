@@ -20,12 +20,16 @@ def client(_client):
     world = test_world.fresh()
     demo_world.seed_workforce(world.sync, world.graph)
     demo_world.seed_tasks(world.tasks)
+    # The hub holds a Dispatcher rather than an answer backend now: the HR
+    # agent emits `HrQuestionAsked` and the `answer-question` Flow owns the
+    # call. This world's flow has no generative backend behind it, so chat
+    # still degrades to facts-plus-retrieval — and now leaves a run saying so.
     deps._employee_service = EmployeeService(
         InMemoryEmployeeDirectory(),
         world.knowledge,
         world.tasks,
         world.graph,
-        answer_backend=None,
+        dispatcher=world.dispatcher,
     )
     demo_world.seed_pto(deps._employee_service)
     return _client
