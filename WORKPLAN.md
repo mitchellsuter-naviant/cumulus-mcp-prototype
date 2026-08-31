@@ -286,6 +286,26 @@ Every subagent is spawned with `model: opus` (Opus 5) — decision 14.
   allow it; purge/reseed/pulse wait behind the deploy, then the capstone
   full-estate sync. Ontology decisions queued: Mailbox→Employee owner
   link; Office `showAs` dropped fact.
+- **2026-08-31 (S2 built end to end; the live write awaits the user)** —
+  All seven S2 stages landed and merged: S2-0 (the Gateway ledgers failed
+  writes; ctx.step meters), S2a (the sweep: Voss found at 0.9196, three
+  non-findings held, double mutation proof), S2b-1 (WRITABLE + write-ahead
+  journal), S2b-2 (the release flow, five outcomes, two-regime commit, the
+  deliver-side echo pass; a value that moved between check and write is an
+  `escalate`, neither `failed` nor `refused`), S2c (every model call
+  governed — the last audit item closed; pricing is governed knowledge,
+  priced at meter time with the revision pinned), S2-C1 (the review screen
+  + DisagreementState), S2-E (12 graded cases, both specs mutation-proven,
+  the app-side FakeErp with a no-drift test). Fleet **17 flows / 17
+  exports**; **1,084 server tests / 131 Dart**. Live staging done: Voss
+  merge CONFIRMED through the Task path (blocked_on_identity 1→0), the
+  disagreement sweep standing at one finding, the release Task on
+  order-desk, SO5037 verified Pending Approval in the live ERP. **The one
+  live write is deliberately left to the user**: the classifier refused
+  ESTATE_WRITES_ENABLED=true at server start (the right boundary), so the
+  finale is the user's — restart with the flag, approve as the Controller,
+  watch the ERP change and the echo come home. S2c's vertex verification
+  still waits on host gcloud reauth.
 - **2026-08-31 (the arc closes — clarity pass applied)** — the clarity
   critic walked the live console as three Naviant personas: 34 findings,
   all fixed at `7ad3a20` (932 server / 111 Dart tests). Highlights:
