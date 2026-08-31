@@ -69,7 +69,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from .eval_world import FLOW_ENTRYPOINTS, EvalWorld, build_world
+from .eval_world import FLOW_ENTRYPOINTS, GATE_RESUMES, EvalWorld, build_world
 from .graph import (
     Claim,
     GraphService,
@@ -153,6 +153,31 @@ TrajectoryKind = Literal[
     "model_calls_at_most",
     "wrote",
     "read",
+    # The three below are about the world the run leaves behind rather than the
+    # path it took, and each exists because a flow shipped a promise the eight
+    # above could not express.
+    #
+    # `reported` — the run's own output, keyed: `found=1, blocked_on_identity=1`,
+    # or `key~text` for containment where the value is a sentence rather than a
+    # scalar. A windowed pass counts things it deliberately does *not* write
+    # down — `blocked_on_identity` is a fact about what it was not allowed to
+    # read, and `order_without_deal` is a one-ended non-finding with no edge to
+    # assert — and a number nothing can grade is a number nobody is answerable
+    # for.
+    "reported",
+    # `task_raised` — a Task on a queue, optionally of a kind
+    # (`order-desk/exception`). `queue` above reads the *gates* a run suspended
+    # on, and the two flows here suspend on nothing: they interrupt a person by
+    # raising a Task and carrying on, and one of them raises it from a delivery
+    # days after the run that wrote the row had finished.
+    "task_raised",
+    # `claimed_by` — every live claim on one field of one type comes from one
+    # source: `SalesOrder.status=erp:erp-sales`. The release flow's central
+    # promise is that Cumulus never writes an authority claim it did not read
+    # back from the ERP, and a `human:` claim would outrank `erp:` forever
+    # while leaving the *value* identical — so nothing about the resolved props
+    # can see it, and only the claims can.
+    "claimed_by",
 ]
 
 
@@ -324,7 +349,15 @@ def seed_fixture(
     Shared with the preview in `worlds.py` deliberately. A preview that
     established the world by a second route could show something no graded run
     ever sees, and a fixture editor you cannot trust is worse than none.
+
+    The recorded estate is established from the same deliveries and in the same
+    pass. A fixture describes one world, and a world where the graph holds an
+    order the ERP has never heard of is not one the write plane could ever have
+    met — so the two shapes of the same row come from one declaration, and a
+    fixture cannot drift from the estate it is a recording of.
     """
+    if world.estate is not None:
+        world.estate.seed(fixture.deliveries)
     for delivery in fixture.deliveries:
         world.sync.deliver(SyncRequest.model_validate(delivery), actor=actor)
     writer = world.graph.writer("fixture", "f0")
@@ -1016,15 +1049,23 @@ class EvalService:
         entrypoint = FLOW_ENTRYPOINTS.get(spec.flow_id)
         if entrypoint is None:
             return None
-        row = entrypoint(world, dict(case.trigger))
+        decisions = [d.model_dump() for d in case.decisions]
+        row = entrypoint(world, dict(case.trigger), decisions)
         # An entrypoint returns whatever its own callers get — a submitted
-        # request row, or the dispatch summary a windowed flow answers with.
-        # Both name the run; only the shape differs, and this is the seam
-        # rather than a wrapper type per flow.
+        # request row, the dispatch summary a windowed flow answers with, or
+        # the hook's account of what a decision started. All three name the
+        # run; only the shape differs, and this is the seam rather than a
+        # wrapper type per flow.
         run_id = (
             str(row.get("run_id") or "") if isinstance(row, dict)
             else getattr(row, "run_id", "") or ""
         )
+        resume = GATE_RESUMES.get(spec.flow_id)
+        if resume is None:
+            # No gate a decision answers mid-run: the flow either never
+            # suspends, or its decisions are what started it and the
+            # entrypoint has already taken them.
+            return world.engine.get(run_id)
         for decision in case.decisions:
             run = world.engine.get(run_id)
             if run is None or run.status != "suspended" or not run.open_task_id:
@@ -1038,10 +1079,7 @@ class EvalService:
             )
             # Resuming through the flow service is the same path a real
             # decision takes, hooks included.
-            if spec.flow_id == "expense-reimbursement":
-                world.expenses.resume_for_task(decided)
-            else:
-                world.payables.resume_for_task(decided)
+            resume(world, decided)
         return world.engine.get(run_id)
 
     # -- grading ------------------------------------------------------------
@@ -1252,7 +1290,11 @@ class EvalService:
     ) -> list[AssertionResult]:
         results: list[AssertionResult] = []
         # Scoped to the milestone, so "no second model call before the
-        # vendor is settled" means what it says.
+        # vendor is settled" means what it says. The three world-level kinds —
+        # `reported`, `task_raised`, `claimed_by` — are the stated exception:
+        # they are about what the run left behind rather than about the path,
+        # and a run's report and the Tasks it raised have no point-in-time
+        # form to scope to.
         in_scope = [s for s in run.steps if s.step_id in set(prefix)]
         step_ids = [s.step_id for s in in_scope]
         gates = [s for s in in_scope if s.kind == "task"]
@@ -1317,4 +1359,77 @@ class EvalService:
                 any(ref.startswith(expected) for ref in reads),
                 ", ".join(dict.fromkeys(reads))[:120] or "nothing",
             )
+        if kind == "reported":
+            return _reported(run.outputs or {}, expected)
+        if kind == "task_raised":
+            return _task_raised(world, expected)
+        if kind == "claimed_by":
+            return _claimed_by(world, expected)
         return False, f"unknown trajectory rule '{kind}'"
+
+
+def _reported(outputs: dict, expected: str) -> tuple[bool, str]:
+    """`key=value` pairs (and `key~text` for containment) against a run's report.
+
+    Every pair is checked and the actual side lists all of them, so a failure
+    says which number was wrong rather than that one of four was. `~` is here
+    because a report's most useful values are not always scalars: a sweep's
+    `top` is the finding it made, in sentences, and "the evidence names the
+    delivery engagement" is a claim about that sentence.
+    """
+    ok = True
+    actual: list[str] = []
+    for clause in [c.strip() for c in expected.split(",") if c.strip()]:
+        at_tilde, at_equals = clause.find("~"), clause.find("=")
+        contains = at_tilde != -1 and (at_equals == -1 or at_tilde < at_equals)
+        key, _, want = clause.partition("~" if contains else "=")
+        key, want = key.strip(), want.strip()
+        if key not in outputs:
+            ok = False
+            actual.append(f"{key}=(not reported)")
+            continue
+        found = outputs[key]
+        text = str(found)
+        hit = want in text if contains else text == want
+        ok = ok and hit
+        actual.append(f"{key}{'~' if contains else '='}{text[:60]}")
+    return ok, "; ".join(actual) or "nothing reported"
+
+
+def _task_raised(world: EvalWorld, expected: str) -> tuple[bool, str]:
+    """A Task on `queue`, or on `queue/kind`. Every Task the world holds.
+
+    World-scoped rather than run-scoped on purpose: the Task an escalation
+    raises belongs to a step that failed, and the Task a divergence raises
+    belongs to a *delivery* that arrived after the run finished. Both are the
+    interruption the case is about, and neither is reachable from the run's
+    journal.
+    """
+    queue, _, kind = expected.partition("/")
+    queue, kind = queue.strip(), kind.strip()
+    held = [(task.queue, task.kind) for task in world.tasks.list()]
+    matched = [
+        pair for pair in held
+        if pair[0] == queue and (not kind or pair[1] == kind)
+    ]
+    return bool(matched), _listed(f"{q}/{k}" for q, k in held)
+
+
+def _claimed_by(world: EvalWorld, expected: str) -> tuple[bool, str]:
+    """`Type.field=source` — every live claim on that field, from that source.
+
+    The whole set, not "at least one": the failure this exists to catch adds a
+    claim rather than replacing one, and a rule that passed on finding the
+    right claim among two would be blind to exactly the case it was written
+    for.
+    """
+    target, _, source = expected.partition("=")
+    object_type, _, field = target.partition(".")
+    sources = {
+        claim.source
+        for record in world.graph.store.objects()
+        if record.type == object_type.strip()
+        for claim in record.claims
+        if claim.field == field.strip()
+    }
+    return sources == {source.strip()}, _listed(sorted(sources))
