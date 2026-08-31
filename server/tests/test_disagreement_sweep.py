@@ -21,11 +21,11 @@ rather than a few assertions bolted onto `test_sync_commerce.py`:
 
 The fixture is the live estate's own rows, recorded — the same Voss and Blue
 Harbor numbers the workplan's ground-truth section verified against the running
-book. **Flagged for S2-E:** these belong in `eval_specs` as the
-`state/naviant-disagreement` fixture, so that one recording feeds the unit
-tests and the graded suite the way `_IDENTITY_*` already does; they are
-declared here because the eval spec is a later stage and the sweep needed a
-world before it had one.
+book — and it is declared in `eval_specs` as `state/naviant-disagreement` and
+read back here. One recording, feeding the unit tests below, the graded suite
+at the bottom of this module, and the release flow that answers what the sweep
+finds: a second copy of these rows would be a second account of one estate,
+free to drift the moment somebody edited it.
 """
 
 import pytest
@@ -39,6 +39,13 @@ from app.disagreement_sweep import (
     deal_subject,
     standing_findings,
 )
+from app.eval_specs import (
+    BLUE_HARBOR_ORDER,
+    OLDER_WINS,
+    VOSS_DEAL,
+    VOSS_ORDER,
+    _state_world,
+)
 from app.graph import link_id, object_id
 from app.models import AssetUpdate
 from app.ontology import ONTOLOGY
@@ -46,106 +53,13 @@ from app.resolution import parse_state_policy, read_state_policy
 from app.sync import SyncRequest
 from tests import world as test_world
 
-VOSS_DEAL = "Voss — Title & Service Records Capture"
-VOSS_ORDER = "SO5037"
-BLUE_HARBOR_ORDER = "SO5003"
-OLDER_WINS = ("Voss — Service Drive Scanner Rollout", "Voss — Deal Jacket Capture")
+#: The three books, in the order the fixture declares them: the CRM's half
+#: (three Voss wins, only one near the order, and a Blue Harbor deal that never
+#: closed), the ERP's (two held orders in the whole book, which is what makes
+#: the counts here assertable rather than approximate), and the delivery
+#: system's, under the nickname a coordinator typed.
+_CRM, _ERP, _PSA = _state_world().deliveries
 
-
-#: The CRM's half, as the live book holds it: three Voss wins, only one of them
-#: near the order, and a Blue Harbor deal that never closed.
-_CRM = {
-    "source": "crm-book",
-    "watermark": "2026-08-30T00:00:00Z",
-    "accounts": [
-        {"external_id": "A1", "name": "Voss Automotive Group",
-         "website": "https://vossauto.example.com", "phone": "(608) 555-0111"},
-        {"external_id": "A2", "name": "Blue Harbor Logistics",
-         "website": "https://blueharbor.example.com",
-         "phone": "(414) 555-0122"},
-    ],
-    "opportunities": [
-        {"external_id": "O1", "name": VOSS_DEAL, "account_external_id": "A1",
-         "stage": "closed-won", "amount": 128000.0,
-         "close_date": "2026-08-14"},
-        # Five months earlier, and its own order was billed long ago. The
-        # nearest false positive in the estate: same counterparty, same state,
-        # a name that shares two words with the order's memo.
-        {"external_id": "O2", "name": OLDER_WINS[0],
-         "account_external_id": "A1", "stage": "closed-won",
-         "amount": 44000.0, "close_date": "2026-03-20"},
-        {"external_id": "O3", "name": OLDER_WINS[1],
-         "account_external_id": "A1", "stage": "closed-won",
-         "amount": 61000.0, "close_date": "2025-11-14"},
-        # Never won. The control that separates "no deal" from "no deal in the
-        # window", which are different facts about an estate.
-        {"external_id": "O4", "name": "Blue Harbor — Fleet Telematics Rollout",
-         "account_external_id": "A2", "stage": "prospecting",
-         "amount": 95000.0, "close_date": "2026-12-01"},
-    ],
-}
-
-#: The ERP's half. Two held orders in the whole book, which is what the live
-#: estate holds and what makes the counts here assertable rather than
-#: approximate.
-_ERP = {
-    "source": "erp-sales",
-    "watermark": "2026-08-30T00:00:00Z",
-    "customers": [
-        {"external_id": "1007", "name": "Voss Automotive Group",
-         "email": "ap@vossauto.example.com", "phone": "(608) 555-0111"},
-        {"external_id": "1011", "name": "Blue Harbor Logistics",
-         "email": "ap@blueharbor.example.com", "phone": "(414) 555-0122"},
-    ],
-    "sales_orders": [
-        {"external_id": "5037", "order_number": VOSS_ORDER,
-         "customer_external_id": "1007", "ordered_date": "2026-08-17",
-         "status": "Pending Approval", "total": 34960.0,
-         "memo": "Title and service records capture — phase 1"},
-        {"external_id": "5003", "order_number": BLUE_HARBOR_ORDER,
-         "customer_external_id": "1011", "ordered_date": "2026-08-11",
-         "status": "Pending Approval", "total": 6900.0,
-         "memo": "Dock scanning refresh"},
-        # Released, and therefore not a disagreement however well it matches.
-        {"external_id": "5025", "order_number": "SO5025",
-         "customer_external_id": "1007", "ordered_date": "2026-03-18",
-         "status": "Billed", "total": 8850.0,
-         "memo": "Service drive scanner rollout"},
-    ],
-}
-
-#: The delivery system's half, under the nickname a coordinator typed. It mints
-#: its own Company — `Voss Auto` is not `Voss Automotive Group` to any
-#: resolver — and the identity sweep proposes the merge at `in_review`, which
-#: is exactly the state this module has to refuse to read across.
-_PSA = {
-    "source": "psa-book",
-    "watermark": "2026-08-30T00:00:00Z",
-    "psa_clients": [
-        {"external_id": "107", "name": "Voss Auto",
-         "contact_name": "Dana Reyes",
-         "contact_email": "dana.reyes@vossauto.example.com"},
-    ],
-    "projects": [
-        # Started five days after the order was raised and immediately parked.
-        # The third system's account of the same commitment, and the evidence
-        # the unconfirmed merge is holding back.
-        {"external_id": "105", "project_code": "ENG-0105",
-         "client_external_id": "107",
-         "name": "Voss Auto — title and service records capture",
-         "status": "on-hold", "project_manager": "S. Hoffmann",
-         "start_date": "2026-08-22", "target_end_date": "2026-11-18",
-         "budget_hours": 260.0, "actual_hours": 12.0},
-        # Long finished, and outside every window. Here so that "a project
-        # exists for this customer" cannot be what makes the signal fire.
-        {"external_id": "115", "project_code": "ENG-0115",
-         "client_external_id": "107",
-         "name": "Voss Auto — deal jacket capture install",
-         "status": "completed", "project_manager": "Danielle G.",
-         "start_date": "2025-11-23", "target_end_date": "2025-12-23",
-         "budget_hours": 110.0},
-    ],
-}
 
 #: A second counterparty, for the one-sided amount rule alone. Its order is
 #: three times its deal, which no honest reading makes a phase of it.
@@ -862,3 +776,107 @@ def test_standing_findings_reads_only_what_is_live_and_standing(booked):
     link.props["status"] = "resolved"
     booked.graph.store.put_link(link)
     assert standing_findings(booked.graph) == []
+
+
+# ---------------------------------------------------------------------------
+# The graded suite
+# ---------------------------------------------------------------------------
+#
+# The same recording, judged through the console's own door. What the unit
+# tests above assert about one pass, the spec asserts as a contract: the class's
+# one live instance found, the two older wins refused, Blue Harbor counted, and
+# — the pair that is the whole argument for the identity work — the same world
+# run twice, differing by one link's status.
+
+
+@pytest.fixture()
+def owner(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "auth_backend", "firebase")
+    monkeypatch.setattr(settings, "admin_api_key", "root-sekret")
+    return {"X-API-Key": "root-sekret"}
+
+
+def _graded(client, owner) -> dict:
+    body = client.post(
+        "/api/v1/evals/disagreement-sweep/run", headers=owner
+    ).json()
+    assert "result" in body, body
+    return body
+
+
+def test_the_two_books_run_green_through_the_eval_route(client, owner, world):
+    """The gate, through the route a console launches: `POST …/run`."""
+    body = _graded(client, owner)
+    cases = body["result"]["cases"]
+    assert body["failed"] == 0, [
+        (c["case_id"], [a for a in c["assertions"] if not a["passed"]], c["error"])
+        for c in cases if not c["passed"]
+    ]
+    assert body["passed"] == 4
+    assert {c["case_id"] for c in cases} == {
+        "state/voss-won-not-released",
+        "state/older-wins-and-blue-harbor-are-not-raised",
+        "state/an-unconfirmed-merge-withholds-the-third-system",
+        "state/confirming-the-merge-admits-the-engagement",
+    }
+    assert all(c["run_status"] == "succeeded" for c in cases)
+    assert body["invariant_violations"] == 0
+    assert body["failed_assertions"] == 0
+
+
+def test_the_graded_world_is_the_one_the_unit_tests_run_on(client, owner):
+    """One recording, and a check that says so rather than a comment.
+
+    The fixture these cases name is the module-level `_CRM`/`_ERP`/`_PSA`
+    above, read back out of `eval_specs`. A second copy of these rows would be
+    a second account of one estate, and the two would agree right up until
+    somebody edited one of them.
+    """
+    fixture = client.get(
+        "/api/v1/evals/fixtures/state/naviant-disagreement", headers=owner
+    ).json()
+    assert fixture["deliveries"] == [_CRM, _ERP, _PSA]
+    assert fixture["flow_id"] == DISAGREEMENT_SWEEP_FLOW_ID
+    # And the pinned read is the policy the sweep is graded against, so a
+    # result carries what it was comparable to.
+    assert fixture["read_set"] == ["knowledge:state-agreement-policy@rev1"]
+
+
+def test_widening_the_window_in_the_document_raises_an_older_win(
+    client, owner, world
+):
+    """The mutation proof, run rather than described.
+
+    The window is the only thing separating Voss's March win from the finding:
+    same counterparty, same two states, and an amount well inside the
+    containment band. Push the far edge out to five months and the sweep
+    correlates it — and the case that says it must not notices, on the
+    assertion that names it. It edits the *asset* rather than the code, which
+    is the sharper demonstration: a controller who thinks a month is too tight
+    can widen it and watch a false positive appear, with nothing redeployed.
+    """
+    assert _graded(client, owner)["failed"] == 0
+
+    asset = world.knowledge.repo.get("state-agreement-policy")
+    world.knowledge.update(asset.id, AssetUpdate(
+        content=asset.content.replace(
+            "Close the window: 30 days after it.",
+            "Close the window: 160 days after it.",
+        ),
+    ))
+    body = _graded(client, owner)
+
+    cases = {c["case_id"]: c for c in body["result"]["cases"]}
+    older = cases["state/older-wins-and-blue-harbor-are-not-raised"]
+    assert not older["passed"]
+    assert any(
+        a["target"].startswith("Opportunity[crm-book:O2]")
+        and a["rule"] == "count" and a["expected"] == "0" and a["actual"] == "1"
+        for a in older["assertions"] if not a["passed"]
+    ), older["assertions"]
+    # And the finding case notices too, because the order it is about now has
+    # two deals disagreeing with it rather than one. A window is not a local
+    # setting: widening it changes what every case in the suite is looking at.
+    assert not cases["state/voss-won-not-released"]["passed"]

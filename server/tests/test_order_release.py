@@ -22,22 +22,30 @@ make it unsafe to point at a customer's ERP:
 
 Nothing here touches a live estate. The wire is `estate_fixtures.FakeEstate`,
 whose `patch` is `erp.py`'s own — picklist, unknown-field 400, and *no
-transition validation*, which is the whole reason `WRITABLE` exists.
+transition validation*, which is the whole reason `WRITABLE` exists. The graded
+suite at the bottom runs on `app.estate_fake.FakeErp`, which is the same route
+reproduced on the app side because a console-triggered eval run executes where
+`tests/` is not importable; a test here drives both and compares them, so the
+two cannot drift apart in silence.
 """
 
 from __future__ import annotations
+
+import dataclasses
 
 import pytest
 
 from app.auth import Principal
 from app.disagreement_sweep import ORDER_DESK_QUEUE, SCAN, STANDING
 from app.estate import EstateConnector, InMemoryConnectorStateStore
+from app.estate_fake import sales_order_rows
 from app.estate_writes import (
     WRITABLE,
     EstateWriter,
     InMemoryEstateWriteJournal,
     write_id,
 )
+from app.eval_specs import VOSS_DEAL, VOSS_ORDER, VOSS_RECORD, _state_world
 from app.gateway import ACTIONS, Refused
 from app.graph import object_id
 from app.order_release import (
@@ -56,9 +64,7 @@ from tests import world as test_world
 
 PROJECT = "cumulus-demo-mitchell-suter"
 TARGET = "sales-order-status"
-VOSS_DEAL = "Voss — Title & Service Records Capture"
-VOSS_ORDER = "SO5037"
-RECORD = "5037"
+RECORD = VOSS_RECORD
 PENDING = "Pending Approval"
 RELEASED = "Pending Fulfillment"
 PATCH_URL = (
@@ -76,48 +82,27 @@ CONTROLLER = Principal(
 
 # -- the world ----------------------------------------------------------------
 #
-# The live estate's own rows for the one case the class has: a Voss deal closed
-# won on the 14th and an order raised on the 17th that the ERP still holds.
+# The same recording the sweep runs on and the graded suites are declared
+# against: `eval_specs`' `state/naviant-disagreement`, which is the live
+# estate's own rows — a Voss deal closed won on the 14th and an order raised on
+# the 17th that the ERP still holds, beside the non-findings that keep the
+# counts honest.
 
-_CRM = {
-    "source": "crm-book",
-    "watermark": "2026-08-30T00:00:00Z",
-    "accounts": [
-        {"external_id": "A1", "name": "Voss Automotive Group",
-         "website": "https://vossauto.example.com", "phone": "(608) 555-0111"},
-    ],
-    "opportunities": [
-        {"external_id": "O1", "name": VOSS_DEAL, "account_external_id": "A1",
-         "stage": "closed-won", "amount": 128000.0,
-         "close_date": "2026-08-14"},
-    ],
-}
-
-_ERP = {
-    "source": "erp-sales",
-    "watermark": "2026-08-30T00:00:00Z",
-    "customers": [
-        {"external_id": "1007", "name": "Voss Automotive Group",
-         "email": "ap@vossauto.example.com", "phone": "(608) 555-0111"},
-    ],
-    "sales_orders": [
-        {"external_id": RECORD, "order_number": VOSS_ORDER,
-         "customer_external_id": "1007", "ordered_date": "2026-08-17",
-         "status": PENDING, "total": 34960.0,
-         "memo": "Title and service records capture — phase 1"},
-    ],
-}
+_CRM, _ERP, _PSA = _state_world().deliveries
 
 
 def _row(status: str = PENDING) -> dict:
-    """`salesOrders/5037` as the estate holds it, verbatim from the workplan's
-    ground truth. The fields are the ERP's, not the graph's."""
-    return {
-        "id": RECORD, "tranId": VOSS_ORDER, "customerId": "1007",
-        "status": status, "total": 34960.0, "tranDate": "2026-08-17",
-        "memo": "Title and service records capture — phase 1",
-        "updatedAt": "2026-08-17T14:02:00Z",
-    }
+    """`salesOrders/5037` as the estate holds it.
+
+    Derived from the fixture's own delivery rather than written out again: the
+    ERP's shape and the feed's shape are two views of one record, and two
+    hand-written copies is how the order a test PATCHes stops being the order
+    the graph is holding.
+    """
+    row = next(
+        r for r in sales_order_rows([_ERP]) if r["id"] == RECORD
+    )
+    return {**row, "status": status}
 
 
 def _estate(status: str = PENDING, **over) -> fx.FakeEstate:
@@ -974,12 +959,223 @@ def test_a_delivery_of_another_shape_does_not_age_anybody_s_write(found):
     assert entry.state == "applied" and entry.echo_pulls == 0
 
 
+def test_the_graded_world_can_never_reach_a_live_estate(world):
+    """The first of the three independent reasons a graded run cannot write.
+
+    `eval_world.build_world` hands every world a writer whose entire wire is a
+    recorded ERP — the read the precondition makes, the PATCH, the verification
+    re-read, and the connector's own fetch. There is no socket anywhere on the
+    object, which is a stronger statement than "the flag is off": it holds on a
+    box where somebody turned the flag on.
+
+    The other two are `ESTATE_WRITES_ENABLED`, asserted below, and the import
+    boundary on `estate_writes.py` in `test_estate_writes.py`.
+    """
+    from app.config import settings
+    from app.eval_world import build_world
+
+    graded = build_world()
+    writer = graded.sync.estate_writer
+    assert writer is not None
+    assert writer.live is False
+    # Every callable that could have been a network call is the fake's.
+    assert writer._fetch.__self__ is graded.estate
+    assert writer._patch.__self__ is graded.estate
+    assert writer.connector._fetch.__self__ is graded.estate
+    assert settings.estate_writes_enabled is False
+    # And the writer it was handed is the writer the flow reads.
+    assert world.sync.estate_writer is not None
+    assert world.sync.estate_writer.live is False
+
+
+def test_the_two_fakes_agree_about_the_sales_order_route():
+    """The recorded estate in `app/` and the one in `tests/`, side by side.
+
+    `tests/estate_fixtures.FakeEstate` serves eighteen resources, list routes,
+    watermarks and outages, and stays where it is for the connector suite.
+    `app/estate_fake.FakeErp` serves one route, because a console-triggered
+    eval run executes where `tests/` is not importable. Two fakes for one ERP
+    is a drift risk, and this is what stops it being a silent one: the shared
+    surface is driven through both and compared, answer for answer.
+    """
+    from app import estate_fake
+
+    url = f"https://p-erp.web.app/api/naviant/v1/salesOrders/{RECORD}"
+    cases: list[tuple[str, dict]] = [
+        ("the declared transition", {"status": RELEASED}),
+        # The picklist is the only validation either one performs, and it is
+        # the only validation the real route performs.
+        ("a value off the picklist", {"status": "Shipped Maybe"}),
+        ("a field the entity does not have", {"released_by": "cumulus"}),
+        # Server-owned fields are ignored rather than rejected, so a caller can
+        # round-trip a record it just read.
+        ("a read-only field beside a real one",
+         {"status": RELEASED, "updatedAt": "2020-01-01T00:00:00Z"}),
+        ("nothing at all", {}),
+        ("a non-string", {"memo": 7}),
+        # The one that matters most: neither validates the transition, because
+        # `erp.py` does not. That absence is the whole reason `WRITABLE` exists.
+        ("a transition the write table forbids", {"status": "Closed"}),
+    ]
+    for label, body in cases:
+        theirs = fx.FakeEstate(resources={("erp", "salesOrders"): [_row()]})
+        ours = estate_fake.FakeErp([_row()])
+        answers = []
+        for fake in (theirs, ours):
+            try:
+                answers.append(("ok", fake.patch(url, dict(body))))
+            except Exception as exc:  # noqa: BLE001 — the answer under test
+                answers.append(
+                    ("refused", getattr(exc, "status", 0),
+                     getattr(exc, "message", str(exc)))
+                )
+        assert answers[0][0] == answers[1][0], f"{label}: {answers}"
+        if answers[0][0] == "refused":
+            assert answers[0][1:] == answers[1][1:], label
+            continue
+        left, right = answers[0][1], answers[1][1]
+        assert left["status"] == right["status"], label
+        # `updatedAt` is server time and moves; that it moved is the property.
+        assert left["updatedAt"] > _row()["updatedAt"], label
+        assert right["updatedAt"] > _row()["updatedAt"], label
+        assert {k: v for k, v in left.items() if k != "updatedAt"} == {
+            k: v for k, v in right.items() if k != "updatedAt"
+        }, label
+
+
 def test_a_deployment_with_no_writer_delivers_exactly_as_before(world):
-    """The read-only estate is a working deployment, not a degraded one."""
-    assert world.sync.estate_writer is None
+    """The read-only estate is a working deployment, not a degraded one.
+
+    Asked for explicitly, because `eval_world.build_world` now hands every
+    world a writer over a recorded ERP — that is the guarantee a graded run
+    cannot reach a live estate, and it means "no writer at all" is a
+    deployment shape this test has to construct rather than inherit.
+    """
+    world.sync.estate_writer = None
     outcomes = world.sync.deliver(
         SyncRequest.model_validate(_ERP), actor="system:test"
     )
     sales = next(o for o in outcomes if o["flow_id"] == "sales-sync")
     assert sales["status"] == "succeeded"
     assert not {"echoes", "diverged", "unechoed"} & set(sales)
+
+
+# ---------------------------------------------------------------------------
+# The graded suite
+# ---------------------------------------------------------------------------
+#
+# Eight cases over seven branches — the echo is two, because an echo and a
+# divergence are two different things for the world to do — driven through the
+# console's own door. Every one of them starts where a release really starts:
+# the sweep raises the Task, a `ScriptedDecision` answers it as the controller
+# would, and `apply_release_decision` emits the Event the run begins from.
+
+
+@pytest.fixture()
+def owner(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "auth_backend", "firebase")
+    monkeypatch.setattr(settings, "admin_api_key", "root-sekret")
+    return {"X-API-Key": "root-sekret"}
+
+
+def _graded(client, owner) -> dict:
+    body = client.post("/api/v1/evals/order-release/run", headers=owner).json()
+    assert "result" in body, body
+    return body
+
+
+def test_every_branch_runs_green_through_the_eval_route(client, owner, world):
+    body = _graded(client, owner)
+    cases = body["result"]["cases"]
+    assert body["failed"] == 0, [
+        (c["case_id"], [a for a in c["assertions"] if not a["passed"]], c["error"])
+        for c in cases if not c["passed"]
+    ]
+    assert body["passed"] == 8
+    assert {c["case_id"] for c in cases} == {
+        "release/one-patch-moves-the-order",
+        "release/a-second-approval-sends-nothing",
+        "release/somebody-else-got-there-first",
+        "release/a-billed-order-escalates",
+        "release/a-door-that-refuses-is-ledgered-failed",
+        "release/a-lying-two-hundred-settles-unverified",
+        "release/the-change-comes-home",
+        "release/a-third-value-comes-home-instead",
+    }
+    assert body["invariant_violations"] == 0
+    assert body["failed_assertions"] == 0
+    # Seven of the eight runs finish; the one whose door refuses hands itself
+    # to a person and waits, which is the ending that branch is about.
+    suspended = [c for c in cases if c["run_status"] == "suspended"]
+    assert [c["case_id"] for c in suspended] == [
+        "release/a-door-that-refuses-is-ledgered-failed"
+    ]
+
+
+def test_the_graded_branches_run_on_the_worlds_own_recording(client, owner):
+    """Every release case names the fixture the sweep is graded against.
+
+    Not a tidiness check. The finding a release closes is written by the sweep,
+    over the same three books, so a release suite with a world of its own would
+    be grading a decision about an order the sweep never saw.
+    """
+    cases = client.get(
+        "/api/v1/evals/order-release/cases", headers=owner
+    ).json()
+    assert {c["fixture_id"] for c in cases} == {"state/naviant-disagreement"}
+    assert all(c["decisions"] for c in cases), "a release is a decision"
+    assert {d["verdict"] for c in cases for d in c["decisions"]} == {"approved"}
+
+
+def test_widening_the_write_table_releases_an_order_it_must_not(
+    client, owner, world, monkeypatch
+):
+    """The mutation proof: the refusal comes from `WRITABLE`, not from the ERP.
+
+    The estate would not have stopped this — `erp.py` validates the picklist
+    and nothing else, so `Billed` straight back to `Pending Fulfillment` is a
+    legal PATCH there and the recorded estate reproduces that faithfully, which
+    the first half of this test demonstrates rather than asserts on trust. What
+    refuses it is one row in a table in Cumulus. Widen that row and the write
+    goes out, and the case that says an order the ERP has billed is not ours to
+    touch fails on exactly the assertions that carried the claim.
+    """
+    import app.estate_writes as estate_writes
+    from app.estate_fake import FakeErp
+
+    # The estate's own answer to the illegal transition, first.
+    permissive = FakeErp([_row("Billed")])
+    url = f"https://p-erp.web.app/api/naviant/v1/salesOrders/{RECORD}"
+    assert permissive.patch(url, {"status": RELEASED})["status"] == RELEASED
+
+    assert _graded(client, owner)["failed"] == 0
+
+    widened = tuple(
+        dataclasses.replace(
+            target,
+            transitions={**target.transitions, "Billed": (RELEASED,)},
+        )
+        if target.id == TARGET else target
+        for target in estate_writes.WRITABLE
+    )
+    monkeypatch.setattr(estate_writes, "WRITABLE", widened)
+    body = _graded(client, owner)
+
+    billed = next(
+        c for c in body["result"]["cases"]
+        if c["case_id"] == "release/a-billed-order-escalates"
+    )
+    assert not billed["passed"]
+    failures = {(a["target"], a["field"], a["expected"], a["actual"])
+                for a in billed["assertions"] if not a["passed"]}
+    # The order moved, in somebody else's system, because one row in a table
+    # said it could.
+    assert ("SalesOrder[SO5037]", "status", "billed", "pending-fulfillment") in (
+        failures
+    ), failures
+    assert any(
+        field == "reported" and "outcome=escalate" in expected
+        for _target, field, expected, _actual in failures
+    ), failures

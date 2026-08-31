@@ -1037,10 +1037,20 @@ String trajectoryPhrase(String kind, String expected) {
       'model_calls_at_most' => 'no more model calls than the case allows',
       'wrote' => 'the case names what must have been written',
       'read' => 'the case names what must have been read',
+      'reported' => 'the run reported the numbers the case names',
+      'task_raised' => 'a task was raised on the desk the case names',
+      'claimed_by' => 'the field the case names is claimed by one source',
       _ => kind,
     };
   }
   final it = '`$expected`';
+  // `claimed_by` is `Type.field=source`, and reading it back as two halves is
+  // the difference between a rule somebody can check and a token pair.
+  final at = expected.indexOf('=');
+  final claimed = at < 0
+      ? 'every claim on $it comes from one source'
+      : 'every claim on `${expected.substring(0, at)}` came from '
+            '`${expected.substring(at + 1)}`';
   return switch (kind) {
     'step_ran' => 'the step $it ran',
     'step_absent' => 'the step $it did not run',
@@ -1053,6 +1063,9 @@ String trajectoryPhrase(String kind, String expected) {
       'at most $expected model call${expected == '1' ? '' : 's'}',
     'wrote' => 'something under $it was written',
     'read' => 'something under $it was read',
+    'reported' => 'the run reported $it',
+    'task_raised' => 'a task was raised on $it',
+    'claimed_by' => claimed,
     _ => '$kind $expected',
   };
 }

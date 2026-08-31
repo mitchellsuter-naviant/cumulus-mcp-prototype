@@ -384,6 +384,7 @@ def declared_fixtures() -> list[Fixture]:
             **expense,
         ),
         _identity_world(),
+        _state_world(),
         _demo_world(),
     ]
 
@@ -1629,14 +1630,922 @@ IDENTITY_CASES = [
 
 
 # ---------------------------------------------------------------------------
+# The state plane — one world, two flows, and the live estate's own rows
+# ---------------------------------------------------------------------------
+#
+# The disagreement sweep and the release that answers it are graded against one
+# recording, because they are two halves of one story: a deal the CRM says was
+# won, an order the ERP has not released, a controller who decides, and a PATCH.
+# Two fixtures would have been two accounts of the same three books, free to
+# drift the moment somebody edited one.
+#
+# These rows are the live estate's, field for field — the same Voss and Blue
+# Harbor numbers the workplan's ground-truth section verified against the
+# running book. `server/tests/test_disagreement_sweep.py` reads them back from
+# here rather than declaring its own, so the unit tests and the graded suite
+# cannot disagree about the world they are describing.
+#
+# What each row is doing:
+#
+# - **Voss's August win against SO5037** — the one live instance of the class.
+#   Closed won on the 14th, ordered on the 17th, still `Pending Approval`.
+# - **Voss's two older wins** — March and last November, each with its own order
+#   long since billed. The nearest false positive in the estate: same
+#   counterparty, same two states, names that share words with the order's memo.
+#   The window is the only thing separating them from the finding.
+# - **SO5025** — released, and therefore not a disagreement however well it
+#   matches: its memo is the March deal's name almost verbatim.
+# - **Blue Harbor's SO5003** — a held order with no won deal behind it at all.
+#   One-ended, so there is no edge to write, and the honest output is a count.
+# - **The PSA's `Voss Auto`** — the delivery system's nickname for the same
+#   dealer group, which mints its own Company and sits behind a `company_same_as`
+#   no steward has confirmed. Its engagement `ENG-0105` is the third system's
+#   account of this exact commitment, and it is inadmissible until somebody says
+#   the two companies are one. `ENG-0115` is long finished and outside every
+#   window, so that "the customer has projects" cannot be what fires the signal.
+
+_STATE_CRM = {
+    "source": "crm-book",
+    "watermark": "2026-08-30T00:00:00Z",
+    "accounts": [
+        {"external_id": "A1", "name": "Voss Automotive Group",
+         "website": "https://vossauto.example.com", "phone": "(608) 555-0111"},
+        {"external_id": "A2", "name": "Blue Harbor Logistics",
+         "website": "https://blueharbor.example.com",
+         "phone": "(414) 555-0122"},
+    ],
+    "opportunities": [
+        {"external_id": "O1", "name": "Voss — Title & Service Records Capture",
+         "account_external_id": "A1", "stage": "closed-won", "amount": 128000.0,
+         "close_date": "2026-08-14"},
+        {"external_id": "O2", "name": "Voss — Service Drive Scanner Rollout",
+         "account_external_id": "A1", "stage": "closed-won",
+         "amount": 44000.0, "close_date": "2026-03-20"},
+        {"external_id": "O3", "name": "Voss — Deal Jacket Capture",
+         "account_external_id": "A1", "stage": "closed-won",
+         "amount": 61000.0, "close_date": "2025-11-14"},
+        # Never won. The control that separates "no deal" from "no deal in the
+        # window", which are different facts about an estate.
+        {"external_id": "O4", "name": "Blue Harbor — Fleet Telematics Rollout",
+         "account_external_id": "A2", "stage": "prospecting",
+         "amount": 95000.0, "close_date": "2026-12-01"},
+    ],
+}
+
+_STATE_ERP = {
+    "source": "erp-sales",
+    "watermark": "2026-08-30T00:00:00Z",
+    "customers": [
+        {"external_id": "1007", "name": "Voss Automotive Group",
+         "email": "ap@vossauto.example.com", "phone": "(608) 555-0111"},
+        {"external_id": "1011", "name": "Blue Harbor Logistics",
+         "email": "ap@blueharbor.example.com", "phone": "(414) 555-0122"},
+    ],
+    "sales_orders": [
+        {"external_id": "5037", "order_number": "SO5037",
+         "customer_external_id": "1007", "ordered_date": "2026-08-17",
+         "status": "Pending Approval", "total": 34960.0,
+         "memo": "Title and service records capture — phase 1"},
+        {"external_id": "5003", "order_number": "SO5003",
+         "customer_external_id": "1011", "ordered_date": "2026-08-11",
+         "status": "Pending Approval", "total": 6900.0,
+         "memo": "Dock scanning refresh"},
+        {"external_id": "5025", "order_number": "SO5025",
+         "customer_external_id": "1007", "ordered_date": "2026-03-18",
+         "status": "Billed", "total": 8850.0,
+         "memo": "Service drive scanner rollout"},
+    ],
+}
+
+_STATE_PSA = {
+    "source": "psa-book",
+    "watermark": "2026-08-30T00:00:00Z",
+    "psa_clients": [
+        {"external_id": "107", "name": "Voss Auto",
+         "contact_name": "Dana Reyes",
+         "contact_email": "dana.reyes@vossauto.example.com"},
+    ],
+    "projects": [
+        {"external_id": "105", "project_code": "ENG-0105",
+         "client_external_id": "107",
+         "name": "Voss Auto — title and service records capture",
+         "status": "on-hold", "project_manager": "S. Hoffmann",
+         "start_date": "2026-08-22", "target_end_date": "2026-11-18",
+         "budget_hours": 260.0, "actual_hours": 12.0},
+        {"external_id": "115", "project_code": "ENG-0115",
+         "client_external_id": "107",
+         "name": "Voss Auto — deal jacket capture install",
+         "status": "completed", "project_manager": "Danielle G.",
+         "start_date": "2025-11-23", "target_end_date": "2025-12-23",
+         "budget_hours": 110.0},
+    ],
+}
+
+#: The order the whole story is about, by the two names it has. `SO5037` is the
+#: transaction number every human uses and `5037` is the id the PATCH URL keys
+#: on; `SalesOrder.external_id` is the only thing that maps between them.
+VOSS_ORDER = "SO5037"
+VOSS_RECORD = "5037"
+VOSS_DEAL = "Voss — Title & Service Records Capture"
+#: An Opportunity's natural key is the CRM's own id namespaced by the book it
+#: came out of — the *source*'s key for the row, which is what a natural key is
+#: when the row has no human-readable one. The name every person uses is the
+#: label, and it is on the ExpectedObject beside each key below so a reader is
+#: never asked to remember which deal `O2` was.
+VOSS_DEAL_KEY = "crm-book:O1"
+OLDER_WIN_KEYS = ("crm-book:O2", "crm-book:O3")
+OLDER_WINS = ("Voss — Service Drive Scanner Rollout", "Voss — Deal Jacket Capture")
+BLUE_HARBOR_ORDER = "SO5003"
+#: The counterparty as the PSA spells it, which is what a case names when it
+#: says a steward has confirmed the merge.
+VOSS_NICKNAME = "Voss Auto"
+
+_STATE_FIXTURE = "state/naviant-disagreement"
+_STATE_READ_SET = ["knowledge:state-agreement-policy@rev1"]
+
+
+def _state_world() -> Fixture:
+    return Fixture(
+        id=_STATE_FIXTURE,
+        # The world two flows run in, so it belongs to neither exclusively —
+        # named for the sweep that reads it, because that is the flow whose
+        # precondition it *is*.
+        flow_id="disagreement-sweep",
+        name="Voss, Blue Harbor, and one order nobody released",
+        summary=(
+            "Two CRM accounts and four opportunities, two ERP customers and "
+            "three sales orders, and the delivery system's nickname for one of "
+            "them — recorded from the live estate. Holds the class's one real "
+            "instance, the two older wins that are the nearest false positive "
+            "in the book, a held order with no won deal behind it, a released "
+            "order whose memo matches better than the finding's, and a third "
+            "system's evidence sitting behind an unconfirmed merge."
+        ),
+        deliveries=[_STATE_CRM, _STATE_ERP, _STATE_PSA],
+        origin="declared",
+        derived_from=DECLARED_IN,
+        authored_by="platform-eng",
+        read_set=_STATE_READ_SET,
+    )
+
+
+#: The finding, as a spec grades it. Confidence is a floor for
+#: `_PROPOSAL_PROPS`' reason — the weights are governed and may be tuned — and
+#: a case that wants to say the number went *down* pairs it with a ceiling.
+_FINDING_PROPS = [
+    FieldRule(
+        field="correlation_confidence", match="at_least",
+        note="a floor: the blend is governed knowledge, and a finding below "
+             "the floor is the wrong answer however it was scored",
+    ),
+    FieldRule(
+        field="status", match="exact",
+        note="`standing` is the only status this flow writes. The other three "
+             "are moved by the order desk's decision and by a later pass",
+    ),
+    FieldRule(field="class", match="exact"),
+]
+
+
+DISAGREEMENT_SPEC = EvalSpec(
+    id="disagreement-sweep",
+    flow_id="disagreement-sweep",
+    version=1,
+    summary=(
+        "What the cross-system disagreement sweep is answerable for: the one "
+        "disagreement the two books really hold, none of the pairs that only "
+        "look like it, and nothing touched at either end. Every assertion is "
+        "about an edge or about a number the pass reports — the sweep writes "
+        "no claim on any object, and a case that graded one would be grading "
+        "somebody else's flow. The counts are graded because half of what this "
+        "pass is worth is what it *declined* to raise and why."
+    ),
+    milestones=[
+        Milestone(
+            id="found",
+            label="once the pass has recorded its findings",
+            anchor="terminal",
+            note=(
+                "Terminal because a windowed pass has no gate to anchor on: it "
+                "raises Tasks without suspending, so the only point where its "
+                "findings are all on the graph is the end."
+            ),
+            objects=[
+                ObjectRule(
+                    type="SalesOrder",
+                    fields=[FieldRule(field="status", match="exact")],
+                    links=[
+                        LinkRule(
+                            type="deal_disagrees_with_order", direction="in",
+                            expect="count", props=_FINDING_PROPS,
+                            note="graded from the stuck end, which is where "
+                                 "the question starts — and counted rather "
+                                 "than asserted to exist, so one rule says "
+                                 "both 'this order has a finding' and 'this "
+                                 "one must not'",
+                        ),
+                    ],
+                ),
+                ObjectRule(
+                    type="Opportunity",
+                    fields=[FieldRule(field="stage", match="exact")],
+                    links=[
+                        LinkRule(
+                            type="deal_disagrees_with_order", direction="out",
+                            expect="count",
+                            props=[FieldRule(
+                                field="correlation_confidence", match="at_most",
+                                note="the ceiling, read from the deal's end; "
+                                     "the floor is read from the order's. Two "
+                                     "bounds on one number, because that is "
+                                     "how a case says a piece of evidence was "
+                                     "*not* admitted — the delivery "
+                                     "engagement is worth 0.08, and a finding "
+                                     "that reached the governed ceiling read "
+                                     "something this one could not",
+                            )],
+                            note="the same edge from the deal, for the wins "
+                                 "that must carry none",
+                        ),
+                    ],
+                ),
+                ObjectRule(
+                    type="Company",
+                    links=[
+                        LinkRule(
+                            type="company_same_as", direction="out",
+                            expect="count",
+                            props=[FieldRule(field="status", match="exact")],
+                            note="the identity gate itself: the same world "
+                                 "twice, differing by this one status",
+                        ),
+                    ],
+                ),
+            ],
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(
+                    kind="read", expected="knowledge:state-agreement-policy",
+                    note="the window, the bands and the class table are "
+                         "governed knowledge and the run must show it read "
+                         "them, or the numbers are constants wearing a "
+                         "policy's name",
+                ),
+                TrajectoryRule(
+                    kind="model_calls_at_most", expected="0",
+                    note="every signal is a date, a ratio, a state or a name "
+                         "similarity, and the blend is addition. A model call "
+                         "here would buy non-determinism and an unarguable "
+                         "number in place of evidence a controller can read",
+                ),
+                TrajectoryRule(
+                    kind="reported",
+                    note="the counts the pass makes and does not write down — "
+                         "what it declined to raise, and what an unconfirmed "
+                         "merge cost it",
+                ),
+                TrajectoryRule(kind="task_raised"),
+                TrajectoryRule(
+                    kind="wrote", expected="link:deal_disagrees_with_order/",
+                    note="edges, and only edges",
+                ),
+            ],
+        ),
+    ],
+)
+
+_STANDING = "standing"
+_IN_REVIEW_STATUS = "in_review"
+_CONFIRMED_STATUS = "confirmed"
+
+DISAGREEMENT_CASES = [
+    EvalCase(
+        id="state/voss-won-not-released",
+        spec_id=DISAGREEMENT_SPEC.id,
+        name="The won deal and the unreleased order are correlated",
+        summary=(
+            "The class's one live instance, with the evidence a controller "
+            "would need to disagree with it. The join is the load-bearing "
+            "part: `pursued_with` and `sold_to` land on one Company because "
+            "resolution already reconciled the CRM's spelling of Voss with the "
+            "ERP's. A name join would have failed on Yahara, Dane County and "
+            "Prairie Records, which is why the sweep does not attempt one."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        expectations=[MilestoneExpectation(
+            milestone="found",
+            objects=[
+                ExpectedObject(
+                    type="SalesOrder", key=VOSS_ORDER,
+                    # Untouched at both ends: a finding is only useful while
+                    # the order still holds the state it was found in, and a
+                    # sweep that helpfully moved it would destroy the fact it
+                    # exists to report.
+                    fields={"status": "pending-approval"},
+                    link_counts={"deal_disagrees_with_order": 1},
+                    link_props={
+                        "deal_disagrees_with_order.correlation_confidence": 0.90,
+                        "deal_disagrees_with_order.status": _STANDING,
+                        "deal_disagrees_with_order.class": "won-not-released",
+                    },
+                ),
+                ExpectedObject(
+                    type="Opportunity", key=VOSS_DEAL_KEY,
+                    fields={"stage": "closed-won"},
+                    link_counts={"deal_disagrees_with_order": 1},
+                ),
+            ],
+            trajectory={
+                "terminal_status": "succeeded",
+                "wrote": "link:deal_disagrees_with_order/",
+                "read": "knowledge:state-agreement-policy",
+                "model_calls_at_most": "0",
+                "reported": "found=1, recorded=1, standing=1, orders_examined=2",
+                "task_raised": "order-desk/state_disagreement",
+            },
+        )],
+    ),
+    EvalCase(
+        id="state/older-wins-and-blue-harbor-are-not-raised",
+        spec_id=DISAGREEMENT_SPEC.id,
+        name="The older wins are not linked, and Blue Harbor is only counted",
+        summary=(
+            "The two ways this pass is wrong if it is wrong. Voss's March and "
+            "November wins are the same counterparty in the same two states "
+            "with names that share words with the order's memo — the window is "
+            "the only thing separating them from the finding, and it is the "
+            "rule the estate would embarrass first. Blue Harbor's held order "
+            "has no won deal behind it at all: one-ended, so there is no edge "
+            "to write, and nobody is paged about it. One Task in the whole "
+            "world, and it is the Voss one."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        expectations=[MilestoneExpectation(
+            milestone="found",
+            objects=[
+                # `Voss — Service Drive Scanner Rollout`, closed won in March.
+                ExpectedObject(
+                    type="Opportunity", key=OLDER_WIN_KEYS[0],
+                    fields={"stage": "closed-won"},
+                    link_counts={"deal_disagrees_with_order": 0},
+                ),
+                # `Voss — Deal Jacket Capture`, closed won last November.
+                ExpectedObject(
+                    type="Opportunity", key=OLDER_WIN_KEYS[1],
+                    fields={"stage": "closed-won"},
+                    link_counts={"deal_disagrees_with_order": 0},
+                ),
+                ExpectedObject(
+                    type="SalesOrder", key=BLUE_HARBOR_ORDER,
+                    fields={"status": "pending-approval"},
+                    link_counts={"deal_disagrees_with_order": 0},
+                ),
+                # Released, and therefore not a disagreement however well it
+                # matches: its memo is the March deal's name almost verbatim.
+                ExpectedObject(
+                    type="SalesOrder", key="SO5025",
+                    fields={"status": "billed"},
+                    link_counts={"deal_disagrees_with_order": 0},
+                ),
+            ],
+            trajectory={
+                "terminal_status": "succeeded",
+                # "We looked and they were out of range" and "nobody ever won
+                # the deal" are different facts about an estate, and a screen
+                # that conflated them would report perfect deal coverage as
+                # none.
+                "reported": (
+                    "outside_window=2, order_without_deal=1, ambiguous=0, "
+                    "desk_tasks=1"
+                ),
+                "model_calls_at_most": "0",
+            },
+        )],
+    ),
+    EvalCase(
+        id="state/an-unconfirmed-merge-withholds-the-third-system",
+        spec_id=DISAGREEMENT_SPEC.id,
+        name="A merge nobody confirmed withholds a third system's evidence",
+        summary=(
+            "Status-gating in the doctrine's sense, and the number that sells "
+            "it. The PSA's engagement for this exact commitment — started five "
+            "days after the order and immediately parked — hangs off `Voss "
+            "Auto`, joined to the counterparty by a `company_same_as` no "
+            "steward has confirmed. The Gateway refuses to act on an "
+            "unconfirmed proposal and so does this: the record is not read, "
+            "the finding stands without it at a confidence below the ceiling, "
+            "and the cost of the unfinished identity work is reported rather "
+            "than absorbed."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        expectations=[MilestoneExpectation(
+            milestone="found",
+            objects=[
+                ExpectedObject(
+                    type="Company", key=VOSS_NICKNAME,
+                    link_counts={"company_same_as": 1},
+                    link_props={"company_same_as.status": _IN_REVIEW_STATUS},
+                ),
+                ExpectedObject(
+                    type="SalesOrder", key=VOSS_ORDER,
+                    link_counts={"deal_disagrees_with_order": 1},
+                    link_props={
+                        "deal_disagrees_with_order.correlation_confidence": 0.90,
+                        "deal_disagrees_with_order.status": _STANDING,
+                    },
+                ),
+                # And from the deal's end, the ceiling — which is where this
+                # case says out loud that the engagement was not read: the
+                # signal is worth 0.08, and the case below asserts the same
+                # pair reaching 0.95 once a steward has confirmed the merge.
+                ExpectedObject(
+                    type="Opportunity", key=VOSS_DEAL_KEY,
+                    fields={"stage": "closed-won"},
+                    link_counts={"deal_disagrees_with_order": 1},
+                    link_props={
+                        "deal_disagrees_with_order.correlation_confidence": 0.94,
+                    },
+                ),
+            ],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": "blocked_on_identity=1, found=1",
+            },
+        )],
+    ),
+    EvalCase(
+        id="state/confirming-the-merge-admits-the-engagement",
+        spec_id=DISAGREEMENT_SPEC.id,
+        name="Confirming the merge admits the same record on the same pass",
+        summary=(
+            "The other half, over the same fixture and the same policy. "
+            "Nothing about the sweep changes between the two cases — one "
+            "link's status does, answered through the Task a steward would "
+            "have answered. The engagement becomes admissible, the evidence "
+            "appears on the finding, the confidence reaches the governed "
+            "ceiling, and nothing is blocked. That is the whole argument for "
+            "the identity work, stated as a pair of results rather than as a "
+            "paragraph."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        trigger={"confirm": [VOSS_NICKNAME]},
+        expectations=[MilestoneExpectation(
+            milestone="found",
+            objects=[
+                ExpectedObject(
+                    type="Company", key=VOSS_NICKNAME,
+                    link_counts={"company_same_as": 1},
+                    link_props={"company_same_as.status": _CONFIRMED_STATUS},
+                ),
+                ExpectedObject(
+                    type="SalesOrder", key=VOSS_ORDER,
+                    link_counts={"deal_disagrees_with_order": 1},
+                    link_props={
+                        "deal_disagrees_with_order.correlation_confidence": 0.95,
+                        "deal_disagrees_with_order.status": _STANDING,
+                    },
+                ),
+                # And the older wins are still refused. The identity work
+                # widens what may be *read*; it does not loosen a required
+                # condition, and a case that only checked the new signal would
+                # not have noticed if it had.
+                ExpectedObject(
+                    type="Opportunity", key=OLDER_WIN_KEYS[0],
+                    fields={"stage": "closed-won"},
+                    link_counts={"deal_disagrees_with_order": 0},
+                ),
+            ],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "blocked_on_identity=0, found=1, top~ENG-0105"
+                ),
+            },
+        )],
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# The release — the only flow that changes a record Cumulus does not own
+# ---------------------------------------------------------------------------
+#
+# Seven branches, one case each (the echo is two, because an echo and a
+# divergence are two different things for the world to do). Every one of them
+# runs against `estate_fake.FakeErp` — `erp.py`'s picklist, its unknown-field
+# 400, its ignored read-only fields, its bumped `updatedAt`, and **no transition
+# validation**, because the real one has none. That last absence is the whole
+# reason `estate_writes.WRITABLE` exists, and a tidier fake would have hidden it.
+#
+# What a case can say about the world it runs in is in `eval_world`'s
+# `start_order_release`: what the ERP holds by the time the desk answers, how
+# the door behaves, whether the approval arrives twice, and what the feed
+# carries home afterwards.
+
+RELEASE_SPEC = EvalSpec(
+    id="order-release",
+    flow_id="order-release",
+    version=1,
+    summary=(
+        "What the outbound write promises. Four things, and each of them on "
+        "its own would make it unsafe to point at a customer's ERP if it were "
+        "not true: it writes at most once, across a retried step and a "
+        "re-delivered approval; the *estate* decides whether the write took, "
+        "never the response code; it never claims authority it did not read "
+        "back, because a `human:` claim on an order's status would outrank the "
+        "ERP forever and freeze the order; and a refusal, a failure and a "
+        "stale precondition are three different accusations that reach three "
+        "different places."
+    ),
+    milestones=[
+        Milestone(
+            id="checked",
+            label="once the precondition has re-read the row",
+            anchor="first_of_kind",
+            selector="resolve",
+            note=(
+                "The point every case reaches, including the one whose write "
+                "fails and suspends the run. Anchored on what the step "
+                "*is* rather than on its id, so splitting or renaming the "
+                "precondition moves no case."
+            ),
+            objects=[
+                ObjectRule(
+                    type="SalesOrder",
+                    fields=[FieldRule(field="status", match="exact")],
+                ),
+            ],
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(
+                    kind="task_raised",
+                    note="the desk a failure reaches. A run that suspends "
+                         "reports nothing, so the Task is the only account of "
+                         "it there is",
+                ),
+                TrajectoryRule(kind="model_calls_at_most", expected="0"),
+            ],
+        ),
+        Milestone(
+            id="settled",
+            label="once the run has finished, however it finished",
+            anchor="terminal",
+            note=(
+                "Terminal, and that includes the runs that decided not to "
+                "write: withholding a release is an ending, not a failure."
+            ),
+            objects=[
+                ObjectRule(
+                    type="SalesOrder",
+                    fields=[FieldRule(field="status", match="exact")],
+                    links=[
+                        LinkRule(
+                            type="deal_disagrees_with_order", direction="in",
+                            expect="count",
+                            props=[
+                                FieldRule(field="status", match="exact"),
+                                FieldRule(field="resolved_how", match="exact"),
+                            ],
+                            note="the finding is the case, and its status is "
+                                 "what the decision moved",
+                        ),
+                    ],
+                ),
+            ],
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(
+                    kind="reported",
+                    note="the flow's own account of what it did to somebody "
+                         "else's system: whether a PATCH was sent, what the "
+                         "journal settled at, and how the finding ended",
+                ),
+                TrajectoryRule(
+                    kind="claimed_by",
+                    expected="SalesOrder.status=erp:erp-sales",
+                    note="the promise this flow exists to keep. A `human:` "
+                         "claim here would outrank `erp:` forever and leave "
+                         "the value identical, so only the claims can see it",
+                ),
+                TrajectoryRule(kind="task_raised"),
+            ],
+        ),
+    ],
+)
+
+_APPROVE = ScriptedDecision(
+    verdict="approved",
+    decided_by="raymond.fitzgerald@naviant.com",
+    note="Release it — the deal closed and the paperwork is done.",
+)
+_RELEASED_STATUS = "pending-fulfillment"
+_HELD_STATUS = "pending-approval"
+
+RELEASE_CASES = [
+    EvalCase(
+        id="release/one-patch-moves-the-order",
+        spec_id=RELEASE_SPEC.id,
+        name="One PATCH moves the order and closes the finding",
+        summary=(
+            "The happy path, and the two-regime split that makes it safe. The "
+            "release is the decision a controller authorized; the read-back "
+            "that follows it is an observation of what the ERP then held, "
+            "landed at the sales feed's own authority. "
+            "They are two Action steps because they are two different claims "
+            "about the world, and collapsing them would put a `human:` claim on "
+            "the order's status — which would outrank the ERP forever and make "
+            "every future disagreement about this order invisible."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        trigger={"record_id": VOSS_RECORD},
+        decisions=[_APPROVE],
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="SalesOrder", key=VOSS_ORDER,
+                fields={"status": _RELEASED_STATUS},
+                link_counts={"deal_disagrees_with_order": 1},
+                link_props={
+                    "deal_disagrees_with_order.status": "resolved",
+                    "deal_disagrees_with_order.resolved_how": "by_cumulus",
+                },
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "outcome=proceed, patched=True, write_state=applied, "
+                    "resolved_how=by_cumulus, landed_status=pending-fulfillment, "
+                    "desk_tasks=0"
+                ),
+                # `landed_status` is the observation's own output, so a
+                # report carrying it is a report from a run that made both
+                # commits: the decision and the observation, two ledger
+                # entries, because they are two different claims about the
+                # world.
+                "claimed_by": "SalesOrder.status=erp:erp-sales",
+            },
+        )],
+    ),
+    EvalCase(
+        id="release/a-second-approval-sends-nothing",
+        spec_id=RELEASE_SPEC.id,
+        name="The same approval twice sends one PATCH",
+        summary=(
+            "Idempotence, driven the way it would really happen: the order is "
+            "already released and the journal remembers asking for that. A "
+            "second decision is a second run and gets its own journal row by "
+            "construction, which is exactly why the precondition cannot be "
+            "'have I written before' and has to be 'does the estate hold what "
+            "I would write, and did anyone here ask for it'."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        trigger={"record_id": VOSS_RECORD, "again": True},
+        decisions=[_APPROVE],
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="SalesOrder", key=VOSS_ORDER,
+                fields={"status": _RELEASED_STATUS},
+                link_counts={"deal_disagrees_with_order": 1},
+                link_props={
+                    "deal_disagrees_with_order.status": "resolved",
+                    "deal_disagrees_with_order.resolved_how": "by_cumulus",
+                },
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "outcome=already_applied, patched=False, resolved=True, "
+                    "desk_tasks=0"
+                ),
+                "claimed_by": "SalesOrder.status=erp:erp-sales",
+            },
+        )],
+    ),
+    EvalCase(
+        id="release/somebody-else-got-there-first",
+        spec_id=RELEASE_SPEC.id,
+        name="An order released elsewhere is resolved externally",
+        summary=(
+            "The same row, the same value, an empty journal. The controller "
+            "wanted the order released and it is released, so the finding is "
+            "over and nobody is interrupted about it — a number on a dashboard "
+            "rather than a Task. This is the branch that must raise nothing."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        trigger={
+            "record_id": VOSS_RECORD, "order_status": "Pending Fulfillment",
+        },
+        decisions=[_APPROVE],
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="SalesOrder", key=VOSS_ORDER,
+                fields={"status": _RELEASED_STATUS},
+                link_counts={"deal_disagrees_with_order": 1},
+                link_props={
+                    "deal_disagrees_with_order.status": "resolved",
+                    "deal_disagrees_with_order.resolved_how": "externally",
+                },
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "outcome=resolved_externally, patched=False, "
+                    "resolved_how=externally, desk_tasks=0"
+                ),
+                "claimed_by": "SalesOrder.status=erp:erp-sales",
+            },
+        )],
+    ),
+    EvalCase(
+        id="release/a-billed-order-escalates",
+        spec_id=RELEASE_SPEC.id,
+        name="An order the ERP has billed escalates and writes nothing",
+        summary=(
+            "The row moved under the approval. The write table lists no move "
+            "out of `Billed` and the estate would happily accept one — "
+            "`erp.py` validates the picklist and nothing else — so this is the "
+            "entire argument for `WRITABLE` in one case. The finding is still "
+            "true and still standing, and the graph learns what the ERP "
+            "actually holds from the read the precondition already made: an "
+            "escalation is not a reason to stay ignorant of a row we just "
+            "looked at."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        trigger={"record_id": VOSS_RECORD, "order_status": "Billed"},
+        decisions=[_APPROVE],
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="SalesOrder", key=VOSS_ORDER,
+                fields={"status": "billed"},
+                link_counts={"deal_disagrees_with_order": 1},
+                link_props={"deal_disagrees_with_order.status": _STANDING},
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "outcome=escalate, patched=False, resolved=False, "
+                    "desk_tasks=1"
+                ),
+                "claimed_by": "SalesOrder.status=erp:erp-sales",
+                "task_raised": "order-desk/exception",
+            },
+        )],
+    ),
+    EvalCase(
+        id="release/a-door-that-refuses-is-ledgered-failed",
+        spec_id=RELEASE_SPEC.id,
+        name="A door that refuses leaves a failed write and a person to tell",
+        summary=(
+            "`failed` and `refused` are different accusations: the Gateway "
+            "refusing is governance working, and the world refusing after it "
+            "was allowed is a write whose effect nobody can be sure of. The "
+            "step retries, fails persistently and hands itself to the desk "
+            "rather than failing into silence — so the run does not finish, "
+            "and this case is graded at the precondition instead. Nothing was "
+            "released and the finding still stands."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        trigger={"record_id": VOSS_RECORD, "door": "refuses"},
+        decisions=[_APPROVE],
+        expectations=[MilestoneExpectation(
+            milestone="checked",
+            objects=[ExpectedObject(
+                type="SalesOrder", key=VOSS_ORDER,
+                fields={"status": _HELD_STATUS},
+            )],
+            trajectory={
+                # Suspended, not failed: the run is waiting on the person it
+                # handed itself to.
+                "terminal_status": "suspended",
+                "task_raised": "order-desk/exception",
+                "model_calls_at_most": "0",
+            },
+        )],
+    ),
+    EvalCase(
+        id="release/a-lying-two-hundred-settles-unverified",
+        spec_id=RELEASE_SPEC.id,
+        name="A door that says yes and changes nothing is not a success",
+        summary=(
+            "The estate decides whether the write took, never the response "
+            "code. A door that answers cheerfully and changes nothing is the "
+            "failure a 200-trusting client cannot see, so the writer re-reads "
+            "and compares. That is a Task and emphatically not a resolved "
+            "finding: the disagreement is still true, and the order still "
+            "reads as the ERP holds it."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        trigger={"record_id": VOSS_RECORD, "door": "lies"},
+        decisions=[_APPROVE],
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="SalesOrder", key=VOSS_ORDER,
+                fields={"status": _HELD_STATUS},
+                link_counts={"deal_disagrees_with_order": 1},
+                link_props={"deal_disagrees_with_order.status": _STANDING},
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "patched=True, write_state=unverified, resolved=False, "
+                    "desk_tasks=1"
+                ),
+                "claimed_by": "SalesOrder.status=erp:erp-sales",
+                "task_raised": "order-desk/exception",
+            },
+        )],
+    ),
+    EvalCase(
+        id="release/the-change-comes-home",
+        spec_id=RELEASE_SPEC.id,
+        name="The change comes home and lands as a no-op",
+        summary=(
+            "Recognizing our own write coming back is a property of the "
+            "*delivery*: no feed declares it, none can, and the flow that made "
+            "the write is long finished. The row still lands — an identical "
+            "claim **is** the no-op, and suppressing the row would throw away "
+            "the delivery that proves the write took — and nobody is "
+            "interrupted."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        trigger={
+            "record_id": VOSS_RECORD, "echo": "Pending Fulfillment",
+        },
+        decisions=[_APPROVE],
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="SalesOrder", key=VOSS_ORDER,
+                fields={"status": _RELEASED_STATUS},
+                link_counts={"deal_disagrees_with_order": 1},
+                link_props={
+                    "deal_disagrees_with_order.status": "resolved",
+                    "deal_disagrees_with_order.resolved_how": "by_cumulus",
+                },
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": "patched=True, write_state=applied, desk_tasks=0",
+                # The point of the case: the feed re-delivered the order and
+                # the claim it carries is byte-identical to the one the
+                # read-back landed, so the graph gained nothing and no steward
+                # was handed a conflict.
+                "claimed_by": "SalesOrder.status=erp:erp-sales",
+            },
+        )],
+    ),
+    EvalCase(
+        id="release/a-third-value-comes-home-instead",
+        spec_id=RELEASE_SPEC.id,
+        name="A third value coming home diverges and asks a person",
+        summary=(
+            "The re-elevating discrepancy: Cumulus set the order, the ERP "
+            "confirmed it, and the feed now says something else. Nothing is "
+            "undone — moving it back is a second decision — and what this "
+            "needs is somebody who knows why it moved. The finding stays "
+            "`resolved`, because it was: the release happened, and this is a "
+            "new fact about the same order."
+        ),
+        fixture_id=_STATE_FIXTURE,
+        trigger={"record_id": VOSS_RECORD, "echo": "Billed"},
+        decisions=[_APPROVE],
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="SalesOrder", key=VOSS_ORDER,
+                fields={"status": "billed"},
+                link_counts={"deal_disagrees_with_order": 1},
+                link_props={"deal_disagrees_with_order.status": "resolved"},
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": "patched=True, write_state=applied, desk_tasks=0",
+                "claimed_by": "SalesOrder.status=erp:erp-sales",
+                # Raised by the *delivery*, days after the run that wrote the
+                # row had finished — which is why this is a fact about the
+                # world rather than a step in a journal.
+                "task_raised": "order-desk/exception",
+            },
+        )],
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # The store
 # ---------------------------------------------------------------------------
 
-SPECS = [AP_SPEC, EXPENSE_SPEC, IDENTITY_SPEC]
+SPECS = [AP_SPEC, EXPENSE_SPEC, IDENTITY_SPEC, DISAGREEMENT_SPEC, RELEASE_SPEC]
 CASES = {
     AP_SPEC.id: AP_CASES,
     EXPENSE_SPEC.id: EXPENSE_CASES,
     IDENTITY_SPEC.id: IDENTITY_CASES,
+    DISAGREEMENT_SPEC.id: DISAGREEMENT_CASES,
+    RELEASE_SPEC.id: RELEASE_CASES,
 }
 
 
@@ -1686,9 +2595,11 @@ def specs_markdown() -> str:
         "",
         "Match rules: `exact` (numbers compare as numbers), `approx` with a "
         "tolerance, `fuzzy` with a similarity floor (for values a model reads "
-        "off a page), `one_of`, `present`, `absent`, and `ignore`. `ignore` is "
-        "used deliberately — a due date is the vendor's payment terms, so "
-        "grading it would be grading the wrong system.",
+        "off a page), `at_least` and `at_most` (a bound rather than a value, "
+        "for scores whose weights are governed and may be tuned), `one_of`, "
+        "`present`, `absent`, and `ignore`. `ignore` is used deliberately — a "
+        "due date is the vendor's payment terms, so grading it would be "
+        "grading the wrong system.",
         "",
     ]
     for spec in SPECS:
