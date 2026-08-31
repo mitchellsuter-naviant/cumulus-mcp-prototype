@@ -41,6 +41,12 @@ from .auth import (
 )
 from .config import settings
 from .deps import get_graph_service
+from .disagreement_sweep import (
+    DISAGREEMENT_SWEEP_FLOW_ID,
+    ORDER_DESK_QUEUE,
+    SCAN,
+    STANDING,
+)
 from .estate_api import pull_feed_now
 from .flow_projection import ProjectionState, project_flow, project_flows
 from .gateway import ACTIONS
@@ -49,7 +55,9 @@ from .identity_sweep import IDENTITY_SWEEP_FLOW_ID, SCANS, SCAN_BY_LINK
 from .mappings import MAPPINGS, Mapping, steward_queue_for_type, validate_mappings
 from .models import utcnow
 from .ontology import ONTOLOGY
+from .order_release import BY_CUMULUS, DISMISSED, EXTERNALLY, read_write_policy
 from .resolution import read_sweep_thresholds
+from .sync import _slug
 
 log = logging.getLogger("cumulus.ui.api")
 
@@ -1266,12 +1274,6 @@ def _side(graph: GraphService, record: ObjectRecord | None, object_id_: str) -> 
             natural_key="", status="missing", fields={}, sources=[],
             conflicted=[],
         )
-    declared = ONTOLOGY.source_identity_link(record.type)
-    sources = sorted({
-        str(other.props.get("source") or "")
-        for _link, other in graph.neighbors(record.id, declared.name, "out")
-        if other.props.get("source")
-    }) if declared is not None else []
     return IdentitySide(
         id=record.id,
         ref=record.ref(),
@@ -1280,7 +1282,7 @@ def _side(graph: GraphService, record: ObjectRecord | None, object_id_: str) -> 
         natural_key=record.natural_key,
         status=record.status,
         fields={k: str(v) for k, v in record.props.items()},
-        sources=sources,
+        sources=_asserted_by(graph, record),
         conflicted=sorted(record.conflicts()),
     )
 
@@ -1483,6 +1485,607 @@ def identity(
         last_sweep=_last_sweep(),
         desks=desks,
         curates=bool(desks),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cross-system disagreement — the order desk's case
+# ---------------------------------------------------------------------------
+#
+# The identity workbench's sibling, and the difference between the two is the
+# whole of the write plane. There, two rows *might* be one party and a steward
+# says whether they are; what changes is what Cumulus believes. Here the two
+# rows are certainly about one commitment, the customer's own two systems say
+# different things about it, and the decision reaches out of Cumulus into an
+# ERP that is not ours.
+#
+# So this composition carries one thing the identity one does not: **what the
+# write would do**, read off `estate_writes.WRITABLE` through
+# `order_release.read_write_policy` rather than described in prose here. The
+# before/after a controller reads is the same declaration the release flow
+# commits through, which makes "the screen promised a transition the table does
+# not permit" a thing that cannot happen rather than a thing we remember not to
+# do.
+#
+# Deliberately **not** a Workspace and not a rail stop. One class with one live
+# instance does not earn a Seeing Space; that arrives when the class table has
+# three rows. This is the payload behind two surfaces — the `state_disagreement`
+# review screen and the dashboard's Judgment panel — for the merge review's
+# reason: one composition, so the modal a controller decides in and the panel
+# that counts the backlog can never describe one finding differently.
+
+
+def may_open_disagreements(principal: Principal) -> bool:
+    """Whether there is a disagreement case for this principal to read.
+
+    `may_open_identity`'s rule, for `may_open_identity`'s reason, over a
+    different desk: the one persona who may release an order is the Controller,
+    and the Controller is own-scoped. Gating on read reach alone would refuse
+    the screen's only user.
+    """
+    return principal.reads_beyond_self or principal.owns_queue(ORDER_DESK_QUEUE)
+
+
+def get_disagreement_principal(
+    principal: Principal = Depends(get_ui_principal),
+) -> Principal:
+    """The order desk's door. See `may_open_disagreements` for the rule."""
+    if may_open_disagreements(principal):
+        return principal
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "A disagreement between two of the customer's systems is the "
+            f"{ORDER_DESK_QUEUE}'s to settle. You do not hold that desk, and "
+            "your access is to your own work — so there is nothing here for "
+            "you rather than something withheld."
+        ),
+    )
+
+
+class DisagreementFact(BaseModel):
+    """One labelled fact off one book's row.
+
+    A list of label/value pairs rather than a dict of props, because the two
+    columns this screen draws do **not** share a vocabulary — a deal has a
+    stage, an amount and a close date; an order has a status, a total and an
+    order date — so there is no shared key to compare on, and pretending there
+    is one would produce a table of empty cells.
+    """
+
+    label: str
+    value: str
+
+
+class DisagreementSide(BaseModel):
+    """One system's account of the commitment, as a person reads it."""
+
+    id: str
+    ref: str
+    type: str
+    label: str
+    natural_key: str
+    #: Which book this is, in the words the screen heads the column with.
+    book: str
+    #: The state the finding turns on, in the ontology's slugged vocabulary —
+    #: `closed-won`, `pending-approval`.
+    state: str
+    #: What this side held when the finding was written. Equal to `state` on a
+    #: finding that is still true, and the whole point when it is not: a
+    #: decision made a week later has to be able to tell "this is the case"
+    #: from "this was the case".
+    state_when_found: str
+    facts: list[DisagreementFact]
+    #: Which feeds assert this row exists. The identity workbench's derivation.
+    sources: list[str]
+    #: True when the finding points at a row the book no longer holds.
+    missing: bool
+
+
+class DisagreementChange(BaseModel):
+    """What approving writes, and what it leaves exactly as it is.
+
+    Every field here is read off the write table, not written here. `unchanged`
+    is *derived* — the ERP facts beside it minus the one field the PATCH sets —
+    so it cannot drift from the column it is about, and a second writable field
+    would appear in both places at once or in neither.
+    """
+
+    #: The one field the PATCH sets.
+    field: str
+    #: The ERP's own words on both sides of the arrow, off the table's
+    #: transitions — not the graph's slug, because the slug is Cumulus's
+    #: vocabulary and this sentence is a promise about somebody else's system.
+    from_value: str
+    to_value: str
+    #: Everything the screen shows about the order that this write does not
+    #: touch, in the labels the column used.
+    unchanged: list[str]
+    target: str
+    app: str
+    resource: str
+    #: How the ERP addresses this row. Off `external_id`, never off the
+    #: transaction id.
+    record_id: str
+    #: Whether the write plane permits this write today.
+    permitted: bool
+    #: Why not, when not — always a sentence. Three sources, and they are
+    #: different kinds of fact: the write table refusing its own declaration,
+    #: the order carrying no ERP address, or the book's copy of the row having
+    #: moved out of a state the table may move an order out of.
+    why_not: str
+
+
+class DisagreementGate(BaseModel):
+    """Whether this finding can be decided, by whom, and where.
+
+    `ProposalGate`'s sibling and not `ProposalGate` itself: the three states
+    are the same three and the sentences are not. A merge proposal with no Task
+    is an anomaly the next sweep repairs; a *finding* with no Task may equally
+    be one the desk already settled, and telling a controller to sweep again
+    would be telling them to re-raise a decision they made.
+    """
+
+    task_id: str
+    #: `open`, or the verdict the desk already recorded.
+    task_status: str
+    queue: str
+    may_decide: bool
+    why_not: str
+
+
+class DisagreementCase(BaseModel):
+    """One finding: the two rows, the evidence, the write, and where it stands."""
+
+    link_id: str
+    link_type: str
+    #: `link:<type>/<id>` — the ref the Task carries as its `case_ref`, so the
+    #: review screen finds its case without a second contract.
+    case_ref: str
+    finding_class: str
+    #: `standing` · `resolved` · `dismissed` · `superseded`, off the edge.
+    status: str
+    #: The correlation score and the evidence behind it, untouched by any
+    #: decision — closing a finding does not rewrite how good it was.
+    confidence: float
+    method: str
+    signals: list[IdentitySignal]
+    policy_ref: str
+    detected_at: str
+    run_id: str
+    counterparty: str
+    #: The two books, named for what they are rather than left/right: this
+    #: screen is read across a labelled boundary, not down a symmetric pair.
+    crm: DisagreementSide
+    erp: DisagreementSide
+    change: DisagreementChange
+    #: True when either row has moved since the finding was written. Not a
+    #: refusal — the release re-reads the ERP itself and escalates — but the
+    #: one fact a controller must have before pressing anything.
+    moved_since_found: bool
+    #: How it ended, on a resolved one: `by_cumulus` or `externally`. Empty on
+    #: every other status, `dismissed` included — that one ended by a judgment
+    #: rather than by the ERP holding the released value.
+    resolved_how: str
+    decided_at: str
+    decided_by: str
+    #: The desk's own words, off the edge — the note they typed, or the
+    #: precondition's reason on a release that found the work already done.
+    resolution: str
+    gate: DisagreementGate
+
+
+class StateSweepRun(BaseModel):
+    """The last pass over the two books. `None` when there has never been one.
+
+    Every field is a number the sweep already published in its run outputs.
+    Nothing here is re-derived, and `blocked_on_identity` could not be:
+    it counts evidence a pass **declined to read**, which leaves no trace on
+    the graph to walk afterwards, and it is the number that says out loud what
+    unfinished identity work is costing.
+    """
+
+    run_id: str
+    at_iso: str
+    status: str
+    orders_examined: int
+    candidates: int
+    found: int
+    blocked_on_identity: int
+    order_without_deal: int
+    ambiguous: int
+    desk_tasks: int
+
+
+class DisagreementScreen(BaseModel):
+    standing: list[DisagreementCase]
+    decided: list[DisagreementCase]
+    #: What `decided` is a window onto. Equal to `len(decided)` until the
+    #: history outgrows `DECIDED_WINDOW`.
+    decided_total: int
+    last_sweep: StateSweepRun | None
+    #: True when this persona holds the desk rather than reading over its
+    #: shoulder.
+    yours: bool
+    desk: str
+
+
+def _asserted_by(graph: GraphService, record: ObjectRecord) -> list[str]:
+    """Which feeds say this row exists. A record only one system has ever seen
+    is a different kind of row from one three systems agree on.
+
+    Two readings, because two kinds of type answer differently and only one of
+    them used to be asked. A **counterparty** is bound to the rows its sources
+    sent through a declared identity edge, and walking that edge is the answer.
+    A **transaction** — an order, a deal — has no such edge and never will:
+    nothing proposes merges between sales orders, so no `SourceRecord` link was
+    ever declared for one. What it has is claims, and every claim carries the
+    namespaced feed that made it.
+
+    Reading only the edge left this blank for an order, which the console then
+    drew as "no source record" beside a row that had plainly arrived from the
+    ERP. The bare feed name is taken off the claim's `authority:feed` source so
+    both readings render in one vocabulary.
+    """
+    declared = ONTOLOGY.source_identity_link(record.type)
+    if declared is not None:
+        return sorted({
+            str(other.props.get("source") or "")
+            for _link, other in graph.neighbors(record.id, declared.name, "out")
+            if other.props.get("source")
+        })
+    return sorted({
+        claim.source.split(":", 1)[-1]
+        for claim in record.claims
+        if claim.source
+    })
+
+
+def _finding_status(link: LinkRecord) -> str:
+    """Where the finding stands, off the edge itself.
+
+    Liveness first, for `_proposal_status`' reason — and what a dead edge means
+    here is the difference. A withdrawn merge proposal is a steward saying "not
+    one party"; a finding is never withdrawn by a decision at all, since both
+    verdicts write a status onto a live edge. So an edge that is not live is
+    one a later pass superseded.
+    """
+    if not link.live:
+        return "superseded"
+    return str(link.props.get("status") or STANDING)
+
+
+def _money(value: object) -> str:
+    try:
+        return f"${float(value or 0):,.2f}"
+    except (TypeError, ValueError):
+        return str(value or "")
+
+
+def _missing_side(
+    object_id_: str, book: str, state_when_found: str
+) -> DisagreementSide:
+    """A row the book no longer holds. Named rather than dropped, for `_side`'s
+    reason: a finding pointing at nothing is itself a finding."""
+    return DisagreementSide(
+        id=object_id_, ref=f"graph:{object_id_}", type="", label="",
+        natural_key="", book=book, state="",
+        state_when_found=state_when_found, facts=[], sources=[], missing=True,
+    )
+
+
+def _deal_side(
+    graph: GraphService, record: ObjectRecord | None, object_id_: str,
+    state_when_found: str,
+) -> DisagreementSide:
+    """The CRM's half: what the pipeline says was committed to.
+
+    Three facts, and they are the three the correlation turned on — the stage
+    that made it a disagreement, and the amount and close date the window and
+    the containment band were measured against. A column of everything the deal
+    holds would bury the evidence in the row beside it.
+    """
+    if record is None:
+        return _missing_side(object_id_, "the CRM", state_when_found)
+    props = record.props
+    return DisagreementSide(
+        id=record.id, ref=record.ref(), type=record.type,
+        label=record.label or record.natural_key,
+        natural_key=record.natural_key,
+        book="the CRM",
+        state=str(props.get("stage") or ""),
+        state_when_found=state_when_found,
+        facts=[
+            DisagreementFact(label="Stage", value=str(props.get("stage") or "")),
+            DisagreementFact(label="Amount", value=_money(props.get("amount_usd"))),
+            DisagreementFact(
+                label="Close date", value=str(props.get("close_date") or "")
+            ),
+        ],
+        sources=_asserted_by(graph, record),
+        missing=False,
+    )
+
+
+def _order_side(
+    graph: GraphService, record: ObjectRecord | None, object_id_: str,
+    state_when_found: str,
+) -> DisagreementSide:
+    """The ERP's half: what the order book says was released.
+
+    The line count is read rather than the lines. What the release does *not*
+    touch is the question this column answers, and "3" answers it where three
+    rows of SKUs would bury it.
+    """
+    if record is None:
+        return _missing_side(object_id_, "the ERP", state_when_found)
+    props = record.props
+    lines = len(graph.neighbors(record.id, "has_so_line", "out"))
+    return DisagreementSide(
+        id=record.id, ref=record.ref(), type=record.type,
+        label=record.label or record.natural_key,
+        natural_key=record.natural_key,
+        book="the ERP",
+        state=str(props.get("status") or ""),
+        state_when_found=state_when_found,
+        facts=[
+            DisagreementFact(label="Status", value=str(props.get("status") or "")),
+            DisagreementFact(label="Total", value=_money(props.get("total_usd"))),
+            DisagreementFact(label="Lines", value=f"{lines}"),
+            DisagreementFact(
+                label="Order date", value=str(props.get("ordered_date") or "")
+            ),
+            DisagreementFact(
+                label="Customer", value=str(props.get("company_name") or "")
+            ),
+            DisagreementFact(label="Memo", value=str(props.get("memo") or "")),
+        ],
+        sources=_asserted_by(graph, record),
+        missing=False,
+    )
+
+
+def _change(service, case_ref: str, erp: DisagreementSide) -> DisagreementChange:
+    """What approving would write, off the write table.
+
+    `read_write_policy` is the release flow's own first step, called here for
+    exactly the reason the merge review calls the identity route: the sentence
+    on the button and the declaration the Action commits through have to be one
+    thing. It reads the graph and the table and touches neither, and it reaches
+    no customer system — the live status is re-read at release time, by the run,
+    which is why nothing below claims to know what the ERP holds right now.
+    """
+    blank = DisagreementChange(
+        field="", from_value="", to_value="", unchanged=[], target="",
+        app="", resource="", record_id="", permitted=False, why_not="",
+    )
+    try:
+        policy = read_write_policy(service, case_ref)
+    except LookupError as exc:
+        return blank.model_copy(update={"why_not": str(exc)})
+
+    field = str(policy.get("field") or "")
+    unchanged = [
+        fact.label.lower() for fact in erp.facts
+        if fact.label.lower() != field.lower() and fact.value
+    ]
+    change = blank.model_copy(update={
+        "field": field,
+        "target": policy["target"],
+        "app": str(policy.get("app") or ""),
+        "resource": str(policy.get("resource") or ""),
+        "record_id": policy["record_id"],
+        "unchanged": unchanged,
+    })
+    if not policy["writable"]:
+        return change.model_copy(update={"why_not": policy["refusal"]})
+
+    # Which row of the table this order is standing on. Matched by slugging the
+    # table's own keys with `sync._slug` — the function that turned the ERP's
+    # `Pending Approval` into the graph's `pending-approval` on the way in is
+    # the only honest thing to map back with.
+    observed = policy["graph_status"]
+    for permitted, destinations in policy.get("transitions", {}).items():
+        if _slug(permitted) == observed and len(destinations) == 1:
+            return change.model_copy(update={
+                "from_value": permitted,
+                "to_value": destinations[0],
+                "permitted": True,
+            })
+    return change.model_copy(update={
+        "why_not": (
+            f"Cumulus's copy of {policy['order_number']} reads "
+            f"`{observed or 'nothing'}`, which the write table may not move an "
+            "order out of. Approving would re-read the ERP and raise what it "
+            "finds to the desk rather than write."
+        ),
+    })
+
+
+def _disagreement_gate(task, principal: Principal) -> DisagreementGate:
+    """Where this finding's decision lives, and whether it is this persona's.
+
+    `_proposal_gate`'s three states, with the third one saying something else.
+    A finding whose Task is gone is not necessarily an anomaly: the sweep
+    refuses to re-raise a finding that is not `standing`, which is exactly what
+    makes a dismissal stick — so the sentence names both readings rather than
+    telling a controller to sweep again.
+    """
+    if task is None:
+        return DisagreementGate(
+            task_id="", task_status="", queue="", may_decide=False,
+            why_not=(
+                "No Task carries this finding, so there is nowhere to decide "
+                "it. The sweep raises one for every finding it writes at "
+                f"`{STANDING}`, and never re-raises one that has been settled "
+                "— so this either predates that or its Task was purged."
+            ),
+        )
+    status = task.status if task.status == "open" else (
+        task.decision.verdict if task.decision is not None else task.status
+    )
+    if task.status != "open":
+        return DisagreementGate(
+            task_id=task.id, task_status=status, queue=task.queue,
+            may_decide=False,
+            why_not=f"Already decided in {task.queue}; the record is below.",
+        )
+    mine = principal.owns_queue(task.queue)
+    bound = ", ".join(principal.queues) or "no queue"
+    return DisagreementGate(
+        task_id=task.id, task_status=status, queue=task.queue,
+        may_decide=mine,
+        why_not=(
+            "" if mine
+            else f"this is {task.queue}'s work; you are bound to {bound}"
+        ),
+    )
+
+
+def _state_sweep() -> StateSweepRun | None:
+    """The most recent disagreement pass, or nothing.
+
+    `_last_sweep`'s sibling, and never a zeroed row standing in for a pass that
+    did not happen — a `blocked_on_identity` of 0 over a book nothing has swept
+    is the most misleading number this panel could draw.
+    """
+    runs = deps.get_run_engine().list(flow_id=DISAGREEMENT_SWEEP_FLOW_ID)
+    if not runs:
+        return None
+    latest = max(runs, key=lambda r: r.started_at_iso)
+    out = latest.outputs or {}
+    return StateSweepRun(
+        run_id=latest.id,
+        at_iso=latest.started_at_iso,
+        status=latest.status,
+        orders_examined=int(out.get("orders_examined", 0) or 0),
+        candidates=int(out.get("candidates", 0) or 0),
+        found=int(out.get("found", 0) or 0),
+        blocked_on_identity=int(out.get("blocked_on_identity", 0) or 0),
+        order_without_deal=int(out.get("order_without_deal", 0) or 0),
+        ambiguous=int(out.get("ambiguous", 0) or 0),
+        desk_tasks=int(out.get("desk_tasks", 0) or 0),
+    )
+
+
+def _counterparty(graph: GraphService, order_id: str) -> str:
+    """Whose commitment this is, off the edge the sweep joined the pair on.
+
+    The edge and not the order's `company_name`, which is denormalized for
+    cheap reads and carries the ERP's own spelling. The join that produced this
+    finding ran on `sold_to` — naming the party by anything else would let the
+    screen and the sweep disagree about who it is about, in exactly the
+    situation where two spellings of one company is the whole problem.
+    """
+    for _link, company in graph.neighbors(order_id, SCAN.to_edge, "out"):
+        return company.label or company.natural_key
+    return ""
+
+
+@router.get("/disagreements", response_model=DisagreementScreen)
+def disagreements(
+    principal: Principal = Depends(get_disagreement_principal),
+) -> DisagreementScreen:
+    """Every finding the two books have produced, standing and settled.
+
+    One call, for `identity`'s reason: the finding is an edge, the evidence is
+    on the edge, the two rows are the objects it joins, the write is a table
+    entry, and whether you may answer it is a property of a Task somewhere
+    else. Fetched separately the client would be assembling the argument — and
+    a controller would be reading a before/after stitched from five instants.
+    """
+    graph = deps.get_graph_service()
+    # The sync service and not the knowledge one: `read_write_policy` walks the
+    # finding's edge to the order it names, which is a graph read.
+    service = deps.get_sync_service()
+    tasks_by_case = {
+        task.case_ref: task
+        for task in deps.get_task_service().list(kind="state_disagreement")
+        if task.case_ref
+    }
+
+    standing: list[DisagreementCase] = []
+    decided: list[DisagreementCase] = []
+    for link in graph.store.links():
+        if link.type != SCAN.link_type:
+            continue
+        found_in = dict(link.props.get("state_when_found") or {})
+        crm = _deal_side(
+            graph, graph.store.get_object(link.from_id), link.from_id,
+            str(found_in.get("opportunity_stage") or ""),
+        )
+        erp = _order_side(
+            graph, graph.store.get_object(link.to_id), link.to_id,
+            str(found_in.get("order_status") or ""),
+        )
+        status = _finding_status(link)
+        case_ref = f"link:{link.type}/{link.id}"
+        case = DisagreementCase(
+            link_id=link.id,
+            link_type=link.type,
+            case_ref=case_ref,
+            finding_class=str(link.props.get("class") or ""),
+            status=status,
+            confidence=link.confidence,
+            method=link.method,
+            # The sweep records its evidence as `identity_sweep.Signal`, which
+            # `disagreement_sweep` imports rather than copies — so the console
+            # reads both passes back through the one model.
+            signals=[
+                IdentitySignal(
+                    name=str(s.get("name") or ""),
+                    weight=float(s.get("weight") or 0),
+                    detail=str(s.get("detail") or ""),
+                )
+                for s in (link.props.get("signals") or [])
+                if isinstance(s, dict)
+            ],
+            policy_ref=str(link.props.get("policy_ref") or ""),
+            detected_at=str(link.props.get("detected_at") or link.valid_from_iso),
+            run_id=str(link.props.get("run_id") or link.run_id),
+            counterparty=_counterparty(graph, link.to_id),
+            crm=crm, erp=erp,
+            change=_change(service, case_ref, erp),
+            moved_since_found=(
+                (bool(crm.state_when_found) and crm.state != crm.state_when_found)
+                or (bool(erp.state_when_found) and erp.state != erp.state_when_found)
+            ),
+            resolved_how=str(link.props.get("resolved_how") or ""),
+            # A standing finding names no decider. The sweep stamps itself on
+            # the edge so it always says who stands behind it, and reporting
+            # that as a decision would put a machine's name where a person's
+            # belongs — `IdentityProposal`'s rule, for its reason.
+            decided_at=(
+                "" if status == STANDING
+                else str(
+                    link.props.get("resolved_at")
+                    or link.props.get("dismissed_at") or ""
+                )
+            ),
+            decided_by=(
+                "" if status == STANDING
+                else str(
+                    link.props.get("resolved_by")
+                    or link.props.get("dismissed_by") or ""
+                )
+            ),
+            resolution=(
+                "" if status == STANDING
+                else str(link.props.get("resolution") or "")
+            ),
+            gate=_disagreement_gate(tasks_by_case.get(case_ref), principal),
+        )
+        (standing if status == STANDING else decided).append(case)
+
+    standing.sort(key=lambda c: (-c.confidence, c.erp.label))
+    decided.sort(key=lambda c: c.decided_at, reverse=True)
+    return DisagreementScreen(
+        standing=standing,
+        decided=decided[:DECIDED_WINDOW],
+        decided_total=len(decided),
+        last_sweep=_state_sweep(),
+        yours=principal.owns_queue(ORDER_DESK_QUEUE),
+        desk=ORDER_DESK_QUEUE,
     )
 
 
@@ -1913,6 +2516,58 @@ class IdentityState(BaseModel):
     last_sweep: SweepRun | None
 
 
+class DisagreementOutcomes(BaseModel):
+    """What the order desk settled in the window, and how each one ended.
+
+    Two numbers off one status rather than two statuses, which is the shape
+    `order_release.RESOLVED` argues for: a finding that is over is `resolved`,
+    and *how* it ended is a property of the resolution. `by_cumulus` is a write
+    this system made and verified; `externally` is the ERP already holding the
+    released value with nothing in the write journal asking for it — somebody
+    else did it, and the desk's decision closed a finding rather than causing
+    anything. Reporting them as one number would make a system that changed
+    nothing indistinguishable from one that changed a customer's order.
+
+    `dismissed` is beside them and not among them: it is the desk saying the
+    two systems may disagree here, which settles the finding without either
+    system moving.
+    """
+
+    days: int
+    resolved: int
+    by_cumulus: int
+    externally: int
+    dismissed: int
+
+
+class DisagreementState(BaseModel):
+    """What the two commercial books are waiting on. `IdentityState`'s sibling.
+
+    Composed by calling the disagreement route's own function, for
+    `IdentityState`'s reason: the screen is the list these numbers are
+    answerable by, and a second derivation would be a second way to be wrong.
+
+    The one number that is **not** derived from that list is
+    `blocked_on_identity`, and the reason is worth reading. It counts evidence
+    the sweep declined to admit because a merge nobody has confirmed was
+    hiding it — a decision *not* to read, which leaves nothing on the graph to
+    walk afterwards. The sweep publishes it; this reads it. The list it is
+    answerable by is the identity workbench, one rail stop away, which is also
+    the only place anybody can do anything about it.
+    """
+
+    standing: int
+    #: Standing findings with an open Task carrying them — the ones the desk
+    #: can actually answer.
+    awaiting_decision: int
+    #: Off the last sweep's own arithmetic. 0 with `last_sweep` set means the
+    #: pass read everything it wanted; 0 with `last_sweep` None means nobody
+    #: has asked.
+    blocked_on_identity: int
+    outcomes: DisagreementOutcomes
+    last_sweep: StateSweepRun | None
+
+
 class JudgmentState(BaseModel):
     open_tasks: int
     high_priority: int
@@ -1921,6 +2576,10 @@ class JudgmentState(BaseModel):
     unowned_with_work: list[str]
     ledger: LedgerWindow
     identity: IdentityState
+    #: The next question after identity, and only askable once identity has
+    #: been answered: given that we know who the customer is, are the systems
+    #: saying compatible things about what was committed to?
+    disagreement: DisagreementState
 
 
 def _known_queues(open_tasks: list) -> set[str]:
@@ -2023,6 +2682,39 @@ def _identity_state(principal: Principal) -> IdentityState:
         withdrawn=sum(1 for p in screen.decided if p.status == "withdrawn"),
         books=screen.books,
         last_sweep=screen.last_sweep,
+    )
+
+
+def _disagreement_state(principal: Principal) -> DisagreementState:
+    """The order desk's screen, counted. See `DisagreementState`.
+
+    Safe to call directly for `_identity_state`'s reason: this route is gated
+    on read reach, and read reach is one of the two ways
+    `may_open_disagreements` lets a principal in.
+
+    The window is counted off the rows the screen returned rather than by
+    re-reading the graph with a date filter — `decided_total` says whether that
+    list was truncated, which is the honest way to report a count over a window
+    onto a window.
+    """
+    screen = disagreements(principal=principal)
+    cutoff = (utcnow() - timedelta(days=DASHBOARD_WINDOW_DAYS)).isoformat()
+    recent = [c for c in screen.decided if c.decided_at >= cutoff]
+    sweep = screen.last_sweep
+    return DisagreementState(
+        standing=len(screen.standing),
+        awaiting_decision=sum(
+            1 for c in screen.standing if c.gate.task_status == "open"
+        ),
+        blocked_on_identity=sweep.blocked_on_identity if sweep else 0,
+        outcomes=DisagreementOutcomes(
+            days=DASHBOARD_WINDOW_DAYS,
+            resolved=sum(1 for c in recent if c.resolved_how),
+            by_cumulus=sum(1 for c in recent if c.resolved_how == BY_CUMULUS),
+            externally=sum(1 for c in recent if c.resolved_how == EXTERNALLY),
+            dismissed=sum(1 for c in recent if c.status == DISMISSED),
+        ),
+        last_sweep=sweep,
     )
 
 
@@ -2191,6 +2883,7 @@ def dashboard(
             ],
             ledger=_ledger_window(DASHBOARD_WINDOW_DAYS),
             identity=_identity_state(principal),
+            disagreement=_disagreement_state(principal),
         ),
         governance=_governance_state(
             principal, without_contract, DASHBOARD_WINDOW_DAYS

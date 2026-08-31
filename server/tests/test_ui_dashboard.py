@@ -634,6 +634,27 @@ def test_the_identity_panel_is_the_workbenchs_own_composition(client):
     assert sum(b["standing"] for b in panel["books"]) == panel["standing"]
 
 
+def test_a_book_the_state_sweep_has_never_touched_says_so(client):
+    """The identity pass has run over this world and the disagreement pass has
+    not, which is the case that separates "the systems agree" from "nobody has
+    asked". `last_sweep` is what tells them apart: a `blocked_on_identity` of 0
+    is only news when there was a pass to withhold anything from.
+
+    A world otherwise full of history, on purpose — a panel that only ever
+    reports zeros in an empty world has not been tested against the way it will
+    actually be read.
+    """
+    panel = _body(client)["judgment"]["disagreement"]
+    assert panel["last_sweep"] is None
+    assert panel["standing"] == 0
+    assert panel["blocked_on_identity"] == 0
+    assert panel["outcomes"]["resolved"] == 0
+    assert panel["outcomes"]["dismissed"] == 0
+    # And its sibling did run here, so this is a fact about one pass rather
+    # than about the world.
+    assert _body(client)["judgment"]["identity"]["last_sweep"] is not None
+
+
 # ---- the ledger ------------------------------------------------------------
 
 

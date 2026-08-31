@@ -7,9 +7,11 @@
 library;
 
 import 'data_layer.dart' show EstateCard;
+import 'disagreement_screen.dart' show StateSweepRun;
 import 'identity_screen.dart' show IdentityBook, SweepRun;
 
 export 'data_layer.dart' show EstateCard;
+export 'disagreement_screen.dart' show StateSweepRun;
 export 'identity_screen.dart' show IdentityBook, SweepRun;
 
 /// One object type, as the map holds it now.
@@ -460,6 +462,93 @@ class IdentityState {
   );
 }
 
+/// What the order desk settled in the window, and how each one ended.
+///
+/// Two numbers off one status rather than two statuses. `byCumulus` is a write
+/// this system made and verified; `externally` is the ERP already holding the
+/// released value with nothing in the write journal asking for it — somebody
+/// else did it, and the desk's decision closed a finding rather than causing
+/// anything. One number for both would make a system that changed nothing read
+/// like one that changed a customer's order.
+///
+/// `dismissed` is beside them and not among them: it is the desk saying the two
+/// systems may disagree here, which settles the finding without either system
+/// moving.
+class DisagreementOutcomes {
+  final int days;
+  final int resolved;
+  final int byCumulus;
+  final int externally;
+  final int dismissed;
+
+  const DisagreementOutcomes({
+    this.days = 30,
+    this.resolved = 0,
+    this.byCumulus = 0,
+    this.externally = 0,
+    this.dismissed = 0,
+  });
+
+  int get settled => resolved + dismissed;
+
+  factory DisagreementOutcomes.fromJson(Map<String, dynamic> json) =>
+      DisagreementOutcomes(
+        days: json['days'] as int? ?? 30,
+        resolved: json['resolved'] as int? ?? 0,
+        byCumulus: json['by_cumulus'] as int? ?? 0,
+        externally: json['externally'] as int? ?? 0,
+        dismissed: json['dismissed'] as int? ?? 0,
+      );
+}
+
+/// What the two commercial books are waiting on. `IdentityState`'s sibling, and
+/// the next question after it: given that we know who the customer is, are the
+/// systems saying compatible things about what was committed to?
+class DisagreementState {
+  final int standing;
+
+  /// Standing findings with an open Task carrying them — the ones the desk can
+  /// actually answer.
+  final int awaitingDecision;
+
+  /// Evidence the last sweep declined to admit because a merge nobody has
+  /// confirmed was hiding it. Read from the sweep's own arithmetic, never
+  /// re-derived: a decision *not* to read leaves nothing on the graph to walk
+  /// afterwards. The list it is answerable by is the identity workbench, which
+  /// is also the only place anybody can do anything about it.
+  final int blockedOnIdentity;
+
+  final DisagreementOutcomes outcomes;
+
+  /// Null when the sweep has never run. What separates "nothing is blocked"
+  /// from "nobody has asked" — a zeroed row standing in for a pass that did not
+  /// happen is the most misleading number this panel could draw.
+  final StateSweepRun? lastSweep;
+
+  const DisagreementState({
+    this.standing = 0,
+    this.awaitingDecision = 0,
+    this.blockedOnIdentity = 0,
+    this.outcomes = const DisagreementOutcomes(),
+    this.lastSweep,
+  });
+
+  factory DisagreementState.fromJson(Map<String, dynamic> json) =>
+      DisagreementState(
+        standing: json['standing'] as int? ?? 0,
+        awaitingDecision: json['awaiting_decision'] as int? ?? 0,
+        blockedOnIdentity: json['blocked_on_identity'] as int? ?? 0,
+        outcomes: DisagreementOutcomes.fromJson(
+          json['outcomes'] as Map<String, dynamic>? ?? const {},
+        ),
+        lastSweep: json['last_sweep'] == null
+            ? null
+            : StateSweepRun.fromJson(
+                json['last_sweep'] as Map<String, dynamic>,
+              ),
+      );
+}
+
 class JudgmentState {
   final int openTasks;
   final int highPriority;
@@ -467,6 +556,7 @@ class JudgmentState {
   final List<String> unownedWithWork;
   final LedgerWindow ledger;
   final IdentityState identity;
+  final DisagreementState disagreement;
 
   const JudgmentState({
     required this.openTasks,
@@ -475,6 +565,7 @@ class JudgmentState {
     required this.unownedWithWork,
     required this.ledger,
     required this.identity,
+    this.disagreement = const DisagreementState(),
   });
 
   factory JudgmentState.fromJson(Map<String, dynamic> json) => JudgmentState(
@@ -491,6 +582,9 @@ class JudgmentState {
     ),
     identity: IdentityState.fromJson(
       json['identity'] as Map<String, dynamic>? ?? const {},
+    ),
+    disagreement: DisagreementState.fromJson(
+      json['disagreement'] as Map<String, dynamic>? ?? const {},
     ),
   );
 }

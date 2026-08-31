@@ -764,6 +764,24 @@ class JudgmentPanel extends StatelessWidget {
                     : '${judgment.identity.awaitingDecision} carry a Task '
                           'somebody can answer',
               ),
+              // The next question after identity, and only askable once
+              // identity has been answered. Its own tile rather than a line in
+              // the identity one: a merge is a belief and a release is a write
+              // into somebody else's system, and a reader must not have to
+              // work out which of the two a number is about.
+              StatTile(
+                label: 'Standing disagreements',
+                value: '${judgment.disagreement.standing}',
+                caption: judgment.disagreement.lastSweep == null
+                    ? 'the two books have never been swept'
+                    : judgment.disagreement.standing == 0
+                    ? 'the two books agree on every held order'
+                    : '${judgment.disagreement.awaitingDecision} carry a Task '
+                          'the order desk can answer',
+                valueColor: judgment.disagreement.standing > 0
+                    ? CumulusTone.warn.foreground
+                    : null,
+              ),
             ],
           ),
           const SizedBox(height: 18),
@@ -793,6 +811,14 @@ class JudgmentPanel extends StatelessWidget {
           _IdentityView(
             identity: judgment.identity,
             onOpen: onOpenIdentity,
+          ),
+          const SizedBox(height: 16),
+          const FieldLabel('Where two of the customer\'s systems disagree'),
+          const SizedBox(height: 6),
+          _DisagreementView(
+            disagreement: judgment.disagreement,
+            onOpenTasks: onOpenTasks,
+            onOpenIdentity: onOpenIdentity,
           ),
         ],
       ),
@@ -1020,6 +1046,107 @@ class _IdentityView extends StatelessWidget {
             icon: const Icon(Icons.compare_arrows, size: 15),
             label: const Text('Open the identity workbench'),
           ),
+        ),
+      ],
+    );
+  }
+}
+
+/// The order desk: what is standing, what unfinished identity work is costing,
+/// and what was settled — split by who actually did it.
+///
+/// Every number here is answerable by a list. `standing` and
+/// `awaitingDecision` open in My Tasks; the outcome split is the settled
+/// findings the same screen holds; and `blockedOnIdentity` is answerable in the
+/// identity workbench, which is the only place anybody can do anything about
+/// it. That last one is the argument for the identity work stated as a number
+/// rather than as a paragraph — so the sentence under it says, in words, what
+/// confirming a merge would buy.
+class _DisagreementView extends StatelessWidget {
+  final DisagreementState disagreement;
+  final VoidCallback? onOpenTasks;
+  final VoidCallback? onOpenIdentity;
+
+  const _DisagreementView({
+    required this.disagreement,
+    this.onOpenTasks,
+    this.onOpenIdentity,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final d = disagreement;
+    final sweep = d.lastSweep;
+    final o = d.outcomes;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          sweep == null
+              // Never a zeroed row standing in for a pass that did not happen.
+              // "0 blocked on identity" over a book nothing has swept is the
+              // most misleading sentence this panel could print.
+              ? 'The disagreement sweep has never run over these two books, so '
+                    'nothing has been correlated. What is below is empty '
+                    'because nobody has asked, not because the systems agree.'
+              : 'Swept ${agoIso(sweep.atIso)} — ${sweep.ordersExamined} held '
+                    'order(s) examined, ${sweep.candidates} pair(s) in the '
+                    'window, ${sweep.found} disagreement(s) found, '
+                    '${sweep.orderWithoutDeal} order(s) with no won deal '
+                    'behind them at all.',
+          style: CumulusText.body,
+        ),
+        if (sweep != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            d.standing == 0
+                ? 'Nothing is standing against the order desk.'
+                : '${d.standing} standing · ${d.awaitingDecision} carry a Task '
+                      'the desk can answer.',
+            style: CumulusText.rowTitle,
+          ),
+          const SizedBox(height: 8),
+          // Two numbers off one status. Folding them together would make a
+          // system that changed nothing read like one that changed a
+          // customer's order.
+          Text(
+            o.settled == 0
+                ? 'Nothing has been settled in the last ${o.days} days.'
+                : 'Settled in ${o.days} days: ${o.resolved} released '
+                      '(${o.byCumulus} written by Cumulus and read back, '
+                      '${o.externally} already done elsewhere) · '
+                      '${o.dismissed} left as they were.',
+            style: CumulusText.meta,
+          ),
+          if (d.blockedOnIdentity > 0) ...[
+            const SizedBox(height: 8),
+            Text(
+              '${d.blockedOnIdentity} piece(s) of evidence were withheld from '
+              'this pass because a merge nobody has confirmed was hiding '
+              'them. Confirming an identity does not just tidy the '
+              'counterparty book — it admits records a third system holds '
+              'about the same commitment, which is evidence this desk would '
+              'otherwise never see.',
+              style: CumulusText.body.copyWith(color: CumulusColors.warn),
+            ),
+          ],
+        ],
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 4,
+          children: [
+            TextButton.icon(
+              onPressed: onOpenTasks,
+              icon: const Icon(Icons.inbox_outlined, size: 15),
+              label: const Text('Open the order desk'),
+            ),
+            if (d.blockedOnIdentity > 0)
+              TextButton.icon(
+                onPressed: onOpenIdentity,
+                icon: const Icon(Icons.link, size: 15),
+                label: const Text('Unblock it in the counterparty book'),
+              ),
+          ],
         ),
       ],
     );

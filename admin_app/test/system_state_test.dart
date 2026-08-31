@@ -540,6 +540,115 @@ void main() {
         findsOneWidget,
       );
     });
+
+    testWidgets('the disagreement tile reads off the sweep and links to the '
+        'desk', (tester) async {
+      await _pump(tester, JudgmentPanel(judgment: _judgment()));
+
+      expect(find.text('STANDING DISAGREEMENTS'), findsOneWidget);
+      expect(
+        find.text('1 carry a Task the order desk can answer'),
+        findsOneWidget,
+      );
+      // The sweep's own arithmetic, quoted rather than recomputed — including
+      // the honest non-finding: an order with no won deal behind it at all.
+      expect(
+        find.textContaining(
+          '2 held order(s) examined, 1 pair(s) in the window, 1 '
+          'disagreement(s) found, 1 order(s) with no won deal behind them at '
+          'all.',
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('Open the order desk'), findsOneWidget);
+    });
+
+    testWidgets('blocked evidence says in words what confirming a merge would '
+        'buy, and offers the way there', (tester) async {
+      // The number that sells the identity work. On its own it is a count of
+      // nothing a reader can picture, so the sentence says what was withheld
+      // and why confirming an identity is what admits it.
+      await _pump(tester, JudgmentPanel(judgment: _judgment()));
+
+      expect(
+        find.textContaining(
+          '1 piece(s) of evidence were withheld from this pass because a '
+          'merge nobody has confirmed was hiding them.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining(
+          'it admits records a third system holds about the same commitment',
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('Unblock it in the counterparty book'), findsOneWidget);
+    });
+
+    testWidgets('a release Cumulus made is counted apart from one it found '
+        'already done', (tester) async {
+      await _pump(tester, JudgmentPanel(
+        judgment: _judgment(
+          disagreement: _disagreement(
+            standing: 0,
+            awaitingDecision: 0,
+            blockedOnIdentity: 0,
+            outcomes: const DisagreementOutcomes(
+              days: 30,
+              resolved: 3,
+              byCumulus: 2,
+              externally: 1,
+              dismissed: 1,
+            ),
+          ),
+        ),
+      ));
+
+      expect(
+        find.text(
+          'Settled in 30 days: 3 released (2 written by Cumulus and read '
+          'back, 1 already done elsewhere) · 1 left as they were.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.text('Nothing is standing against the order desk.'),
+        findsOneWidget,
+      );
+      // Nothing blocked, so nothing to unblock — and no dead link offering it.
+      expect(find.text('Unblock it in the counterparty book'), findsNothing);
+    });
+
+    testWidgets('a book nothing has swept says so rather than reporting zeros',
+        (tester) async {
+      // A "0 blocked on identity" over a book nothing has ever swept is the
+      // most misleading sentence this panel could print: it reads as "the
+      // systems agree" when it means "nobody has asked".
+      await _pump(tester, JudgmentPanel(
+        judgment: _judgment(
+          disagreement: _disagreement(
+            standing: 0,
+            awaitingDecision: 0,
+            blockedOnIdentity: 0,
+            sweep: null,
+          ),
+        ),
+      ));
+
+      expect(
+        find.textContaining(
+          'What is below is empty because nobody has asked, not because the '
+          'systems agree.',
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('the two books have never been swept'), findsOneWidget);
+      expect(
+        find.text('Nothing is standing against the order desk.'),
+        findsNothing,
+      );
+    });
   });
 
   group('GovernancePanel', () {
@@ -766,8 +875,10 @@ FeedState _feed({
 JudgmentState _judgment({
   LedgerWindow? ledger,
   IdentityState? identity,
+  DisagreementState? disagreement,
   List<String> unowned = const [],
 }) => JudgmentState(
+  disagreement: disagreement ?? _disagreement(),
   openTasks: 6,
   highPriority: 1,
   queues: const [
@@ -823,6 +934,36 @@ JudgmentState _judgment({
           ratifications: 2,
         ),
       ),
+);
+
+/// The order desk's tile, over the estate's real Voss case: one standing
+/// finding the desk can answer, and one piece of evidence an unconfirmed merge
+/// is holding back.
+DisagreementState _disagreement({
+  int standing = 1,
+  int awaitingDecision = 1,
+  int blockedOnIdentity = 1,
+  DisagreementOutcomes outcomes = const DisagreementOutcomes(),
+  StateSweepRun? sweep = _stateSweep,
+}) => DisagreementState(
+  standing: standing,
+  awaitingDecision: awaitingDecision,
+  blockedOnIdentity: blockedOnIdentity,
+  outcomes: outcomes,
+  lastSweep: sweep,
+);
+
+const _stateSweep = StateSweepRun(
+  runId: 'run_ds_89c7bf74fb',
+  atIso: '',
+  status: 'succeeded',
+  ordersExamined: 2,
+  candidates: 1,
+  found: 1,
+  blockedOnIdentity: 1,
+  orderWithoutDeal: 1,
+  ambiguous: 0,
+  deskTasks: 1,
 );
 
 GovernanceState _governance({

@@ -16,6 +16,7 @@ import '../models/flow.dart';
 import '../models/data_layer.dart';
 import '../models/eval.dart';
 import '../models/graph.dart';
+import '../models/disagreement_screen.dart';
 import '../models/identity_screen.dart';
 import '../models/ontology_screen.dart';
 import '../models/payable.dart';
@@ -1166,6 +1167,26 @@ class ApiClient {
     );
     _check(resp);
     return IdentityScreen.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// The order desk's cases: every cross-system disagreement the sweep has
+  /// found, standing and settled, with what approving each one would write.
+  ///
+  /// `identityScreen`'s sibling and one call for its reason, plus one of its
+  /// own: the before/after on the approve button is read server-side off the
+  /// same write table the release Action commits through. Composing it here
+  /// would let this console promise a transition the Action would refuse.
+  ///
+  /// Throws 403 for a persona that does not hold the order desk and reads only
+  /// its own work — the refusal carries the sentence the screen prints.
+  Future<DisagreementScreen> disagreementScreen() async {
+    final resp = await _send(
+      _http.get(_uri('/api/ui/v1/disagreements'), headers: await _headers()),
+    );
+    _check(resp);
+    return DisagreementScreen.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
   }
