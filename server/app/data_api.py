@@ -320,6 +320,40 @@ def sweep_identities(
     return outcome
 
 
+@router.post("/state/sweep", status_code=202)
+def sweep_disagreements(
+    window: str = Query(default="", max_length=200),
+    principal: Principal = Depends(get_principal),
+) -> dict:
+    """Close a state window: correlate the CRM's won deals against held orders.
+
+    Safe to call at any time, on the same terms as the identity sweep above and
+    for the same reason: it changes no canonical object and writes to no
+    external system. What it records is a finding at `standing` — an edge
+    between two rows that already exist — and the worst a spurious run costs is
+    the pass itself plus edges the order desk can dismiss.
+
+    Admin, because it raises work into somebody's queue. Note which queue:
+    a finding lands in `order-desk`, so this route can put a revenue decision
+    in front of the controller and must not be reachable by a reader.
+    """
+    require_role(principal, "admin")
+    outcome = deps.get_sync_service().sweep_disagreements(
+        actor=principal.uid, window=window,
+    )
+    log.info(
+        "Disagreement sweep run",
+        extra={
+            "actor": principal.uid, "runId": outcome.get("run_id"),
+            "found": outcome.get("found"),
+            "standing": outcome.get("standing"),
+            "blockedOnIdentity": outcome.get("blocked_on_identity"),
+            "deskTasks": outcome.get("desk_tasks"),
+        },
+    )
+    return outcome
+
+
 # ---- the derived anomaly baseline -----------------------------------------
 
 

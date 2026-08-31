@@ -1330,6 +1330,36 @@ LINK_TYPES: tuple[LinkType, ...] = (
              "the CRM feed, which keys people on an address precisely so that "
              "two spellings stay two people until somebody looks",
              nature="identity"),
+    # ---- a disagreement between two systems, as an edge --------------------
+    #
+    # The four links above say *these two rows are one thing*. This one says
+    # the opposite kind of thing about two rows that are definitely not: the
+    # CRM's deal and the ERP's order are different objects, both correct, and
+    # what is wrong is the gap between what they say. Nothing merges, nothing
+    # is superseded, and neither end is touched — the finding is the edge.
+    #
+    # `association` and not `identity`, though it carries confidence and a
+    # status the way an identity link does. The distinction is what the
+    # assertion is *about*: an identity link claims two objects are one party
+    # and a resolver walks it, and something walking this one looking for a
+    # party would find a deal and an order and be wrong about both.
+    #
+    # Named for its endpoints rather than for the class, because the class
+    # table is governed data and this declaration is not: a second class
+    # between the same two types is a row in `state-agreement-policy`, and a
+    # class between *different* types (a delivered project against an unbilled
+    # order) is a second link declared here.
+    #
+    # `many-to-many`, because a phased deal legitimately produces several
+    # orders and a consolidating order legitimately closes several deals; the
+    # sweep's job is to show the desk the field it found, not to pick one.
+    LinkType("deal_disagrees_with_order", "Opportunity", "SalesOrder",
+             "many-to-many",
+             "two systems holding one commitment and saying incompatible "
+             "things about it — the CRM's deal closed won while the ERP's "
+             "order sits unreleased. Carries the class, the correlation "
+             "confidence, the signals that produced it, the states both rows "
+             "held when it was found, and a status the order desk moves"),
 )
 
 # Ordered highest-authority first. A human correction outranks every system;

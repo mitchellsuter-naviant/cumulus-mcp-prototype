@@ -342,16 +342,20 @@ def test_the_ledger_route_scopes_reads_and_lists_the_closed_action_set(
         "link-company-record", "confirm-vendor", "land-source-records",
         "apply-source-records", "resolve-identities",
         "propose-identity-link", "confirm-identity-link",
+        "record-disagreements",
     }
-    # The two identity Actions carry no queue in the table, for two different
-    # reasons — and the table says which. A queue says whose *work* an Action
-    # is: proposing is nobody's work (a Flow does it unasked), and confirming
-    # is somebody's work but not always the same somebody, because the sweep
-    # proposes across both counterparty books. So the confirmation takes its
-    # desk from the Task it answers, which is the only place that knows.
+    # Three Actions carry no queue in the table, for two different reasons —
+    # and the table says which. A queue says whose *work* an Action is:
+    # proposing a merge and recording a disagreement are nobody's work (a Flow
+    # does each unasked, on its own authority), and confirming is somebody's
+    # work but not always the same somebody, because the sweep proposes across
+    # both counterparty books. So the confirmation takes its desk from the Task
+    # it answers, which is the only place that knows.
     by_id = {a["id"]: a for a in actions}
     assert by_id["propose-identity-link"]["queue"] == ""
     assert by_id["propose-identity-link"]["queue_from_task"] is False
+    assert by_id["record-disagreements"]["queue"] == ""
+    assert by_id["record-disagreements"]["queue_from_task"] is False
     assert by_id["confirm-identity-link"]["queue"] == ""
     assert by_id["confirm-identity-link"]["queue_from_task"] is True
     # And nothing else in the table derives its desk: an Action that declares

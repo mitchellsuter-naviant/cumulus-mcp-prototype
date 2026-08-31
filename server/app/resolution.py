@@ -169,6 +169,138 @@ def read_sweep_thresholds(knowledge) -> SweepThresholds:
 
 
 # ---------------------------------------------------------------------------
+# The state-agreement policy
+# ---------------------------------------------------------------------------
+#
+# A second governed document, and a second document on purpose. The asset above
+# governs *identity* — whether two rows are about one party — and this one
+# governs *agreement*: whether two systems, having already agreed who the party
+# is, are saying compatible things about what was committed to. A steward
+# tuning "how alike is alike" and a controller tuning "how long after a deal
+# closes may an order still be that deal's order" are different people asking
+# different questions, and folding them into one file would make each one's
+# edit land in the other's paragraph.
+#
+# It lives here rather than in `disagreement_sweep` for the reason the sweep
+# thresholds do: parsing a governed document is resolution's job, the flow's
+# job is to act on what came back, and a reader looking for "where do the
+# numbers come from" should find every answer in one module.
+
+STATE_POLICY_ASSET_ID = "state-agreement-policy"
+
+#: One row of the governed disagreement table: the two states, and what their
+#: coexistence is called. A tuple rather than a model because it is read-only
+#: data parsed out of prose, and because a class the code has to *name* would
+#: put the table back in the code.
+StateDisagreement = tuple[str, str, str]
+
+
+class StatePolicy(BaseModel):
+    """Where the state sweep's lines fall, parsed from its own asset.
+
+    Every value here is one a business owner can defend in a sentence, which is
+    the test for whether something belongs in a governed document rather than
+    in code: "an order more than a month after the close is the next
+    engagement" is a policy, and "blend token overlap with character
+    similarity" is machinery.
+    """
+
+    #: How far *before* a close date an order may sit and still be that deal's
+    #: order. Shorter than the lag because ordering follows closing; non-zero
+    #: because the two systems are updated by different people on different
+    #: days and the paperwork sometimes lands first.
+    lead_days: int = 21
+    #: And how far after. Past this an order is the next engagement.
+    lag_days: int = 30
+    #: The similarity at which a deal's name and an order's memo corroborate.
+    #: Higher than the identity sweep's name floor, and deliberately: that
+    #: floor decides whether a pair is *looked at*, and this one is a piece of
+    #: positive evidence about two rows already joined by a counterparty.
+    name_floor: float = 0.60
+    #: The band an order/deal ratio must fall in to corroborate. One-sided by
+    #: design — an order is routinely a phase of a deal, and one larger than
+    #: the deal that produced it is a different commitment.
+    amount_floor: float = 0.10
+    amount_ceiling: float = 1.15
+    #: The most confidence the sweep may claim about a pair.
+    ceiling: float = 0.95
+    #: The governed table, as (opportunity stage, order status, class name).
+    disagreements: tuple[StateDisagreement, ...] = (
+        ("closed-won", "pending-approval", "won-not-released"),
+    )
+    source_ref: str = f"knowledge:{STATE_POLICY_ASSET_ID}"
+    found_asset: bool = False
+
+    def classify(self, stage: str, status: str) -> str:
+        """The disagreement two states name, or "" if they are compatible."""
+        for want_stage, want_status, name in self.disagreements:
+            if stage == want_stage and status == want_status:
+                return name
+        return ""
+
+    @property
+    def held_statuses(self) -> tuple[str, ...]:
+        """The order statuses any row of the table calls a disagreement.
+
+        The scan walks orders first — there are far fewer held orders than won
+        deals — so this is the set it filters the book down to before it looks
+        at a single opportunity.
+        """
+        return tuple(dict.fromkeys(status for _s, status, _n in self.disagreements))
+
+
+#: A row of the governed markdown table: three backticked slugs between pipes.
+#: Anchored on the backticks so the header row and the `|---|` rule cannot
+#: parse as data — a table whose header quietly became a disagreement class is
+#: the failure mode a looser pattern buys.
+_TABLE_ROW = re.compile(
+    r"^\|\s*`([a-z][a-z0-9-]*)`\s*\|\s*`([a-z][a-z0-9-]*)`\s*\|"
+    r"\s*`([a-z][a-z0-9-]*)`\s*\|",
+    re.M,
+)
+
+
+def parse_state_policy(content: str) -> StatePolicy:
+    values = StatePolicy(found_asset=True)
+    for pattern, field, cast in (
+        (r"open the window:?\s*(\d+)\s*day", "lead_days", int),
+        (r"close the window:?\s*(\d+)\s*day", "lag_days", int),
+        (r"corroborate on names at or above:?\s*(\d+(?:\.\d+)?)", "name_floor",
+         float),
+        (r"never raise above:?\s*(\d+(?:\.\d+)?)", "ceiling", float),
+    ):
+        found = re.search(pattern, content, re.I)
+        if found:
+            setattr(values, field, cast(found.group(1)))
+    band = re.search(
+        r"an order between\s*(\d+(?:\.\d+)?)\s*and\s*(\d+(?:\.\d+)?)\s*of the deal",
+        content, re.I,
+    )
+    if band:
+        values.amount_floor = float(band.group(1))
+        values.amount_ceiling = float(band.group(2))
+    rows = tuple(_TABLE_ROW.findall(content))
+    if rows:
+        # Only when the document has a table. An asset somebody truncated must
+        # fall back to the declared default rather than to *no* classes, which
+        # would make a broken policy read as a clean sweep.
+        values.disagreements = rows
+    return values
+
+
+def read_state_policy(knowledge) -> StatePolicy:
+    asset = knowledge.repo.get(STATE_POLICY_ASSET_ID) if knowledge else None
+    if asset is None:
+        log.warning("State-agreement policy missing; using defaults")
+        return StatePolicy(found_asset=False)
+    values = parse_state_policy(asset.content)
+    values.source_ref = (
+        f"knowledge:{STATE_POLICY_ASSET_ID}@rev{getattr(asset, 'revision', 1)}"
+    )
+    return values
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 

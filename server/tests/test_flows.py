@@ -39,7 +39,7 @@ from app.runs import RunRecord
 from tests import world as test_world
 
 # The eleven inbound feeds that write the graph. With the two authored flows
-# and the identity sweep below they are the fourteen the fleet holds.
+# and the two sweeps below they are the fifteen the fleet holds.
 SYNC_FLOWS = {
     "vendor-sync", "purchase-order-sync", "receiving-sync",
     "workforce-sync", "calendar-sync", "crm-sync", "sales-sync",
@@ -48,17 +48,20 @@ SYNC_FLOWS = {
 }
 #: Every feed now carries its Tier-2 declarative export — the carried debt
 #: reached zero, so the UNDECLARED_FEEDS set that tracked it is gone.
-#: `identity-sweep` is neither a feed nor an authored per-case flow: it is
-#: windowed like the feeds and reads the book they wrote, and it carries its
+#: `identity-sweep` and `disagreement-sweep` are neither feeds nor authored
+#: per-case flows: both are windowed like the feeds and read the book they
+#: wrote — the first asking whether two rows are one party, the second asking
+#: whether two systems agree about what was committed to — and both carry their
 #: export like everything else.
 DECLARED_FLOWS = SYNC_FLOWS | {
     "expense-reimbursement", "accounts-payable", "identity-sweep",
+    "disagreement-sweep",
 }
 
 
 @pytest.fixture()
 def world():
-    """A fresh world: fourteen registered flow bodies, no runs, no tasks."""
+    """A fresh world: fifteen registered flow bodies, no runs, no tasks."""
     return test_world.fresh()
 
 
@@ -167,7 +170,7 @@ def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
     by_id = {r["id"]: r for r in rows}
     assert SYNC_FLOWS < set(by_id)
     assert {"expense-reimbursement", "accounts-payable"} < set(by_id)
-    assert len(rows) == 15  # fourteen declared flows, plus the unmapped probe
+    assert len(rows) == 16  # fifteen declared flows, plus the unmapped probe
 
     # A definition-less row says so, rather than borrowing a lifecycle state
     # it has no definition to hold.
@@ -380,8 +383,8 @@ def test_the_fleet_run_count_is_the_real_run_count(client, world):
         for row in client.get("/api/v1/flows").json()
     ]
     assert stats["runs"] == sum(u["runs"] for u in per_flow)
-    assert stats["flows"] == 14
-    assert stats["definitions"] == 14
+    assert stats["flows"] == 15
+    assert stats["definitions"] == 15
     # The carried debt reached zero: every flow that runs carries its export.
     assert stats["without_definition"] == 0
 

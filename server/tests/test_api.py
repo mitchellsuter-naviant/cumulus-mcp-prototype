@@ -26,14 +26,14 @@ def test_healthz(client):
     # 9 seed documents + 2 seeded extraction prompts + 4 generated
     # schema-exports (ontology, collections, mappings, eval specs) — the
     # fixture publishes them like startup does.
-    assert resp.json()["assets"] == 15
+    assert resp.json()["assets"] == 16
 
 
 def test_list_and_prefix_filter(client):
-    assert len(client.get("/api/v1/assets").json()) == 15
+    assert len(client.get("/api/v1/assets").json()) == 16
     # The kind filter carves the Library out of the corpus: documents only.
     docs = client.get("/api/v1/assets", params={"kind": "document"}).json()
-    assert len(docs) == 9
+    assert len(docs) == 10
     assert all(a["kind"] == "document" for a in docs)
     # And it carves out the governed prompts, which are knowledge without being
     # documents: they instruct a ModelCall rather than arguing with a policy.

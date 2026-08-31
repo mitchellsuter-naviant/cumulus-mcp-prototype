@@ -57,6 +57,14 @@ ALL_QUEUES: tuple[str, ...] = (
     # Cumulus pays, the other decides who Cumulus thinks it is dealing with,
     # and the desks are not interchangeable even where one person sits at both.
     "data-stewardship",
+    # disagreement_sweep.ORDER_DESK_QUEUE — where a two-system disagreement
+    # about an order lands. Deliberately not `ap-clerk` and deliberately not
+    # either stewardship desk: releasing an order is a revenue decision, and
+    # the authority that approves what Cumulus *pays* is not the authority
+    # that decides what it *bills*. Keeping them apart is what makes "Connie
+    # may not release revenue" a fact the system enforces rather than a
+    # sentence in a runbook.
+    "order-desk",
     "hr",                   # employee.HR_QUEUE
     "knowledge-curation",
     "eval-review",
@@ -159,11 +167,13 @@ _USERS: tuple[tuple[str, str, str, str, tuple[str, ...], str], ...] = (
         "controller", "raymond.fitzgerald@naviant.com", "Raymond Fitzgerald",
         "Controller",
         ("ap-clerk", "expense-review", "vendor-stewardship",
-         "data-stewardship"),
-        "The finance decision-maker: approves the spend and owns both "
+         "data-stewardship", "order-desk"),
+        "The finance decision-maker: approves the spend, owns both "
         "master-data desks — who Cumulus pays, and who it thinks it is "
-        "dealing with. Test a reimbursement above the policy limit, a "
-        "posting gate, and a steward call on a vendor that will not resolve.",
+        "dealing with — and is the only persona who may release an order the "
+        "CRM says was won. Test a reimbursement above the policy limit, a "
+        "posting gate, a steward call on a vendor that will not resolve, and "
+        "a disagreement between the CRM and the ERP about one commitment.",
     ),
     (
         "ap", "connie.alberts@naviant.com", "Connie Alberts",

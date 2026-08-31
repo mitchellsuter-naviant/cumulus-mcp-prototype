@@ -45,9 +45,18 @@ log = logging.getLogger("cumulus.tasks")
 #: objects and the evidence joining them) and because a decision hook that had
 #: to tell them apart from the payload would guess wrong the first time the two
 #: shapes converged.
+#:
+#: `state_disagreement` is the third of that family and the one that leaves the
+#: graph. The first two are questions about what Cumulus *believes* — is this
+#: row that entity, are these two entities one party — and both are answered by
+#: moving a status. This one is a question about what Cumulus should *do* to
+#: somebody else's system: approving it releases an order in the customer's
+#: ERP. Same shape, categorically different blast radius, and a screen that
+#: could not tell them apart would put an outbound write behind the same button
+#: as a master-data tidy-up.
 TaskKind = Literal[
-    "decision", "match_review", "merge_review", "curation", "eval_review",
-    "exception",
+    "decision", "match_review", "merge_review", "state_disagreement",
+    "curation", "eval_review", "exception",
 ]
 TaskStatus = Literal["open", "done"]
 TaskVerdict = Literal["approved", "rejected", "corrected"]

@@ -148,6 +148,22 @@ ACTIONS: dict[str, Action] = {a.id: a for a in (
            regime="observation"),
     # a resolution — a Rule picked the winner, automatically and on the record
     Action(id="resolve-identities", target="entity-layer", regime="resolution"),
+    # Recording that two systems disagree. **No queue**, for exactly the
+    # reason `propose-identity-link` above carries none: a queue binding says
+    # whose *work* an Action is, and noticing a disagreement is nobody's work.
+    # The sweep does it on its own authority, unasked, and a queue here would
+    # refuse the Flow outright — a Flow principal owns only the queues its
+    # declaration binds it to.
+    #
+    # The work that *does* have a desk is the Task this write makes possible,
+    # which lands in `order-desk`, and the write that would act on it lives in
+    # a different Action entirely. Keeping them apart is what lets an auditor
+    # tell "Cumulus noticed" from "somebody decided" without reading a payload.
+    #
+    # `decision` and not `observation`: no source reported this. It is the
+    # product of a rule reading two sources against a governed policy, which
+    # is a determination Cumulus made and must answer for.
+    Action(id="record-disagreements", target="entity-layer"),
 )}
 
 
