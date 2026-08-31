@@ -734,10 +734,18 @@ class _TaskReviewState extends State<_TaskReview> {
 // `merge_review` is two entities the book already holds, and the proposal is
 // already on the graph at `in_review`; the answer flips its status. Named
 // apart here because they read apart to the person holding the queue.
+//
+// `state_disagreement` is the third and the only one whose approval leaves the
+// building: two of the customer's own systems are holding one commitment and
+// saying incompatible things about it, and answering yes writes to one of them.
+// The label says "systems" rather than "data" for that reason — nothing here is
+// wrong with a row, and the person deciding is being asked about the business
+// and not about the book.
 String kindLabel(String kind) => switch (kind) {
   'decision' => 'Flow decision',
   'match_review' => 'Entity match review',
   'merge_review' => 'Proposed merge',
+  'state_disagreement' => 'Systems disagree',
   'curation' => 'Knowledge curation',
   'eval_review' => 'Eval review',
   'exception' => 'Exception',
@@ -748,6 +756,7 @@ IconData _iconFor(String kind) => switch (kind) {
   'decision' => Icons.gavel_outlined,
   'match_review' => Icons.join_left_outlined,
   'merge_review' => Icons.merge_outlined,
+  'state_disagreement' => Icons.compare_arrows_outlined,
   'curation' => Icons.auto_stories_outlined,
   'eval_review' => Icons.grading_outlined,
   'exception' => Icons.report_gmailerrorred_outlined,
@@ -758,6 +767,10 @@ CumulusTone _toneFor(QueueTask task) => switch (task.kind) {
   'decision' => CumulusTone.accent,
   'match_review' => CumulusTone.teal,
   'merge_review' => CumulusTone.teal,
+  // Amber rather than teal: the other two reviews are about the book, and this
+  // one is about the business. Not `danger` either — nothing is broken, and a
+  // red badge on a deal somebody won would misread the room.
+  'state_disagreement' => CumulusTone.warn,
   'curation' => CumulusTone.violet,
   'eval_review' => CumulusTone.neutral,
   'exception' => CumulusTone.danger,

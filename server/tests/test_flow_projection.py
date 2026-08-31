@@ -300,14 +300,15 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
         "psa-sync",
         "identity-sweep",
         "disagreement-sweep",
-        # The sixteenth, and the only one here that touches no graph at all:
+        # The only one here that touches no graph at all:
         # a question asked of the corpus is a Flow now, so the engine can name
         # it. It is projected like everything else and its projection is
         # empty in both directions, which is the honest read — see the
         # explicit case below.
         "answer-question",
+        "order-release",
     }
-    # Eleven of the sixteen are inbound syncs. They all have FlowDefinitions now,
+    # Eleven of the seventeen are inbound syncs. They all have FlowDefinitions now,
     # but the projection is still drawn from the engine and from stored runs:
     # a definition says what a flow is *meant* to touch, and this module is
     # about what it did.
@@ -329,6 +330,16 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
             # was ever read, which is the distinction this module exists for.
             assert projection.writes == []
             assert projection.establishes == []
+            continue
+        if projection.flow_id == "order-release":
+            # Registered and never run in this world, which is the honest
+            # answer: the sweep found nothing here to approve, so nobody
+            # approved anything. `never_ran` is a different fact from "ran and
+            # wrote nothing" and the projection is right to keep them apart —
+            # this is the flow whose runs reach a customer's ERP, and "it has
+            # never been used in this deployment" is exactly what an operator
+            # should be told about it.
+            assert projection.state == "never_ran"
             continue
         assert projection.state == "observed", projection.flow_id
         if projection.flow_id == "employment-event-sync":

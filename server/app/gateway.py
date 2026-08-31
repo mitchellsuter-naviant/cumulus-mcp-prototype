@@ -164,6 +164,28 @@ ACTIONS: dict[str, Action] = {a.id: a for a in (
     # product of a rule reading two sources against a governed policy, which
     # is a determination Cumulus made and must answer for.
     Action(id="record-disagreements", target="entity-layer"),
+    # The one Action that changes somebody else's system, and the only one in
+    # this table whose target is not a book Cumulus keeps. Everything above it
+    # writes into the graph, where a bad write is reversible by a steward and
+    # every claim it made is still on the record; this one ends in an HTTP
+    # PATCH to a customer's ERP, where the ledger entry is the *only* thing
+    # Cumulus will still hold if the run that made it dies.
+    #
+    # `queue_from_task=True` for `confirm-identity-link`'s reason, arrived at
+    # from the other side. There is one desk today — `order-desk`, bound to the
+    # controller alone, because releasing revenue is a different authority from
+    # deciding who the customer is — and pinning it here would be right until
+    # the second class of disagreement arrives with a second desk behind it.
+    # Taking the desk off the Task keeps the queue that raised the work and the
+    # queue that may commit it the same queue by construction, which is the bug
+    # the identity link had to be fixed for.
+    #
+    # `decision`, emphatically: a human approved this, and the whole two-regime
+    # split in `order_release.py` exists so that the *observation* of what the
+    # ERP then held is a separate Action with a separate ledger entry. Cumulus
+    # never writes an authority claim it did not read back.
+    Action(id="release-sales-order", target="sales-records",
+           queue_from_task=True),
 )}
 
 

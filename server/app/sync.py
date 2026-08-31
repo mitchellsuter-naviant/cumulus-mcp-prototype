@@ -35,7 +35,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -56,6 +56,7 @@ from .graph import (
 from . import disagreement_sweep, identity_sweep
 from .disagreement_sweep import (
     DISAGREEMENT_SWEEP_FLOW_ID,
+    ORDER_DESK_QUEUE,
     STATE_WINDOW_EVENT,
 )
 from .identity_sweep import (
@@ -75,6 +76,16 @@ from .resolution import (
 )
 from .runs import RunContext, RunEngine
 from .tasks import Task, TaskEvidence, TaskProposal, TaskService
+
+if TYPE_CHECKING:  # pragma: no cover — the estate reads *this* module's shapes
+    # Type-only, and it has to be: `estate_writes` imports `estate`, which
+    # imports this module for its wire shapes, so a runtime import here would
+    # close the loop. The dependency is real and one-directional anyway —
+    # `deliver` wants the write *journal*, and `_settle_echoes` reaches for it
+    # where it is used. Nothing on this side of the plane calls `apply`, and
+    # `pull_all` runs on a timer above it: that is the property `estate_writes`
+    # exists as a sibling to protect.
+    from .estate_writes import EstateWriter
 
 log = logging.getLogger("cumulus.sync")
 
@@ -826,11 +837,18 @@ class SyncService:
         engine: RunEngine | None = None,
         gateway: ActionGateway | None = None,
         dispatcher: Dispatcher | None = None,
+        estate_writer: "EstateWriter | None" = None,
     ) -> None:
         self.graph = graph
         self.knowledge = knowledge
         self.tasks = tasks
         self.engine = engine
+        #: The outbound plane, or None where nothing is wired to write. The
+        #: read side has never needed it and still does not; what `deliver`
+        #: needs is the *journal*, to recognize a row it is about to land as
+        #: something this system asked for. None is a working deployment — an
+        #: estate Cumulus only reads — and every path here treats it as one.
+        self.estate_writer = estate_writer
         # Never None — see the note in payables.py. Every write in this module
         # goes through the Gateway, including the ones no human authorized.
         self.gateway = gateway or ActionGateway(
@@ -867,6 +885,13 @@ class SyncService:
             # what the identity sweep has confirmed is what this one is allowed
             # to join across. Registered beside it for the same reason.
             disagreement_sweep.register(self)
+            # And the answer to what that one finds — the only flow on this
+            # engine that writes to a system Cumulus does not own. Deferred
+            # like the feed modules above, and for the same reason: it imports
+            # this one for the status vocabulary the ERP's strings land in.
+            from . import order_release
+
+            order_release.register(self)
 
     def _act(self, ctx: RunContext, action_id: str, step_id: str) -> PendingAction:
         """A sync write, committed by the Flow that is running.
@@ -898,6 +923,13 @@ class SyncService:
         """
         if self.engine is None or self.dispatcher is None:
             raise RuntimeError("Sync service has no run engine wired")
+        # Before the plan loop, because the question it answers is about the
+        # rows as delivered rather than about anything a flow did with them,
+        # and because a divergence has to be noticed even on a delivery whose
+        # flow later fails. No feed opts into this and none can: recognizing
+        # our own change coming home is a property of the delivery, not of the
+        # flow that lands it.
+        echoes = self._settle_echoes(request)
         outcomes: list[dict] = []
         plan: list[tuple[str, list[Any]]] = [
             (VENDOR_EVENT, request.vendors),
@@ -1019,6 +1051,7 @@ class SyncService:
                         "flow_id": existing.flow_id, "run_id": run_id,
                         "status": existing.status, "replayed": True,
                         **(existing.outputs or {}),
+                        **echoes.get(event, {}),
                     })
                     continue
             record = self.dispatcher.emit(
@@ -1029,6 +1062,11 @@ class SyncService:
                 "flow_id": record.flow_id, "run_id": record.id,
                 "status": record.status, "replayed": False,
                 **(record.outputs or {}),
+                # After the outputs, deliberately: the echo counts are facts
+                # about this delivery and not about the run, and a feed that
+                # ever grows a key of the same name should not be able to
+                # overwrite the write plane's account of itself.
+                **echoes.get(event, {}),
             })
         return outcomes
 
@@ -2009,6 +2047,154 @@ class SyncService:
             landed += 1
         return {"landed": landed, "unchanged": unchanged}
 
+    # -- the echo ----------------------------------------------------------
+    #
+    # Two facts that look identical on the wire and mean opposite things, which
+    # is why the second one gets its own pass rather than another counter in
+    # `_land`:
+    #
+    #   `unchanged` above  — the source re-delivered a row we already hold,
+    #                        byte for byte. Nothing happened anywhere. It is
+    #                        noise about the *feed*, and suppressing it costs
+    #                        nothing because there was never anything to learn.
+    #   an echo down here  — the source delivered a row that is different
+    #                        because *Cumulus changed it*, and the estate is
+    #                        now telling us so. Something happened, we caused
+    #                        it, and the row landing is the confirmation. It is
+    #                        evidence about the *write*, and suppressing it
+    #                        would throw away the only proof the write took.
+    #
+    # The graph needs no suppression for it — `order_release.s1` already landed
+    # an `erp:` claim identical to the one the feed is about to write, so the
+    # upsert dedupes and the revision does not move. What needs recognizing is
+    # the reporting: an operator asking "did that release actually take" is
+    # asking about this pass, and a write that never comes home is the question
+    # nobody would otherwise think to ask.
+
+    #: How many deliveries of a row's own feed may arrive without carrying it
+    #: home before the write is called `unechoed`. Three rather than one: the
+    #: estate's deltas are watermarked, and a pull that raced the write's own
+    #: `updatedAt` legitimately misses it once.
+    ECHO_PATIENCE = 3
+
+    #: One row per writable target: (target, the event its feed arrives under,
+    #: the list on the request that carries it, the field on that wire shape).
+    #: A table for `WRITABLE`'s reason and kept beside the delivery rather than
+    #: beside the writer: which wire shape a resource arrives in is this
+    #: module's fact, and `estate_writes.py` is a sibling that must not learn
+    #: it. A test holds every target here to one in `WRITABLE`, so a write
+    #: nobody could ever confirm is a failure rather than a silence.
+    ECHO_SHAPES: tuple[tuple[str, str, str, str], ...] = (
+        ("sales-order-status", SALES_EVENT, "sales_orders", "status"),
+    )
+
+    def _settle_echoes(self, request: "SyncRequest") -> dict[str, dict]:
+        """Walk the delivered rows against the writes still waiting to be seen.
+
+        Three endings, all of them named before this was written:
+
+        - **echoed** — the row carries the value we asked for. The write is
+          confirmed by the estate's own feed, which is a stronger statement
+          than the re-read that settled it `applied`: that was the estate
+          answering a question, this is the estate volunteering it.
+        - **diverged** — the row carries a *third* value. Somebody moved the
+          order after Cumulus did, and the thing the controller approved is no
+          longer what the ERP holds. That re-elevates the discrepancy and gets
+          a Task.
+        - **unechoed** — the feed has delivered `ECHO_PATIENCE` times and never
+          carried it. Not a Task: nothing is known to be wrong, and the honest
+          form of "we cannot confirm this" is a number on a dashboard.
+
+        Nothing here writes to an estate, and it could not: the journal is all
+        it touches on the write plane, and `pull_all` sits above it on a timer.
+        """
+        from .estate_writes import awaiting_echo
+
+        writer = self.estate_writer
+        if writer is None:
+            return {}
+        open_entries = awaiting_echo(writer.journal)
+        if not open_entries:
+            return {}
+
+        counts: dict[str, dict] = {}
+        for target, event, attribute, field in self.ECHO_SHAPES:
+            rows = list(getattr(request, attribute, None) or [])
+            if not rows:
+                # The feed that would carry the echo delivered nothing of this
+                # shape, so this delivery is not evidence either way and must
+                # not age anybody's write.
+                continue
+            by_id = {str(getattr(r, "external_id", "")): r for r in rows}
+            tally = {"echoes": 0, "diverged": 0, "unechoed": 0}
+            for entry in open_entries:
+                if entry.target != target:
+                    continue
+                row = by_id.get(entry.record_id)
+                if row is None:
+                    entry.echo_pulls += 1
+                    if entry.echo_pulls >= self.ECHO_PATIENCE:
+                        entry.state = "unechoed"
+                        tally["unechoed"] += 1
+                    writer.journal.put(entry)
+                    continue
+                found = str(getattr(row, field, "") or "")
+                if found == entry.value:
+                    entry.state = "echoed"
+                    tally["echoes"] += 1
+                else:
+                    entry.state = "diverged"
+                    entry.verified = found
+                    tally["diverged"] += 1
+                    self._raise_divergence(entry, found)
+                writer.journal.put(entry)
+            if any(tally.values()):
+                counts[event] = {k: v for k, v in tally.items() if v}
+        return counts
+
+    def _raise_divergence(self, entry, found: str) -> None:
+        """The one ending that is somebody's work.
+
+        Idempotent on the journal entry's own id, so a feed that delivers the
+        same divergent row twice asks once — and a Task somebody has already
+        answered is left exactly as they left it.
+        """
+        task_id = f"task_echo_{entry.id.replace(':', '_')}"
+        if self.tasks.get(task_id) is not None:
+            return
+        self.tasks.create(Task(
+            id=task_id,
+            kind="exception",
+            title=(
+                f"{entry.resource}/{entry.record_id}: the ERP no longer holds "
+                "the value you approved"
+            ),
+            summary=(
+                f"Cumulus set {entry.field} to `{entry.value}` and the ERP "
+                f"confirmed it. The feed has now delivered the same record "
+                f"holding `{found}`, so something changed it afterwards. "
+                "Nothing has been undone and nothing will be — moving it back "
+                "is a second decision. What this needs is somebody who knows "
+                "why it moved."
+            ),
+            queue=ORDER_DESK_QUEUE,
+            priority="high",
+            flow_id=entry.action,
+            run_id=entry.run_id,
+            evidence=[
+                TaskEvidence(label="Approved value", value=entry.value),
+                TaskEvidence(label="The ERP now says", value=found or "empty"),
+                TaskEvidence(label="Written by", value=entry.actor or "unknown"),
+                TaskEvidence(label="Write journal", value=entry.id),
+            ],
+            resumes="nothing resumes; this is a fact to be explained",
+            created_at_iso=utcnow().isoformat(),
+        ))
+        log.warning(
+            "An applied estate write came home holding a third value",
+            extra={"writeId": entry.id, "asked": entry.value, "found": found},
+        )
+
     # -- the steward's decision --------------------------------------------
 
     def apply_match_decision(
@@ -2288,6 +2474,22 @@ class SyncService:
             lambda w: self._assert_merge_decision(task, link, verdict, w)
         )
 
+    def apply_release_decision(
+        self, task: Task, principal: Principal | None = None
+    ) -> dict | None:
+        """The order desk's verdict on a disagreement. The third of the three.
+
+        Thin here and thick in `order_release`, deliberately: this module is
+        already the longest in the package and the outbound write plane is the
+        one part of it a reader should be able to find without scrolling past
+        the counterparty book. What lives here is the same thing that lives
+        here for the other two — the fact that this service is where a resume
+        hook goes looking.
+        """
+        from . import order_release
+
+        return order_release.apply_release_decision(self, task, principal)
+
     def _assert_merge_decision(
         self, task: Task, link: LinkRecord, verdict: str, graph: GraphWriter
     ) -> dict:
@@ -2474,5 +2676,8 @@ def build_sync_service(
     engine: RunEngine | None,
     gateway: ActionGateway | None = None,
     dispatcher: Dispatcher | None = None,
+    estate_writer: "EstateWriter | None" = None,
 ) -> SyncService:
-    return SyncService(graph, knowledge, tasks, engine, gateway, dispatcher)
+    return SyncService(
+        graph, knowledge, tasks, engine, gateway, dispatcher, estate_writer
+    )

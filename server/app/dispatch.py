@@ -46,6 +46,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
+from .auth import Principal
 from .models import utcnow
 from .runs import RunEngine, RunRecord
 
@@ -168,6 +169,15 @@ TRIGGERS: dict[str, Trigger] = {t.id: t for t in (
             starts="answer-question"),
     Trigger(id="hr-question-asked", event="HrQuestionAsked",
             starts="answer-question"),
+    # And the answer to what that sweep found — per *case*, unlike the pass
+    # that produced it, because a controller approves one order at a time and
+    # the thing that happens next reaches into their ERP. The sweep does not
+    # suspend waiting for this: it raises Tasks and finishes, and a decision
+    # days later starts an independent run whose case is the finding. That
+    # separation is why the release can re-read the world for itself rather
+    # than acting on a state somebody looked at last Tuesday.
+    Trigger(id="order-release-approved", event="OrderReleaseApproved",
+            starts="order-release"),
 )}
 
 #: The trigger index. The doctrine keeps it in a fast key-value store for O(1)
@@ -300,7 +310,8 @@ class Dispatcher:
 
     def emit(
         self, name: str, inputs: dict | None = None, *, actor: str = "",
-        run_id: str | None = None,
+        run_id: str | None = None, case_ref: str = "",
+        principal: Principal | None = None,
     ) -> Dispatch:
         """Record the fact, then start what its Triggers name — in that order.
 
@@ -308,6 +319,18 @@ class Dispatcher:
         Event can name them: the log says "this fact started run X" at a moment
         when run X does not exist, which is the ordering the doctrine asks for
         and the one the previous design had backwards.
+
+        `case_ref` fills a field `Event` has always declared and nothing on this
+        path had ever set. A windowed fact has no case and leaves it empty; a
+        per-case one — an approval on one order — names the thing it is about,
+        and that name reaches the run, its steps and every ledger entry they
+        commit. Without it an auditor joining a PATCH back to the finding that
+        justified it has only the run id, which says when but not what.
+
+        `principal` is the human whose judgment released the gate, carried for
+        `tasks_api`'s reason: the Gateway checks who is committing *at the
+        write*, so a decision that arrives here without its decider commits as
+        the Flow's own — accurate for a timer, a lie for an approval.
         """
         inputs = inputs or {}
         matched = _BY_EVENT.get(name, [])
@@ -322,7 +345,7 @@ class Dispatcher:
         event = self.events.append(Event(
             id=f"evt_{secrets.token_hex(5)}",
             name=name, at_iso=utcnow().isoformat(), actor=actor,
-            payload=_facts(inputs),
+            case_ref=case_ref, payload=_facts(inputs),
             triggers=[t.id for t in matched], starts=ids,
         ))
         if not matched:
@@ -334,7 +357,7 @@ class Dispatcher:
         runs = [
             self.engine.start(
                 trigger.starts, inputs, actor=actor, run_id=rid,
-                caused_by=event.id,
+                caused_by=event.id, case_ref=case_ref, principal=principal,
             )
             for trigger, rid in zip(matched, ids)
         ]
