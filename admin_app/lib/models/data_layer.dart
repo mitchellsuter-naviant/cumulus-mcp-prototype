@@ -241,13 +241,28 @@ class PullState {
 
   bool get failed => lastOutcome == 'failed' || lastError.isNotEmpty;
 
-  /// The furthest point any of this feed's cursors has reached — what the next
-  /// pull will ask the estate for. The largest, not the first: the resources
-  /// advance independently and the row states one number.
+  /// The furthest point any of this feed's cursors has reached. The largest,
+  /// not the first, and **not** what the next pull will ask the estate for:
+  /// each resource is asked from its own cursor, so on a multi-resource feed
+  /// this is a summary and never a promise. [orderedWatermarks] is what the
+  /// row prints when there is more than one.
   String get watermark {
     if (watermarks.isEmpty) return '';
     return watermarks.values.reduce((a, b) => a.compareTo(b) >= 0 ? a : b);
   }
+
+  /// Each resource with its own cursor, in the order the feed delivers them —
+  /// which is the order the pull asks for them in, and the order the row
+  /// already names the resources in.
+  List<(String, String)> get orderedWatermarks => [
+    for (final resource in resources)
+      if (watermarks.containsKey(resource)) (resource, watermarks[resource]!),
+    // Anything the connector holds a cursor for that the registry no longer
+    // lists is still a real position, and hiding it would make a stale cursor
+    // invisible exactly when somebody is looking for one.
+    for (final entry in watermarks.entries)
+      if (!resources.contains(entry.key)) (entry.key, entry.value),
+  ];
 
   factory PullState.fromJson(Map<String, dynamic> json) => PullState(
     active: json['active'] as bool? ?? false,
@@ -375,11 +390,26 @@ class SourceFeed {
   final String lastError;
   final String watermark;
   final int deliveries;
+
+  /// Rows the delivery carried, before anything decided what to keep.
+  ///
+  /// Kept apart from [recordsLanded] because they are two facts and one word
+  /// was doing both jobs: a bind feed lands everything it is handed, and a
+  /// reify feed lands a fraction — the PSA delivery carries 374 rows and keeps
+  /// 13 of them as landing records.
+  final int records;
+
   final int recordsLanded;
-  final int linked;
-  final int created;
+
+  /// Null — never zero — when this feed's contract does not report the
+  /// disposition. A bind mapping has no resolve step to link or mint with and
+  /// no payload hash to suppress a redelivery by, so "0 minted · 0 linked"
+  /// over 145 landed rows was a confident answer to a question nobody asked.
+  final int? linked;
+  final int? created;
+  final int? unchanged;
+
   final int awaitingSteward;
-  final int unchanged;
 
   /// Null when no Mapping claims this feed — rows arriving under no declared
   /// contract, which is exactly the finding the screen is for.
@@ -404,6 +434,7 @@ class SourceFeed {
     required this.lastError,
     required this.watermark,
     required this.deliveries,
+    this.records = 0,
     required this.recordsLanded,
     required this.linked,
     required this.created,
@@ -432,11 +463,14 @@ class SourceFeed {
     lastError: json['last_error'] as String? ?? '',
     watermark: json['watermark'] as String? ?? '',
     deliveries: json['deliveries'] as int? ?? 0,
+    records: json['records'] as int? ?? 0,
     recordsLanded: json['records_landed'] as int? ?? 0,
-    linked: json['linked'] as int? ?? 0,
-    created: json['created'] as int? ?? 0,
+    // Absent stays absent: `as int?` on a missing key is null, which is the
+    // whole point of the field being nullable on the wire.
+    linked: json['linked'] as int?,
+    created: json['created'] as int?,
     awaitingSteward: json['awaiting_steward'] as int? ?? 0,
-    unchanged: json['unchanged'] as int? ?? 0,
+    unchanged: json['unchanged'] as int?,
     contract: json['contract'] == null
         ? null
         : SourceContract.fromJson(json['contract'] as Map<String, dynamic>),

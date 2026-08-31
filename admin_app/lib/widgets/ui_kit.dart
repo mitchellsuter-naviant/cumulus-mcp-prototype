@@ -1004,11 +1004,27 @@ class UsageBar extends StatelessWidget {
 }
 
 /// `1.2K` / `3.4M` — counts read as magnitudes rather than digits.
+///
+/// For a number somebody might reconcile against a list, use [groupedCount]:
+/// `1.5K` cannot be checked against anything, and a governance screen whose
+/// whole rule is "every number is answerable by a list somewhere else" has to
+/// print the number that list would add up to.
 String compactCount(int n) => n >= 1000000
     ? '${(n / 1000000).toStringAsFixed(1)}M'
     : n >= 1000
     ? '${(n / 1000).toStringAsFixed(1)}K'
     : '$n';
+
+/// `1,543` — the exact count, grouped so it can still be read at a glance.
+String groupedCount(int n) {
+  final digits = n.abs().toString();
+  final buffer = StringBuffer(n < 0 ? '-' : '');
+  for (var i = 0; i < digits.length; i++) {
+    if (i > 0 && (digits.length - i) % 3 == 0) buffer.write(',');
+    buffer.write(digits[i]);
+  }
+  return buffer.toString();
+}
 
 /// `just now` / `12m ago` / `6h ago` / `3d ago` / `4mo ago`.
 /// Run timestamps cross the wire as ISO strings, never parsed dates — the
@@ -1025,4 +1041,28 @@ String agoLabel(DateTime when) {
   if (diff.inDays < 1) return '${diff.inHours}h ago';
   if (diff.inDays < 30) return '${diff.inDays}d ago';
   return '${(diff.inDays / 30).floor()}mo ago';
+}
+
+/// `in 14m` — the forward half of [agoLabel], for a time that has not happened.
+///
+/// Its own function rather than a sign flip inside `agoLabel`, because the two
+/// read as opposite claims: a scheduled next pull rendered through `agoLabel`
+/// came out as "next just now" and, once the clock passed it, "next 3m ago" —
+/// a future stated as a past. `due now` is the honest reading of a moment that
+/// has arrived; anything further behind is overdue and says so.
+String untilLabel(DateTime when) {
+  final diff = when.difference(DateTime.now());
+  if (diff.isNegative) {
+    final late = diff.abs();
+    return late.inMinutes < 1 ? 'due now' : 'overdue by ${_span(late)}';
+  }
+  if (diff.inMinutes < 1) return 'in under a minute';
+  return 'in ${_span(diff)}';
+}
+
+String _span(Duration d) {
+  if (d.inHours < 1) return '${d.inMinutes}m';
+  if (d.inDays < 1) return '${d.inHours}h';
+  if (d.inDays < 30) return '${d.inDays}d';
+  return '${(d.inDays / 30).floor()}mo';
 }

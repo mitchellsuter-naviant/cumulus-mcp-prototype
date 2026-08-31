@@ -252,7 +252,11 @@ class ApiClient {
   /// Returned as the two shapes the screen already holds rather than a third
   /// model: a [LibraryRow] would be an [AssetSummary] and an [AssetUsage] with
   /// a new name, and a name is a concept someone has to learn.
-  Future<({List<AssetSummary> assets, Map<String, AssetUsage> usage})>
+  ///
+  /// `days` comes back beside them because the screen states the window in
+  /// prose — "no reads recorded in 30d" — and a literal there is a caption
+  /// that keeps its number when the request changes its mind.
+  Future<({List<AssetSummary> assets, Map<String, AssetUsage> usage, int days})>
   libraryScreen({int days = 30}) async {
     final resp = await _send(
       _http.get(
@@ -265,6 +269,7 @@ class ApiClient {
     final rows = (body['assets'] as List<dynamic>? ?? const [])
         .cast<Map<String, dynamic>>();
     return (
+      days: body['days'] as int? ?? days,
       assets: [
         for (final row in rows)
           AssetSummary(

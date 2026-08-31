@@ -36,17 +36,22 @@ import 'flows_screen.dart';
 /// your queue, the workspaces you work in. The rest are the platform: the
 /// knowledge layer first, because everything else is either written into it
 /// (Flows) or governs who may touch it (Identities).
-const int _homeIndex = 0;
-const int _calendarIndex = 1;
-const int _tasksIndex = 2;
-const int _expenseWorkspaceIndex = 3;
-const int _payablesWorkspaceIndex = 4;
-const int _identityWorkspaceIndex = 5;
-const int _systemStateIndex = 6;
-const int _knowledgeIndex = 7;
-const int _flowsIndex = 8;
-const int _identitiesIndex = 9;
-const int _employeeHubIndex = 10;
+/// Read from `command_palette.dart`, which is the one place they are declared.
+/// They used to be declared here *and* copied there, and the copy drifted:
+/// three of the palette's entries still pointed where those sections had been
+/// before a reorder. The palette owns `OpenSectionIntent`, so the vocabulary
+/// that intent speaks lives beside it.
+const int _homeIndex = homeIndex;
+const int _calendarIndex = calendarIndex;
+const int _tasksIndex = tasksIndex;
+const int _expenseWorkspaceIndex = expenseWorkspaceIndex;
+const int _payablesWorkspaceIndex = payablesWorkspaceIndex;
+const int _identityWorkspaceIndex = identityWorkspaceIndex;
+const int _systemStateIndex = systemStateIndex;
+const int _knowledgeIndex = knowledgeIndex;
+const int _flowsIndex = flowsIndex;
+const int _identitiesIndex = identitiesIndex;
+const int _employeeHubIndex = employeeHubIndex;
 
 /// The Library's tab index inside the Knowledge layer section. Named because
 /// the palette navigates to it and a bare `1` would not survive a reorder.
@@ -76,6 +81,30 @@ List<RailDestination> _destinations(int openTasks, Session? session) {
   // this on the session because the rule is its own (`may_open_identity`), and
   // deriving it here would mean a copy of the queue names in Dart.
   final curatesIdentity = session == null || session.mayOpenIdentity;
+  final workspaces = <RailChild>[
+    if (ownsWorkspace(session, expenseQueue))
+      const RailChild(
+        label: 'Expense Reimbursement',
+        detail: 'requests, decisions, spend',
+        index: _expenseWorkspaceIndex,
+      ),
+    if (ownsWorkspace(session, payablesQueue))
+      const RailChild(
+        label: 'Accounts Payable',
+        detail: 'invoices, matching, posting',
+        index: _payablesWorkspaceIndex,
+      ),
+    // Named for what it holds rather than "Identity", which this rail already
+    // spends on the roster of people who may sign in. These are
+    // counterparties: the companies, vendors and contacts the estate keeps
+    // more than one row about.
+    if (curatesIdentity)
+      const RailChild(
+        label: 'Counterparty identity',
+        detail: 'proposed merges, evidence, decisions',
+        index: _identityWorkspaceIndex,
+      ),
+  ];
   return [
     const RailDestination(
       icon: Icons.home_outlined,
@@ -97,32 +126,16 @@ List<RailDestination> _destinations(int openTasks, Session? session) {
     // not a plane of the map. They hung off the Knowledge layer's Data tab
     // once, which put a business surface inside the governance surface; the
     // dropdown is where they belong.
-    RailDestination(
-      icon: Icons.grid_view_outlined,
-      label: 'Workspaces',
-      children: [
-        const RailChild(
-          label: 'Expense Reimbursement',
-          detail: 'requests, decisions, spend',
-          index: _expenseWorkspaceIndex,
-        ),
-        const RailChild(
-          label: 'Accounts Payable',
-          detail: 'invoices, matching, posting',
-          index: _payablesWorkspaceIndex,
-        ),
-        // Named for what it holds rather than "Identity", which this rail
-        // already spends on the roster of people who may sign in. These are
-        // counterparties: the companies, vendors and contacts the estate keeps
-        // more than one row about.
-        if (curatesIdentity)
-          const RailChild(
-            label: 'Counterparty identity',
-            detail: 'proposed merges, evidence, decisions',
-            index: _identityWorkspaceIndex,
-          ),
-      ],
-    ),
+    //
+    // A stop with no children left is dropped whole: an empty dropdown is a
+    // destination that opens onto nothing, which is the same dead end as a
+    // stop whose route can only 403.
+    if (workspaces.isNotEmpty)
+      RailDestination(
+        icon: Icons.grid_view_outlined,
+        label: 'Workspaces',
+        children: workspaces,
+      ),
     // The governance group opens on the reading of the whole deployment,
     // because every other stop in it is one of the surfaces this one counts:
     // it says which of them is worth opening this morning.
@@ -235,6 +248,20 @@ class _HomeShellState extends State<HomeShell> {
       // whoever the server already thinks you are, which is the honest
       // fallback: the alternative is a shell that will not draw.
     }
+    _publishSessionToPalette();
+  }
+
+  /// The palette offers what the rail offers.
+  ///
+  /// It used to list every governance section unconditionally, so an
+  /// own-scoped persona could jump to one the rail had correctly dropped and
+  /// land on the blank widget the shell mounts in its place.
+  ///
+  /// Set here rather than inside `build`: the catalog is a ChangeNotifier the
+  /// palette listens to, and notifying it mid-build would mark a widget dirty
+  /// while the frame it belongs to is being assembled.
+  void _publishSessionToPalette() {
+    _catalog.session = _session.session.value;
   }
 
   /// Every section is rebuilt from scratch afterwards — see [SessionController]
@@ -246,6 +273,7 @@ class _HomeShellState extends State<HomeShell> {
     } on ApiException {
       // A refused switch leaves the previous session on screen.
     }
+    _publishSessionToPalette();
     await _refreshTaskBadge();
   }
 
@@ -327,6 +355,18 @@ class _HomeShellState extends State<HomeShell> {
         !session.mayOpenIdentity) {
       return const SizedBox.shrink();
     }
+    // And the same again for the two workspaces that belong to a desk. The
+    // AP route behind this one now refuses an unbound persona outright, so
+    // leaving the section mounted through a switch would fetch a 403 and draw
+    // it as an outage.
+    if (index == _expenseWorkspaceIndex &&
+        !ownsWorkspace(session, expenseQueue)) {
+      return const SizedBox.shrink();
+    }
+    if (index == _payablesWorkspaceIndex &&
+        !ownsWorkspace(session, payablesQueue)) {
+      return const SizedBox.shrink();
+    }
     return build();
   }
 
@@ -378,17 +418,21 @@ class _HomeShellState extends State<HomeShell> {
           _lazy(_calendarIndex, () => CalendarSection(api: _api), session),
           _lazy(
             _tasksIndex,
-            () => TasksSection(api: _api, onQueueChanged: _refreshTaskBadge),
+            () => TasksSection(
+              api: _api,
+              session: session,
+              onQueueChanged: _refreshTaskBadge,
+            ),
             session,
           ),
           _lazy(
             _expenseWorkspaceIndex,
-            () => ReimbursementsView(api: _api),
+            () => ReimbursementsView(api: _api, session: session),
             session,
           ),
           _lazy(
             _payablesWorkspaceIndex,
-            () => PayablesView(api: _api),
+            () => PayablesView(api: _api, session: session),
             session,
           ),
           _lazy(
@@ -618,10 +662,12 @@ class _NotYours extends StatelessWidget {
         child: CumulusEmptyState(
           icon: Icons.lock_outline,
           title: 'This is not scoped to you',
+          // Second person, and never "this persona" — the persona is what you
+          // are here, not a third party the screen is discussing.
           message:
-              'The Knowledge layer describes the whole map — every object '
-              'type, the whole corpus, every inbound feed. This persona reads '
-              'its own work, so there is nothing here for it rather than '
+              'The Knowledge layer is the whole map: every object type, the '
+              'whole governed corpus, every inbound feed. Your access is to '
+              'your own work, so there is nothing here for you rather than '
               'something withheld. Your queues are on Home and My Tasks.',
         ),
       ),

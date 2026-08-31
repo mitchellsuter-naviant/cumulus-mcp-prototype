@@ -58,14 +58,123 @@ void main() {
 
       expect(find.text('· pulled 3m ago'), findsOneWidget);
       expect(find.text('· delivered'), findsOneWidget);
-      // One cursor is shown and it is the furthest of the three: the
-      // resources advance independently, and the next pull asks from the last
-      // point every one of them has passed.
+      // One cursor per resource, because they advance independently and the
+      // next pull asks each route from its own. Collapsing them to the
+      // furthest stated a position two of the three have not reached — and
+      // then the Sync now caption promised to read from it.
       expect(
-        find.text('· cursor 2026-08-29T20:42:09.970713+00:00'),
+        find.text('· employees up to 2026-08-29T20:42:09.970713+00:00 (UTC)'),
         findsOneWidget,
       );
-      expect(find.text('since 2026-08-29 20:42'), findsOneWidget);
+      expect(
+        find.text('· jobs up to 2026-08-16T22:16:21.929959+00:00 (UTC)'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('· departments up to 2026-08-16T22:16:24.438947+00:00 (UTC)'),
+        findsOneWidget,
+      );
+      expect(find.text('each route since its own cursor'), findsOneWidget);
+    });
+
+    testWidgets('a single-resource feed still states one cursor, in UTC',
+        (tester) async {
+      await _pump(tester, SourceFeedRow(
+        feed: _feed(
+          deliveries: 1,
+          recordsLanded: 14,
+          lastStatus: 'succeeded',
+          pull: _pull(
+            lastPullAt: DateTime.now().toIso8601String(),
+            lastOutcome: 'delivered',
+            watermarks: const {
+              'vendors': '2026-08-29T20:42:09.970713+00:00',
+            },
+          ),
+        ),
+        onSyncNow: () {},
+      ));
+
+      expect(
+        find.text('· cursor 2026-08-29T20:42:09.970713+00:00 (UTC)'),
+        findsOneWidget,
+      );
+      // Trimming for the caption is what dropped the offset, so the short form
+      // says which zone it is in — a reader in Madison had every reason to
+      // read `2026-08-29 20:42` as local.
+      expect(find.text('since 2026-08-29 20:42 UTC'), findsOneWidget);
+    });
+
+    testWidgets('a scheduled next pull is stated in the tense it is in',
+        (tester) async {
+      await _pump(tester, SourceFeedRow(
+        feed: _feed(
+          deliveries: 1,
+          recordsLanded: 3,
+          lastStatus: 'succeeded',
+          pull: _pull(
+            lastPullAt: DateTime.now().toIso8601String(),
+            lastOutcome: 'delivered',
+            nextPullAt: DateTime.now()
+                .add(const Duration(minutes: 14, seconds: 30))
+                .toIso8601String(),
+          ),
+        ),
+        onSyncNow: () {},
+      ));
+
+      // `agoLabel` rendered this as "next just now" and, once the clock passed
+      // it, "next 3m ago" — a future stated as a past.
+      expect(find.text('· next pull in 14m'), findsOneWidget);
+    });
+
+    testWidgets('a bind feed reports no disposition rather than three zeros',
+        (tester) async {
+      await _pump(tester, SourceFeedRow(
+        feed: _feed(
+          deliveries: 1,
+          records: 145,
+          recordsLanded: 145,
+          lastStatus: 'succeeded',
+        ),
+        onSyncNow: () {},
+      ));
+
+      expect(
+        find.text(
+          '1 delivery(s) · 145 received · 145 newly landed · '
+          'disposition not reported by this mapping',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a reify feed keeps a fraction of what it carries, and says '
+        'both numbers', (tester) async {
+      await _pump(tester, SourceFeedRow(
+        feed: _feed(
+          source: 'psa-book',
+          deliveries: 1,
+          records: 374,
+          recordsLanded: 13,
+          created: 6,
+          linked: 1,
+          unchanged: 0,
+          lastStatus: 'succeeded',
+        ),
+        onSyncNow: () {},
+      ));
+
+      // `landed` means new landing records here and every bound row on a bind
+      // feed, so one number could not mean the same thing twice.
+      expect(
+        find.text(
+          '1 delivery(s) · 374 received · 13 newly landed · '
+          '0 unchanged (byte-identical redelivery) · '
+          '1 linked to an existing entity · 6 minted',
+        ),
+        findsOneWidget,
+      );
     });
 
     testWidgets('a failed pull prints what the estate said, verbatim',
@@ -129,11 +238,44 @@ void main() {
       ));
 
       // The delta, not a second total: the row under it says 17 landed, and
-      // this pull is what put them there.
+      // this pull is what put them there. No "0 unchanged": this feed runs no
+      // hash check, so there is no such count to take a delta of.
       expect(
         find.text(
           'Pulled 22 record(s) (7 departments · 5 jobs · 10 employees) '
-          '· 17 landed, 0 unchanged',
+          '· 17 newly landed',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a feed that does suppress redeliveries reports the delta',
+        (tester) async {
+      await _pump(tester, SourceFeedRow(
+        feed: _feed(source: 'erp-vendors', recordsLanded: 14, deliveries: 1),
+        note: SyncNote.of(
+          SyncNowOutcome(
+            source: 'erp-vendors',
+            outcome: 'delivered',
+            pulled: const {'vendors': 14},
+            delivered: 14,
+            chunks: 1,
+            error: '',
+            row: _feed(
+              source: 'erp-vendors',
+              recordsLanded: 14,
+              unchanged: 2,
+              deliveries: 1,
+            ),
+          ),
+          _feed(source: 'erp-vendors', unchanged: 0),
+        ),
+        onSyncNow: () {},
+      ));
+
+      expect(
+        find.text(
+          'Pulled 14 record(s) (14 vendors) · 14 newly landed, 2 unchanged',
         ),
         findsOneWidget,
       );
@@ -255,7 +397,20 @@ void main() {
         find.text('5 apps · crm, erp, office, hris, dms'),
         findsOneWidget,
       );
-      expect(find.text('pulse on · low'), findsOneWidget);
+      // "pulse on · low" and "3 processes running" both read as operational
+      // health. What they say is that everything arriving from this estate is
+      // fabricated on a timer, and the pill has to lead with that.
+      expect(
+        find.text(
+          'simulated estate · 3 process scripts · synthetic activity: low',
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('3 processes running'), findsNothing);
+      // A fact about this process, not about the customer's system: it is
+      // `bool(ESTATE_API_KEY)`, and "unauthenticated estate" described the
+      // estate as open to the world.
+      expect(find.text('no credential configured'), findsOneWidget);
       // No warm component of our own: absent a loop, the cadence belongs to
       // whatever is doing the calling.
       expect(
@@ -339,8 +494,14 @@ SourceFeed _feed({
   String lastRunAtIso = '',
   String lastStatus = '',
   int deliveries = 0,
+  int? records,
   int recordsLanded = 0,
-  int unchanged = 0,
+  // Null by default, because `hris-workforce` is a bind feed and a bind feed
+  // never reports a disposition. Passing zeros here is exactly the coercion
+  // the wire stopped doing.
+  int? unchanged,
+  int? linked,
+  int? created,
   int awaitingSteward = 0,
   PullState? pull,
 }) => SourceFeed(
@@ -353,9 +514,10 @@ SourceFeed _feed({
   lastError: '',
   watermark: '',
   deliveries: deliveries,
+  records: records ?? recordsLanded,
   recordsLanded: recordsLanded,
-  linked: 0,
-  created: 0,
+  linked: linked,
+  created: created,
   awaitingSteward: awaitingSteward,
   unchanged: unchanged,
   contract: null,

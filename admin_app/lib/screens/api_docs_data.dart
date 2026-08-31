@@ -18,6 +18,13 @@ class ApiAuth {
   const ApiAuth(this.label, {this.keysRefused = false});
 
   static const reader = ApiAuth('user+');
+
+  /// Enumerating the whole deployment: the corpus, the taxonomy, the access
+  /// map. A rung on the write ladder cannot express it — the axis is read
+  /// reach, and only `own` is confined — so it is its own label rather than
+  /// `user+` with a caveat in the notes. Reading a *named* asset or team stays
+  /// `user+`: that is how an own-scoped screen renders the clause a run cited.
+  static const beyondSelf = ApiAuth('user+, reading past your own work');
   static const admin = ApiAuth('admin+');
   static const owner = ApiAuth('owner');
   static const open = ApiAuth('open');
@@ -122,11 +129,13 @@ const knowledgeGroup = EndpointGroup(
       method: 'GET',
       path: '/api/v1/assets',
       summary: 'List assets as summaries, without their content.',
-      auth: ApiAuth.reader,
+      auth: ApiAuth.beyondSelf,
       notes:
-          'Returns every match with no pagination, so filter with `prefix` on '
-          'a large corpus rather than listing everything and filtering client '
-          'side.',
+          'Browsing the corpus is a governance read: a principal scoped to '
+          'its own work is refused here and may still fetch any document it '
+          'can name. Returns every match with no pagination, so filter with '
+          '`prefix` on a large corpus rather than listing everything and '
+          'filtering client side.',
       params: [
         ApiParam('prefix', 'string', where: 'query',
             description:
@@ -147,8 +156,11 @@ const knowledgeGroup = EndpointGroup(
       method: 'GET',
       path: '/api/v1/assets/tree',
       summary: 'The taxonomy as a nested tree, for browsing.',
-      auth: ApiAuth.reader,
-      notes: 'Includes drafts — it is a navigation aid, not a published view.',
+      auth: ApiAuth.beyondSelf,
+      notes:
+          'The whole corpus in one shape, so it is gated like the list beside '
+          'it. Includes drafts — it is a navigation aid, not a published '
+          'view.',
       responseExample: '''{
   "name": "",
   "assets": [],
@@ -579,10 +591,13 @@ const teamsGroup = EndpointGroup(
       method: 'GET',
       path: '/api/v1/teams',
       summary: 'List teams.',
-      auth: ApiAuth.reader,
+      auth: ApiAuth.beyondSelf,
       notes:
-          'For a team you are not on and are not a platform admin of, '
-          '`members` comes back empty and `my_team_role` null, while '
+          'The roster is the deployment\'s access map, so enumerating it '
+          'needs read reach past your own work; `GET /api/v1/teams/{slug}` '
+          'stays open, because an asset naming its owning team has to resolve '
+          'somewhere. For a team you are not on and are not a platform admin '
+          'of, `members` comes back empty and `my_team_role` null, while '
           '`member_count` still reports the real size.',
       responseExample: '''[{
   "slug": "finance", "name": "Finance", "description": "",

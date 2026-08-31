@@ -810,7 +810,13 @@ def test_sync_now_refuses_a_persona_that_reads_only_its_own_work(estate_client):
         headers=_as("customer-user:ae"),
     )
     assert refused.status_code == 403
-    assert "reads only its own" in refused.json()["detail"]
+    # The sentence names *this* surface and addresses the reader directly. One
+    # rule, four screens, four nouns: a person who opened Sources and was told
+    # "this describes the whole map" was answered about something else.
+    assert refused.json()["detail"] == (
+        "The source registry covers the whole deployment. Your access is to "
+        "your own work."
+    )
 
 
 def test_sync_now_of_a_feed_the_registry_does_not_hold_is_a_404(estate_client):
@@ -855,7 +861,7 @@ def test_the_console_sync_now_gates_where_the_machine_route_gates():
 
     console = inspect.signature(ui_api.sync_source_now)
     assert console.parameters["principal"].default.dependency is (
-        ui_api.get_knowledge_principal
+        ui_api.get_sources_principal
     )
     machine = inspect.getsource(estate_api.sync_now)
     assert 'require_role(principal, "admin")' in machine
@@ -878,16 +884,22 @@ def test_only_platform_scope_sees_the_mapping_registry_problems(client):
 def test_the_knowledge_routes_inherit_the_console_door():
     """The no-keys rule is inherited, never restated.
 
-    `get_knowledge_principal` depends on `get_ui_principal` rather than
-    re-deriving the check, so a machine credential is refused at the same door
-    as every other console route and there is one place for that rule to live.
+    Every door `governance_door` builds depends on `get_ui_principal` rather
+    than re-deriving the check, so a machine credential is refused at the same
+    door as every other console route and there is one place for that rule to
+    live. The *sentence* differs per surface and the *rule* does not, which is
+    the whole point of the factory.
     """
-    gate = inspect.signature(ui_api.get_knowledge_principal)
-    assert gate.parameters["principal"].default.dependency is get_ui_principal
-
-    for route in (ui_api.ontology, ui_api.sources, ui_api.library):
+    doors = {
+        ui_api.ontology: ui_api.get_ontology_principal,
+        ui_api.sources: ui_api.get_sources_principal,
+        ui_api.library: ui_api.get_library_principal,
+    }
+    for route, door in doors.items():
         depends = inspect.signature(route).parameters["principal"].default
-        assert depends.dependency is ui_api.get_knowledge_principal, route.__name__
+        assert depends.dependency is door, route.__name__
+        gate = inspect.signature(door)
+        assert gate.parameters["principal"].default.dependency is get_ui_principal
 
     machine = Principal(
         uid="svc-1", email="svc@machine", role="owner", key_id="k_1"
@@ -895,3 +907,29 @@ def test_the_knowledge_routes_inherit_the_console_door():
     with pytest.raises(HTTPException) as refused:
         get_ui_principal(machine)
     assert refused.value.status_code == 403
+
+
+def test_each_governance_surface_refuses_in_its_own_words():
+    """Four screens, four nouns, second person, and never the word *persona*.
+
+    A refusal is the only thing the refused reader sees, so one sentence for
+    four screens can only ever name a generality: somebody who opened Sources
+    used to be told that "this describes the whole map", which is an answer to
+    a question they did not ask.
+    """
+    own = Principal(uid="u", email="u@x", role="user", scope="own")
+    seen: set[str] = set()
+    for door in (
+        ui_api.get_ontology_principal,
+        ui_api.get_library_principal,
+        ui_api.get_sources_principal,
+        ui_api.get_dashboard_principal,
+    ):
+        with pytest.raises(HTTPException) as refused:
+            door(own)
+        detail = refused.value.detail
+        assert refused.value.status_code == 403
+        assert detail.endswith("Your access is to your own work.")
+        assert "persona" not in detail.lower()
+        seen.add(detail)
+    assert len(seen) == 4

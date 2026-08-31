@@ -52,6 +52,23 @@ class _AssetsSectionState extends State<AssetsSection> {
 
   List<AssetSummary> _assets = [];
   Map<String, AssetUsage> _usage = const {};
+
+  /// The whole corpus, including what this screen filters out. Kept so the
+  /// caption can name what is not here rather than leaving the reader to
+  /// wonder why 9 documents sit under a "15 assets" corpus everywhere else.
+  int _corpusTotal = 0;
+  Map<String, int> _otherKinds = const {};
+
+  /// The traffic window, echoed by the server. Held rather than written into
+  /// the caption as `30d`, which is a number that keeps itself when the
+  /// request changes its mind.
+  int _windowDays = 30;
+
+  /// When the newest document in the corpus was written. "No reads in 30d"
+  /// over a corpus four minutes old is a fact about the corpus, not about the
+  /// documents.
+  DateTime? _newest;
+
   String? _lens;
 
   /// The dead-weight lenses. Two of them, because "nobody uses this" has two
@@ -157,7 +174,26 @@ class _AssetsSectionState extends State<AssetsSection> {
         // prompts are governed alongside them; this screen shows the half
         // that argues and carries authority.
         _assets = screen.assets.where((a) => a.kind == 'document').toList();
-        _usage = screen.usage;
+        // Usage folded over the *same* set. It used to fold over all fifteen
+        // assets while the count beside it said nine, so one number described
+        // the documents and its neighbour described the corpus.
+        final shown = {for (final a in _assets) a.id};
+        _usage = {
+          for (final entry in screen.usage.entries)
+            if (shown.contains(entry.key)) entry.key: entry.value,
+        };
+        _corpusTotal = screen.assets.length;
+        _otherKinds = {};
+        for (final asset in screen.assets) {
+          if (asset.kind == 'document') continue;
+          _otherKinds[asset.kind] = (_otherKinds[asset.kind] ?? 0) + 1;
+        }
+        _windowDays = screen.days;
+        _newest = _assets.isEmpty
+            ? null
+            : _assets
+                  .map((a) => a.updatedAt)
+                  .reduce((a, b) => a.isAfter(b) ? a : b);
         _loading = false;
       });
     } catch (e) {
@@ -252,24 +288,44 @@ class _AssetsSectionState extends State<AssetsSection> {
     );
   }
 
+  /// "No reads" over a corpus younger than the window is a fact about the
+  /// corpus. Four minutes of history cannot show thirty days of traffic, and
+  /// the honest sentence says which of the two it is short of.
+  String get _trafficPill {
+    final reads = _usage.values.fold<int>(0, (sum, u) => sum + u.reads);
+    if (_hasTraffic) return '$reads reads in ${_windowDays}d';
+    final newest = _newest;
+    if (newest != null &&
+        DateTime.now().difference(newest) < Duration(days: _windowDays)) {
+      return 'no reads yet · corpus is ${agoLabel(newest).replaceAll(' ago', '')} old';
+    }
+    return 'no reads recorded in ${_windowDays}d';
+  }
+
   Widget _heading() {
     final published = _assets.where((a) => a.status == 'published').length;
-    final reads = _usage.values.fold<int>(0, (sum, u) => sum + u.reads);
     return PlaneHeader(
+      // The corpus is bigger than this screen, and the summary now names what
+      // it holds back rather than only the exports — the prompts a flow reads
+      // are governed here too, and a reader counting 15 assets elsewhere
+      // against 9 here was owed both halves.
       summary:
           'What people wrote down that agents must obey: policies, standards, '
           'guidelines and notes — the documents that argue and carry '
-          'authority. Generated exports live under Ontology.',
+          'authority. The generated schema exports and the flows\' prompts are '
+          'governed in the same corpus and are read under Ontology and Flows.',
       pills: [
-        MetaPill('${_assets.length} documents'),
+        MetaPill(
+          _otherKinds.isEmpty
+              ? '${_assets.length} documents'
+              : '${_assets.length} of $_corpusTotal assets are documents',
+        ),
         MetaPill('$published published', tone: CumulusTone.success),
         // Traffic belongs here rather than on a survey screen, because the
-        // lenses that act on it are two chips below. Stated as a plain fact
+        // lenses that act on it are two chips below. Folded over the same nine
+        // documents the count names, so the two agree. Stated as a plain fact
         // when there is none: nothing has been read is not an alarm.
-        if (!_loading)
-          MetaPill(
-            _hasTraffic ? '$reads reads in 30d' : 'no reads recorded in 30d',
-          ),
+        if (!_loading) MetaPill(_trafficPill),
       ],
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
@@ -418,15 +474,24 @@ class _AssetsSectionState extends State<AssetsSection> {
           ),
         ],
       ),
+      // The revision beside the age, because a governed document is cited at
+      // one — every ref in the console reads `knowledge:id@rev3` — and a row
+      // that showed only "updated 4m ago" left the reader no way to tell a
+      // freshly seeded first draft from a policy on its ninth edit.
       subtitle: Text(
-        '${asset.path} · updated ${agoLabel(asset.updatedAt)}'
+        '${asset.path} · rev ${asset.revision} · '
+        'updated ${agoLabel(asset.updatedAt)}'
         '${asset.owner.isEmpty ? "" : " · ${asset.owner}"}'
         '${asset.tags.isEmpty ? "" : " · ${asset.tags.join(", ")}"}',
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
       trailing: [
-        _UsagePip(usage: _usage[asset.id], known: _hasTraffic),
+        _UsagePip(
+          usage: _usage[asset.id],
+          known: _hasTraffic,
+          days: _windowDays,
+        ),
         const SizedBox(width: 8),
         StatusBadge(asset.status, tone: toneForStatus(asset.status)),
         const SizedBox(width: 8),
@@ -451,7 +516,16 @@ class _UsagePip extends StatelessWidget {
   /// dead weight merely because the metrics have not loaded.
   final bool known;
 
-  const _UsagePip({required this.usage, required this.known});
+  /// The window the server actually measured, not a literal — the tooltips
+  /// state it in prose and would otherwise keep saying "30 days" whatever was
+  /// asked for.
+  final int days;
+
+  const _UsagePip({
+    required this.usage,
+    required this.known,
+    required this.days,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -467,7 +541,7 @@ class _UsagePip extends StatelessWidget {
       return Tooltip(
         message: ignored
             ? 'Surfaced in $impressions '
-                  '${impressions == 1 ? "search" : "searches"} in 30 days and '
+                  '${impressions == 1 ? "search" : "searches"} in $days days and '
                   'never opened — it ranks for questions it does not answer'
             : 'Never surfaced in a search in 30 days — nothing can read what '
                   'search does not return',
@@ -484,7 +558,7 @@ class _UsagePip extends StatelessWidget {
       message:
           '$impressions surfaced · $reads '
           '${reads == 1 ? "read" : "reads"} · $citations '
-          '${citations == 1 ? "citation" : "citations"} in 30 days'
+          '${citations == 1 ? "citation" : "citations"} in $days days'
           '${usage?.lastUsedAt == null ? "" : " · last ${agoLabel(usage!.lastUsedAt!)}"}',
       child: Row(
         mainAxisSize: MainAxisSize.min,

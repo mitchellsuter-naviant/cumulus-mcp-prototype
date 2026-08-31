@@ -277,13 +277,18 @@ class _HomeSectionState extends State<HomeSection> {
               ],
             ),
             const SizedBox(height: 16),
+            // No receiving clause. This estate has no receiving system: the
+            // feed is registered and has never run, the book holds no
+            // ReceivingReport, and a match here pairs an invoice line with a
+            // purchase-order line and nothing else. Promising a three-way
+            // match described machinery the reader cannot go and find.
             Text(
               'Every invoice runs the same path: extract, resolve the vendor '
-              'against the master, match it three ways against the purchase '
-              'order and the receiving report, screen it against the '
-              'vendor\'s own history, then post under the governed limit or '
-              'route it to a clerk. Anything on this list stopped at that '
-              'last gate.',
+              'against the master, match the billed lines against the '
+              'purchase order — and against the receipts too, wherever a '
+              'receiving feed delivers them — screen it against the vendor\'s '
+              'own history, then post under the governed limit or route it to '
+              'a clerk. Anything on this list stopped at that last gate.',
               style: CumulusText.body,
             ),
             const SizedBox(height: 16),
@@ -321,9 +326,14 @@ class _HomeSectionState extends State<HomeSection> {
               Row(
                 children: [
                   Expanded(
+                    // `taskStats` is queue-scoped server-side, so "across
+                    // every queue" claimed a reach the number does not have —
+                    // for an own-scoped persona it is their own bindings and
+                    // nothing else.
                     child: Text(
                       '${_tasks.open} task${_tasks.open == 1 ? '' : 's'} '
-                      'across every queue are waiting on a person'
+                      'across your queues ${_tasks.open == 1 ? 'is' : 'are'} '
+                      'waiting on a person'
                       '${_tasks.highPriority > 0 ? ', ${_tasks.highPriority} '
                                 'of them high priority' : ''}.',
                       style: CumulusText.meta,

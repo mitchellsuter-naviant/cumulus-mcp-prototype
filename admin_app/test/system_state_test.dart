@@ -154,7 +154,10 @@ void main() {
         ],
       )));
 
-      expect(find.text('the book now holds Employee 8 · Team 7'), findsOneWidget);
+      // A bind mapping lands nothing of its own, so its rows *are* these
+      // types — "binds to", not "resolves against", and never a heading about
+      // landing over a book the rows never passed through.
+      expect(find.text('binds to Employee 8 · Team 7'), findsOneWidget);
       expect(
         find.text(
           'Landed 17 rows against a book holding 15: the natural key collapsed '
@@ -176,12 +179,20 @@ void main() {
         recordsLanded: 14,
         created: 14,
         landsAs: 'SourceRecord',
+        landedType:
+            const EntityCount(type: 'SourceRecord', instances: 300, feeds: 4),
         lastStatus: 'succeeded',
         entities: const [EntityCount(type: 'Vendor', instances: 13, feeds: 2)],
       )));
 
+      // Both halves, never merged: the rows *became* SourceRecords and then
+      // resolved against Vendor, and printing the second under a heading about
+      // landing described a book those rows are not in.
       expect(
-        find.text('the book now holds Vendor 13 (2 feeds resolve against it)'),
+        find.text(
+          'lands as SourceRecord 300 (4 feeds land into it) · '
+          'resolves against Vendor 13 (2 feeds resolve against it)',
+        ),
         findsOneWidget,
       );
       expect(
@@ -203,9 +214,12 @@ void main() {
       await _pump(tester, FeedHealthRow(feed: _feed(
         source: 'crm-book',
         deliveries: 1,
+        records: 170,
         recordsLanded: 109,
         created: 36,
         landsAs: 'SourceRecord',
+        landedType:
+            const EntityCount(type: 'SourceRecord', instances: 300, feeds: 4),
         lastStatus: 'succeeded',
         entities: const [
           EntityCount(type: 'Company', instances: 40, feeds: 2),
@@ -213,10 +227,68 @@ void main() {
       )));
 
       expect(
-        find.text('the book now holds Company 40 (2 feeds resolve against it)'),
+        find.textContaining(
+          'resolves against Company 40 (2 feeds resolve against it)',
+        ),
         findsOneWidget,
       );
       expect(find.textContaining('natural key collapsed'), findsNothing);
+      // Received and landed are two facts: 170 rows arrived and 109 of them
+      // became landing records.
+      expect(
+        find.textContaining('170 received · 109 newly landed'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a contract that resolves nothing still names where its rows '
+        'went', (tester) async {
+      // The employment-event ledger reifies and stops. Its destination line
+      // used to be suppressed entirely, because the only thing that could fill
+      // it was a resolution target and this contract declares none.
+      await _pump(tester, FeedHealthRow(feed: _feed(
+        source: 'hris-employment-events',
+        deliveries: 1,
+        records: 159,
+        recordsLanded: 159,
+        unchangedRows: 0,
+        landsAs: 'SourceRecord',
+        landedType:
+            const EntityCount(type: 'SourceRecord', instances: 300, feeds: 4),
+        lastStatus: 'succeeded',
+      )));
+
+      expect(
+        find.text('lands as SourceRecord 300 (4 feeds land into it)'),
+        findsOneWidget,
+      );
+      // It reports `unchanged` and nothing else, so the two it does not report
+      // are absent rather than zero — and the one it does is printed.
+      expect(
+        find.text(
+          '1 delivery(s) · 159 received · 159 newly landed · '
+          '0 redelivered byte-identical',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a bind feed reports no disposition rather than three zeros',
+        (tester) async {
+      await _pump(tester, FeedHealthRow(feed: _feed(
+        deliveries: 1,
+        records: 145,
+        recordsLanded: 145,
+        lastStatus: 'succeeded',
+      )));
+
+      expect(
+        find.text(
+          '1 delivery(s) · 145 received · 145 newly landed · '
+          'disposition not reported by this mapping',
+        ),
+        findsOneWidget,
+      );
     });
 
     testWidgets('a feed under no Mapping says so on the row', (tester) async {
@@ -272,8 +344,11 @@ void main() {
       ));
 
       expect(find.text('nobody bound'), findsOneWidget);
+      // The kind a person reads, not the enum a Task stores — the same
+      // `kindLabel` My Tasks uses, so a desk and the queue it opens are not
+      // two names for one thing.
       expect(
-        find.text('oldest waiting 1d · 4 merge_review'),
+        find.text('oldest waiting 1d · 4 proposed merge'),
         findsOneWidget,
       );
     });
@@ -321,9 +396,15 @@ void main() {
         find.text('2 committed · 1 refused at the write'),
         findsOneWidget,
       );
-      expect(find.text('observation'), findsOneWidget);
-      expect(find.text('decision'), findsOneWidget);
-      expect(find.text('resolution'), findsOneWidget);
+      // Named, not slugged. The three regimes are only distinguishable to
+      // somebody who already knows the distinction the Gateway draws, and
+      // setting the wire value in code font did not teach it to anybody.
+      expect(
+        find.text('Observation — a system asserting what it saw'),
+        findsOneWidget,
+      );
+      expect(find.text('Decision — a person answering'), findsOneWidget);
+      expect(find.text('Resolution — two records ruled one'), findsOneWidget);
     });
 
     testWidgets('an empty ledger window states the three regimes exist anyway',
@@ -536,11 +617,14 @@ void main() {
       await _pump(tester, const SystemStateNotYours());
 
       expect(find.text('This is not scoped to you'), findsOneWidget);
+      // Second person, and never "this persona" — the persona is what you are
+      // here, not a third party the screen is discussing about you.
       expect(
-        find.textContaining('so there is nothing here for it rather than '
+        find.textContaining('so there is nothing here for you rather than '
             'something withheld'),
         findsOneWidget,
       );
+      expect(find.textContaining('persona'), findsNothing);
       // No retry on a refusal that can never succeed.
       expect(find.bySubtype<OutlinedButton>(), findsNothing);
     });
@@ -591,11 +675,15 @@ FeedState _feed({
   String kind = '',
   String contractId = 'hris-workforce',
   String landsAs = '',
+  EntityCount? landedType,
   int deliveries = 0,
+  int? records,
   int recordsLanded = 0,
-  int created = 0,
-  int linked = 0,
-  int unchangedRows = 0,
+  // Null by default: a bind mapping never reports a disposition, and passing
+  // zeros here is exactly the coercion the wire stopped doing.
+  int? created,
+  int? linked,
+  int? unchangedRows,
   int awaitingSteward = 0,
   String lastStatus = '',
   List<EntityCount> entities = const [],
@@ -609,7 +697,12 @@ FeedState _feed({
   kind: kind,
   contractId: source == 'wms-receiving' ? '' : contractId,
   landsAs: landsAs,
+  // A reify feed's landing type is served beside its resolution targets; a
+  // fixture that names one without the other is not a shape the server emits.
+  landedType: landedType ??
+      (landsAs.isEmpty ? null : EntityCount(type: landsAs, instances: 0, feeds: 1)),
   deliveries: deliveries,
+  records: records ?? recordsLanded,
   recordsLanded: recordsLanded,
   created: created,
   linked: linked,

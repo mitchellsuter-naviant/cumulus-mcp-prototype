@@ -336,11 +336,15 @@ class _Comparison extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        // No "resolved under precedence". Precedence settles two claims on
+        // *one* object; these are two objects, and whether they are one is the
+        // question this steward is here to answer. Saying it was already
+        // resolved told them their decision had been taken.
         FieldLabel(
           'The two records',
           hint:
               '${p.conflict.length} field(s) disagree · '
-              '${p.agree.length} agree · resolved under precedence',
+              '${p.agree.length} agree',
         ),
         Container(
           decoration: BoxDecoration(

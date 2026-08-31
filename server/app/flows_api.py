@@ -230,6 +230,18 @@ def _label(flow_id: str) -> str:
     return flow_id.replace("-", " ").capitalize()
 
 
+def _task_scope(principal: Principal) -> tuple[str, ...] | None:
+    """The queues whose open Tasks this principal is shown, or `None` for all.
+
+    The same narrowing `tasks_api.task_stats` applies, deliberately: the Flows
+    header and My Tasks are two readings of one queue, and an unscoped total
+    here put "Awaiting judgment 21" on the same screen as an AE whose queue is
+    clear. A principal that reads past its own work still sees the fleet total,
+    because diagnosing the deployment is what that reach is for.
+    """
+    return None if principal.reads_beyond_self else principal.queues
+
+
 def _rollup(
     flow_id: str,
     defn: FlowDefinition | None,
@@ -270,8 +282,9 @@ def _detail(
     flow_id: str,
     defn: FlowDefinition | None,
     eval_cases: int,
+    queues: tuple[str, ...] | None = None,
 ) -> FlowDetailPublic:
-    base = _rollup(flow_id, defn, flow_runs(flow_id), open_tasks(flow_id))
+    base = _rollup(flow_id, defn, flow_runs(flow_id), open_tasks(flow_id, queues))
     if defn is None:
         # A sync feed has runs and no map. Saying so beats a 404 on a row the
         # fleet list just showed, and beats inventing a definition for it.
@@ -330,7 +343,7 @@ def list_flows(
     needle = q.strip().lower()
     service = get_flow_service()
     runs_by_flow = fleet_runs()
-    tasks_by_flow = open_tasks_by_flow()
+    tasks_by_flow = open_tasks_by_flow(_task_scope(principal))
     for flow_id in fleet_flow_ids():
         defn = service.get(flow_id)
         row = _rollup(
@@ -361,7 +374,7 @@ def fleet_stats(
     service = get_flow_service()
     defs = service.list()
     runs_by_flow = fleet_runs()
-    tasks_by_flow = open_tasks_by_flow()
+    tasks_by_flow = open_tasks_by_flow(_task_scope(principal))
     flow_ids = fleet_flow_ids()
 
     per_day: dict[str, FleetSeriesDay] = {}
@@ -485,7 +498,7 @@ def create_flow(
             status_code=409, detail=f"A flow named '{payload.id}' already exists"
         )
     log.info("Flow registered", extra={"flowId": created.id, "actor": principal.uid})
-    return _detail(created.id, created, 0)
+    return _detail(created.id, created, 0, _task_scope(principal))
 
 
 @router.get("/{flow_id}", response_model=FlowDetailPublic)
@@ -494,7 +507,7 @@ def get_flow(
 ) -> FlowDetailPublic:
     require_reader(principal)
     defn = _in_fleet_or_404(flow_id)
-    return _detail(flow_id, defn, eval_case_count(flow_id))
+    return _detail(flow_id, defn, eval_case_count(flow_id), _task_scope(principal))
 
 
 @router.patch("/{flow_id}", response_model=FlowDetailPublic)
@@ -521,7 +534,7 @@ def update_flow(
         )
     updated = get_flow_service().update(defn.model_copy(update=patch))
     log.info("Flow updated", extra={"flowId": flow_id, "actor": principal.uid})
-    return _detail(flow_id, updated, eval_case_count(flow_id))
+    return _detail(flow_id, updated, eval_case_count(flow_id), _task_scope(principal))
 
 
 @router.delete("/{flow_id}", status_code=204)

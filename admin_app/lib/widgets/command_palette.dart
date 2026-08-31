@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../models/asset.dart';
 import '../models/identity.dart';
+import '../models/session.dart';
 import '../models/team.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
@@ -61,6 +62,50 @@ class OpenSectionIntent extends PaletteIntent {
   final int index;
   const OpenSectionIntent(this.index);
 }
+
+// ---- The shell's navigation vocabulary --------------------------------------
+//
+// One definition, read by both the rail and the palette. It lived in two
+// places and drifted: three of the palette's copies still pointed where those
+// sections used to be, so "Knowledge layer" opened the identity workbench and
+// "Flows" opened System state. It sits here rather than in `home_shell.dart`
+// because `OpenSectionIntent` above is the type that carries an index, and the
+// shell already imports this file — the other direction would be a cycle.
+
+const int homeIndex = 0;
+const int calendarIndex = 1;
+const int tasksIndex = 2;
+const int expenseWorkspaceIndex = 3;
+const int payablesWorkspaceIndex = 4;
+const int identityWorkspaceIndex = 5;
+const int systemStateIndex = 6;
+const int knowledgeIndex = 7;
+const int flowsIndex = 8;
+const int identitiesIndex = 9;
+const int employeeHubIndex = 10;
+
+/// The queues the two business workspaces belong to. Named because the rail,
+/// the palette and the shell's unmounting rule all have to agree, and three
+/// copies of a string is how they stop agreeing.
+const String expenseQueue = 'expense-review';
+const String payablesQueue = 'ap-clerk';
+
+/// Whether this session reaches a workspace whose work sits in one queue.
+///
+/// The rule the identity workbench already draws, applied to the two
+/// workspaces that had none. A Workspace is a Seeing Space — you watch a
+/// workstream without being assigned anything in it — but *whose* workstream
+/// is still a question, and both of these carry more than their rows: the AP
+/// one opens the vendor master, every open purchase order, the posting policy
+/// and a control that runs the flow. An own-scoped persona bound to neither
+/// desk was being offered all of it.
+///
+/// Reading past your own work is the other way in, so Naviant Support and the
+/// customer's admin keep both. A null session means the answer is still in
+/// flight, and offering a stop that turns out not to be yours is the better of
+/// the two errors — the route behind it refuses in a sentence.
+bool ownsWorkspace(Session? session, String queue) =>
+    session == null || session.scope != 'own' || session.queues.contains(queue);
 
 /// Escape hatch to the full-page result list when the dropdown's ten aren't
 /// enough.
@@ -336,74 +381,161 @@ class CommandCatalog extends ChangeNotifier {
   bool get isLoaded => _loaded;
   List<Team> get teams => _teams;
 
-  static const _staticEntries = <CatalogEntry>[
-    CatalogEntry(
-      label: 'New asset',
-      detail: 'author a document in the knowledge layer',
-      keywords: 'create add new document write',
-      icon: Icons.add_circle_outline,
-      tone: CumulusTone.accent,
-      intent: CreateAssetIntent(),
+  /// The acting session, so the palette offers what the rail offers.
+  ///
+  /// Set by the shell whenever the session changes. Null before the first load
+  /// — and null means offer everything, on the same reasoning the rail uses:
+  /// hiding a stop from somebody who turns out to be entitled to it is the
+  /// worse of the two errors while the answer is still in flight.
+  Session? _session;
+
+  set session(Session? value) {
+    if (value == _session) return;
+    _session = value;
+    notifyListeners();
+  }
+
+  /// Every destination the palette can jump to, with the predicate that
+  /// decides whether it exists for this reader.
+  ///
+  /// The section indices are the shell's own constants. They are imported
+  /// rather than written out because they were written out once and drifted:
+  /// three of them still pointed where those sections used to live, so
+  /// "Knowledge layer" opened the identity workbench and "Flows" opened
+  /// System state.
+  ///
+  /// The predicates are the rail's, for the reason the rail has them: a
+  /// governance section an own-scoped persona cannot open renders as a blank
+  /// screen, which is worse than not being offered at all — the shell
+  /// unmounts what the rail drops, so the palette was navigating to a
+  /// deliberately empty widget and calling it a destination.
+  static final List<(CatalogEntry, bool Function(Session?))> _navigation = [
+    (
+      const CatalogEntry(
+        label: 'New asset',
+        detail: 'author a document in the knowledge layer',
+        keywords: 'create add new document write',
+        icon: Icons.add_circle_outline,
+        tone: CumulusTone.accent,
+        intent: CreateAssetIntent(),
+      ),
+      _governs,
     ),
-    CatalogEntry(
-      label: 'Home',
-      detail: 'your day, and where accounts payable stands',
-      keywords: 'home today schedule day start dashboard',
-      icon: Icons.home_outlined,
-      intent: OpenSectionIntent(0),
+    (
+      const CatalogEntry(
+        label: 'Home',
+        detail: 'your day, and where accounts payable stands',
+        keywords: 'home today schedule day start dashboard',
+        icon: Icons.home_outlined,
+        intent: OpenSectionIntent(homeIndex),
+      ),
+      _always,
     ),
-    CatalogEntry(
-      label: 'Calendar',
-      detail: 'your week, mirrored from the calendar provider',
-      keywords: 'calendar week schedule meetings agenda free busy',
-      icon: Icons.calendar_today_outlined,
-      intent: OpenSectionIntent(1),
+    (
+      const CatalogEntry(
+        label: 'Calendar',
+        detail: 'your week, mirrored from the calendar provider',
+        keywords: 'calendar week schedule meetings agenda free busy',
+        icon: Icons.calendar_today_outlined,
+        intent: OpenSectionIntent(calendarIndex),
+      ),
+      _always,
     ),
-    CatalogEntry(
-      label: 'My Tasks',
-      detail: 'the queue — judgments waiting on a person',
-      keywords: 'tasks queue inbox decisions approve review hitl',
-      icon: Icons.inbox_outlined,
-      intent: OpenSectionIntent(2),
+    (
+      const CatalogEntry(
+        label: 'My Tasks',
+        detail: 'the queue — judgments waiting on a person',
+        keywords: 'tasks queue inbox decisions approve review hitl',
+        icon: Icons.inbox_outlined,
+        intent: OpenSectionIntent(tasksIndex),
+      ),
+      _always,
     ),
-    CatalogEntry(
-      label: 'Knowledge layer',
-      detail: 'the governed corpus',
-      keywords: 'assets documents corpus taxonomy',
-      icon: Icons.hub_outlined,
-      intent: OpenSectionIntent(5),
+    (
+      const CatalogEntry(
+        label: 'System state',
+        detail: 'the whole deployment, on one screen',
+        keywords: 'system state dashboard governance health map feeds desks',
+        icon: Icons.monitor_heart_outlined,
+        intent: OpenSectionIntent(systemStateIndex),
+      ),
+      _governs,
     ),
-    CatalogEntry(
-      label: 'Flows',
-      detail: 'authored logic — definitions, runs, cost and audit',
-      keywords: 'flows workflows dataflows agents pipelines runs cost roi testing',
-      icon: Icons.account_tree_outlined,
-      intent: OpenSectionIntent(6),
+    (
+      const CatalogEntry(
+        label: 'Knowledge layer',
+        detail: 'the governed corpus',
+        keywords: 'assets documents corpus taxonomy ontology sources',
+        icon: Icons.hub_outlined,
+        intent: OpenSectionIntent(knowledgeIndex),
+      ),
+      _governs,
     ),
-    CatalogEntry(
-      label: 'Identities, access & keys',
-      detail: 'people, agents, teams and API keys',
-      keywords: 'users agents teams api keys access',
-      icon: Icons.groups_outlined,
-      intent: OpenSectionIntent(7),
+    (
+      const CatalogEntry(
+        label: 'Flows',
+        detail: 'authored logic — definitions, runs, cost and audit',
+        keywords:
+            'flows workflows dataflows agents pipelines runs cost roi testing',
+        icon: Icons.account_tree_outlined,
+        intent: OpenSectionIntent(flowsIndex),
+      ),
+      _always,
     ),
-    // The workspaces. Section indices, like the ones above, mirror the
-    // constants in home_shell.dart — they are the shell's vocabulary, and the
-    // palette navigates in it.
-    CatalogEntry(
-      label: 'Expense Reimbursement',
-      detail: 'workspace — requests, decisions, spend',
-      keywords: 'workspace expenses reimbursement receipts claims spend',
-      icon: Icons.folder_outlined,
-      intent: OpenSectionIntent(3),
+    (
+      const CatalogEntry(
+        label: 'Identities, access & keys',
+        detail: 'people, agents, teams and API keys',
+        keywords: 'users agents teams api keys access',
+        icon: Icons.groups_outlined,
+        intent: OpenSectionIntent(identitiesIndex),
+      ),
+      _governs,
     ),
-    CatalogEntry(
-      label: 'Accounts Payable',
-      detail: 'workspace — invoices, matching, posting',
-      keywords: 'workspace ap accounts payable invoices vendors posting',
-      icon: Icons.folder_outlined,
-      intent: OpenSectionIntent(4),
+    // The workspaces, each gated on the desk whose work it is — the same
+    // predicate the rail's dropdown draws its children with.
+    (
+      const CatalogEntry(
+        label: 'Expense Reimbursement',
+        detail: 'workspace — requests, decisions, spend',
+        keywords: 'workspace expenses reimbursement receipts claims spend',
+        icon: Icons.folder_outlined,
+        intent: OpenSectionIntent(expenseWorkspaceIndex),
+      ),
+      _ownsExpenses,
     ),
+    (
+      const CatalogEntry(
+        label: 'Accounts Payable',
+        detail: 'workspace — invoices, matching, posting',
+        keywords: 'workspace ap accounts payable invoices vendors posting',
+        icon: Icons.folder_outlined,
+        intent: OpenSectionIntent(payablesWorkspaceIndex),
+      ),
+      _ownsPayables,
+    ),
+    (
+      const CatalogEntry(
+        label: 'Counterparty identity',
+        detail: 'workspace — proposed merges, evidence, decisions',
+        keywords: 'identity merge steward counterparty vendor company duplicate',
+        icon: Icons.compare_arrows,
+        intent: OpenSectionIntent(identityWorkspaceIndex),
+      ),
+      _curatesIdentity,
+    ),
+  ];
+
+  static bool _always(Session? s) => true;
+  static bool _governs(Session? s) => s == null || s.scope != 'own';
+  static bool _curatesIdentity(Session? s) => s == null || s.mayOpenIdentity;
+  static bool _ownsExpenses(Session? s) => ownsWorkspace(s, expenseQueue);
+  static bool _ownsPayables(Session? s) => ownsWorkspace(s, payablesQueue);
+
+  /// The destinations this session may actually open.
+  List<CatalogEntry> get navigationEntries => [
+    for (final (entry, allowed) in _navigation)
+      if (allowed(_session)) entry,
   ];
 
   Future<void> ensureLoaded() async {
@@ -430,7 +562,7 @@ class CommandCatalog extends ChangeNotifier {
   }
 
   List<CatalogEntry> get entries => [
-    ..._staticEntries,
+    ...navigationEntries,
     for (final a in _assets)
       CatalogEntry(
         label: a.title,
@@ -811,7 +943,7 @@ class CommandPaletteController extends ChangeNotifier {
       PaletteSection(
         title: 'Actions',
         rows: [
-          for (final entry in CommandCatalog._staticEntries)
+          for (final entry in catalog.navigationEntries)
             _rowForEntry(entry),
         ],
         note: 'type to search · owner: authority: status: tag: path: to filter',

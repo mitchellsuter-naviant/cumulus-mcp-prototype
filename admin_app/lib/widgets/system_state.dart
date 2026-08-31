@@ -6,6 +6,10 @@ import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'cumulus_shell.dart';
 import 'sources_plane.dart' show EstateHeaderCard;
+// One vocabulary for a Task kind across the console. A desk here counting
+// `merge_review` while My Tasks calls it a Proposed merge would be two names
+// for one thing, and the reader has to hold both.
+import 'tasks_view.dart' show kindLabel;
 import 'ui_kit.dart';
 
 /// System state — the current state of the whole system, on one screen.
@@ -123,7 +127,13 @@ class _SystemStateSectionState extends State<SystemStateSection> {
             pills: [
               if (screen != null) ...[
                 MetaPill('as of ${agoIso(screen.atIso)}'),
-                MetaPill('rates over ${screen.windowDays} days'),
+                // Named for what actually has a window. Two panels here read
+                // over one — the Gateway ledger and the ModelCall spend — and
+                // everything else is a stock as of now, so "rates over 30
+                // days" put a window on counts that have none.
+                MetaPill(
+                  'ledger and spend cover ${screen.windowDays} days',
+                ),
               ],
             ],
             trailing: OutlinedButton.icon(
@@ -184,12 +194,13 @@ class SystemStateNotYours extends StatelessWidget {
         child: CumulusEmptyState(
           icon: Icons.lock_outline,
           title: 'This is not scoped to you',
+          // Second person, and never "this persona" — the persona is what
+          // you are here, not a third party the screen is discussing.
           message:
-              'System state is the whole deployment at once — every object '
-              'type, every feed, every desk and the Gateway\'s own record. '
-              'This persona reads its own work, so there is nothing here for '
-              'it rather than something withheld. Your queues are on Home and '
-              'My Tasks.',
+              'System state reads every collection, feed, desk and ledger '
+              'entry at once. Your access is to your own work, so there is '
+              'nothing here for you rather than something withheld. Your '
+              'queues are on Home and My Tasks.',
         ),
       ),
     ],
@@ -230,14 +241,17 @@ class MapPanel extends StatelessWidget {
         children: [
           StatStrip(
             tiles: [
+              // Exact, not `1.5K`. Every figure on this screen is meant to be
+              // answerable by a list one stop away, and a rounded magnitude is
+              // the one shape you cannot check a list against.
               StatTile(
                 label: 'Objects',
-                value: compactCount(map.objects),
+                value: groupedCount(map.objects),
                 caption: '${map.collections.length} collections govern them',
               ),
               StatTile(
                 label: 'Links',
-                value: compactCount(map.links),
+                value: groupedCount(map.links),
                 caption: 'live edges between them',
               ),
               StatTile(
@@ -389,10 +403,19 @@ class ArrivalsPanel extends StatelessWidget {
                           '${arrivals.estate.feedsRegistered} registered feeds '
                           'are pullable',
               ),
+              // Received, not landed. `landed` means new landing records on a
+              // reify feed and every bound row on a bind feed, so a total
+              // summed from it reported two thirds of the traffic as if it
+              // were all of it. What was kept is stated beside it rather than
+              // replacing it — both are true and they answer different
+              // questions.
               StatTile(
-                label: 'Records landed',
-                value: compactCount(arrivals.recordsLanded),
-                caption: 'rows handed to the door, across every delivery',
+                label: 'Records received',
+                value: groupedCount(arrivals.recordsReceived),
+                caption:
+                    'rows handed to the door · '
+                    '${groupedCount(arrivals.recordsLanded)} kept as landing '
+                    'records or bound rows',
               ),
               StatTile(
                 label: 'Awaiting a steward',
@@ -425,7 +448,15 @@ class ArrivalsPanel extends StatelessWidget {
               style: CumulusText.body,
             )
           else
-            for (final feed in arrivals.feeds) FeedHealthRow(feed: feed),
+            for (final feed in arrivals.feeds)
+              FeedHealthRow(
+                feed: feed,
+                // The served list, not a second derivation of it. The row used
+                // to re-decide "no contract" from its own empty `contractId`,
+                // which is the same answer by a different route — and the
+                // route that can drift from the governance panel's count.
+                underNoContract: arrivals.withoutContract.contains(feed.source),
+              ),
         ],
       ),
     );
@@ -441,7 +472,16 @@ class ArrivalsPanel extends StatelessWidget {
 class FeedHealthRow extends StatelessWidget {
   final FeedState feed;
 
-  const FeedHealthRow({super.key, required this.feed});
+  /// Whether the served `without_contract` list names this feed. Passed in
+  /// rather than re-derived from [FeedState.contractId] so the badge and the
+  /// governance panel's count are one answer.
+  final bool underNoContract;
+
+  const FeedHealthRow({
+    super.key,
+    required this.feed,
+    this.underNoContract = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -470,7 +510,7 @@ class FeedHealthRow extends StatelessWidget {
                 tone: tone,
                 dense: true,
               ),
-              if (feed.contractId.isEmpty)
+              if (underNoContract || feed.contractId.isEmpty)
                 const StatusBadge(
                   'no contract',
                   tone: CumulusTone.danger,
@@ -494,10 +534,7 @@ class FeedHealthRow extends StatelessWidget {
           Text(
             feed.neverDelivered
                 ? 'Nothing delivered yet — no run, and nothing landed.'
-                : '${feed.deliveries} delivery(s) · ${feed.recordsLanded} '
-                      'records landed · ${feed.created} minted · '
-                      '${feed.linked} linked to an entity already in the book '
-                      '· ${feed.unchangedRows} redelivered byte-identical',
+                : _arrivals,
             style: CumulusText.meta,
           ),
           // The connector's half, and the word `unchanged` in its other sense:
@@ -510,23 +547,20 @@ class FeedHealthRow extends StatelessWidget {
                 if (feed.lastPullAgeSeconds == null)
                   '· never pulled'
                 else
-                  '· pulled ${_since(feed.lastPullAgeSeconds)} ago',
+                  '· pulled ${_ago(feed.lastPullAgeSeconds)}',
                 if (feed.lastPullOutcome == 'unchanged')
                   '· the estate reported no delta, so nothing was fetched'
                 else if (feed.lastPullOutcome.isNotEmpty)
                   '· ${feed.lastPullOutcome}',
                 if (feed.watermarkAgeSeconds != null)
-                  '· read up to ${_since(feed.watermarkAgeSeconds)} ago',
+                  '· read up to ${_ago(feed.watermarkAgeSeconds)}',
               ].join(' '),
               style: CumulusText.meta,
             ),
           ],
-          if (feed.entities.isNotEmpty) ...[
+          if (_destination.isNotEmpty) ...[
             const SizedBox(height: 4),
-            Text(
-              'the book now holds ${feed.entities.map(_entity).join(' · ')}',
-              style: CumulusText.meta,
-            ),
+            Text(_destination, style: CumulusText.meta),
           ],
           if (_collapse.isNotEmpty) ...[
             const SizedBox(height: 4),
@@ -557,6 +591,54 @@ class FeedHealthRow extends StatelessWidget {
     );
   }
 
+  /// What arrived, what was kept, and what became of it.
+  ///
+  /// Two arrival counts because they are two facts: `received` is what the
+  /// delivery carried, `landed` is what the landing step kept, and on a reify
+  /// feed they differ by most of the traffic. The three dispositions are
+  /// printed only where the feed's contract reports them — a bind mapping has
+  /// no resolve step and no payload hash, so "0 minted · 0 linked · 0
+  /// redelivered" over 145 landed rows was a confident answer to a question
+  /// this contract never asks.
+  String get _arrivals {
+    final parts = [
+      '${feed.deliveries} delivery(s)',
+      '${feed.records} received',
+      '${feed.recordsLanded} newly landed',
+    ];
+    final created = feed.created;
+    final linked = feed.linked;
+    final unchanged = feed.unchangedRows;
+    if (created == null && linked == null && unchanged == null) {
+      parts.add('disposition not reported by this mapping');
+      return parts.join(' · ');
+    }
+    if (created != null) parts.add('$created minted');
+    if (linked != null) {
+      parts.add('$linked linked to an entity already in the book');
+    }
+    if (unchanged != null) parts.add('$unchanged redelivered byte-identical');
+    return parts.join(' · ');
+  }
+
+  /// Where the rows went: the type they *became*, then the types they resolve
+  /// against. Never merged under one heading — a reify feed's rows land as
+  /// `SourceRecord` and then resolve against Vendor, and printing the second
+  /// under "the book now holds" described a book those rows are not in.
+  ///
+  /// A contract that resolves nothing still lands somewhere, so this stays
+  /// non-empty for the employment-event ledger rather than vanishing.
+  String get _destination {
+    final landed = feed.landedType;
+    final parts = <String>[
+      if (landed != null) 'lands as ${_entity(landed, verb: 'land into')}',
+      if (feed.entities.isNotEmpty)
+        '${landed == null ? 'binds to' : 'resolves against'} '
+            '${feed.entities.map((e) => _entity(e)).join(' · ')}',
+    ];
+    return parts.join(' · ');
+  }
+
   /// The natural-key collapse, said only where it is *proved* rather than
   /// merely suggested.
   ///
@@ -571,8 +653,11 @@ class FeedHealthRow extends StatelessWidget {
     if (feed.contractId.isEmpty || feed.entities.isEmpty) return '';
     final held = feed.entities.fold<int>(0, (sum, e) => sum + e.instances);
     if (held == 0) return '';
-    if (feed.created > held) {
-      return 'Minted ${feed.created} rows against a book holding $held: the '
+    // A feed that never reports what it minted proves nothing by this
+    // argument, so it is not offered one.
+    final created = feed.created;
+    if (created != null && created > held) {
+      return 'Minted $created rows against a book holding $held: the '
           'natural key collapsed the difference — two source rows under one '
           'key are one entity, not a dropped delivery.';
     }
@@ -584,8 +669,14 @@ class FeedHealthRow extends StatelessWidget {
     return '';
   }
 
-  static String _entity(EntityCount e) => e.feeds > 1
-      ? '${e.type} ${e.instances} (${e.feeds} feeds resolve against it)'
+  /// A type and what the book holds of it, with the shared-book caveat when
+  /// more than one contract writes into it — `instances` is then not this
+  /// feed's output, and a row that did not say so would invite reading it as
+  /// one. `verb` is how the other contracts reach it: they resolve *against* a
+  /// resolution target and *land into* a landing type.
+  static String _entity(EntityCount e, {String verb = 'resolve against'}) =>
+      e.feeds > 1
+      ? '${e.type} ${e.instances} (${e.feeds} feeds $verb it)'
       : '${e.type} ${e.instances}';
 }
 
@@ -646,13 +737,18 @@ class JudgmentPanel extends StatelessWidget {
                     ? CumulusTone.warn.foreground
                     : null,
               ),
+              // "Governed writes: 27" over a book holding thousands of rows
+              // read as a nearly idle system. A Gateway entry is one committed
+              // *operation* — a sync feed's whole landing pass is one — so the
+              // caption says what the unit is rather than letting the number
+              // be read as a row count.
               StatTile(
-                label: 'Governed writes',
+                label: 'Gateway commits',
                 value: '$decisions',
                 caption: decisions == 0
                     ? 'nothing has been committed through the Gateway'
-                    : '${ledger.refused} refused · every one declared its '
-                          'regime',
+                    : '$decisions governed operations, ${ledger.refused} '
+                          'refused — one commit writes a batch, not a row',
               ),
               StatTile(
                 label: 'Standing proposals',
@@ -729,8 +825,12 @@ class QueueDepthRow extends StatelessWidget {
                     ? 'nothing open'
                     : 'oldest waiting '
                           '${_since(queue.oldestOpenAgeSeconds)}'
+                          // The kinds a person reads, not the enum a Task
+                          // stores. `match_review` is a wire value; "Entity
+                          // match review" is the thing on the desk, and
+                          // `kindLabel` is where the console already says so.
                           ' · ${queue.byKind.entries.map((e) => '${e.value} '
-                              '${e.key}').join(' · ')}',
+                              '${kindLabel(e.key).toLowerCase()}').join(' · ')}',
                 style: CumulusText.meta,
               ),
               if (queue.unowned)
@@ -756,6 +856,17 @@ class QueueDepthRow extends StatelessWidget {
   }
 }
 
+/// A write regime as a person reads it. The same treatment `kindLabel` gives
+/// a Task kind, and for the same reason: `resolution` is a wire value, and the
+/// three of them are only distinguishable to somebody who already knows the
+/// distinction the Gateway is drawing.
+String regimeLabel(String regime) => switch (regime) {
+  'observation' => 'Observation — a system asserting what it saw',
+  'decision' => 'Decision — a person answering',
+  'resolution' => 'Resolution — two records ruled one',
+  _ => regime,
+};
+
 class _LedgerWindowView extends StatelessWidget {
   final LedgerWindow ledger;
 
@@ -768,7 +879,7 @@ class _LedgerWindowView extends StatelessWidget {
         'Nothing has been committed through the Action Gateway in the last '
         '${ledger.days} days. The three regimes below exist whether or not '
         'anything used them.\n'
-        '${ledger.byRegime.map((r) => r.regime).join(' · ')}',
+        '${ledger.byRegime.map((r) => regimeLabel(r.regime)).join(' · ')}',
         style: CumulusText.body,
       );
     }
@@ -780,11 +891,13 @@ class _LedgerWindowView extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         for (final regime in ledger.byRegime) ...[
+          // Not `mono: true` any more: these were slugs typeset as slugs, and
+          // a reader who has to be told what `observation` means is not helped
+          // by having it set in code font.
           UsageBar(
-            label: regime.regime,
+            label: regimeLabel(regime.regime),
             count: regime.total,
             max: widest,
-            mono: true,
           ),
           const SizedBox(height: 2),
           Text(
@@ -829,10 +942,16 @@ class _IdentityView extends StatelessWidget {
               ? 'The identity sweep has never run over these books, so nothing '
                     'has been proposed. What is below is the size of each book, '
                     'not a verdict on it.'
+              // Present tense, because nobody has answered any of them yet:
+              // "9 were ratifications" over zero decided reads as a report of
+              // work that happened. A ratification is what the Task *is* —
+              // a formality to countersign — not something it became. The
+              // identity workbench's own footer is the phrasing this follows.
               : 'Swept ${agoIso(sweep.atIso)} — ${sweep.compared} pair(s) '
                     'compared, ${sweep.proposed} proposed, '
-                    '${sweep.stewardTasks} Task(s) raised of which '
-                    '${sweep.ratifications} were ratifications.',
+                    '${sweep.stewardTasks} Task(s) raised, '
+                    '${sweep.ratifications} of those a ratification rather '
+                    'than a question.',
           style: CumulusText.body,
         ),
         const SizedBox(height: 8),
@@ -899,6 +1018,14 @@ class GovernancePanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final spend = governance.spend;
     final problems = governance.registryProblems;
+    // Two findings pointing opposite ways, and merging them made a breach
+    // hide inside a heap of stale declarations. `undeclared` is a flow
+    // touching what no Collection permits — governance failing to cover what
+    // is happening, and the only one of the two anybody must act on today.
+    // The rest declare a path no run has taken, which is a promise nothing has
+    // kept: worth stating, never worth alarming about.
+    final breaches = governance.gaps.where((g) => g.undeclared).length;
+    final unexercised = governance.gaps.length - breaches;
     return SectionCard(
       title: 'Is governance holding',
       subtitle: 'what is declared, against what actually happened',
@@ -918,14 +1045,17 @@ class GovernancePanel extends StatelessWidget {
                 caption: 'every flow the engine can name, run or not',
               ),
               StatTile(
-                label: 'With a gap',
-                value: '${governance.gaps.length}',
-                caption: governance.gaps.isEmpty
+                label: 'Undeclared reach',
+                value: '$breaches',
+                caption: breaches > 0
+                    ? 'flow(s) reading or writing what no Collection permits'
+                          '${unexercised == 0 ? '' : ' · $unexercised more '
+                              'declare a path no run has taken'}'
+                    : unexercised == 0
                     ? 'declared and observed agree everywhere'
-                    : 'declared and observed disagree',
-                valueColor: governance.gaps.isNotEmpty
-                    ? CumulusTone.warn.foreground
-                    : null,
+                    : '$unexercised flow(s) declare a path no run has taken — '
+                          'a promise, not a breach',
+                valueColor: breaches > 0 ? CumulusTone.danger.foreground : null,
               ),
               StatTile(
                 label: 'Feeds with no contract',
@@ -1104,4 +1234,11 @@ String _since(int? seconds) {
   if (seconds < 86400) return '${seconds ~/ 3600}h';
   if (seconds < 86400 * 30) return '${seconds ~/ 86400}d';
   return '${seconds ~/ (86400 * 30)}mo';
+}
+
+/// [_since] with the direction attached, and the one case where attaching it
+/// blindly is wrong: a pull a moment old rendered as "pulled just now ago".
+String _ago(int? seconds) {
+  final span = _since(seconds);
+  return span == 'never' || span == 'just now' ? span : '$span ago';
 }

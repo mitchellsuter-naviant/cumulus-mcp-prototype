@@ -860,6 +860,43 @@ def test_every_composer_control_is_a_row_from_the_graph(client, world):
     assert limit["ref"] == "knowledge:invoice-posting-policy@rev1"
 
 
+def test_the_composer_offers_orders_that_are_actually_open(client, world):
+    """"N open PO(s)" counted the closed and the fully-billed ones too.
+
+    The count is `len(orders)` and the word is "open", so the two have to
+    agree at the source rather than in the caption. Named as the closed set
+    because the status vocabulary is the ERP's and grows: a word this
+    deployment has not seen yet is more safely read as still-open than
+    silently dropped out of the picker.
+    """
+    _vendors(world)
+    world.sync.deliver(SyncRequest.model_validate({
+        "source": "erp-purchase-orders",
+        "purchase_orders": [
+            {
+                "external_id": f"PO-99{n}", "po_number": f"PO-99{n}",
+                "vendor_external_id": "V-10041",
+                "vendor_name": "Acme Industrial Inc.",
+                "ordered_date": "2026-08-05", "status": status,
+                "lines": [{
+                    "sku": "STL-0250", "description": "Hot-rolled steel plate",
+                    "quantity_ordered": 1.0, "unit_price_usd": 486.00,
+                }],
+            }
+            for n, status in enumerate(
+                ["open", "pending-receipt", "partially-received",
+                 "fully-billed", "closed", "cancelled"]
+            )
+        ],
+    }), actor="system:test")
+
+    composer = client.get(UI_PAYABLES).json()["composer"]
+    acme = next(v for v in composer["vendors"] if "Acme" in v["label"])
+    offered = {o["status"] for o in acme["orders"]}
+    assert offered == {"open", "pending-receipt", "partially-received"}
+    assert len(acme["orders"]) == 3
+
+
 def test_a_composed_submission_sends_the_string_it_showed(client, world):
     demo_world.seed_payables(world.payables, sync=world.sync)
     outcome = client.post(UI_SUBMISSIONS, json=_composed()).json()
@@ -894,11 +931,14 @@ def test_the_outcome_marks_the_clause_the_rule_cited(client, world):
 
 
 def test_may_decide_answers_require_queue_before_the_403(client, world):
-    """Tomas is bound to `ap-clerk`; Kim is bound to nothing.
+    """Tomas is bound to `ap-clerk`; Naviant Support is bound to nothing.
 
     The gate is the same gate. What differs is who may release it, and that is
     a queue binding rather than a rung on the write ladder — so the screen has
-    to say which queue, not merely "not allowed".
+    to say which queue, not merely "not allowed". Support is the sharp case
+    now that the workspace itself is queue-gated: it reads every invoice in
+    the deployment, which is what platform reach is for, and decides none of
+    them, which is what a queue binding is for.
     """
     demo_world.seed_payables(world.payables, sync=world.sync)
     body = _composed(invoice_number="ACME-INV-9003", total_usd=9800.0)
@@ -911,12 +951,45 @@ def test_may_decide_answers_require_queue_before_the_403(client, world):
     # Which step stopped it, not merely that something did.
     assert tomas["step_id"].startswith("k2") and tomas["step_name"] == "review-invoice"
 
-    body["scenario"]["invoice_number"] = "ACME-INV-9004"
-    kim = client.post(
-        UI_SUBMISSIONS, json=body, headers={"X-Cumulus-Persona": "customer-user:ae"}
-    ).json()["gate"]
-    assert not kim["may_decide"]
-    assert kim["why_not"] == "this is in ap-clerk; you are bound to no queue"
+    screen = client.get(
+        UI_PAYABLES, headers={"X-Cumulus-Persona": "naviant-support"}
+    ).json()
+    support = next(
+        o["gate"] for o in screen["invoices"]
+        if o["invoice"]["invoice_number"] == "ACME-INV-9003"
+    )
+    assert support["queue"] == "ap-clerk"
+    assert not support["may_decide"]
+    assert support["why_not"] == "this is in ap-clerk; you are bound to no queue"
+
+
+def test_the_ap_workspace_is_the_clerk_desk_not_a_public_screen(client, world):
+    """Kim owns no queue, and the workspace is more than the rows she has none of.
+
+    The table was already scoped to her — an empty one — but the screen around
+    it is the vendor master, every open purchase order, the posting policy and
+    a control that runs the flow and can auto-post money. None of that is
+    anyone's own work, so the door says which desk it is rather than handing
+    over an empty table that reads as "the business is quiet".
+    """
+    demo_world.seed_payables(world.payables, sync=world.sync)
+    kim = {"X-Cumulus-Persona": "customer-user:ae"}
+
+    refused = client.get(UI_PAYABLES, headers=kim)
+    assert refused.status_code == 403
+    assert "ap-clerk" in refused.json()["detail"]
+    assert "your own work" in refused.json()["detail"]
+
+    submitted = client.post(UI_SUBMISSIONS, json=_composed(), headers=kim)
+    assert submitted.status_code == 403
+
+    # Platform reach opens the screen and still may not file an invoice:
+    # reading a workstream and committing to its book are different acts.
+    support = {"X-Cumulus-Persona": "naviant-support"}
+    assert client.get(UI_PAYABLES, headers=support).status_code == 200
+    blocked = client.post(UI_SUBMISSIONS, json=_composed(), headers=support)
+    assert blocked.status_code == 403
+    assert "ap-clerk" in blocked.json()["detail"]
 
 
 def test_an_upload_carries_no_hints_and_a_key_gets_no_door(client, world):
@@ -936,10 +1009,21 @@ def test_an_upload_carries_no_hints_and_a_key_gets_no_door(client, world):
 
 def test_the_screen_and_its_strip_count_the_same_slice(client, world):
     """One route, so the strip cannot be computed over a different read than
-    the table under it — the failure the two-call version made possible."""
+    the table under it — the failure the two-call version made possible.
+
+    The two personas `AP_VISIBLE` gives zero rows are not on this list: they
+    are refused the console screen outright (see
+    `test_the_ap_workspace_is_the_clerk_desk_not_a_public_screen`). The REST
+    table still answers them with an empty list, which is the honest shape for
+    a row list; a *workspace* with a composer in it is not a row list.
+    """
     demo_world.seed_payables(world.payables, sync=world.sync)
     for persona, expected in sorted(AP_VISIBLE.items()):
-        screen = client.get(
+        response = client.get(
             UI_PAYABLES, headers={"X-Cumulus-Persona": persona}
-        ).json()
+        )
+        if expected == 0:
+            assert response.status_code == 403, persona
+            continue
+        screen = response.json()
         assert len(screen["invoices"]) == screen["stats"]["total"] == expected

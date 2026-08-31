@@ -308,6 +308,98 @@ def test_records_landed_and_entities_held_are_both_reported(estate_client):
     assert entities["Team"]["feeds"] == 1
 
 
+def test_a_bind_feed_reports_no_disposition_rather_than_three_zeros(
+    estate_client,
+):
+    """`None` is not `0`, and here the difference is the whole reading.
+
+    A bind mapping has no resolve step to link or mint with and no payload
+    hash to suppress a redelivery by, so it never reports the three
+    dispositions at all. Coercing an absent key to zero printed "0 minted · 0
+    linked · 0 redelivered byte-identical" under a feed that had just landed
+    every row it was handed — a confident answer to a question this contract
+    does not ask.
+    """
+    estate_client.connector.pull(HRIS_WORKFORCE)
+    feed = next(
+        f for f in _body(estate_client)["arrivals"]["feeds"]
+        if f["source"] == HRIS_WORKFORCE
+    )
+    assert feed["records_landed"] == 17
+    assert feed["created"] is None
+    assert feed["linked"] is None
+    assert feed["unchanged_rows"] is None
+
+    # And a reify feed that *does* run a resolver reports real numbers, so the
+    # absence above is a property of the contract rather than of the payload.
+    estate_client.connector.pull("erp-vendors")
+    vendors = next(
+        f for f in _body(estate_client)["arrivals"]["feeds"]
+        if f["source"] == "erp-vendors"
+    )
+    assert vendors["created"] is not None and vendors["created"] > 0
+    assert vendors["linked"] == 0
+    assert vendors["unchanged_rows"] == 0
+
+
+def test_received_and_landed_are_two_numbers_because_they_are_two_facts(
+    estate_client,
+):
+    """A reify feed keeps a fraction of what it is handed, and the screen has
+    to be able to say both halves.
+
+    `landed` means new landing records on a reify feed and every bound row on
+    a bind feed, so a total summed from it alone under-reported the estate's
+    traffic by a third. `records` is what the delivery carried.
+    """
+    estate_client.connector.pull("psa-book")
+    feed = next(
+        f for f in _body(estate_client)["arrivals"]["feeds"]
+        if f["source"] == "psa-book"
+    )
+    assert feed["lands_as"] == "SourceRecord"
+    assert feed["records"] > feed["records_landed"]
+
+    # A bind feed keeps everything it was handed, which is why the two numbers
+    # look interchangeable until a reify feed is beside them.
+    estate_client.connector.pull(HRIS_WORKFORCE)
+    workforce = next(
+        f for f in _body(estate_client)["arrivals"]["feeds"]
+        if f["source"] == HRIS_WORKFORCE
+    )
+    assert workforce["records"] == workforce["records_landed"] == 17
+
+
+def test_a_reify_feed_names_the_type_its_rows_became(estate_client):
+    """The destination line said "the book now holds Vendor 13" over a feed
+    whose rows had become `SourceRecord`s — the resolution target printed under
+    a heading about landing. Both halves are carried so the row can say "lands
+    as X · resolves against Y", and a contract that resolves nothing still has
+    a destination to name.
+    """
+    estate_client.connector.pull("hris-employment-events")
+    ledger = next(
+        f for f in _body(estate_client)["arrivals"]["feeds"]
+        if f["source"] == "hris-employment-events"
+    )
+    # Resolves nothing by declaration — and still lands somewhere, which is
+    # what kept this row's destination line from being suppressed entirely.
+    assert ledger["entities"] == []
+    assert ledger["landed_type"]["type"] == "SourceRecord"
+    assert ledger["landed_type"]["instances"] > 0
+    # Four contracts land as `SourceRecord`, so the book is shared and the row
+    # is entitled to say so rather than claim the count as its own.
+    assert ledger["landed_type"]["feeds"] > 1
+
+    # A bind mapping lands nothing of its own, and says that with `None`.
+    estate_client.connector.pull(HRIS_WORKFORCE)
+    workforce = next(
+        f for f in _body(estate_client)["arrivals"]["feeds"]
+        if f["source"] == HRIS_WORKFORCE
+    )
+    assert workforce["lands_as"] == "" and workforce["landed_type"] is None
+
+
 def test_a_type_fed_by_more_than_one_source_says_so(client):
     """Two feeds resolve onto the counterparty book. Reporting its size on each
     of their rows without saying it is shared would invite reading one feed's
@@ -778,7 +870,12 @@ def test_read_reach_decides_who_may_open_the_screen(client, persona):
     resp = client.get(ROUTE, headers=_as(persona.id))
     if persona.scope == "own":
         assert resp.status_code == 403, persona.id
-        assert "own" in resp.json()["detail"]
+        # This screen's own noun, not a shared generality — and addressed to
+        # the reader rather than to the persona they are wearing.
+        assert resp.json()["detail"] == (
+            "System state reads every collection, feed, desk and ledger entry "
+            "at once. Your access is to your own work."
+        )
     else:
         assert resp.status_code == 200, persona.id
 
@@ -788,7 +885,9 @@ def test_the_screen_inherits_the_console_door():
     machine has no screens, and a second dependency here would be a second,
     quieter copy of both."""
     depends = inspect.signature(ui_api.dashboard).parameters["principal"].default
-    assert depends.dependency is ui_api.get_knowledge_principal
+    assert depends.dependency is ui_api.get_dashboard_principal
+    door = inspect.signature(ui_api.get_dashboard_principal)
+    assert door.parameters["principal"].default.dependency is get_ui_principal
 
     machine = Principal(
         uid="svc-1", email="svc@machine", role="owner", key_id="k_1",

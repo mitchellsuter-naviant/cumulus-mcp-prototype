@@ -325,7 +325,15 @@ class SweepRun {
   final int compared;
   final int considered;
   final int proposed;
+
+  /// **Not** `IdentityBook.standing` or `IdentityState.standing`, which count
+  /// proposals waiting on a steward. This is the sweep's own word for edges it
+  /// found already on the graph and therefore left alone — a measure of
+  /// idempotence, not of backlog. The name is the run's output key; no screen
+  /// renders it, and this note is what stops the first one that tries from
+  /// adding the two together.
   final int standing;
+
   final int stewardTasks;
 
   /// How many of those Tasks were ratifications rather than questions.

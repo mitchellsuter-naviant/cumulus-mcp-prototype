@@ -48,6 +48,14 @@ class EmployeeProfile {
   final String nextCompanyHoliday;
   final List<Benefit> benefits;
 
+  /// The governed auto-approval window, parsed from the PTO policy, and the
+  /// revision-stamped ref it came from. Served rather than written here: the
+  /// hub used to print a literal "3 working days" beside the claim that the
+  /// number was governed, so editing the policy moved the rule and not the
+  /// sentence.
+  final double ptoAutoApproveDays;
+  final String ptoPolicyRef;
+
   const EmployeeProfile({
     required this.email,
     required this.name,
@@ -61,6 +69,8 @@ class EmployeeProfile {
     required this.ptoAccrualPerMonth,
     required this.nextCompanyHoliday,
     required this.benefits,
+    this.ptoAutoApproveDays = 0,
+    this.ptoPolicyRef = '',
   });
 
   factory EmployeeProfile.fromJson(Map<String, dynamic> json) =>
@@ -80,6 +90,9 @@ class EmployeeProfile {
         benefits: (json['benefits'] as List<dynamic>? ?? const [])
             .map((e) => Benefit.fromJson(e as Map<String, dynamic>))
             .toList(),
+        ptoAutoApproveDays:
+            (json['pto_auto_approve_days'] as num? ?? 0).toDouble(),
+        ptoPolicyRef: json['pto_policy_ref'] as String? ?? '',
       );
 }
 

@@ -105,6 +105,12 @@ class _SourcesPlaneState extends State<SourcesPlane> {
   Widget build(BuildContext context) {
     final screen = _screen;
     final feeds = screen?.sources ?? const <SourceFeed>[];
+    // Received, not landed. `landed` counts new landing records on a reify
+    // feed and every bound row on a bind feed, so a header summed from it
+    // reported a third of the estate's traffic as if it were all of it — the
+    // PSA feed alone carries 374 rows and keeps 13. What was kept is stated
+    // beside it; both are true and they answer different questions.
+    final received = feeds.fold<int>(0, (sum, f) => sum + f.records);
     final landed = feeds.fold<int>(0, (sum, f) => sum + f.recordsLanded);
     final waiting = feeds.fold<int>(0, (sum, f) => sum + f.awaitingSteward);
     final problems = screen?.problems ?? const <String>[];
@@ -128,7 +134,9 @@ class _SourcesPlaneState extends State<SourcesPlane> {
             if (screen != null) ...[
               MetaPill('${feeds.length} feeds'),
               MetaPill(
-                landed == 0 ? 'nothing landed yet' : '$landed records landed',
+                received == 0
+                    ? 'nothing received yet'
+                    : '$received records received · $landed newly landed',
               ),
               if (waiting > 0)
                 MetaPill(
@@ -319,26 +327,47 @@ class EstateHeaderCard extends StatelessWidget {
                     ? 'no apps discovered'
                     : '${estate.apps.length} apps · ${estate.apps.join(", ")}',
               ),
-              if (estate.processes.isNotEmpty)
-                MetaPill('${estate.processes.length} processes running'),
-              // Absent and off are different facts, so an estate that reports
-              // no pulse at all gets no pill rather than a false "stopped".
-              if (estate.pulseEnabled != null)
+              // The "pulse" is scripted business activity: the estate runs
+              // process scripts that invent rows on a timer. "pulse on · low"
+              // and "4 processes running" both read as operational health —
+              // a live system doing real work — when what they say is that
+              // everything arriving from here is fabricated. One pill, and it
+              // leads with the word that matters.
+              //
+              // Absent and off stay different facts: an estate that reports no
+              // pulse block at all is not one whose simulation is stopped, so
+              // it keeps its process count and claims nothing about activity.
+              if (estate.pulseEnabled == null)
+                MetaPill(
+                  estate.processes.isEmpty
+                      ? 'no process scripts declared'
+                      : '${estate.processes.length} process scripts · '
+                            'activity not reported',
+                )
+              else
                 MetaPill(
                   estate.pulseEnabled!
-                      ? 'pulse on${estate.pulseIntensity.isEmpty ? "" : " · ${estate.pulseIntensity}"}'
-                      : 'pulse off',
-                  tone: estate.pulseEnabled! ? CumulusTone.teal : null,
+                      ? 'simulated estate · '
+                            '${estate.processes.length} process scripts · '
+                            'synthetic activity: '
+                            '${estate.pulseIntensity.isEmpty ? "unstated" : estate.pulseIntensity}'
+                      : 'simulated estate · '
+                            '${estate.processes.length} process scripts · '
+                            'synthetic activity: stopped',
+                  tone: CumulusTone.warn,
                 ),
               MetaPill(
                 estate.pullIntervalSeconds > 0
                     ? 'polling every ${estate.pullIntervalSeconds}s'
                     : 'pulled on demand — no loop of our own',
               ),
+              // A fact about this process, not about the estate. "Unauthenticated
+              // estate" described the customer's system as open to the world;
+              // what it actually means is that ESTATE_API_KEY is unset here.
               MetaPill(
                 estate.authenticated
                     ? 'credential configured'
-                    : 'unauthenticated estate',
+                    : 'no credential configured',
               ),
             ],
           ),
@@ -372,17 +401,26 @@ class SyncNote {
     }
     final row = outcome.row;
     final landed = row == null ? null : row.recordsLanded - before.recordsLanded;
-    final unchanged = row == null ? null : row.unchanged - before.unchanged;
+    // Only a feed whose contract suppresses byte-identical redeliveries has an
+    // `unchanged` to report a delta on. On one that does not, the phrase is
+    // omitted rather than printed as a zero it never measured.
+    final unchanged = row?.unchanged == null || before.unchanged == null
+        ? null
+        : row!.unchanged! - before.unchanged!;
     final waiting = row == null
         ? null
         : row.awaitingSteward - before.awaitingSteward;
+    final delta = [
+      if (landed != null) '$landed newly landed',
+      if (unchanged != null) '$unchanged unchanged',
+      if (waiting != null && waiting > 0) '$waiting awaiting a steward',
+    ].join(', ');
     return SyncNote(
       message: [
         'Pulled ${outcome.recordsPulled} record(s) '
             '(${outcome.pulled.entries.map((e) => "${e.value} ${e.key}").join(" · ")})',
         if (outcome.chunks > 1) 'in ${outcome.chunks} deliveries',
-        if (landed != null) '· $landed landed, $unchanged unchanged',
-        if (waiting != null && waiting > 0) ', $waiting awaiting a steward',
+        if (delta.isNotEmpty) '· $delta',
       ].join(' '),
       failed: false,
     );
@@ -491,10 +529,7 @@ class SourceFeedRow extends StatelessWidget {
           Text(
             feed.neverDelivered
                 ? 'Nothing delivered yet — no run, and nothing landed.'
-                : '${feed.deliveries} delivery(s) · ${feed.recordsLanded} '
-                      'landed · ${feed.unchanged} unchanged (byte-identical '
-                      'redelivery) · ${feed.linked} linked to an existing '
-                      'entity · ${feed.created} minted',
+                : _arrivals(feed),
           ),
           if (!feed.neverDelivered) ...[
             const SizedBox(height: 6),
@@ -503,8 +538,15 @@ class SourceFeedRow extends StatelessWidget {
               runSpacing: 4,
               children: [
                 Text(feed.flowId, style: CumulusText.mono),
-                if (feed.watermark.isNotEmpty)
-                  Text('· watermark ${feed.watermark}',
+                // One label for one thing. The run-derived watermark and the
+                // connector's cursor are the same value read two ways, and
+                // printing both under two names invited reading them as two
+                // positions that might disagree. On a pulled feed the
+                // connector's is authoritative — it survives a pull that
+                // found nothing — so this line only speaks for a feed that
+                // pushes and has no connector state at all.
+                if (pull == null && feed.watermark.isNotEmpty)
+                  Text('· cursor ${_utc(feed.watermark)}',
                       style: CumulusText.meta),
                 if (feed.lastRunId.isNotEmpty)
                   Text('· ${feed.lastRunId}', style: CumulusText.mono),
@@ -527,10 +569,22 @@ class SourceFeedRow extends StatelessWidget {
                 ),
                 if (pull.lastOutcome.isNotEmpty)
                   Text('· ${pull.lastOutcome}', style: CumulusText.meta),
-                if (pull.watermark.isNotEmpty)
-                  Text('· cursor ${pull.watermark}', style: CumulusText.mono),
+                // Per resource, because they advance independently. Collapsing
+                // five cursors to their maximum stated a position four of them
+                // have not reached — and it is the number the Sync now caption
+                // below was promising to read from.
+                if (pull.watermarks.length == 1)
+                  Text('· cursor ${_utc(pull.watermark)}',
+                      style: CumulusText.meta)
+                else
+                  for (final cursor in pull.orderedWatermarks)
+                    Text('· ${cursor.$1} up to ${_utc(cursor.$2)}',
+                        style: CumulusText.meta),
+                // A time that has not happened yet, said in the tense it is
+                // in: `agoLabel` rendered the next scheduled pull as "next
+                // just now", and as "next 3m ago" once the clock passed it.
                 if (pull.nextPullAt.isNotEmpty)
-                  Text('· next ${_ago(pull.nextPullAt)}',
+                  Text('· next pull ${_until(pull.nextPullAt)}',
                       style: CumulusText.meta),
               ],
             ),
@@ -546,31 +600,41 @@ class SourceFeedRow extends StatelessWidget {
           ],
           if (contract != null) ...[
             const SizedBox(height: 6),
+            // The contract in the order somebody reads it: which system this
+            // is, what its rows become, who wins a disagreement, how often it
+            // arrives, where the rows are kept and what happens when one will
+            // not resolve. `system` was parsed and never shown, so the line
+            // opened on a bare enum — `contract: bind` — and the one fact that
+            // says what the feed *is* was the one fact missing.
             Wrap(
               spacing: 12,
               runSpacing: 4,
               children: [
-                Text(
-                  'contract: ${contract.strategy}'
-                  '${contract.landsAs.isEmpty ? '' : ' → ${contract.landsAs}'}',
-                  style: CumulusText.meta,
-                ),
-                for (final type in contract.resolvesTo)
-                  Text('· $type', style: CumulusText.mono),
+                if (contract.system.isNotEmpty)
+                  Text(contract.system, style: CumulusText.meta),
+                Text('· ${_strategy(contract)}', style: CumulusText.meta),
+                if (contract.resolvesTo.isNotEmpty)
+                  Text('· resolves against ${contract.resolvesTo.join(", ")}',
+                      style: CumulusText.meta),
+                // Not "claims write as crm", which names the label rather than
+                // what it decides. Precedence is only ever read when two
+                // systems disagree, and this is that sentence.
                 if (contract.precedenceSource.isNotEmpty)
                   Text(
-                    '· claims write as ${contract.precedenceSource}',
+                    '· conflicts resolve as ${contract.precedenceSource}',
                     style: CumulusText.meta,
                   ),
-                if (contract.matchPolicy.isNotEmpty)
-                  Text('· policy ${contract.matchPolicy}',
-                      style: CumulusText.mono),
-                Text('· custody ${contract.custody}', style: CumulusText.meta),
+                if (contract.freshness.isNotEmpty)
+                  Text('· ${contract.freshness}', style: CumulusText.meta),
+                Text('· ${_custody(contract.custody)}',
+                    style: CumulusText.meta),
                 if (contract.collection.isNotEmpty)
                   Text('· governed by ${contract.collection}',
                       style: CumulusText.meta),
-                Text('· escalates ${contract.escalation}',
+                Text('· ${_escalation(contract.escalation)}',
                     style: CumulusText.meta),
+                if (contract.matchPolicy.isNotEmpty)
+                  Text('· ${contract.matchPolicy}', style: CumulusText.mono),
               ],
             ),
           ],
@@ -681,12 +745,17 @@ class _SyncControl extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 4),
+        // A multi-resource feed has no single "since": each route is asked
+        // from its own cursor, and naming the furthest of them promised a
+        // narrower pull than the one the button starts.
         Text(
           syncing
               ? 'pulling ${pull.resources.length} route(s)'
-              : pull.everPulled
-              ? 'since ${_short(pull.watermark)}'
-              : 'first pull reads everything',
+              : !pull.everPulled
+              ? 'first pull reads everything'
+              : pull.watermarks.length > 1
+              ? 'each route since its own cursor'
+              : 'since ${_short(pull.watermark)}',
           textAlign: TextAlign.right,
           style: CumulusText.statCaption,
         ),
@@ -695,11 +764,71 @@ class _SyncControl extends StatelessWidget {
   }
 }
 
+/// What a delivery carried, what it kept, and what became of the rows.
+///
+/// Two arrival counts because they are two facts: a bind feed lands every row
+/// it is handed and a reify feed lands a fraction, so one number could not
+/// mean the same thing twice. The dispositions print only where the feed's
+/// contract reports them — a bind mapping has no resolve step and no payload
+/// hash, and "0 unchanged (byte-identical redelivery)" over a feed that runs
+/// no hash check was an answer to a question it never asks.
+String _arrivals(SourceFeed feed) {
+  final parts = [
+    '${feed.deliveries} delivery(s)',
+    '${feed.records} received',
+    '${feed.recordsLanded} newly landed',
+  ];
+  final unchanged = feed.unchanged;
+  final linked = feed.linked;
+  final created = feed.created;
+  if (unchanged == null && linked == null && created == null) {
+    parts.add('disposition not reported by this mapping');
+    return parts.join(' · ');
+  }
+  if (unchanged != null) {
+    parts.add('$unchanged unchanged (byte-identical redelivery)');
+  }
+  if (linked != null) parts.add('$linked linked to an existing entity');
+  if (created != null) parts.add('$created minted');
+  return parts.join(' · ');
+}
+
+/// The materialization decision, said rather than spelled. `reify` and `bind`
+/// are the vocabulary of the registry; what they mean is whether a row becomes
+/// an object you can adjudicate.
+String _strategy(SourceContract contract) => switch (contract.strategy) {
+  'reify' => 'each row lands as '
+      '${contract.landsAs.isEmpty ? "an object" : contract.landsAs}',
+  'bind' => 'columns bind to types; no row is reified',
+  _ => contract.strategy,
+};
+
+String _custody(String custody) => switch (custody) {
+  'copy' => 'rows are copied into the map',
+  'reference' => 'the map holds a pointer; the bytes stay in the source',
+  _ => 'custody $custody',
+};
+
+String _escalation(String escalation) => switch (escalation) {
+  'per-row task' => 'an unresolvable row raises a Task',
+  'windowed aggregate' => 'unresolvable rows are counted on the run, not paged',
+  _ => 'escalates $escalation',
+};
+
 /// A cursor short enough for a caption. The full value is on the row above it,
 /// so this trims rather than reformats — nothing here should imply a precision
-/// the watermark does not have.
-String _short(String iso) =>
-    iso.length > 16 ? iso.substring(0, 16).replaceFirst('T', ' ') : iso;
+/// the watermark does not have. The zone is stated because trimming is exactly
+/// what dropped it: `2026-08-30T19:10:53+00:00` became `2026-08-30 19:10`,
+/// which a reader in Madison has every reason to read as local.
+String _short(String iso) => iso.length > 16
+    ? '${iso.substring(0, 16).replaceFirst('T', ' ')} UTC'
+    : iso;
+
+/// The full cursor, marked for what it is. Watermarks are compared as strings
+/// against what the estate serves, so the value is never reformatted — only
+/// labelled.
+String _utc(String iso) =>
+    iso.endsWith('+00:00') || iso.endsWith('Z') ? '$iso (UTC)' : iso;
 
 /// `agoLabel` over an ISO string, tolerating the empty and the unparseable —
 /// a feed that has never run has no timestamp, and that is a legible state.
@@ -707,6 +836,15 @@ String _ago(String iso) {
   if (iso.isEmpty) return 'never';
   final when = DateTime.tryParse(iso);
   return when == null ? '—' : agoLabel(when);
+}
+
+/// The forward half of [_ago], for a moment that has not arrived. A scheduled
+/// next pull run through `agoLabel` read as "next just now" and then "next 3m
+/// ago" — a future stated as a past.
+String _until(String iso) {
+  if (iso.isEmpty) return 'unscheduled';
+  final when = DateTime.tryParse(iso);
+  return when == null ? '—' : untilLabel(when);
 }
 
 IconData _iconFor(String kind) => switch (kind) {

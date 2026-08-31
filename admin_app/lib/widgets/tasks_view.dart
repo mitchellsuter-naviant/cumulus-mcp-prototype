@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../models/session.dart';
 import '../models/task.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
@@ -29,7 +30,16 @@ class TasksSection extends StatefulWidget {
   /// follow a decision made here.
   final VoidCallback? onQueueChanged;
 
-  const TasksSection({super.key, required this.api, this.onQueueChanged});
+  /// The acting session, so an empty list can say which of its two causes it
+  /// is. Null only before the first session load.
+  final Session? session;
+
+  const TasksSection({
+    super.key,
+    required this.api,
+    this.onQueueChanged,
+    this.session,
+  });
 
   @override
   State<TasksSection> createState() => _TasksSectionState();
@@ -226,13 +236,7 @@ class _TasksSectionState extends State<TasksSection> {
         ),
         Expanded(
           child: visible.isEmpty
-              ? CumulusEmptyState(
-                  icon: _showDone ? Icons.history : Icons.task_alt,
-                  title: _showDone ? 'No decisions yet' : 'Queue is clear',
-                  message: _showDone
-                      ? 'Decided tasks stay here — the record is the point.'
-                      : 'Nothing is waiting on your judgment right now.',
-                )
+              ? _emptyState()
               : ListView.builder(
                   padding: const EdgeInsets.fromLTRB(28, 0, 14, 32),
                   itemCount: visible.length,
@@ -247,6 +251,39 @@ class _TasksSectionState extends State<TasksSection> {
                 ),
         ),
       ],
+    );
+  }
+
+  /// Nothing to show, and the two reasons for it are opposite claims.
+  ///
+  /// "Queue is clear" said to somebody bound to no queue at all is the same
+  /// error the AP panel on Home already fixed: it reports the business as
+  /// quiet to the person least able to check. A persona with no bindings has
+  /// no queue to be clear — work routes to desks and they hold none — and
+  /// saying so is also the only way they learn why the screen is empty.
+  Widget _emptyState() {
+    final unbound = widget.session != null && widget.session!.queues.isEmpty;
+    if (_showDone) {
+      return const CumulusEmptyState(
+        icon: Icons.history,
+        title: 'No decisions yet',
+        message: 'Decided tasks stay here — the record is the point.',
+      );
+    }
+    if (unbound) {
+      return const CumulusEmptyState(
+        icon: Icons.inbox_outlined,
+        title: 'You are not bound to a queue',
+        message:
+            'Work routes to desks, and you hold none. This is not an empty '
+            'queue — it is no queue. Tasks are waiting elsewhere in the '
+            'deployment and none of them is yours to decide.',
+      );
+    }
+    return const CumulusEmptyState(
+      icon: Icons.task_alt,
+      title: 'Queue is clear',
+      message: 'Nothing is waiting on your judgment right now.',
     );
   }
 }

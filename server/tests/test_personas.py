@@ -249,6 +249,48 @@ def test_an_own_scoped_persona_cannot_read_the_graph_around_it(client):
     assert client.get("/api/v1/graph/vendors", headers=kim).status_code == 200
 
 
+def test_an_own_scoped_persona_may_name_a_document_and_not_browse_for_one(
+    client,
+):
+    """The same rule the rail draws, now held by the routes behind it.
+
+    The console drops the Knowledge layer and the identity roster for an
+    own-scoped persona, and the command palette offered both anyway — which is
+    how this was found. But the palette was only reporting what the server
+    said: `/assets` and `/teams` enumerated the whole deployment for anybody
+    who asked.
+
+    The split is not "assets are secret". Reading *this* policy is how an
+    own-scoped screen renders the clause a run cited — the posting limit under
+    the AP composer, the PTO window on the hub — so naming one stays open, and
+    so does naming the team an asset says owns it. Browsing the corpus, or the
+    access map, is a governance act.
+    """
+    kim = {"X-Cumulus-Persona": "customer-user:ae"}
+    for path in ("/api/v1/assets", "/api/v1/assets/tree", "/api/v1/teams"):
+        refused = client.get(path, headers=kim)
+        assert refused.status_code == 403, path
+        assert refused.json()["detail"].endswith(
+            "Your access is to your own work — a document you can name is "
+            "still yours to read."
+        ) or refused.json()["detail"].endswith(
+            "Your access is to your own work — a team you can name is still "
+            "yours to read."
+        ), path
+
+    named = client.get("/api/v1/assets/expense-approval-policy", headers=kim)
+    assert named.status_code == 200
+    assert client.get(
+        "/api/v1/refs/knowledge:expense-approval-policy", headers=kim
+    ).status_code == 200
+
+    # And a persona that reads past itself still gets the list it is for.
+    for persona in ("naviant-support", "customer-admin"):
+        headers = {"X-Cumulus-Persona": persona}
+        assert client.get("/api/v1/assets", headers=headers).status_code == 200
+        assert client.get("/api/v1/teams", headers=headers).status_code == 200
+
+
 def test_tenant_and_platform_scope_agree_across_surfaces():
     """Three scopes, read as two different binaries, put `tenant` on opposite
     sides of the same question — the customer's own admin saw every expense

@@ -513,6 +513,41 @@ def test_success_rate_is_taken_over_finished_runs(client, world):
     assert usage["tasks_raised"] == 1
 
 
+def test_awaiting_judgment_is_the_slice_my_tasks_would_show(client, world):
+    """One queue, two screens, one number.
+
+    The Flows header counted every open Task in the deployment while My Tasks
+    counted the reader's own bindings, so an AE bound to nothing read
+    "Awaiting judgment 21" next to "Queue is clear". Both surfaces now take
+    the narrowing `TaskService.stats` takes, and the fleet total is bounded by
+    the queue total on every persona — the header can never claim work the
+    queue behind it would not show.
+    """
+    submit_expenses(world, 1, hint="total=900.00 category=meals")
+
+    for persona, visible in (
+        # Platform reach: the deployment is theirs to diagnose.
+        ("naviant-engineer", True),
+        # Bound to `expense-review`, which is where this Task landed.
+        ("customer-user:ceo", True),
+        # Bound to nothing at all.
+        ("customer-user:ae", False),
+        # Bound to two queues, neither of them this one.
+        ("customer-admin", True),
+    ):
+        headers = {"X-Cumulus-Persona": persona}
+        stats = client.get("/api/v1/flows/stats", headers=headers).json()
+        queue = client.get("/api/v1/tasks/stats", headers=headers).json()
+        rows = client.get("/api/v1/flows", headers=headers).json()
+        row = next(r for r in rows if r["id"] == "expense-reimbursement")
+
+        assert (stats["tasks_open"] > 0) is visible, persona
+        assert row["tasks_open"] == stats["tasks_open"], persona
+        # The header is a subset of the queue: a Task with no flow behind it
+        # is real work and simply has no row here to be counted on.
+        assert stats["tasks_open"] <= queue["open"], persona
+
+
 # ---- versions ----
 
 

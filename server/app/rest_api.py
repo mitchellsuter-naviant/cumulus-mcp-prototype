@@ -83,6 +83,35 @@ def _require_can_write(principal: Principal, owner: str | None) -> None:
     )
 
 
+def _require_corpus_reach(principal: Principal, surface: str) -> None:
+    """Gate an enumeration of the whole corpus, never a single document.
+
+    The split is deliberate and it is the same one the console draws. Reading
+    *this* policy is how an own-scoped screen renders the clause a run cited —
+    the posting limit on the AP composer, the PTO window on the hub — so
+    `GET /assets/{id}` and `GET /refs/{ref}` stay open to any reader. Reading
+    the *list* is browsing the whole governed corpus across every team, which
+    is a governance act: the console drops the Knowledge layer stop for an
+    own-scoped persona, and until now the route it dropped answered 200 to a
+    direct call anyway.
+    """
+    if principal.reads_beyond_self:
+        return
+    log.warning(
+        "Corpus enumeration denied",
+        extra={"uid": principal.uid, "persona": principal.persona_id,
+               "surface": surface},
+    )
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"{surface} covers the whole governed corpus, across every team. "
+            "Your access is to your own work — a document you can name is "
+            "still yours to read."
+        ),
+    )
+
+
 @router.get("/assets", response_model=list[AssetSummary])
 def list_assets(
     prefix: str | None = None,
@@ -91,6 +120,7 @@ def list_assets(
     principal: Principal = Depends(get_principal),
 ) -> list[AssetSummary]:
     require_reader(principal)
+    _require_corpus_reach(principal, "The asset list")
     return [
         a.summary()
         for a in get_service().list_assets(prefix=prefix, status=status)
@@ -101,6 +131,7 @@ def list_assets(
 @router.get("/assets/tree")
 def asset_tree(principal: Principal = Depends(get_principal)) -> dict:
     require_reader(principal)
+    _require_corpus_reach(principal, "The asset taxonomy")
     return get_service().tree()
 
 

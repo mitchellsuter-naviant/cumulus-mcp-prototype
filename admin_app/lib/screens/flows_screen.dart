@@ -180,17 +180,33 @@ class _FlowsSectionState extends State<FlowsSection> {
             StatTile(
               label: 'Runs · 30d',
               value: compactCount(stats.runs),
-              caption: '≈${(stats.runs / stats.days).round()} per day',
+              // Rounded to a whole number, eleven runs in a month came out as
+              // "≈0 per day" next to a headline of 11 — a rate that reads as
+              // "nothing is happening" over a fleet that is running.
+              caption: stats.runs == 0
+                  ? 'nothing ran in ${stats.days}d'
+                  : stats.runs < stats.days
+                  ? '${stats.runs} in the last ${stats.days} days'
+                  : '≈${(stats.runs / stats.days).toStringAsFixed(1)} per day',
             ),
             StatTile(
               label: 'Model spend · 30d',
               value: money(stats.modelSpendUsd),
-              // A spend of zero means two things. `unrecorded` is the one
-              // that is true here: the calls happened and nothing priced them.
-              caption: stats.costBasis == 'unrecorded'
-                  ? '${compactCount(stats.modelCalls)} calls, none priced'
-                  : '${compactCount(stats.pricedModelCalls)} of '
-                        '${compactCount(stats.modelCalls)} calls priced',
+              // A spend of zero means two opposite things and the tile has to
+              // say which. `unrecorded` is a hole — calls happened and nothing
+              // priced them. `no-model-calls` is a real zero, and it is what
+              // this estate reports: no flow in the window called a model at
+              // all, which is the same disclosure the AP upload panel makes
+              // about its stub extractor rather than a figure to celebrate.
+              caption: switch (stats.costBasis) {
+                'unrecorded' =>
+                  '${compactCount(stats.modelCalls)} calls, none priced',
+                'no-model-calls' =>
+                  'nothing called a model in ${stats.days}d, so this is '
+                      'genuinely zero',
+                _ => '${compactCount(stats.pricedModelCalls)} of '
+                    '${compactCount(stats.modelCalls)} calls priced',
+              },
             ),
             StatTile(
               label: 'Hours returned · 30d',
@@ -199,16 +215,22 @@ class _FlowsSectionState extends State<FlowsSection> {
                   'measurement',
               valueColor: CumulusColors.success,
             ),
+            // Scoped server-side to the queues this persona is bound to — the
+            // same slice My Tasks takes. Unscoped, an AE bound to nothing read
+            // "Awaiting judgment 21" beside a queue reading "clear".
             StatTile(
               label: 'Awaiting judgment',
               value: '${stats.tasksOpen}',
-              caption: 'open tasks across queues',
+              caption: 'open tasks in your queues',
               valueColor: stats.tasksOpen > 0 ? CumulusColors.warn : null,
             ),
+            // `escalated` counts runs with a failed step. Everywhere else in
+            // the console "escalated" means routed to a person, which is what
+            // a Task is — and those are the tile above.
             StatTile(
               label: 'Success rate',
               value: percent(stats.successRate),
-              caption: '${stats.escalated} escalated in ${stats.days}d',
+              caption: '${stats.escalated} runs broke in ${stats.days}d',
             ),
           ],
         ),

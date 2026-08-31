@@ -159,6 +159,12 @@ class FeedState {
   /// holds.
   final String landsAs;
 
+  /// What the book holds of [landsAs], on the same terms as [entities]. Null
+  /// for a bind mapping, which lands nothing of its own. Carried so the
+  /// destination line can name where the rows *went* — the resolution targets
+  /// were being printed under a heading about landing.
+  final EntityCount? landedType;
+
   /// Null for a feed that pushes; it has no app for discovery to confirm.
   final bool? active;
 
@@ -167,10 +173,20 @@ class FeedState {
   final String lastStatus;
   final String lastError;
   final int deliveries;
+
+  /// Rows the delivery carried, against rows the landing step kept. Two facts,
+  /// not one: on a reify feed they diverge by two thirds.
+  final int records;
+
   final int recordsLanded;
-  final int created;
-  final int linked;
-  final int unchangedRows;
+
+  /// Null — never zero — when this feed's contract does not report the
+  /// disposition. See [SourceFeed] in `data_layer.dart`: a bind mapping has
+  /// no resolve step and no payload hash, so it never answers these.
+  final int? created;
+  final int? linked;
+  final int? unchangedRows;
+
   final int awaitingSteward;
   final List<EntityCount> entities;
 
@@ -192,16 +208,18 @@ class FeedState {
     this.contractId = '',
     this.transport = '',
     this.landsAs = '',
+    this.landedType,
     this.active,
     this.lastRunAtIso = '',
     this.lastRunAgeSeconds,
     this.lastStatus = '',
     this.lastError = '',
     this.deliveries = 0,
+    this.records = 0,
     this.recordsLanded = 0,
-    this.created = 0,
-    this.linked = 0,
-    this.unchangedRows = 0,
+    this.created,
+    this.linked,
+    this.unchangedRows,
     this.awaitingSteward = 0,
     this.entities = const [],
     this.pulls = false,
@@ -220,16 +238,21 @@ class FeedState {
     contractId: json['contract_id'] as String? ?? '',
     transport: json['transport'] as String? ?? '',
     landsAs: json['lands_as'] as String? ?? '',
+    landedType: json['landed_type'] == null
+        ? null
+        : EntityCount.fromJson(json['landed_type'] as Map<String, dynamic>),
     active: json['active'] as bool?,
     lastRunAtIso: json['last_run_at_iso'] as String? ?? '',
     lastRunAgeSeconds: json['last_run_age_seconds'] as int?,
     lastStatus: json['last_status'] as String? ?? '',
     lastError: json['last_error'] as String? ?? '',
     deliveries: json['deliveries'] as int? ?? 0,
+    records: json['records'] as int? ?? 0,
     recordsLanded: json['records_landed'] as int? ?? 0,
-    created: json['created'] as int? ?? 0,
-    linked: json['linked'] as int? ?? 0,
-    unchangedRows: json['unchanged_rows'] as int? ?? 0,
+    // Absent stays absent — see the field comments above.
+    created: json['created'] as int?,
+    linked: json['linked'] as int?,
+    unchangedRows: json['unchanged_rows'] as int?,
     awaitingSteward: json['awaiting_steward'] as int? ?? 0,
     entities: (json['entities'] as List<dynamic>? ?? const [])
         .map((e) => EntityCount.fromJson(e as Map<String, dynamic>))
@@ -278,6 +301,12 @@ class ArrivalsState {
         .map((e) => '$e')
         .toList(),
   );
+
+  /// Rows handed to the door across every feed. The total the header states,
+  /// because it is the one that means "traffic": summing [recordsLanded]
+  /// instead reported a third of the estate's arrivals as if it were all of
+  /// them, since a reify feed lands a fraction of what it carries.
+  int get recordsReceived => feeds.fold(0, (sum, f) => sum + f.records);
 
   int get recordsLanded => feeds.fold(0, (sum, f) => sum + f.recordsLanded);
 }

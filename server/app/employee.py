@@ -71,6 +71,13 @@ class EmployeeProfile(BaseModel):
     pto_accrual_per_month: float = 1.67
     next_company_holiday: str = "Labor Day · Sep 7"
     benefits: list[Benefit] = Field(default_factory=list)
+    #: The governed auto-approval window and the revision-stamped ref it was
+    #: parsed from — the same pair `request_pto` decides on. Derived on every
+    #: read like name and title above, never stored: the console printed a
+    #: hardcoded "3 working days" beside the claim that the number was
+    #: governed, so editing the policy moved the rule and not the sentence.
+    pto_auto_approve_days: float = 0.0
+    pto_policy_ref: str = ""
 
 
 class PtoRequest(BaseModel):
@@ -255,6 +262,7 @@ class EmployeeService:
         with a default balance and a full set of benefits — so the hub showed
         a person nobody employs and days nobody had accrued.
         """
+        window, policy_ref = self.auto_approve_window()
         person = self.graph.get(object_id("Employee", email)) if email else None
         if person is None:
             return EmployeeProfile(
@@ -267,6 +275,8 @@ class EmployeeService:
                 pto_balance_days=0.0,
                 pto_accrual_per_month=0.0,
                 next_company_holiday="",
+                pto_auto_approve_days=window,
+                pto_policy_ref=policy_ref,
             )
         profile = self.directory.get_profile(email) or self.directory.put_profile(
             EmployeeProfile(email=email, benefits=_default_benefits())
@@ -276,6 +286,9 @@ class EmployeeService:
         profile.location = str(person.props.get("location") or "")
         profile.team = self._linked_label(person.id, "member_of")
         profile.manager = self._linked_label(person.id, "reports_to")
+        # The rule the hub prints, read off the same asset `request_pto` reads.
+        profile.pto_auto_approve_days = window
+        profile.pto_policy_ref = policy_ref
         return profile
 
     def _linked_label(self, person_id: str, link_type: str) -> str:

@@ -1,4 +1,6 @@
 import 'package:cumulus_admin/models/asset.dart';
+import 'package:cumulus_admin/models/session.dart';
+import 'package:cumulus_admin/services/api_client.dart';
 import 'package:cumulus_admin/widgets/command_palette.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -263,7 +265,102 @@ void main() {
       expect(isWeakSemanticHit(decoded), isFalse);
     });
   });
+
+  // The palette navigates in the shell's vocabulary. Two things have to hold
+  // of that vocabulary and neither did: the indices have to name the sections
+  // they claim to, and the destinations have to be the ones this reader can
+  // actually open.
+  group('navigation entries', () {
+    CommandCatalog catalogFor(Session? session) =>
+        CommandCatalog(ApiClient())..session = session;
+
+    Map<String, int> sectionsOf(CommandCatalog catalog) => {
+      for (final entry in catalog.navigationEntries)
+        if (entry.intent case OpenSectionIntent(:final index))
+          entry.label: index,
+    };
+
+    test('every section entry points at the section it names', () {
+      // The copy that lived here drifted after a rail reorder: "Knowledge
+      // layer" opened the identity workbench and "Flows" opened System state,
+      // because three indices were written out by hand and never revisited.
+      expect(sectionsOf(catalogFor(null)), {
+        'Home': homeIndex,
+        'Calendar': calendarIndex,
+        'My Tasks': tasksIndex,
+        'System state': systemStateIndex,
+        'Knowledge layer': knowledgeIndex,
+        'Flows': flowsIndex,
+        'Identities, access & keys': identitiesIndex,
+        'Expense Reimbursement': expenseWorkspaceIndex,
+        'Accounts Payable': payablesWorkspaceIndex,
+        'Counterparty identity': identityWorkspaceIndex,
+      });
+    });
+
+    test('an own-scoped persona is not offered what the rail drops', () {
+      // Kim: own scope, no queues, no identity desk. The shell unmounts every
+      // one of these for her, so offering them meant navigating to a
+      // deliberately blank widget and calling it a destination.
+      final kim = catalogFor(_session(scope: 'own', queues: const []));
+      final labels = kim.navigationEntries.map((e) => e.label).toSet();
+
+      expect(labels, {'Home', 'Calendar', 'My Tasks', 'Flows'});
+      expect(labels, isNot(contains('System state')));
+      expect(labels, isNot(contains('Knowledge layer')));
+      expect(labels, isNot(contains('New asset')));
+      expect(labels, isNot(contains('Accounts Payable')));
+    });
+
+    test('a queue binding is what opens a workspace, not a rung', () {
+      // Connie and Diane sit on the same rung of the write ladder and own
+      // different desks, which is the whole reason a queue binding exists.
+      final connie =
+          catalogFor(_session(scope: 'own', queues: const ['ap-clerk']));
+      final diane =
+          catalogFor(_session(scope: 'own', queues: const ['expense-review']));
+
+      final hers = connie.navigationEntries.map((e) => e.label);
+      final his = diane.navigationEntries.map((e) => e.label);
+      expect(hers, contains('Accounts Payable'));
+      expect(hers, isNot(contains('Expense Reimbursement')));
+      expect(his, contains('Expense Reimbursement'));
+      expect(his, isNot(contains('Accounts Payable')));
+    });
+
+    test('reading past your own work opens everything', () {
+      // Naviant Support owns no queue at all and still reads the deployment:
+      // scope and bindings are orthogonal axes, and a workspace is a Seeing
+      // Space before it is a desk.
+      final support =
+          catalogFor(_session(scope: 'platform', queues: const []));
+      final labels = support.navigationEntries.map((e) => e.label);
+      expect(labels, contains('Accounts Payable'));
+      expect(labels, contains('Expense Reimbursement'));
+      expect(labels, contains('System state'));
+    });
+  });
 }
+
+Session _session({required String scope, required List<String> queues}) =>
+    Session(
+      uid: 'u',
+      email: 'u@naviant.com',
+      personaId: 'p',
+      label: 'P',
+      person: 'P',
+      title: '',
+      authority: 'user',
+      scope: scope,
+      queues: queues,
+      inWorkforce: true,
+      impersonatedBy: null,
+      maySwitchPersona: false,
+      // The workbench's own rule, answered by the server. Off unless a
+      // steward desk is held; `platform` reach turns it on there.
+      mayOpenIdentity: scope != 'own',
+      groups: const [],
+    );
 
 /// Mirrors the old, unfenced subsequence rule so a test can assert it was the
 /// culprit rather than just asserting the new behaviour.

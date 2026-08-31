@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Collection
 from datetime import date, datetime, timedelta
 from typing import Literal, Protocol
 
@@ -540,24 +541,33 @@ def fleet_runs() -> dict[str, list[RunRecord]]:
     return grouped
 
 
-def open_tasks_by_flow() -> dict[str, int]:
+def open_tasks_by_flow(
+    queues: Collection[str] | None = None,
+) -> dict[str, int]:
     """Open Tasks per flow, counted in the task store.
 
     The synthesized backlog this replaces was a per-day random draw off the
     definition's task rate, so it moved at midnight and correlated with
     nothing a person could act on. These are the rows in the queue.
+
+    `queues` narrows the count to one principal's bindings — the same slice
+    `TaskService.stats` takes, and for the same reason. An unscoped total on
+    the Flows header put "Awaiting judgment 21" beside a My Tasks reading
+    "Queue is clear", which is two screens arguing about one number.
     """
     counts: dict[str, int] = {}
     from .deps import get_task_service
 
     for task in get_task_service().list(status="open"):
+        if queues is not None and task.queue not in queues:
+            continue
         if task.flow_id:
             counts[task.flow_id] = counts.get(task.flow_id, 0) + 1
     return counts
 
 
-def open_tasks(flow_id: str) -> int:
-    return open_tasks_by_flow().get(flow_id, 0)
+def open_tasks(flow_id: str, queues: Collection[str] | None = None) -> int:
+    return open_tasks_by_flow(queues).get(flow_id, 0)
 
 
 # ---------------------------------------------------------------------------

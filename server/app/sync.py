@@ -665,7 +665,21 @@ class SyncRequest(BaseModel):
 
 
 class SourceStatus(BaseModel):
-    """What the Data → Sources lens reads for one feed."""
+    """What the Data → Sources lens reads for one feed.
+
+    Two counts of arrival, because one word was doing both jobs. `records` is
+    what the delivery *carried*; `records_landed` is what the landing step
+    kept. On a bind feed they are equal — nothing is reified, so every row
+    binds — but on a reify feed they diverge hard: the PSA delivery carries 374
+    rows and lands 13 of them as `SourceRecord`s, and a screen that summed only
+    the second reported a third of the traffic as if it were all of it.
+
+    The three dispositions are `None` rather than `0` when the feed's flow
+    never reported them. A bind mapping has no resolve step to link or mint
+    with and no payload hash to suppress a redelivery by, so `0 minted · 0
+    linked · 0 unchanged` over 145 landed rows was a confident answer to a
+    question this contract does not ask. Absent says that; zero cannot.
+    """
 
     source: str
     kind: SyncKind
@@ -675,12 +689,26 @@ class SourceStatus(BaseModel):
     last_status: str = ""
     watermark: str = ""
     deliveries: int = 0
+    #: Rows the delivery carried, before anything decided what to keep.
+    records: int = 0
     records_landed: int = 0
-    linked: int = 0
-    created: int = 0
+    linked: int | None = None
+    created: int | None = None
     awaiting_steward: int = 0
-    unchanged: int = 0
+    unchanged: int | None = None
     last_error: str = ""
+
+
+def _accumulate(total: int | None, outputs: dict, key: str) -> int | None:
+    """Sum a disposition across runs, keeping "never reported" distinct from 0.
+
+    A run that does not carry the key leaves the total exactly as it was — so
+    a feed whose flow has no resolve step stays `None` however many times it
+    delivers, and one that reported a real zero stays `0`.
+    """
+    if key not in outputs:
+        return total
+    return (total or 0) + int(outputs.get(key) or 0)
 
 
 def _payload_hash(payload: dict) -> str:
@@ -2305,10 +2333,11 @@ class SyncService:
                     run.inputs.get("watermark") or status.watermark
                 )
                 outputs = run.outputs or {}
+                status.records += int(outputs.get("records", 0) or 0)
                 status.records_landed += int(outputs.get("landed", 0) or 0)
-                status.unchanged += int(outputs.get("unchanged", 0) or 0)
-                status.linked += int(outputs.get("linked", 0) or 0)
-                status.created += int(outputs.get("created", 0) or 0)
+                status.unchanged = _accumulate(status.unchanged, outputs, "unchanged")
+                status.linked = _accumulate(status.linked, outputs, "linked")
+                status.created = _accumulate(status.created, outputs, "created")
                 status.awaiting_steward += int(outputs.get("awaiting_steward", 0) or 0)
                 if run.error:
                     status.last_error = run.error

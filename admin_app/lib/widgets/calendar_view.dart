@@ -72,10 +72,17 @@ class _CalendarSectionState extends State<CalendarSection> {
       children: [
         Padding(
           padding: const EdgeInsets.fromLTRB(28, 20, 28, 0),
+          // The branch was inverted, so it addressed everybody in the wrong
+          // person: a named agenda *is* yours — the persona you are acting as
+          // is who you are here — and an unnamed one belongs to a principal
+          // the org chart has never heard of, who has no calendar at all.
+          // "Calendar · yours" was printed over exactly the second case.
           child: PageHeading(
-            eyebrow: agenda == null || agenda.name.isEmpty
-                ? 'Calendar · yours'
-                : 'Calendar · ${agenda.name}'
+            eyebrow: agenda == null
+                ? 'Calendar'
+                : agenda.name.isEmpty
+                ? 'Calendar · no mailbox in this workforce'
+                : 'Calendar · yours'
                       '${agenda.title.isEmpty ? '' : ' · ${agenda.title}'}',
             title: _rangeLabel(_weekStart, end),
             subtitle:

@@ -391,7 +391,12 @@ def test_a_plain_user_with_no_team_writes_nothing(client, owner, act_as):
 
     act_as(nobody["uid"], "nobody@example.com", role="user")
 
-    assert client.get("/api/v1/assets").status_code == 200
+    # Reads narrowed with the corpus gate: naming a document stays open —
+    # a policy chip on an own-scoped screen resolves through it — while
+    # browsing the whole corpus is a governance read this principal does not
+    # have. The writes below are the point either way.
+    assert client.get("/api/v1/assets/expense-approval-policy").status_code == 200
+    assert client.get("/api/v1/assets").status_code == 403
     resp = client.post(
         "/api/v1/assets",
         json={

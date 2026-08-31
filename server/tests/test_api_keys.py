@@ -33,6 +33,14 @@ def owner(monkeypatch):
 
 _names = iter(f"Agent {n}" for n in range(1, 1000))
 
+#: The liveness probe for a credential: a seeded document, read by name.
+#:
+#: It used to be `GET /api/v1/assets`, which a `user`-role key can no longer
+#: call — `reach_for("user")` scopes it to its own work, and enumerating the
+#: corpus is a governance read. Naming a document is not, so this is the route
+#: that still separates "the key works" from "the key is dead".
+PROBE = "/api/v1/assets/expense-approval-policy"
+
 
 def _identity(client, owner, role="user", **kw):
     """An agent identity to hang a key off; display names must be unique."""
@@ -79,22 +87,34 @@ def test_secret_is_not_stored_in_the_clear(client, owner):
 
 
 def test_minted_key_authenticates_and_is_counted(client, owner):
+    """Authenticated is not the same as authorized, and both are counted.
+
+    A `user`-role key carries `own` reach, so it may read a document it can
+    name and may not enumerate the corpus — and the 403 on the second is
+    itself proof the credential authenticated. Both requests are the key's
+    traffic and both are counted: usage is recorded where the credential is
+    resolved, so a misconfigured integration hammering a route it may not use
+    is visible rather than invisible.
+    """
     minted = _mint(client, owner)
     headers = {"X-API-Key": minted["token"]}
 
-    assert client.get("/api/v1/assets", headers=headers).status_code == 200
-    assert client.get("/api/v1/assets", headers=headers).status_code == 200
+    assert client.get(PROBE, headers=headers).status_code == 200
+    assert client.get(PROBE, headers=headers).status_code == 200
+    assert client.get("/api/v1/assets", headers=headers).status_code == 403
 
     deps._api_key_directory.flush()
     record = deps._api_key_directory.get(minted["key"]["id"])
-    assert record.request_count == 2
+    assert record.request_count == 3
     assert record.last_used_at is not None
 
     usage = client.get(
         f"/api/v1/api-keys/{minted['key']['id']}/usage", headers=owner
     ).json()
-    assert sum(day["count"] for day in usage) == 2
-    assert usage[0]["endpoints"]["/api/v1/assets"] == 2
+    assert sum(day["count"] for day in usage) == 3
+    assert usage[0]["endpoints"] == {
+        "/api/v1/assets/:id": 2, "/api/v1/assets": 1
+    }
 
 
 def test_usage_paths_are_templated_not_per_asset(client, owner):
@@ -193,13 +213,13 @@ def test_deleting_an_identity_revokes_and_blocks_its_keys(client, owner):
     identity = _identity(client, owner)
     minted = _mint(client, owner, identity_uid=identity["uid"])
     headers = {"X-API-Key": minted["token"]}
-    assert client.get("/api/v1/assets", headers=headers).status_code == 200
+    assert client.get(PROBE, headers=headers).status_code == 200
 
     assert (
         client.delete(f"/api/v1/identities/{identity['uid']}", headers=owner).status_code
         == 204
     )
-    assert client.get("/api/v1/assets", headers=headers).status_code == 401
+    assert client.get(PROBE, headers=headers).status_code == 401
     listed = client.get("/api/v1/api-keys", headers=owner).json()[0]
     assert listed["status"] == "revoked"
 
@@ -244,13 +264,13 @@ def test_minted_key_cannot_manage_keys(client, owner):
 def test_revoke_blocks_the_key_immediately(client, owner):
     minted = _mint(client, owner)
     headers = {"X-API-Key": minted["token"]}
-    assert client.get("/api/v1/assets", headers=headers).status_code == 200
+    assert client.get(PROBE, headers=headers).status_code == 200
 
     assert (
         client.delete(f"/api/v1/api-keys/{minted['key']['id']}", headers=owner).status_code
         == 204
     )
-    resp = client.get("/api/v1/assets", headers=headers)
+    resp = client.get(PROBE, headers=headers)
     assert resp.status_code == 401
     assert "revoked" in resp.json()["detail"].lower()
 
@@ -280,11 +300,11 @@ def test_expired_key_is_rejected(client, owner, monkeypatch):
 
     minted = _mint(client, owner, expires_in_days=1)
     headers = {"X-API-Key": minted["token"]}
-    assert client.get("/api/v1/assets", headers=headers).status_code == 200
+    assert client.get(PROBE, headers=headers).status_code == 200
 
     record = deps._api_key_directory.get(minted["key"]["id"])
     record.expires_at = api_keys.utcnow() - timedelta(seconds=1)
-    assert client.get("/api/v1/assets", headers=headers).status_code == 401
+    assert client.get(PROBE, headers=headers).status_code == 401
     assert client.get("/api/v1/api-keys", headers=owner).json()[0]["status"] == "expired"
 
 

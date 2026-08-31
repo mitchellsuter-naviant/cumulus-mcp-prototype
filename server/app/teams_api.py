@@ -160,6 +160,25 @@ def _asset_count(slug: str) -> int:
 @router.get("", response_model=list[TeamPublic])
 def list_teams(principal: Principal = Depends(get_principal)) -> list[TeamPublic]:
     require_reader(principal)
+    # Enumerating every team in the deployment is a governance read, and the
+    # console already treats it as one — the "Identities, access & keys" stop
+    # is dropped for an own-scoped persona, while this route answered 200 to
+    # the same principal calling it directly. `GET /{slug}` stays open, because
+    # an asset row naming its owning team is how an own-scoped screen resolves
+    # what "owned by platform-eng" means.
+    if not principal.reads_beyond_self:
+        log.warning(
+            "Team enumeration denied",
+            extra={"uid": principal.uid, "persona": principal.persona_id},
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "The team roster is the whole deployment's access map. Your "
+                "access is to your own work — a team you can name is still "
+                "yours to read."
+            ),
+        )
     # Resolve identities and asset counts once for the whole list rather than
     # per team: both are full scans of their store.
     identities = {i.uid: i for i in get_identity_service().list()}

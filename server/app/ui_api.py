@@ -32,7 +32,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from . import data_collections, deps, flows, payables, personas
-from .auth import Principal, get_principal, require_reader, require_role
+from .auth import (
+    Principal,
+    get_principal,
+    require_queue,
+    require_reader,
+    require_role,
+)
 from .config import settings
 from .deps import get_graph_service
 from .estate_api import pull_feed_now
@@ -193,29 +199,52 @@ def session(principal: Principal = Depends(get_ui_principal)) -> Session:
 # decision; it was the shape of `/api/v1` showing through.
 
 
-def get_knowledge_principal(
-    principal: Principal = Depends(get_ui_principal),
-) -> Principal:
+def governance_door(surface: str):
     """The governance surfaces' read reach: platform or tenant, never own.
 
-    Built on `get_ui_principal` rather than beside it, so the no-keys rule is
-    inherited in one place and cannot drift into a second spelling. Shared by
-    the Knowledge layer and the system-state screen because it is one argument,
-    not two: neither is scoped to one person's work — the ontology, the corpus,
-    the feeds, the desks and the ledger are the shape of the whole deployment.
-    So an own-scoped persona is refused outright rather than handed an empty
-    diagram, which it would read as "there is nothing here" instead of "this is
-    not yours".
+    One rule, four sentences. The rule is shared because the argument is one
+    argument — the ontology, the corpus, the feeds, the desks and the ledger
+    are the shape of the whole deployment, so an own-scoped reader is refused
+    outright rather than handed an empty diagram it would read as "there is
+    nothing here" instead of "this is not yours".
+
+    The *sentence* is per surface because a refusal is the only thing that
+    reader sees, and one sentence for four screens can only name a generality:
+    somebody who opened Sources was told that "this describes the whole map",
+    which is not what they asked for. `surface` completes "<noun phrase>. Your
+    access is to your own work." — second person, and never the word *persona*,
+    which is our vocabulary for a thing they experience as themselves. The
+    identity workbench's bespoke refusal is the model.
+
+    Built on `get_ui_principal` so the no-keys rule is inherited in one place
+    and cannot drift into a second spelling.
     """
-    if not principal.reads_beyond_self:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This describes the whole map, not one person's work. "
-                "This persona reads only its own."
-            ),
-        )
-    return principal
+
+    def door(principal: Principal = Depends(get_ui_principal)) -> Principal:
+        if not principal.reads_beyond_self:
+            raise HTTPException(
+                status_code=403,
+                detail=f"{surface} Your access is to your own work.",
+            )
+        return principal
+
+    return door
+
+
+#: The four doors, named once so a route reads as the surface it serves.
+get_ontology_principal = governance_door(
+    "The ontology is every object type in the deployment and the flows that "
+    "touch them."
+)
+get_library_principal = governance_door(
+    "The library is the whole governed corpus, across every team."
+)
+get_sources_principal = governance_door(
+    "The source registry covers the whole deployment."
+)
+get_dashboard_principal = governance_door(
+    "System state reads every collection, feed, desk and ledger entry at once."
+)
 
 
 #: The cluster an object type falls into when no Collection claims it.
@@ -361,7 +390,7 @@ def ontology(
     flow: str | None = Query(
         default=None, description="Overlay this flow's observed footprint."
     ),
-    principal: Principal = Depends(get_knowledge_principal),
+    principal: Principal = Depends(get_ontology_principal),
 ) -> OntologyScreen:
     """Everything the model diagram draws.
 
@@ -541,7 +570,14 @@ class PullState(BaseModel):
 
 
 class SourceRow(BaseModel):
-    """One feed: how it is running, what it promised, what it left behind."""
+    """One feed: how it is running, what it promised, what it left behind.
+
+    `records` and `records_landed` are both here because they are different
+    facts and one of them was standing in for both. See `sync.SourceStatus`:
+    received is what arrived, landed is what the landing step kept, and the
+    three dispositions are `None` on a feed whose contract never reports them
+    rather than a confident zero.
+    """
 
     source: str
     kind: str
@@ -552,11 +588,13 @@ class SourceRow(BaseModel):
     last_error: str
     watermark: str
     deliveries: int
+    #: Rows the delivery carried, before anything decided what to keep.
+    records: int = 0
     records_landed: int
-    linked: int
-    created: int
+    linked: int | None = None
+    created: int | None = None
     awaiting_steward: int
-    unchanged: int
+    unchanged: int | None = None
     #: `None` when no Mapping claims this feed — rows arriving under no
     #: declared contract, which is exactly the finding this screen is for.
     contract: SourceContract | None
@@ -796,6 +834,7 @@ def _source_rows(pulls: dict[str, PullState]) -> list[SourceRow]:
             last_run_at_iso=status.last_run_at_iso,
             last_status=status.last_status, last_error=status.last_error,
             watermark=status.watermark, deliveries=status.deliveries,
+            records=status.records,
             records_landed=status.records_landed, linked=status.linked,
             created=status.created, awaiting_steward=status.awaiting_steward,
             unchanged=status.unchanged,
@@ -814,8 +853,8 @@ def _source_rows(pulls: dict[str, PullState]) -> list[SourceRow]:
         rows.append(SourceRow(
             source=feed, kind="", flow_id="", last_run_id="",
             last_run_at_iso="", last_status="", last_error=pull.last_error,
-            watermark="", deliveries=0, records_landed=0, linked=0,
-            created=0, awaiting_steward=0, unchanged=0,
+            watermark="", deliveries=0, records=0, records_landed=0,
+            linked=None, created=None, awaiting_steward=0, unchanged=None,
             contract=_contract(contracts.get(feed)),
             pull=pull, artifacts=[], artifacts_total=0,
         ))
@@ -824,7 +863,7 @@ def _source_rows(pulls: dict[str, PullState]) -> list[SourceRow]:
 
 @router.get("/sources", response_model=SourcesScreen)
 def sources(
-    principal: Principal = Depends(get_knowledge_principal),
+    principal: Principal = Depends(get_sources_principal),
 ) -> SourcesScreen:
     """Every inbound feed, against the contract it lands under.
 
@@ -846,7 +885,7 @@ def sources(
 @router.post("/sources/{source}/sync-now", response_model=SyncNowOutcome)
 def sync_source_now(
     source: str,
-    principal: Principal = Depends(get_knowledge_principal),
+    principal: Principal = Depends(get_sources_principal),
 ) -> SyncNowOutcome:
     """Pull one feed now, and answer with the row the screen redraws.
 
@@ -916,7 +955,7 @@ class LibraryScreen(BaseModel):
 @router.get("/library", response_model=LibraryScreen)
 def library(
     days: int = Query(default=30, ge=1, le=365),
-    principal: Principal = Depends(get_knowledge_principal),
+    principal: Principal = Depends(get_library_principal),
 ) -> LibraryScreen:
     """The corpus and its usage, joined.
 
@@ -1018,8 +1057,9 @@ def get_identity_principal(
         status_code=403,
         detail=(
             "The identity workbench is the counterparty book's curation desk. "
-            "This persona owns neither stewardship queue and reads only its "
-            "own work, so there is nothing here for it."
+            "You hold neither stewardship queue, and your access is to your "
+            "own work — so there is nothing here for you rather than "
+            "something withheld."
         ),
     )
 
@@ -1169,6 +1209,12 @@ class SweepRun(BaseModel):
     compared: int
     considered: int
     proposed: int
+    #: **Not** `IdentityBook.standing` or `IdentityState.standing`, which count
+    #: proposals waiting on a steward. This is the sweep's own word for edges
+    #: it found already on the graph and therefore left alone — a measure of
+    #: idempotence, not of backlog. Kept rather than renamed because it is the
+    #: run's output key; no screen renders it, and this note is what stops the
+    #: first one that tries from adding the two together.
     standing: int
     steward_tasks: int
     #: How many of those Tasks were ratifications rather than questions. The
@@ -1631,10 +1677,12 @@ class EntityCount(BaseModel):
 
     type: str
     instances: int
-    #: How many Mappings resolve rows against this type. More than one and the
-    #: book is shared, so `instances` is not this feed's output: the mail and
-    #: calendar feeds resolve *against* Employee without ever minting one, and
-    #: the ERP and the CRM both write the counterparty book.
+    #: How many Mappings write into this type — resolving against it on
+    #: `entities`, landing into it on `landed_type`. More than one and the book
+    #: is shared, so `instances` is not this feed's output: the mail and
+    #: calendar feeds resolve *against* Employee without ever minting one, the
+    #: ERP and the CRM both write the counterparty book, and four contracts
+    #: land their rows as `SourceRecord`.
     feeds: int
 
 
@@ -1663,6 +1711,12 @@ class FeedState(BaseModel):
     #: `records_landed` comparable to what the book holds: a feed that lands
     #: `SourceRecord`s is not short of entities when it holds fewer of them.
     lands_as: str
+    #: What the book holds of `lands_as`, on the same terms as `entities`. A
+    #: reify feed's rows *become* this type, so the destination line can say
+    #: "lands as PurchaseOrder 31 · resolves against Vendor 13" rather than
+    #: printing the resolution targets under a heading about landing. `None`
+    #: for a bind mapping, which lands nothing of its own.
+    landed_type: EntityCount | None
     #: `None` for a feed that pushes; it has no app for discovery to confirm.
     active: bool | None
     last_run_at_iso: str
@@ -1670,10 +1724,15 @@ class FeedState(BaseModel):
     last_status: str
     last_error: str
     deliveries: int
+    #: Rows the delivery carried, against rows the landing step kept. See
+    #: `SourceRow`: on a reify feed these diverge by two thirds.
+    records: int = 0
     records_landed: int
-    created: int
-    linked: int
-    unchanged_rows: int
+    #: `None` — never `0` — when this feed's contract does not report the
+    #: disposition. See `sync.SourceStatus`.
+    created: int | None = None
+    linked: int | None = None
+    unchanged_rows: int | None = None
     awaiting_steward: int
     entities: list[EntityCount]
     #: Whether Cumulus pulls this feed. A pushed feed keeps its own cadence and
@@ -1711,9 +1770,12 @@ def _feed_states(rows: list[SourceRow]) -> list[FeedState]:
     graph = deps.get_graph_service()
     by_type, _conflicted, _by_link = _graph_counts(graph)
     fed_by: dict[str, int] = {}
+    lands_by: dict[str, int] = {}
     for mapping in MAPPINGS:
         for type_name in mapping.resolves_to:
             fed_by[type_name] = fed_by.get(type_name, 0) + 1
+        if mapping.lands_as:
+            lands_by[mapping.lands_as] = lands_by.get(mapping.lands_as, 0) + 1
 
     out: list[FeedState] = []
     for row in rows:
@@ -1722,16 +1784,26 @@ def _feed_states(rows: list[SourceRow]) -> list[FeedState]:
             max(pull.watermarks.values()) if pull and pull.watermarks else ""
         )
         contract = row.contract
+        lands_as = contract.lands_as if contract else ""
         out.append(FeedState(
             source=row.source, kind=row.kind, flow_id=row.flow_id,
             contract_id=contract.id if contract else "",
             transport=contract.transport if contract else "",
-            lands_as=contract.lands_as if contract else "",
+            lands_as=lands_as,
+            landed_type=(
+                EntityCount(
+                    type=lands_as,
+                    instances=by_type.get(lands_as, 0),
+                    feeds=lands_by.get(lands_as, 0),
+                )
+                if lands_as else None
+            ),
             active=pull.active if pull else None,
             last_run_at_iso=row.last_run_at_iso,
             last_run_age_seconds=_age_seconds(row.last_run_at_iso),
             last_status=row.last_status, last_error=row.last_error,
-            deliveries=row.deliveries, records_landed=row.records_landed,
+            deliveries=row.deliveries, records=row.records,
+            records_landed=row.records_landed,
             created=row.created, linked=row.linked,
             unchanged_rows=row.unchanged,
             awaiting_steward=row.awaiting_steward,
@@ -2059,7 +2131,7 @@ class Dashboard(BaseModel):
 
 @router.get("/dashboard", response_model=Dashboard)
 def dashboard(
-    principal: Principal = Depends(get_knowledge_principal),
+    principal: Principal = Depends(get_dashboard_principal),
 ) -> Dashboard:
     """The current state of the whole system, in one call.
 
@@ -2160,6 +2232,17 @@ class ComposerOrder(BaseModel):
     receipts: list[str]
 
 
+#: A purchase order nothing more can be billed against. The composer offers the
+#: complement and the vendor card counts it, so "N open PO(s)" is a count of
+#: orders that are open — it used to include the closed and the fully-billed,
+#: which made the number and the word disagree on every vendor.
+#:
+#: Named as the closed set rather than the open one because the ERP's
+#: vocabulary is the source's and grows: a status this deployment has not seen
+#: yet is more safely read as still-open than silently dropped from the picker.
+CLOSED_PO_STATUSES = frozenset({"cancelled", "closed", "fully-billed"})
+
+
 class ComposerVendor(BaseModel):
     label: str
     slug: str
@@ -2248,7 +2331,7 @@ def _composer() -> Composer:
             continue
         orders: list[ComposerOrder] = []
         for _, order in graph.neighbors(vendor.id, "ordered_from", "in"):
-            if order.props.get("status") == "cancelled":
+            if str(order.props.get("status") or "") in CLOSED_PO_STATUSES:
                 continue
             received: dict[str, float] = {}
             receipts: list[str] = []
@@ -2364,9 +2447,34 @@ def _gate(record: payables.InvoiceRecord, principal: Principal) -> OutcomeGate |
     )
 
 
+def get_payables_principal(
+    principal: Principal = Depends(get_ui_principal),
+) -> Principal:
+    """The AP workspace's door: the clerk queue, or read reach past yourself.
+
+    The rows were already scoped — `PayableService.list` narrows an own-scoped
+    reader to their own — but the screen is more than its rows. The composer is
+    the vendor master, every open purchase order, the posting policy and a
+    control that runs the flow, none of which is anybody's *own* work, and all
+    of which an AE with no queue could open. So the same rule the rail draws
+    with gates the route behind it: own the desk, or read past yourself.
+    """
+    if principal.reads_beyond_self or principal.owns_queue(payables.CLERK_QUEUE):
+        return principal
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "The Accounts Payable workspace is the "
+            f"`{payables.CLERK_QUEUE}` desk — the vendor master, its open "
+            "orders and the posting policy. You are not bound to it, and your "
+            "access is to your own work."
+        ),
+    )
+
+
 @router.get("/payables", response_model=PayablesScreen)
 def payables_screen(
-    principal: Principal = Depends(get_ui_principal),
+    principal: Principal = Depends(get_payables_principal),
 ) -> PayablesScreen:
     """The AP workspace: the rows this reader is accountable for, and the
     composer that starts a new run against real graph rows."""
@@ -2403,9 +2511,18 @@ class PayableSubmission(BaseModel):
 @router.post("/payables/submissions", response_model=PayableOutcome, status_code=201)
 def submit_payable(
     body: PayableSubmission,
-    principal: Principal = Depends(get_ui_principal),
+    principal: Principal = Depends(get_payables_principal),
 ) -> PayableOutcome:
-    """Run the accounts-payable flow now, and answer with a screen."""
+    """Run the accounts-payable flow now, and answer with a screen.
+
+    Gated harder than the read beside it. Reading the workspace is a
+    Seeing-Space capability — a platform principal diagnosing the deployment
+    belongs in it — but *submitting* posts to the AP book and may auto-post
+    money under the governed limit, so it needs the desk itself. Naviant
+    Support reads every invoice and files none, which is exactly the line
+    `require_queue` draws for a Task decision.
+    """
+    require_queue(principal, payables.CLERK_QUEUE)
     hint = body.scenario.to_hint() if body.scenario is not None else ""
     if not hint and not body.image_base64 and not body.filename:
         raise HTTPException(

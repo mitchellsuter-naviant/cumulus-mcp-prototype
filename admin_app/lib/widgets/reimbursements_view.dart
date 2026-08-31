@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 
 import '../models/reimbursement.dart';
+import '../models/session.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'command_palette.dart' show expenseQueue, ownsWorkspace;
 import 'mini_charts.dart';
 import 'run_workbench.dart';
 import 'ui_kit.dart';
@@ -19,13 +21,25 @@ import 'ui_kit.dart';
 class ReimbursementsView extends StatefulWidget {
   final ApiClient api;
 
-  const ReimbursementsView({super.key, required this.api});
+  /// The acting session, so an empty table can say which of its two causes it
+  /// is. Null only before the first session load.
+  final Session? session;
+
+  const ReimbursementsView({super.key, required this.api, this.session});
 
   @override
   State<ReimbursementsView> createState() => _ReimbursementsViewState();
 }
 
 class _ReimbursementsViewState extends State<ReimbursementsView> {
+  /// Whether the expense queue is this persona's work. The table is scoped
+  /// server-side either way — this only decides what its emptiness *means*.
+  /// Home's AP panel draws exactly this distinction; the workspaces were the
+  /// two screens that did not, and "No requests in this state yet" told the
+  /// person least able to check that the business was quiet.
+  bool get _seesTheQueue =>
+      ownsWorkspace(widget.session, expenseQueue);
+
   List<Reimbursement>? _rows;
   ReimbursementStats? _stats;
   String? _error;
@@ -182,10 +196,27 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
           ),
           const SizedBox(height: 14),
           if (visible.isEmpty)
-            const CumulusEmptyState(
-              icon: Icons.table_rows_outlined,
-              title: 'Nothing at this lens',
-              message: 'No requests in this state yet.',
+            // Three states, and only one of them used to be said. "Nothing at
+            // this lens" is meaningless with ALL selected — no lens is on —
+            // and an empty table has two causes that are opposite claims: no
+            // requests exist, or none of them is yours to see.
+            CumulusEmptyState(
+              icon: _seesTheQueue
+                  ? Icons.table_rows_outlined
+                  : Icons.lock_outline,
+              title: !_seesTheQueue
+                  ? 'Not scoped to you'
+                  : _lens == 'all'
+                  ? 'No requests yet'
+                  : 'Nothing $_lens',
+              message: !_seesTheQueue
+                  ? 'You are not bound to the expense-review queue, so this '
+                        'table holds only requests you filed yourself. This is '
+                        'what you can see, not what there is.'
+                  : _lens == 'all'
+                  ? 'The expense-reimbursement flow has written no rows here.'
+                  : 'No request is in the $_lens state. Clear the lens to see '
+                        'the whole table.',
             )
           else
             ListCard(

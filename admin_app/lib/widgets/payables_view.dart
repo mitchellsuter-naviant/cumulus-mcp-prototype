@@ -7,9 +7,11 @@ import 'package:flutter/services.dart';
 import '../models/data_layer.dart';
 import '../models/payable.dart';
 import '../models/run.dart';
+import '../models/session.dart';
 import '../models/task.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'command_palette.dart' show ownsWorkspace, payablesQueue;
 import 'ref_chips.dart';
 import 'run_workbench.dart';
 import 'side_drawer.dart';
@@ -20,22 +22,33 @@ import 'ui_kit.dart';
 ///
 /// What makes this table interesting is what it records *around* the
 /// extraction: which canonical vendor the printed name resolved to and how,
-/// how the billed lines paired against the purchase order and the receiving
-/// report, and what the anomaly screen made of the invoice against that
-/// vendor's own history. [InvoiceOutcomeView] shows all three, plus the
+/// how the billed lines paired against the purchase order — and against the
+/// receipts, where a receiving feed has delivered any — and what the anomaly
+/// screen made of the invoice against that vendor's own history. [InvoiceOutcomeView] shows all three, plus the
 /// governed values the posting rule read — and it is the same widget for a row
 /// you expand and for the run you just started, because they are the same
 /// thing seen at two moments.
 class PayablesView extends StatefulWidget {
   final ApiClient api;
 
-  const PayablesView({super.key, required this.api});
+  /// The acting session, so an empty table can say which of its two causes it
+  /// is. Null only before the first session load.
+  final Session? session;
+
+  const PayablesView({super.key, required this.api, this.session});
 
   @override
   State<PayablesView> createState() => _PayablesViewState();
 }
 
 class _PayablesViewState extends State<PayablesView> {
+  /// Whether the AP queue is this persona's work. The table is scoped
+  /// server-side either way — this only decides what its emptiness *means*.
+  /// Home's AP panel draws exactly this distinction; the workspace itself did
+  /// not, and "No invoices in this state yet" told the person least able to
+  /// check that the business was quiet.
+  bool get _seesTheQueue => ownsWorkspace(widget.session, payablesQueue);
+
   PayablesScreen? _screen;
   String? _error;
   String _lens = 'all';
@@ -194,10 +207,28 @@ class _PayablesViewState extends State<PayablesView> {
           ),
           const SizedBox(height: 14),
           if (visible.isEmpty)
-            const CumulusEmptyState(
-              icon: Icons.table_rows_outlined,
-              title: 'Nothing at this lens',
-              message: 'No invoices in this state yet.',
+            // Three states, and only one of them used to be said. "Nothing at
+            // this lens" is meaningless with ALL selected — no lens is on —
+            // and an empty table has two causes that are opposite claims: no
+            // invoices exist, or none of them is yours to see.
+            CumulusEmptyState(
+              icon: _seesTheQueue
+                  ? Icons.table_rows_outlined
+                  : Icons.lock_outline,
+              title: !_seesTheQueue
+                  ? 'Not scoped to you'
+                  : _lens == 'all'
+                  ? 'No invoices yet'
+                  : 'Nothing $_lens',
+              message: !_seesTheQueue
+                  ? 'You are not bound to the ap-clerk queue, so this table '
+                        'holds only invoices you filed yourself. This is what '
+                        'you can see, not what there is.'
+                  : _lens == 'all'
+                  ? 'The accounts-payable flow has written no rows here. '
+                        'Compose one above and it runs now.'
+                  : 'No invoice is in the $_lens state. Clear the lens to see '
+                        'the whole table.',
             )
           else
             ListCard(
@@ -599,11 +630,19 @@ class _InvoiceComposerCardState extends State<InvoiceComposerCard> {
         _vendorFacts(vendor),
       ],
       const SizedBox(height: 16),
+      // The receiving column is named only where there is one. This estate has
+      // no receiving system — the feed has never delivered and the book holds
+      // no receipt — so an order with no receipts pairs against the purchase
+      // order and nothing else, and saying otherwise described a leg the
+      // reader cannot go and find.
       FieldLabel(
         _order == null ? 'Lines, from the catalog' : 'Lines on ${_order!.poNumber}',
         hint: _order == null
             ? 'no purchase order behind this invoice, so nothing to bill '
                   'against — the match will have nothing to pair with'
+            : _order!.receipts.isEmpty
+            ? 'stepped from what the order ordered; nothing has been received '
+                  'against it, so the match has only the order to pair with'
             : 'stepped from what the order ordered; the receiving column is '
                   'what was actually booked in',
       ),
@@ -685,6 +724,9 @@ class _InvoiceComposerCardState extends State<InvoiceComposerCard> {
         tone: vendor.status == 'active' ? CumulusTone.success : CumulusTone.warn,
         dense: true,
       ),
+      // "Open" is now true of the list this counts: the composer is served
+      // only orders that can still be billed against, so the count and the
+      // word agree at the source rather than in this caption.
       Text(
         [
           if (vendor.taxId.isNotEmpty) 'tax ${vendor.taxId}',
@@ -862,8 +904,19 @@ class _InvoiceComposerCardState extends State<InvoiceComposerCard> {
     );
   }
 
+  /// One twist, and whether the branch it advertises can be reached from here.
+  ///
+  /// The quantity-variance branch compares billed against *received*, so it
+  /// needs a receiving report. This estate has none — the feed has never
+  /// delivered — and the checkbox promised a branch that cannot fire, which
+  /// teaches the wrong thing while looking right. Derived from the chosen
+  /// order's own receipts rather than asserted, so it starts telling the truth
+  /// the day a receiving feed lands one.
   Widget _twistRow(ScenarioTwist twist) {
     final clause = widget.composer.clause(twist.clauseId);
+    final unreachable =
+        twist.branch == 'quantity variance' &&
+        (_order == null || _order!.receipts.isEmpty);
     return Padding(
       padding: const EdgeInsets.only(bottom: 2),
       child: Row(
@@ -898,6 +951,20 @@ class _InvoiceComposerCardState extends State<InvoiceComposerCard> {
                       child: _monoChip(
                         '${clause.label}: ${clause.value}',
                         tone: CumulusTone.accent,
+                      ),
+                    ),
+                  if (unreachable)
+                    const Tooltip(
+                      message:
+                          'The branch compares billed against received. '
+                          'Nothing has been received against this order, so '
+                          'the match has no receiving leg to find a variance '
+                          'in — the run will take the not-received path '
+                          'instead.',
+                      child: StatusBadge(
+                        'unreachable here — nothing received',
+                        tone: CumulusTone.warn,
+                        dense: true,
                       ),
                     ),
                 ],

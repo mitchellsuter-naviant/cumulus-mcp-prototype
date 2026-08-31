@@ -171,10 +171,17 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
         const SizedBox(height: 14),
         StatStrip(
           tiles: [
+            // The balance and the accrual are the deployment's defaults until
+            // somebody enrols this person — the hub mints a profile at these
+            // numbers the first time it is read, and nothing has varied them.
+            // The caption says so rather than presenting a class default as
+            // this person's accrued record.
             StatTile(
               label: 'PTO balance',
               value: '${profile.ptoBalanceDays}',
-              caption: 'days · +${profile.ptoAccrualPerMonth}/month',
+              caption:
+                  'days · +${profile.ptoAccrualPerMonth}/month · the '
+                  'deployment default, not an HRIS balance',
             ),
             StatTile(
               label: 'Pending requests',
@@ -189,13 +196,25 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
           ],
         ),
         const SizedBox(height: 16),
-        _PtoCard(api: _api, onChanged: _load, requests: _pto ?? const []),
+        _PtoCard(
+          api: _api,
+          onChanged: _load,
+          requests: _pto ?? const [],
+          autoApproveDays: profile.ptoAutoApproveDays,
+          policyRef: profile.ptoPolicyRef,
+        ),
         const SizedBox(height: 16),
         _ExpenseCard(api: _api, onChanged: _load, mine: _mine ?? const []),
         const SizedBox(height: 16),
+        // Not "what you are enrolled in". Every profile gets the same four
+        // plans the first time the hub reads it; nothing here comes from an
+        // enrolment system and nothing varies per person yet. Presenting a
+        // deployment default as somebody's own record is the kind of claim a
+        // reader has no way to check.
         SectionCard(
           title: 'Benefits',
-          subtitle: 'what you are enrolled in',
+          subtitle: 'the plans this deployment offers — enrolment is not '
+              'modelled yet, so these are the same for everyone',
           child: Column(
             children: [
               for (final b in profile.benefits)
@@ -244,10 +263,19 @@ class _PtoCard extends StatefulWidget {
   final VoidCallback onChanged;
   final List<PtoRequest> requests;
 
+  /// The governed auto-approval window, and the ref it was parsed from. Served
+  /// with the profile: this card claimed the window was governed while
+  /// printing a literal `3`, so editing the policy asset moved the rule the
+  /// flow applies and left the sentence beside it saying the old number.
+  final double autoApproveDays;
+  final String policyRef;
+
   const _PtoCard({
     required this.api,
     required this.onChanged,
     required this.requests,
+    required this.autoApproveDays,
+    required this.policyRef,
   });
 
   @override
@@ -326,10 +354,17 @@ class _PtoCardState extends State<_PtoCard> {
 
   @override
   Widget build(BuildContext context) {
+    // The number and the ref both come from the asset the flow reads, so the
+    // rule this card states and the rule `request_pto` applies cannot drift.
+    final window = widget.autoApproveDays;
     return SectionCard(
       title: 'Time off',
-      subtitle:
-          'requests of 3 working days or fewer auto-approve — governed by the PTO policy',
+      subtitle: window <= 0
+          ? 'the PTO policy does not state an auto-approval window, so every '
+                'request routes to HR'
+          : 'requests of ${window.toStringAsFixed(window % 1 == 0 ? 0 : 1)} '
+                'working days or fewer auto-approve — governed by '
+                '${widget.policyRef.isEmpty ? 'the PTO policy' : widget.policyRef}',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [

@@ -90,6 +90,58 @@ def test_a_principal_outside_the_workforce_is_told_so(client, persona):
     assert me["pto_balance_days"] == 0
 
 
+def test_the_hub_is_served_the_window_it_calls_governed(client):
+    """The console printed "requests of 3 working days or fewer auto-approve"
+    from a literal `3` in Dart, beside the claim that the number was governed.
+
+    Editing the policy asset moved the rule and not the sentence — the exact
+    drift the whole governed-knowledge argument exists to prevent — so the
+    parsed value and the revision-stamped ref it came from travel with the
+    profile, and the rule the screen states is the rule the flow applies.
+    """
+    me = client.get("/api/v1/employee/me", headers=ME).json()
+    assert me["pto_auto_approve_days"] == 3.0
+    assert me["pto_policy_ref"].startswith("knowledge:pto-policy@rev")
+
+    published = client.get("/api/v1/assets/pto-policy").json()
+    edited = client.put(
+        "/api/v1/assets/pto-policy",
+        json={
+            "content": published["content"].replace(
+                "3 working days or fewer", "5 working days or fewer"
+            ),
+        },
+    )
+    assert edited.status_code == 200
+
+    moved = client.get("/api/v1/employee/me", headers=ME).json()
+    assert moved["pto_auto_approve_days"] == 5.0
+    assert moved["pto_policy_ref"] != me["pto_policy_ref"]
+
+    # And the flow decides on the same value the hub now prints.
+    request = client.post(
+        "/api/v1/employee/pto",
+        json={"start_date": "2026-09-14", "end_date": "2026-09-18", "days": 4,
+              "note": "a week off"},
+        headers=ME,
+    ).json()
+    assert request["state"] == "approved"
+    assert "governed 5-day auto-approval window" in request["reason"]
+
+
+def test_a_principal_outside_the_workforce_still_reads_the_governed_rule(
+    client,
+):
+    """The window is a fact about the deployment, not about the reader — the
+    hub says what the policy is even where it has nobody to apply it to."""
+    me = client.get(
+        "/api/v1/employee/me", headers=_as(personas.ENGINEER.id)
+    ).json()
+    assert me["in_workforce"] is False
+    assert me["pto_auto_approve_days"] == 3.0
+    assert me["pto_policy_ref"].startswith("knowledge:pto-policy@rev")
+
+
 def test_short_pto_auto_approves_within_governed_window(client):
     resp = client.post(
         "/api/v1/employee/pto",
