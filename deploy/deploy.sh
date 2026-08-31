@@ -132,6 +132,43 @@ if [[ "$EMBEDDING_BACKEND" == "vertex" || "$MODEL_BACKEND" == "vertex" ]]; then
     --condition=None --quiet >/dev/null
 fi
 
+# ---- The estate ------------------------------------------------------------
+#
+# Which live customer environment this deployment pulls from. Machinery-config,
+# not map: a Mapping never names a project, and neither does anything in
+# `server/app` — it arrives here, at the deployment boundary.
+#
+# Deliberately no default. The estate project is per-developer (the demo
+# ecosystem's `.firebaserc` is git-ignored for the same reason), and guessing
+# one would point a deployment at somebody else's data. Empty is honest: the
+# world comes up empty and every screen says so, because the mock seed world
+# was deleted when the estate became the only world.
+ESTATE_PROJECT="${ESTATE_PROJECT:-}"
+ESTATE_NAMESPACE="${ESTATE_NAMESPACE:-naviant}"
+
+# Writes to the customer's systems are off unless somebody says otherwise, in
+# writing, per deployment. There is no undo on the far side of an Action.
+ESTATE_WRITES_ENABLED="${ESTATE_WRITES_ENABLED:-false}"
+
+if [[ -z "$ESTATE_PROJECT" ]]; then
+  echo "==> No ESTATE_PROJECT set — deploying with no estate registered."
+  echo "    The world will be empty until one is configured. To connect:"
+  echo "      ESTATE_PROJECT=cumulus-demo-<name> ./deploy/deploy.sh $PROJECT_ID"
+else
+  echo "==> Estate: $ESTATE_PROJECT / $ESTATE_NAMESPACE (writes: $ESTATE_WRITES_ENABLED)"
+fi
+
+# The connector is a client of its own server, so it needs a credential for the
+# door like any other feed. `CONNECTOR_DELIVER_URL` is left unset on purpose —
+# it falls back to PUBLIC_BASE_URL, which is set to this service's own URL
+# below, so the two can never disagree.
+ESTATE_ENV="ESTATE_PROJECT=$ESTATE_PROJECT,ESTATE_NAMESPACE=$ESTATE_NAMESPACE"
+ESTATE_ENV="$ESTATE_ENV,ESTATE_WRITES_ENABLED=$ESTATE_WRITES_ENABLED"
+ESTATE_ENV="$ESTATE_ENV,CONNECTOR_API_KEY=$ADMIN_API_KEY"
+# The in-server pull loop stays off in a deployment: Scheduling is a sourced
+# capability, and Cloud Scheduler drives the pull below. Nothing here stays warm.
+ESTATE_ENV="$ESTATE_ENV,ESTATE_PULL_INTERVAL_SECONDS=0"
+
 echo "==> Deploying server to Cloud Run"
 # Collections whose *row shape* changed with the flow rewrite, pinned to a
 # generation. The seeds only run against an empty collection, so pointing at
@@ -144,10 +181,23 @@ echo "==> Deploying server to Cloud Run"
 # Set them here rather than by hand after the fact, because --set-env-vars
 # *replaces* the whole environment: an override applied to a live revision is
 # silently dropped by the next deploy.
-COLLECTION_GENERATION="${COLLECTION_GENERATION:-v3}"
+COLLECTION_GENERATION="${COLLECTION_GENERATION:-v4}"
 GENERATION_ENV="TASKS_COLLECTION=tasks_$COLLECTION_GENERATION"
 GENERATION_ENV="$GENERATION_ENV,REIMBURSEMENTS_COLLECTION=reimbursements_$COLLECTION_GENERATION"
 GENERATION_ENV="$GENERATION_ENV,PAYABLES_COLLECTION=payables_$COLLECTION_GENERATION"
+# v4 pins the world itself, not only the three reshaped tables. The generation
+# before it holds a world that no longer exists: a seeded mock customer with
+# its own vendors, staff and personas, deleted when the estate became the only
+# source of business data. Those rows are not stale in shape, they are stale in
+# *subject* — a graph carrying `acme-industrial` beside a synced counterparty
+# book would be a deployment that demonstrates a contradiction. So the graph,
+# the journals and the two append-only logs move with it, and the old world
+# stays readable in Firestore rather than being migrated or deleted.
+GENERATION_ENV="$GENERATION_ENV,GRAPH_OBJECTS_COLLECTION=graph_objects_$COLLECTION_GENERATION"
+GENERATION_ENV="$GENERATION_ENV,GRAPH_LINKS_COLLECTION=graph_links_$COLLECTION_GENERATION"
+GENERATION_ENV="$GENERATION_ENV,RUNS_COLLECTION=flow_runs_$COLLECTION_GENERATION"
+GENERATION_ENV="$GENERATION_ENV,LEDGER_COLLECTION=curation_ledger_$COLLECTION_GENERATION"
+GENERATION_ENV="$GENERATION_ENV,EVENTS_COLLECTION=events_$COLLECTION_GENERATION"
 
 echo "==> Pinning reshaped collections to generation $COLLECTION_GENERATION"
 
@@ -155,7 +205,7 @@ gcloud run deploy "$SERVICE" \
   --source "$REPO_ROOT/server" \
   --region "$REGION" \
   --allow-unauthenticated \
-  --set-env-vars "STORAGE_BACKEND=firestore,AUTH_BACKEND=firebase,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ADMIN_API_KEY=$ADMIN_API_KEY,EMBEDDING_BACKEND=$EMBEDDING_BACKEND,EMBEDDING_LOCATION=$VERTEX_MODEL_LOCATION,MODEL_BACKEND=$MODEL_BACKEND,MODEL_LOCATION=$VERTEX_MODEL_LOCATION,$GENERATION_ENV" \
+  --set-env-vars "STORAGE_BACKEND=firestore,AUTH_BACKEND=firebase,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ADMIN_API_KEY=$ADMIN_API_KEY,EMBEDDING_BACKEND=$EMBEDDING_BACKEND,EMBEDDING_LOCATION=$VERTEX_MODEL_LOCATION,MODEL_BACKEND=$MODEL_BACKEND,MODEL_LOCATION=$VERTEX_MODEL_LOCATION,$GENERATION_ENV,$ESTATE_ENV" \
   --quiet
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"
@@ -164,6 +214,51 @@ echo "==> Service URL: $SERVICE_URL"
 echo "==> Updating PUBLIC_BASE_URL env var"
 gcloud run services update "$SERVICE" --region "$REGION" \
   --update-env-vars "PUBLIC_BASE_URL=$SERVICE_URL" --quiet
+
+# ---- Scheduling, sourced ----------------------------------------------------
+#
+# The connector pulls on a cadence, and nothing in Cumulus stays warm to make
+# that happen: Scheduling is a capability filled by an adapter, the endpoint is
+# the port, and Cloud Scheduler is the adapter here. The in-server loop that
+# does this on a laptop is off in a deployment (ESTATE_PULL_INTERVAL_SECONDS=0).
+#
+# The two sweeps are on the same footing. Both are windowed Flows woken by a
+# fact — "a window closed over the book" — and a scheduler is what closes a
+# window when no source pushed anything.
+if [[ -n "$ESTATE_PROJECT" ]]; then
+  echo "==> Enabling Cloud Scheduler"
+  gcloud services enable cloudscheduler.googleapis.com --quiet
+
+  schedule_job() {
+    local name="$1" cron="$2" path="$3" description="$4"
+    local args=(
+      --location="$REGION"
+      --schedule="$cron"
+      --time-zone="Etc/UTC"
+      --uri="$SERVICE_URL$path"
+      --http-method=POST
+      --update-headers="X-API-Key=$ADMIN_API_KEY"
+      --description="$description"
+      --attempt-deadline=600s
+      --quiet
+    )
+    if gcloud scheduler jobs describe "$name" --location="$REGION" >/dev/null 2>&1; then
+      gcloud scheduler jobs update http "$name" "${args[@]}" >/dev/null
+      echo "    updated $name ($cron)"
+    else
+      gcloud scheduler jobs create http "$name" "${args[@]}" >/dev/null
+      echo "    created $name ($cron)"
+    fi
+  }
+
+  echo "==> Scheduling the pull and the sweeps"
+  schedule_job "cumulus-estate-pull" "*/15 * * * *" "/api/v1/estate/pull" \
+    "Pull every registered estate feed's delta and deliver it through the door."
+  schedule_job "cumulus-identity-sweep" "20 * * * *" "/api/v1/identity/sweep" \
+    "Propose cross-source identity links over the counterparty book."
+  schedule_job "cumulus-state-sweep" "40 * * * *" "/api/v1/state/sweep" \
+    "Find disagreements between systems about the same commitment."
+fi
 
 echo "==> Configuring Flutter app for Firebase (web)"
 cd "$REPO_ROOT/admin_app"
@@ -193,6 +288,13 @@ echo "=========================================================="
 echo "Deployed."
 echo "  API + MCP:   $SERVICE_URL   (MCP endpoint: $SERVICE_URL/mcp/)"
 echo "  Admin app:   https://$PROJECT_ID.web.app"
+if [[ -n "$ESTATE_PROJECT" ]]; then
+  echo "  Estate:      $ESTATE_PROJECT / $ESTATE_NAMESPACE"
+  echo "               writes $ESTATE_WRITES_ENABLED · pull every 15m · sweeps hourly"
+else
+  echo "  Estate:      none registered — the world comes up empty"
+fi
+echo "  World:       collection generation $COLLECTION_GENERATION"
 echo
 echo "Next: enable Email/Password sign-in (one-time, console UI):"
 echo "  https://console.firebase.google.com/project/$PROJECT_ID/authentication/providers"
