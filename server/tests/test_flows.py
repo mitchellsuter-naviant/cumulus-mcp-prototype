@@ -53,15 +53,18 @@ SYNC_FLOWS = {
 #: wrote — the first asking whether two rows are one party, the second asking
 #: whether two systems agree about what was committed to — and both carry their
 #: export like everything else.
+#: `order-release` is neither: it is the one per-case flow that writes to a
+#: system Cumulus does not own, started by the approval of what the
+#: disagreement sweep found.
 DECLARED_FLOWS = SYNC_FLOWS | {
     "expense-reimbursement", "accounts-payable", "identity-sweep",
-    "disagreement-sweep",
+    "disagreement-sweep", "order-release",
 }
 
 
 @pytest.fixture()
 def world():
-    """A fresh world: fifteen registered flow bodies, no runs, no tasks."""
+    """A fresh world: sixteen registered flow bodies, no runs, no tasks."""
     return test_world.fresh()
 
 
@@ -158,7 +161,7 @@ def probe_flow(client, owner, flow_id: str) -> None:
 
 def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
     """The list used to be the registry, so it showed two flows in a system
-    that runs fourteen. Eleven inbound sync feeds write the graph, a twelfth
+    that runs sixteen. Eleven inbound sync feeds write the graph, a twelfth
     windowed flow proposes edges across it, and all of them now have a
     `FlowDefinition` — but the list is still read off the engine,
     because the two agreeing today is a fact about today. A body registered
@@ -170,7 +173,7 @@ def test_the_fleet_is_every_flow_that_runs_not_every_definition(client, world):
     by_id = {r["id"]: r for r in rows}
     assert SYNC_FLOWS < set(by_id)
     assert {"expense-reimbursement", "accounts-payable"} < set(by_id)
-    assert len(rows) == 16  # fifteen declared flows, plus the unmapped probe
+    assert len(rows) == 17  # sixteen declared flows, plus the unmapped probe
 
     # A definition-less row says so, rather than borrowing a lifecycle state
     # it has no definition to hold.
@@ -383,8 +386,8 @@ def test_the_fleet_run_count_is_the_real_run_count(client, world):
         for row in client.get("/api/v1/flows").json()
     ]
     assert stats["runs"] == sum(u["runs"] for u in per_flow)
-    assert stats["flows"] == 15
-    assert stats["definitions"] == 15
+    assert stats["flows"] == 16
+    assert stats["definitions"] == 16
     # The carried debt reached zero: every flow that runs carries its export.
     assert stats["without_definition"] == 0
 

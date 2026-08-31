@@ -1882,6 +1882,79 @@ def _seed_definitions() -> list[FlowDefinition]:
             ],
         ),
         FlowDefinition(
+            id="order-release",
+            name="Order release",
+            description=(
+                "The one flow that changes a system Cumulus does not own. A "
+                "controller approves a disagreement the sweep found, and this "
+                "runs per case: it re-reads the order in the ERP, checks the "
+                "move against the closed table of writes this system is "
+                "permitted to make, journals the intent before the request "
+                "leaves, sends one PATCH, reads the record back, and only "
+                "then records the finding as resolved. The estate decides "
+                "whether the write took — never the 200. **Two Actions, two "
+                "regimes**: releasing is a decision a human authorized, and "
+                "what the ERP says afterwards is an observation, landed under "
+                "the ERP's own authority. Cumulus never writes an authority "
+                "claim it did not read back, because a human claim on an "
+                "order's status would outrank the ERP forever and freeze the "
+                "order. Five things can be true when it looks: the order is "
+                "still held (release it), it already holds the released value "
+                "and this system asked for that (nothing to do), it holds it "
+                "and nobody here asked (somebody else released it), it has "
+                "moved somewhere this system may not write from (ask a "
+                "person), or the table does not permit the move at all "
+                "(refused before any request exists). **There is no undo**: "
+                "moving an order back is a second decision."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["write-back", "sales-orders", "estate", "governed-write",
+                  "per-case"],
+            queues=["order-desk"],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(0),
+            updated_at=_ago(0),
+            steps=[
+                FlowStep(id="t1", type="trigger", name="OrderReleaseApproved",
+                         summary="one run per approved finding — per case, unlike the windowed sweep that raised it, because a controller releases one order at a time and the run has to re-read the world rather than trust a state somebody looked at days ago",
+                         config={"event": "OrderReleaseApproved"}, next=["x1"]),
+                FlowStep(id="x1", type="transform", name="read-write-policy",
+                         summary="the one row of the write table this flow may go through — resource, field and the transitions permitted out of each value — and the order it is about, whose ERP record id is read off the object's `external_id` and never sliced out of its transaction number",
+                         config={"source": "estate_writes:WRITABLE",
+                                 "target": "sales-order-status"},
+                         next=["z1"]),
+                FlowStep(id="z1", type="resolve", name="check-preconditions",
+                         summary="re-reads the record in the ERP and answers one of five ways — proceed, already ours, resolved by somebody else, escalate, or refused by the table before any request exists. Read-only, and deliberately outside the guarded write: this reaches a customer's network, and a read that failed inside an Action would be ledgered as a failed write",
+                         config={"reads": "erp.salesOrders", "outcomes": "5",
+                                 "compares": "value, not updatedAt"},
+                         next=["a1", "k1"]),
+                FlowStep(id="a1", type="action", name="release-sales-order",
+                         summary="the intent is journalled before the request leaves, one PATCH is sent, the record is read back, and the finding moves to `resolved` in the same commit — write-ahead because a request that raises may still have landed, and verified by re-read because a cheerful 200 that changed nothing settles `unverified` and raises a Task instead of reporting success",
+                         config={"target": "sales-records",
+                                 "gateway": "action-gateway",
+                                 "journal": "estate_write_journal",
+                                 "asserts": "no human claim on the order; at most one PATCH per run"},
+                         next=["s1"]),
+                FlowStep(id="s1", type="action", name="apply-source-records",
+                         summary="what the ERP said when it was read back, landed as an observation under `erp:erp-sales` — the same claim the feed itself writes, so the delta that carries this change home is a byte-identical no-op rather than a conflict",
+                         config={"target": "entity-layer",
+                                 "gateway": "action-gateway",
+                                 "regime": "observation"},
+                         next=["k1"]),
+                FlowStep(id="k1", type="task", name="tell-the-order-desk",
+                         summary="a Task when the ERP is not where the approval left it, or when it accepted the write and did not change — and deliberately nothing at all when somebody else had already released the order, which is a number and not an interruption",
+                         config={"queue": "order-desk"}, next=["e1"]),
+                FlowStep(id="e1", type="event", name="SalesOrderReleased",
+                         summary="emitted on commit — or `OrderReleaseWithheld`, just as loudly, because a run that decided not to write is not a run that did nothing",
+                         config={"event": "SalesOrderReleased"}),
+            ],
+        ),
+        FlowDefinition(
             id="psa-sync",
             name="Delivery book sync",
             description=(

@@ -60,6 +60,12 @@ GRAPH_FLOWS = {
     "accounts-payable",
     "identity-sweep",
     "disagreement-sweep",
+    # The answer to what that one finds, and it belongs in the picker for the
+    # reason the picker is built from the engine at all: it writes the graph
+    # (the finding's status, and the ERP's own account of the order it read
+    # back), so a reader asking "what has touched SalesOrder" must be able to
+    # name it.
+    "order-release",
     "calendar-sync",
     "crm-sync",
     "dms-sync",

@@ -300,8 +300,9 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
         "psa-sync",
         "identity-sweep",
         "disagreement-sweep",
+        "order-release",
     }
-    # Eleven of the fifteen are inbound syncs. They all have FlowDefinitions now,
+    # Eleven of the sixteen are inbound syncs. They all have FlowDefinitions now,
     # but the projection is still drawn from the engine and from stored runs:
     # a definition says what a flow is *meant* to touch, and this module is
     # about what it did.
@@ -315,6 +316,16 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
             # catch a sweep that started inventing findings to look busy.
             assert projection.state == "ran_but_wrote_nothing"
             assert projection.writes == [] and projection.establishes == []
+            continue
+        if projection.flow_id == "order-release":
+            # Registered and never run in this world, which is the honest
+            # answer: the sweep found nothing here to approve, so nobody
+            # approved anything. `never_ran` is a different fact from "ran and
+            # wrote nothing" and the projection is right to keep them apart —
+            # this is the flow whose runs reach a customer's ERP, and "it has
+            # never been used in this deployment" is exactly what an operator
+            # should be told about it.
+            assert projection.state == "never_ran"
             continue
         assert projection.state == "observed", projection.flow_id
         if projection.flow_id == "employment-event-sync":

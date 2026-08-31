@@ -223,6 +223,12 @@ class EstateWriteRecord(BaseModel):
     intended_at: str = ""
     settled_at: str = ""
     error: str = ""
+    #: How many deliveries of this row's own feed have arrived since the write
+    #: without carrying it home. Not a state and not a timestamp: "no echo yet"
+    #: after one pull is normal and after several is a fact, and the honest unit
+    #: is pulls rather than minutes because the feed's cadence is somebody
+    #: else's decision. The delivery-side echo pass owns it.
+    echo_pulls: int = 0
 
     @field_validator("state")
     @classmethod
@@ -331,7 +337,7 @@ def awaiting_echo(journal: EstateWriteJournal) -> list[EstateWriteRecord]:
 # ---------------------------------------------------------------------------
 
 
-def _write_id(target: str, record_id: str, run_id: str) -> str:
+def write_id(target: str, record_id: str, run_id: str) -> str:
     """One row per run, not per attempt.
 
     A step with `retries=1` replays its whole body, and the second attempt is
@@ -339,6 +345,11 @@ def _write_id(target: str, record_id: str, run_id: str) -> str:
     second write. Two *runs* against one record are two decisions and get two
     rows, which is how a failure stays legible after somebody retries it an
     hour later.
+
+    Public because the caller needs it too, and for the reason the id is
+    derived rather than minted: a step re-entering its own body has to be able
+    to ask "did I already send this?" before it sends it again, and the only
+    address that answers is the one this function computes.
     """
     return f"{target}:{record_id}:{run_id or secrets.token_hex(6)}"
 
@@ -501,7 +512,7 @@ class EstateWriter:
         self._url(spec.app, spec.resource, record_id)
 
         record = EstateWriteRecord(
-            id=_write_id(target, record_id, run_id),
+            id=write_id(target, record_id, run_id),
             target=target,
             app=spec.app,
             resource=spec.resource,
@@ -537,6 +548,33 @@ class EstateWriter:
             verified=found,
             estate_updated_at=str(after.get("updatedAt") or ""),
         )
+
+    def reconcile(self, record: EstateWriteRecord) -> EstateWriteRecord:
+        """Ask the estate what an unfinished write actually did.
+
+        The one question a retry has to answer before it becomes a second
+        PATCH. An entry left at `intent` or `failed` says a request either was
+        about to leave or left and was not answered, and both of those *may
+        have landed* — `failed` carries status 0 for exactly the case where
+        there was no answer at all. Sending again without asking is the
+        double-write the whole value-comparison design exists to prevent, and
+        no `If-Match` exists to prevent it for us.
+
+        Settles `applied` when the estate now holds the value we asked for.
+        Otherwise the entry keeps the state it had and records what was found
+        instead, so the caller can decide — send it, or stop, because the row
+        has moved somewhere this system may not write from.
+        """
+        after = self.read(record.app, record.resource, record.record_id)
+        found = str(after.get(record.field) or "")
+        if found == record.value:
+            return self._settle(
+                record, "applied", verified=found,
+                estate_updated_at=str(after.get("updatedAt") or ""),
+            )
+        record.verified = found
+        self.journal.put(record)
+        return record
 
     def _settle(self, record: EstateWriteRecord, state: str, **fields: Any):
         for key, value in fields.items():

@@ -345,7 +345,13 @@ def get_sync_service() -> SyncService:
         gateway = get_action_gateway()
         dispatcher = get_dispatcher()
         service = build_sync_service(
-            graph, knowledge, tasks, engine, gateway, dispatcher
+            graph, knowledge, tasks, engine, gateway, dispatcher,
+            # Handed in whether or not writes are enabled: a disabled writer is
+            # a real object holding no way to reach a network, and the delivery
+            # side wants its *journal* regardless — a deployment that wrote
+            # last week and had the switch turned off since still has echoes
+            # coming home.
+            get_estate_writer(),
         )
         with _lock:
             if _sync_service is None:

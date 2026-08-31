@@ -61,6 +61,56 @@ class TaskDecisionRequest(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
+#: Which resume hook answers which kind of Task.
+#:
+#: This was a tuple of six lambdas, every one of them run on every decision,
+#: every one of them opening with a guard that returned None for kinds that
+#: were not its own. Thirty no-ops and one real call, and the routing — the
+#: only thing a reader actually wants from this — was not written down
+#: anywhere; it was distributed across six other modules' first two lines.
+#:
+#: Keyed, the table *is* the routing, and it is exhaustive over `TaskKind` on
+#: purpose: a new kind with no hook shows up here as an empty tuple somebody
+#: chose, rather than as a silent fall-through nobody noticed. A test holds it
+#: to the declared kinds.
+#:
+#: The two shapes in it are different and the difference is worth reading. The
+#: **run gates** — payables and reimbursements — are keyed on the Task's
+#: `flow_id` rather than its kind, because a Task that suspended a run can be
+#: any kind that flow chose to raise; they appear under every kind those flows
+#: use to gate. The **judgments** — a steward's on an identity, a controller's
+#: on a disagreement — belong to exactly one kind each and commit straight
+#: through the Gateway with no run to record them, which is why an exception
+#: escaping one of them has to reach the caller (see below).
+_RUN_GATES: tuple = (
+    lambda t, p: get_reimbursement_service().apply_task_decision(t, p),
+    lambda t, p: get_payable_service().apply_task_decision(t, p),
+)
+
+RESUME_HOOKS: dict[str, tuple] = {
+    "decision": _RUN_GATES + (
+        # PTO, which gates on `case_ref` rather than on a run of its own.
+        lambda t, _p: get_employee_service().apply_task_decision(t),
+    ),
+    "curation": _RUN_GATES,
+    "eval_review": _RUN_GATES,
+    "exception": _RUN_GATES,
+    # A steward's entity-resolution decision is the *first* write on that
+    # record: a batch sync asserts nothing while the Task is open.
+    "match_review": (lambda t, p: get_sync_service().apply_match_decision(t, p),),
+    # And its sibling on the other kind: a proposed cross-source merge already
+    # sits in the graph at `in_review`, so this decision flips it or withdraws
+    # it rather than asserting anything new.
+    "merge_review": (lambda t, p: get_sync_service().apply_merge_decision(t, p),),
+    # And the controller's, on a disagreement between two of the customer's own
+    # systems. Approving starts a run that writes to one of them; rejecting
+    # settles the finding here and now.
+    "state_disagreement": (
+        lambda t, p: get_sync_service().apply_release_decision(t, p),
+    ),
+}
+
+
 def _visible(principal: Principal, queue: str, mine: bool) -> bool:
     """Whether this principal should be shown work sitting in `queue`.
 
@@ -146,8 +196,9 @@ def decide_task(
         raise HTTPException(status_code=409, detail="Task already decided")
 
     # The resume half of suspend/resume: a decision on a task raised by a live
-    # runner resumes that run. Each hook no-ops on tasks that are not its kind,
-    # so at most one of them acts on any given Task.
+    # runner resumes that run. `RESUME_HOOKS` says which hooks answer for this
+    # kind of Task, so the ones that could only have no-opped are not called at
+    # all.
     #
     # The principal travels with the decision, because the Action Gateway
     # checks who is committing at the write and not at this route. A hook that
@@ -171,20 +222,9 @@ def decide_task(
     # is the resume that has no run to record it: a steward's entity decision,
     # committed straight through the Gateway, where an exception really is the
     # only trace there would ever be.
-    for resume in (
-        lambda t: get_reimbursement_service().apply_task_decision(t, principal),
-        lambda t: get_payable_service().apply_task_decision(t, principal),
-        lambda t: get_employee_service().apply_task_decision(t),
-        # A steward's entity-resolution decision is the *first* write on
-        # that record: a batch sync asserts nothing while the Task is open.
-        lambda t: get_sync_service().apply_match_decision(t, principal),
-        # And its sibling on the other kind: a proposed cross-source merge
-        # already sits in the graph at `in_review`, so this decision flips
-        # it or withdraws it rather than asserting anything new.
-        lambda t: get_sync_service().apply_merge_decision(t, principal),
-    ):
+    for resume in RESUME_HOOKS.get(decided.kind, ()):
         try:
-            resume(decided)
+            resume(decided, principal)
         except Refused as refusal:
             log.warning(
                 "Task decision refused at the Action Gateway",

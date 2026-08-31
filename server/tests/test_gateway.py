@@ -342,8 +342,15 @@ def test_the_ledger_route_scopes_reads_and_lists_the_closed_action_set(
         "link-company-record", "confirm-vendor", "land-source-records",
         "apply-source-records", "resolve-identities",
         "propose-identity-link", "confirm-identity-link",
-        "record-disagreements",
+        "record-disagreements", "release-sales-order",
     }
+    # Eleven Actions write into books Cumulus keeps. Exactly one leaves the
+    # building, and it is worth being able to see that in one line: a bad
+    # graph write is reversible by a steward and every claim it made is still
+    # on the record, where this one ends in a PATCH to a customer's ERP.
+    assert [a["id"] for a in actions if a["target"] == "sales-records"] == [
+        "release-sales-order"
+    ]
     # Three Actions carry no queue in the table, for two different reasons —
     # and the table says which. A queue says whose *work* an Action is:
     # proposing a merge and recording a disagreement are nobody's work (a Flow
@@ -358,10 +365,16 @@ def test_the_ledger_route_scopes_reads_and_lists_the_closed_action_set(
     assert by_id["record-disagreements"]["queue_from_task"] is False
     assert by_id["confirm-identity-link"]["queue"] == ""
     assert by_id["confirm-identity-link"]["queue_from_task"] is True
+    assert by_id["release-sales-order"]["queue"] == ""
+    assert by_id["release-sales-order"]["queue_from_task"] is True
     # And nothing else in the table derives its desk: an Action that declares
-    # one must not accept one from a caller.
-    assert [a["id"] for a in actions if a["queue_from_task"]] == [
-        "confirm-identity-link"
+    # one must not accept one from a caller. Two do, and they arrived at it
+    # from opposite directions — the identity link because one Action serves
+    # two stewards' books, the release because there is one desk today and
+    # pinning it would be right until the second class of disagreement brings
+    # a second desk behind it.
+    assert sorted(a["id"] for a in actions if a["queue_from_task"]) == [
+        "confirm-identity-link", "release-sales-order"
     ]
     # Every Action names one of the three regimes and nothing else.
     assert {a["regime"] for a in actions} == {
