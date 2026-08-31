@@ -149,6 +149,18 @@ TRIGGERS: dict[str, Trigger] = {t.id: t for t in (
     # before the run exists, like everything else.
     Trigger(id="identity-window-closed", event="IdentityWindowClosed",
             starts="identity-sweep", wakes="window"),
+    # Two facts, one response. A question asked of the corpus is a case — one
+    # question, one run, one answer — whichever door it arrived at, and the
+    # `answer-question` Flow is where the last ungoverned ModelCall in the
+    # system finally has a journal. The HR agent gets its own event name
+    # rather than reusing `QuestionAsked` because the fact is genuinely
+    # different (it carries an employee's own balance and benefits into the
+    # context) and the log should be able to say which desk was asked; that it
+    # starts the same Flow is the Trigger's answer, not the caller's.
+    Trigger(id="question-asked", event="QuestionAsked",
+            starts="answer-question"),
+    Trigger(id="hr-question-asked", event="HrQuestionAsked",
+            starts="answer-question"),
 )}
 
 #: The trigger index. The doctrine keeps it in a fast key-value store for O(1)

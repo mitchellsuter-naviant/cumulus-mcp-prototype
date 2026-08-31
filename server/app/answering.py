@@ -32,17 +32,27 @@ import logging
 from typing import Any, Callable, Protocol
 
 from .config import settings
+from .flows import read_model_rates
 from .models import (
     AskAnswer,
     AskStep,
     AssetFilter,
     Citation,
 )
+from .runs import ModelUsage, RunContext
 from .search import make_snippet
 
 log = logging.getLogger("cumulus.answering")
 
 MAX_TOOL_RESULT_CHARS = 12_000
+
+#: The Flow one question becomes. Its Tier-2 export is in `flows.py` and the
+#: two Triggers that start it are in `dispatch.py`.
+ANSWER_FLOW_ID = "answer-question"
+#: The fact a question is. `HrQuestionAsked` is the Employee Hub's own name for
+#: the same shape, bound to the same Flow — see `dispatch.TRIGGERS`.
+QUESTION_EVENT = "QuestionAsked"
+HR_QUESTION_EVENT = "HrQuestionAsked"
 
 
 SYSTEM_INSTRUCTION = """\
@@ -98,6 +108,13 @@ class Toolbox:
     structured plane. Every call is logged into `steps`, and every asset id the
     planner touched lands in `touched` so citations can be resolved back to real
     documents rather than trusting the model's spelling.
+
+    It also carries `usage`: what the planner's own turns consumed, summed
+    across the loop. That belongs here for the same reason `steps` does — this
+    object is the run's record of one planner's activity, and the alternative
+    was a third return value threaded through a Protocol that three call sites
+    and every scripted test backend implement. A backend that reports nothing
+    leaves it at zero, which reads as *unpriced* and never as free.
     """
 
     def __init__(
@@ -112,7 +129,20 @@ class Toolbox:
         self._graph = graph
         self.steps: list[AskStep] = []
         self.touched: dict[str, str] = {}
+        self.usage = ModelUsage()
         self._documents_read = 0
+
+    # -- accounting -------------------------------------------------------
+
+    def record_model_turn(self, usage: ModelUsage) -> None:
+        """Sum one planner turn onto this question's total.
+
+        Per turn here, per *question* at the journal. A planner that calls four
+        tools makes five model turns to answer once; five ModelCall rows would
+        make the fleet's call count a fact about how chatty the planner is
+        rather than about how often somebody asked something.
+        """
+        self.usage = self.usage + usage
 
     # -- helpers ----------------------------------------------------------
 
@@ -786,6 +816,13 @@ class VertexAnswerBackend:
             response = self._client.models.generate_content(
                 model=self._model, contents=contents, config=config
             )
+            # Every turn, including the ones that only call tools and the last
+            # one before a budget exhaustion — a question that ran out of
+            # steps still cost what it cost, and dropping those tokens would
+            # under-report exactly the questions worth noticing.
+            tools.record_model_turn(
+                ModelUsage.from_vertex(self._model, response)
+            )
             candidate = (response.candidates or [None])[0]
             if candidate is None or candidate.content is None:
                 break
@@ -853,17 +890,62 @@ def build_answer_backend(
 
 
 class AnswerService:
-    """Answers questions, with or without a generative backend behind it."""
+    """Answers questions, with or without a generative backend behind it.
 
-    def __init__(self, service, teams, backend: AnswerBackend | None, graph=None) -> None:
+    Every question now goes through a Flow. `ask` emits `QuestionAsked` and
+    hands back what the run produced; `answer_now` is the loop that used to be
+    `ask`, unchanged, and is what the run's one ModelCall step calls. The
+    split is what puts a journal, a read-set and a cost under the last
+    ungoverned model call in the system — /ask, the A2A door and the HR agent
+    were three call sites that reached a planner with nothing recording that
+    they had.
+
+    A service built without a dispatcher (a scripted test, a preview world)
+    answers directly, which is also the seam that keeps `answer_now` free of
+    any knowledge that a Flow exists.
+    """
+
+    def __init__(
+        self,
+        service,
+        teams,
+        backend: AnswerBackend | None,
+        graph=None,
+        dispatcher=None,
+        engine=None,
+    ) -> None:
         self._service = service
         self._teams = teams
         self._backend = backend
         self._graph = graph
+        self._dispatcher = dispatcher
+        if engine is not None:
+            engine.register(
+                ANSWER_FLOW_ID,
+                lambda ctx, inputs: answer_body(self, ctx, inputs),
+            )
 
     @property
     def enabled(self) -> bool:
         return self._backend is not None
+
+    @property
+    def knowledge(self):
+        """The corpus this service answers from — the Flow reads it too."""
+        return self._service
+
+    def toolbox(self, include_drafts: bool = False) -> "Toolbox":
+        """A fresh tool surface over this service's planes.
+
+        One constructor, because the Flow needs to hold the Toolbox it hands
+        to `answer_now` (the summed usage is read back off it) and a second
+        construction site would be a second answer to "what can the planner
+        reach", drifting the moment either gained a plane.
+        """
+        return Toolbox(
+            self._service, self._teams, include_drafts=include_drafts,
+            graph=self._graph,
+        )
 
     def status(self) -> dict:
         return {
@@ -876,12 +958,68 @@ class AnswerService:
         question: str,
         scope_asset_id: str | None = None,
         include_drafts: bool = False,
+        *,
+        asked_by: str = "",
     ) -> AskAnswer:
-        tools = Toolbox(
-            self._service, self._teams, include_drafts=include_drafts,
-            graph=self._graph,
+        """One question, one Event, one run — and the answer the run produced.
+
+        Accepted cost (workplan risk 8): a run per /ask. The alternative is a
+        model call the fleet cannot see, which is the thing being fixed. A
+        retention window is the answer if the volume ever justifies one.
+
+        Degrades rather than fails, like everything else here: a run that
+        could not produce an answer falls through to answering directly, and
+        says so in the log rather than handing a reader a 500.
+        """
+        if self._dispatcher is None:
+            return self.answer_now(
+                question, scope_asset_id=scope_asset_id,
+                include_drafts=include_drafts,
+            )
+        try:
+            run = self._dispatcher.emit(
+                QUESTION_EVENT,
+                {
+                    "question": question,
+                    "scope_asset_id": scope_asset_id or "",
+                    "include_drafts": include_drafts,
+                },
+                actor=asked_by,
+            ).one()
+            answered = run.outputs.get("answer")
+            if answered:
+                return AskAnswer.model_validate(answered)
+            log.warning(
+                "Answer run produced nothing; answering directly",
+                extra={"runId": run.id, "status": run.status},
+            )
+        except Exception:
+            log.exception("Answer flow did not run; answering directly")
+        return self.answer_now(
+            question, scope_asset_id=scope_asset_id,
+            include_drafts=include_drafts,
         )
-        context = self._scope_context(question, scope_asset_id, tools)
+
+    def answer_now(
+        self,
+        question: str,
+        *,
+        context: str | None = None,
+        scope_asset_id: str | None = None,
+        include_drafts: bool = False,
+        tools: "Toolbox | None" = None,
+    ) -> AskAnswer:
+        """The planner loop, exactly as it was before it had a Flow around it.
+
+        `context` and `tools` are the two seams the Flow needs and nothing
+        else uses: the body supplies the Toolbox so it can read the summed
+        usage off it afterwards, and supplies a context directly when the
+        caller is the HR agent, whose context is an employee's own facts
+        rather than an open document.
+        """
+        tools = tools if tools is not None else self.toolbox(include_drafts)
+        if context is None:
+            context = self._scope_context(question, scope_asset_id, tools)
 
         if self._backend is None:
             return self._retrieval_answer(question, tools, include_drafts)
@@ -1018,3 +1156,92 @@ class AnswerService:
             steps=tools.steps,
             backend="retrieval",
         )
+
+
+# ---- The flow ---------------------------------------------------------------
+#
+# Small enough to live beside the loop it wraps. A separate module would put
+# one import between a reader and the question "what does the step actually
+# call?", and the answer is the function directly above.
+
+
+def answer_body(service: AnswerService, ctx: RunContext, inputs: dict) -> dict:
+    """One question, three journal rows: the trigger, the call, the answer.
+
+    **One ModelCall step, however many turns it took.** The planner's turns
+    are summed on the Toolbox and land here once, because the fleet counts
+    questions asked and not sentences generated — a per-turn row would make
+    `model_calls` a measure of the planner's verbosity.
+
+    **And it is only a `modelcall` row when a model was actually called.**
+    With `MODEL_BACKEND=none` the answer is ranked documents and nothing
+    generative ran, so the step is a `transform` and the fleet reports
+    `no-model-calls` rather than one unpriced call. Recording a ModelCall that
+    never happened would inflate the very count this flow exists to make
+    truthful — and `cost_basis` draws exactly that distinction, so writing the
+    row would defeat it a layer down.
+    """
+    question = str(inputs.get("question") or "")
+    supplied_context = inputs.get("context")
+    include_drafts = bool(inputs.get("include_drafts"))
+    scope_asset_id = str(inputs.get("scope_asset_id") or "") or None
+
+    ctx.event(
+        "t1",
+        str(inputs.get("event") or QUESTION_EVENT),
+        (
+            f"{len(question)} character question"
+            + (f", scoped to {scope_asset_id}" if scope_asset_id else "")
+        ),
+        kind="trigger",
+    )
+
+    # Held rather than left to `answer_now`, because the summed usage is read
+    # back off it after the call — the meter has nowhere else to look.
+    tools = service.toolbox(include_drafts)
+    # The price sheet, read at the revision this run priced against. Same
+    # posture as the extraction flows: a ref on the metered step, because the
+    # rates decide what the journal says the call cost and nothing about what
+    # the flow does.
+    rates = read_model_rates(service.knowledge)
+    generative = service.enabled
+
+    answer = ctx.step(
+        "m1", "answer-question", "modelcall" if generative else "transform",
+        fn=lambda: service.answer_now(
+            question,
+            context=supplied_context,
+            scope_asset_id=scope_asset_id,
+            include_drafts=include_drafts,
+            tools=tools,
+        ).model_dump(mode="json"),
+        summary=lambda out: (
+            f"{out['backend']}: {len(out['citations'])} citation(s) over "
+            f"{len(out['steps'])} tool call(s)"
+            + (f" · {tools.usage.tokens:,} tokens" if tools.usage.tokens else "")
+            + (" · truncated" if out.get("truncated") else "")
+        ),
+        # None when the planner reported nothing, so the step's empty literals
+        # stand rather than a `ModelUsage` full of zeros claiming to be an
+        # authoritative reading. A backend that failed into the retrieval
+        # fallback lands here too: the call site was a model call, and it is
+        # recorded as one with no price, which is what `unrecorded` means.
+        meter=lambda _out: (
+            rates.priced(tools.usage) if tools.usage.model else None
+        ),
+        refs=[rates.source_ref] if generative else [],
+    )
+
+    ctx.event(
+        "e1", "QuestionAnswered",
+        f"answered by {answer['backend']} with "
+        f"{len(answer['citations'])} citation(s)",
+    )
+    # The whole `AskAnswer`, because `ask` reconstitutes its return value from
+    # this: the run is the answer's only home, and a partial copy here would
+    # make the journal and the reply two different records of one event.
+    return {
+        "answer": answer,
+        "backend": answer["backend"],
+        "citations": len(answer["citations"]),
+    }

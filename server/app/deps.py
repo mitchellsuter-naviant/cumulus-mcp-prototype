@@ -526,11 +526,9 @@ def get_employee_service() -> EmployeeService:
         knowledge = get_service()
         tasks = get_task_service()
         teams = get_team_service()
-        if _answer_backend is _MISSING:
-            backend = _build_answer_backend()
-            with _lock:
-                if globals()["_answer_backend"] is _MISSING:
-                    globals()["_answer_backend"] = backend
+        # No answer backend here any more: the HR agent emits an Event and the
+        # `answer-question` Flow owns the call. The hub holds the Dispatcher
+        # instead, which is the one thing it needs to start a run.
         service = build_employee_service(
             settings.storage_backend,
             settings.firestore_project,
@@ -538,8 +536,8 @@ def get_employee_service() -> EmployeeService:
             knowledge,
             tasks,
             get_graph_service(),
-            answer_backend=_answer_backend,
             teams=teams,
+            dispatcher=get_dispatcher(),
         )
         with _lock:
             if _employee_service is None:
@@ -571,6 +569,14 @@ def _build_answer_backend():
 
 
 def get_answer_service() -> AnswerService:
+    """The answering stack, wired to start a run per question.
+
+    Still built per call rather than cached — the backend behind it is cached
+    because it holds no request state, but this wrapper closes over the
+    knowledge and graph singletons that tests swap out from under it. Building
+    it also registers the `answer-question` body on the engine, which is a
+    dict assignment and idempotent by construction.
+    """
     global _answer_backend
     # Resolved before the lock: `_lock` is not reentrant and both take it.
     service = get_service()
@@ -580,7 +586,12 @@ def get_answer_service() -> AnswerService:
         with _lock:
             if _answer_backend is _MISSING:
                 _answer_backend = backend
-    return AnswerService(service, teams, _answer_backend, graph=get_graph_service())
+    return AnswerService(
+        service, teams, _answer_backend,
+        graph=get_graph_service(),
+        dispatcher=get_dispatcher(),
+        engine=get_run_engine(),
+    )
 
 
 def get_asset_usage() -> AssetUsageStore:
