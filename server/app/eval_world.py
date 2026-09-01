@@ -176,7 +176,7 @@ def build_world(source_knowledge=None, *, seed_dir: str | None = None) -> EvalWo
     )
     expenses = ReimbursementService(
         InMemoryReimbursementDirectory(), StubReceiptReader(), knowledge, tasks,
-        engine, graph, documents, gateway, dispatcher,
+        engine, graph, documents, gateway, dispatcher, queues,
     )
     payables = PayableService(
         InMemoryPayableDirectory(), StubInvoiceReader(), knowledge, tasks,

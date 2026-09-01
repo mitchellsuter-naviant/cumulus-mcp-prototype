@@ -68,6 +68,17 @@ ALL_QUEUES: tuple[str, ...] = (
     "hr",                   # employee.HR_QUEUE
     "knowledge-curation",
     "eval-review",
+    # The band above the routing table's top threshold. A desk rather than a
+    # bigger number on the existing one, because the governed policy has always
+    # said a VP signs for spend over $5,000 and the flow has always sent it to
+    # the same reviewer as a $210 dinner — the document and the machinery
+    # disagreeing in the customer's favour is still a disagreement.
+    "expense-review-exec",
+    # routing.OPS_QUEUE — where a *step that threw* goes, as distinct from a
+    # business escalation. A Vertex 400 about a file format used to land on the
+    # finance approver's desk: the Controller cannot fix a mime type, and the
+    # person who can was not looking at that queue.
+    "platform-operations",
 )
 
 
@@ -193,7 +204,7 @@ _USERS: tuple[tuple[str, str, str, str, tuple[str, ...], str], ...] = (
     (
         "ceo", "diane.vogel@naviant.com", "Diane Vogel",
         "Chief Executive Officer",
-        ("expense-review",),
+        ("expense-review", "expense-review-exec"),
         "The org-wide read. Every department rolls up here, so it is the "
         "persona for a view that should span the whole company.",
     ),

@@ -48,7 +48,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field, field_validator
 
-from . import media
+from . import media, routing
 from .anomaly import AnomalyService, parse_anomaly_thresholds
 from .auth import Principal, flow_principal
 from .dispatch import Dispatcher, InMemoryEventLog
@@ -1138,7 +1138,10 @@ class PayableService:
             refs=[
                 f"document:{document_id}", prompt.source_ref, rates.source_ref,
             ],
-            retries=1, escalate_queue=CLERK_QUEUE,
+            # The operations desk, not the AP clerk's: an extraction that
+            # threw is an engineering fault, and Connie has no verdict to give
+            # on one. See the note at the same step in `reimbursements`.
+            retries=1, escalate_queue=routing.OPS_QUEUE,
         ))
 
         # -- z1: the printed name becomes one canonical vendor ------------

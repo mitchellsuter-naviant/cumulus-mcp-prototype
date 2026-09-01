@@ -38,6 +38,28 @@ here change what the flow does — no code changes, and every edit is logged.
   total (the submitter's own split); requesting more than the document supports
   by beyond this tolerance is always elevated.
 
+## Approval routing
+
+Which desk an elevated request lands on. The flow reads this table the same way
+it reads the limits above: edit it here and the next submission routes
+differently, with no code change and every edit logged.
+
+A desk is either a **queue** somebody administers, or `manager-of(submitter)`,
+which is answered against the org chart when the request is elevated — the
+submitter's manager gets it on their own desk.
+
+| Amount | Desk |
+| --- | --- |
+| Over $0 | manager-of(submitter) |
+| Over $5,000 | expense-review-exec |
+
+- Restricted category desk: expense-review-exec
+- Fallback desk: expense-review
+
+The fallback is what a request gets when the org chart cannot answer — a
+submitter with no manager recorded, or a contractor outside the reporting
+line. It is a real desk with real people on it, not a dead letter.
+
 ## Submission rules
 
 - Expenses must be submitted within 30 days of being incurred.

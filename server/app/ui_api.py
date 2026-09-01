@@ -2601,10 +2601,13 @@ def _known_queues(open_tasks: list) -> set[str]:
 
 def _queue_states() -> list[QueueState]:
     tasks = deps.get_task_service().list(status="open")
-    bound: dict[str, list[str]] = {}
-    for persona in personas.ALL_PERSONAS:
-        for queue in persona.queues:
-            bound.setdefault(queue, []).append(persona.label)
+    # Both sources, through the one function that unions them. This used to
+    # scan the persona roster inline, which was right while the roster was the
+    # only place a binding could live and became wrong the moment a desk could
+    # be held from the registry: a personal desk minted by routing has a real
+    # holder and read as unowned, so the dashboard reported a governance
+    # finding about a queue that was fine.
+    queue_service = deps.get_queue_service()
 
     states: list[QueueState] = []
     for queue in sorted(_known_queues(tasks)):
@@ -2622,7 +2625,7 @@ def _queue_states() -> list[QueueState]:
             by_kind=by_kind,
             oldest_open_at_iso=oldest,
             oldest_open_age_seconds=_age_seconds(oldest),
-            bound=sorted(bound.get(queue, [])),
+            bound=queue_service.holder_labels(queue),
         ))
     return states
 

@@ -519,6 +519,7 @@ def get_reimbursement_service() -> ReimbursementService:
             documents=get_document_service(),
             gateway=get_action_gateway(),
             dispatcher=get_dispatcher(),
+            queues=get_queue_service(),
         )
         with _lock:
             if _reimbursement_service is None:

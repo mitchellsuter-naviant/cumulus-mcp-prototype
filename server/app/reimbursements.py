@@ -26,11 +26,17 @@ because the engine hides the replay. Steps:
   read-policy (governed values, at the revision read) → x2 project-lines
   (documents + extractions + commentary → facts) → then a loop: r{n}
   needs-elevation (Rule)
-  → k{n} elevate-review (gate) → x{n} apply-correction → back to the Rule → a1
+  x2r resolve-approver (which desk, per the governed routing table)
+  → k{n} elevate-review (gate) → x{2+n} apply-correction → back to the Rule → a1
   record-expense (Action: writes the graph) → e1 ExpenseRecorded (Event).
 
 Everything non-deterministic — model calls, id minting, clock reads — happens
 inside a step, so a replay is exact.
+
+The correction rounds own `x3`, `x4`, `x5` — the projection scans those ids to
+find the newest facts — which is why the routing step is `x2r` and not the next
+number along. A step id is part of the journal's shape: picked once, and never
+renumbered because a resumed run would then replay nothing.
 """
 
 from __future__ import annotations
@@ -46,7 +52,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from . import data_collections, media
+from . import data_collections, media, routing
 from .auth import Principal, flow_principal
 from .dispatch import Dispatcher, InMemoryEventLog
 from .documents import DOCUMENT_COLLECTION, DocumentService, Region
@@ -204,6 +210,24 @@ class SubmittedDocument(BaseModel):
     filename: str = ""
     note: str = ""
     hint: str = ""
+
+
+class ResolvedDesk(BaseModel):
+    """Which desk this request would be elevated to, and why that one.
+
+    Its own model because it is a *step output* — journalled, replayed, and
+    read back on resume — so it needs a shape rather than a bare string. The
+    explanation travels with it for the reason it exists at all: a queue slug
+    in a journal says where work went, and a reader needs to know whether that
+    was the governed table or a fallback covering for a gap in the org chart.
+    """
+
+    queue: str
+    target: str = ""
+    explanation: str = ""
+    fell_back: bool = False
+    amount_usd: float = 0.0
+    restricted: bool = False
 
 
 class DocumentSlot(BaseModel):
@@ -731,6 +755,7 @@ class ReimbursementService:
         documents: DocumentService | None = None,
         gateway: ActionGateway | None = None,
         dispatcher: Dispatcher | None = None,
+        queues=None,  # QueueService — duck-typed, `queues` imports `auth`
     ) -> None:
         self.directory = directory
         self.reader = reader
@@ -739,6 +764,10 @@ class ReimbursementService:
         self.engine = engine
         self.graph = graph
         self.documents = documents
+        # The desk registry, for routing an elevated request to a named
+        # person's own queue. Optional: without it the governed table still
+        # decides, and a target that needs a registry falls back.
+        self.queues = queues
         # Never None — see the same note in payables.py. A service wired
         # without a Gateway still writes through one.
         self.gateway = gateway or ActionGateway(
@@ -811,6 +840,16 @@ class ReimbursementService:
             else:
                 stats.denied += 1
         return stats
+
+    def read_policy_content(self) -> str:
+        """The policy document itself, for the parts of it that are not values.
+
+        `read_policy` returns the five numbers the Rule needs; the routing
+        table is a table, and re-parsing it into `PolicyValues` would put a
+        second grammar into a model whose whole job is to hold scalars.
+        """
+        asset = self.knowledge.repo.get(POLICY_ASSET_ID)
+        return asset.content if asset is not None else ""
 
     def read_policy(self) -> PolicyValues:
         asset = self.knowledge.repo.get(POLICY_ASSET_ID)
@@ -975,7 +1014,15 @@ class ReimbursementService:
                     rates.source_ref,
                 ],
                 retries=1,
-                escalate_queue=REVIEW_QUEUE,
+                # A step that *threw* goes to the operations desk, not to the
+                # approver's. This escalated to `expense-review` and put a
+                # Vertex 400 about a file format in front of the Controller,
+                # who cannot fix a mime type — while the engineer who can was
+                # not looking at that queue. The business escalations below
+                # still route to a reviewer, and that difference is the point:
+                # one of these is somebody's judgment to give and the other is
+                # a bug.
+                escalate_queue=routing.OPS_QUEUE,
             )
             extractions.append(ReceiptExtraction.model_validate(raw))
 
@@ -1015,6 +1062,33 @@ class ReimbursementService:
         )
         lines = [ExpenseLine.model_validate(line) for line in lines_raw]
 
+        # x3 · transform — which desk an elevated request would land on.
+        #
+        # A *transform* and not part of the Rule, because answering it means
+        # walking the org chart and DOCTRINE point 199 is explicit that a Rule
+        # never fetches: the caller gathers the inputs and hands them in. So
+        # the graph walk happens here, once, and the Rule below is handed a
+        # concrete queue.
+        #
+        # Resolved before the loop rather than at the gate so that the *reason*
+        # is in the journal whether or not anybody was ultimately asked — "this
+        # would have gone to Diane" is worth knowing about a request that
+        # auto-approved, and it is what makes the routing table auditable
+        # rather than merely effective.
+        requested_total = round(sum(line.requested_usd for line in lines), 2)
+        restricted_here = any(
+            line.category in policy.restricted for line in lines
+        )
+        routed = ResolvedDesk.model_validate(ctx.step(
+            "x2r", "resolve-approver", "transform",
+            fn=lambda: self._resolve_desk(
+                employee, requested_total, restricted_here
+            ).model_dump(),
+            summary=lambda out: out["explanation"],
+            refs=[policy.source_ref],
+        ))
+        ctx.note_refs(f"queue:{routed.queue}")
+
         # The review loop. Each round is its own Rule step and its own gate, so
         # the journal shows exactly how many times a person was asked.
         state: ReimbursementState = "approved"
@@ -1050,7 +1124,9 @@ class ReimbursementService:
             decision = ctx.gate(
                 f"k{round_number}", "elevate-review",
                 build_task=lambda rn=round_number, esc=escalations, ln=lines: (
-                    self._build_review_task(ctx.record, ln, esc, policy, rn, employee)
+                    self._build_review_task(
+                        ctx.record, ln, esc, policy, rn, employee, routed
+                    )
                 ),
             )
             decided_by = decision.decided_by
@@ -1208,6 +1284,43 @@ class ReimbursementService:
             self.documents.set_regions(slot.document_id, extraction.regions)
         return extraction
 
+    def _resolve_desk(
+        self, employee: str, amount_usd: float, restricted: bool
+    ) -> ResolvedDesk:
+        """Read the governed routing table, then answer it against the graph.
+
+        Degrades in one direction only. A policy with no routing section, an
+        org chart with no manager for this person, a graph that is not wired at
+        all — each lands on the fallback desk with `fell_back` set and a
+        sentence saying which of those happened. The one thing that must never
+        come out of here is a queue nobody holds, because a Task on a desk with
+        no people is work that exists and that nobody will ever see.
+        """
+        policy_asset = self.read_policy_content()
+        table = routing.parse_routing(policy_asset, default_fallback=REVIEW_QUEUE)
+        target = table.target_for(amount_usd, restricted)
+        resolved = routing.resolve(
+            target,
+            submitter_email=employee,
+            graph=self.graph,
+            queues=self.queues,
+            fallback=table.fallback,
+        )
+        if self.queues is None:
+            # No registry wired (a unit test): the table still decides, and a
+            # resolver that needed one falls back rather than raising.
+            resolved = routing.ResolvedQueue(
+                queue=table.fallback if target == routing.MANAGER_OF else target,
+                target=target,
+                fell_back=target == routing.MANAGER_OF,
+                explanation=f"routed to '{target}' by the governed table",
+            )
+        return ResolvedDesk(
+            queue=resolved.queue, target=resolved.target,
+            explanation=resolved.explanation, fell_back=resolved.fell_back,
+            amount_usd=amount_usd, restricted=restricted,
+        )
+
     def _build_review_task(
         self,
         record: RunRecord,
@@ -1216,6 +1329,7 @@ class ReimbursementService:
         policy: PolicyValues,
         round_number: int,
         employee: str,
+        routed: ResolvedDesk | None = None,
     ) -> Task:
         kinds = sorted({e.kind for e in escalations})
         total = round(sum(line.requested_usd for line in lines), 2)
@@ -1230,7 +1344,7 @@ class ReimbursementService:
                 + ". The reviewer may correct amounts, split a document into "
                 "several lines, add a missing line, or supply a purpose."
             ),
-            queue=REVIEW_QUEUE,
+            queue=routed.queue if routed else REVIEW_QUEUE,
             priority="high" if total > policy.limit_usd * 5 else "normal",
             flow_id=FLOW_ID,
             run_id=record.id,
@@ -1701,6 +1815,7 @@ def build_reimbursement_service(
     documents: DocumentService | None = None,
     gateway: ActionGateway | None = None,
     dispatcher: Dispatcher | None = None,
+    queues=None,
 ) -> ReimbursementService:
     directory: ReimbursementDirectory
     if backend == "firestore":
@@ -1709,5 +1824,5 @@ def build_reimbursement_service(
         directory = InMemoryReimbursementDirectory()
     return ReimbursementService(
         directory, reader, knowledge, tasks, engine, graph, documents, gateway,
-        dispatcher,
+        dispatcher, queues,
     )

@@ -232,6 +232,26 @@ class QueueService:
                     held.append(persona.email)
         return sorted(held)
 
+    def holder_labels(self, slug: str) -> list[str]:
+        """Who holds this desk, as a screen should print them.
+
+        The registry keys people on email because that is the identifier that
+        spans a credential, the roster and the graph. A console reading
+        "raymond.fitzgerald@naviant.com" where it used to read "Raymond
+        Fitzgerald" would be a regression dressed as a refactor, so the display
+        name is resolved here — from the roster where it knows the person, from
+        the membership record otherwise, and from the email itself when neither
+        has a better answer.
+        """
+        by_email: dict[str, str] = {}
+        queue = self.directory.get(slug)
+        for member in queue.members if queue else []:
+            by_email.setdefault(member.email.lower(), member.label or member.email)
+        for persona in personas.ALL_PERSONAS:
+            if slug in persona.queues and persona.email:
+                by_email[persona.email.lower()] = persona.label
+        return sorted(by_email.values())
+
     def claim_ttl(self, slug: str) -> int:
         queue = self.directory.get(slug)
         return queue.claim_ttl_seconds if queue else DEFAULT_CLAIM_TTL_SECONDS
@@ -408,6 +428,11 @@ _ROSTER_BLURBS: dict[str, str] = {
     "eval-review": "Flow evaluations awaiting a reviewer's label.",
     "hr": "People requests — time off, and the rest of the hub's judgment "
           "calls.",
+    "expense-review-exec": "Reimbursements above the governed executive "
+                           "threshold, and every restricted category.",
+    "platform-operations": "Flow steps that threw. An engineering fault, not a "
+                           "business judgment — nothing here is somebody's "
+                           "approval to give.",
 }
 
 
