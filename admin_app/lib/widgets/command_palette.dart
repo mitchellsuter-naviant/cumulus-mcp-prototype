@@ -83,6 +83,7 @@ const int knowledgeIndex = 7;
 const int flowsIndex = 8;
 const int identitiesIndex = 9;
 const int employeeHubIndex = 10;
+const int queuesIndex = 11;
 
 /// The queues the two business workspaces belong to. Named because the rail,
 /// the palette and the shell's unmounting rule all have to agree, and three
@@ -489,6 +490,16 @@ class CommandCatalog extends ChangeNotifier {
         keywords: 'users agents teams api keys access',
         icon: Icons.groups_outlined,
         intent: OpenSectionIntent(identitiesIndex),
+      ),
+      _governs,
+    ),
+    (
+      const CatalogEntry(
+        label: 'Desks',
+        detail: 'queues, who holds them, and how long a claim lasts',
+        keywords: 'queue queues desk desks routing claim members binding work',
+        icon: Icons.workspaces_outline,
+        intent: OpenSectionIntent(queuesIndex),
       ),
       _governs,
     ),

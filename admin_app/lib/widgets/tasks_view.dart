@@ -326,6 +326,33 @@ class _TaskRow extends StatelessWidget {
                   dense: true,
                 ),
               const Spacer(),
+              // Say it in the list, not only in the panel. Scanning a queue
+              // and opening three rows to learn none of them are yours is the
+              // same wasted judgment the panel-level check exists to prevent,
+              // spent one click earlier.
+              if (task.isOpen && task.isHeldBySomeoneElse) ...[
+                Tooltip(
+                  message: '${task.claim?.who ?? 'Someone'} is working this',
+                  child: const Icon(Icons.lock_clock,
+                      size: 13, color: CumulusColors.inkMuted),
+                ),
+                const SizedBox(width: 8),
+              ] else if (task.isOpen && task.isHeldByYou) ...[
+                const Tooltip(
+                  message: 'You are holding this',
+                  child: Icon(Icons.back_hand_outlined,
+                      size: 13, color: CumulusColors.accent),
+                ),
+                const SizedBox(width: 8),
+              ] else if (task.isOpen && !task.holdsQueue) ...[
+                const Tooltip(
+                  message: 'Another desk’s work — visible to you, not yours '
+                      'to decide',
+                  child: Icon(Icons.visibility_outlined,
+                      size: 13, color: CumulusColors.inkMuted),
+                ),
+                const SizedBox(width: 8),
+              ],
               Text(_age(task.createdAtIso), style: CumulusText.meta),
             ],
           ),
@@ -436,6 +463,34 @@ class _TaskReviewState extends State<_TaskReview> {
     );
   }
 
+  Future<void> _claim({bool steal = false}) async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      widget.onDecided(await widget.api.claimTask(widget.task.id, steal: steal));
+    } on ApiException catch (e) {
+      if (mounted) setState(() => _error = e.message);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _release() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      widget.onDecided(await widget.api.releaseTask(widget.task.id));
+    } on ApiException catch (e) {
+      if (mounted) setState(() => _error = e.message);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   Future<void> _decide(
     String verdict, {
     String? note,
@@ -458,7 +513,10 @@ class _TaskReviewState extends State<_TaskReview> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = e.statusCode == 409
+          // A 409 used to mean one thing. It now means two, and they call
+          // for opposite next moves: a decided task is over, a claimed one is
+          // somebody's morning you can either wait for or take.
+          _error = e.statusCode == 409 && e.message.contains('already decided')
               ? 'Someone already decided this task.'
               : e.message;
         });
@@ -612,11 +670,118 @@ class _TaskReviewState extends State<_TaskReview> {
                   style: CumulusText.meta,
                 ),
               ),
-            if (task.isOpen) ..._decisionControls(task) else _decided(task),
+            if (task.isOpen) ...[
+              _claimBar(task),
+              if (task.decidable)
+                ..._decisionControls(task)
+              else
+                _blocked(task),
+            ] else
+              _decided(task),
           ],
         ),
       ),
     );
+  }
+
+  /// The lease, and what to do about it.
+  ///
+  /// Only rendered for a desk you actually hold: on somebody else's queue the
+  /// claim is not the obstacle and offering it would be a second dead end
+  /// under the first.
+  Widget _claimBar(QueueTask task) {
+    if (!task.holdsQueue) return const SizedBox.shrink();
+    final claim = task.claim;
+    final held = task.isHeldBySomeoneElse || task.isHeldByYou;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Row(
+        children: [
+          Icon(
+            held ? Icons.lock_clock : Icons.lock_open_outlined,
+            size: 15,
+            color: task.isHeldBySomeoneElse
+                ? CumulusTone.warn.foreground
+                : CumulusColors.inkMuted,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              switch (task.claimState) {
+                'yours' =>
+                  'You are holding this${claim == null ? '' : ' until '
+                      '${_clock(claim.expiresAtIso)}'}. It returns to the '
+                      'queue on its own if you walk away.',
+                'held' =>
+                  '${claim?.who ?? 'Someone'} is working this'
+                      '${claim == null ? '' : ' until ${_clock(claim.expiresAtIso)}'}'
+                      '${(claim?.stealCount ?? 0) > 0
+                          ? ' · taken over ${claim!.stealCount}×'
+                          : ''}.',
+                _ => 'Unclaimed — take it so nobody else starts the same work.',
+              },
+              style: CumulusText.meta,
+            ),
+          ),
+          const SizedBox(width: 10),
+          if (task.isHeldByYou)
+            TextButton(
+              onPressed: _busy ? null : _release,
+              child: const Text('Release'),
+            )
+          else
+            OutlinedButton.icon(
+              onPressed: _busy ? null : () => _claim(steal: task.claimWouldSteal),
+              icon: Icon(
+                task.claimWouldSteal ? Icons.pan_tool_alt_outlined : Icons.back_hand_outlined,
+                size: 15,
+              ),
+              label: Text(task.claimWouldSteal ? 'Take it over' : 'Claim'),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// Why the verdict row is not here, said plainly and with somewhere to go.
+  Widget _blocked(QueueTask task) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: CumulusColors.surface,
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: CumulusColors.border),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.do_not_disturb_on_outlined,
+                size: 15, color: CumulusColors.inkMuted),
+            const SizedBox(width: 8),
+            Text('Not yours to decide', style: CumulusText.statLabel),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(task.blockedReason, style: CumulusText.body),
+        if (task.queueHolders.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            'Switch persona to one of them to act on it, or have an '
+            'administrator add you to the desk.',
+            style: CumulusText.meta,
+          ),
+        ],
+      ],
+    ),
+  );
+
+  static String _clock(String iso) {
+    final at = DateTime.tryParse(iso)?.toLocal();
+    if (at == null) return iso;
+    return '${at.hour.toString().padLeft(2, '0')}:'
+        '${at.minute.toString().padLeft(2, '0')}';
   }
 
   List<Widget> _decisionControls(QueueTask task) => [

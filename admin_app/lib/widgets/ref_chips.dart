@@ -3,17 +3,23 @@ import 'package:flutter/material.dart';
 import '../models/asset.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'document_drawer.dart';
 import 'side_drawer.dart';
 import 'ui_kit.dart';
 
 /// Refs as chips. Shared by run journals and task reviews so a pinned read
 /// reads as the same object wherever it surfaces.
 ///
-/// `knowledge:` chips are the only tappable ones. The resolver answers
+/// `knowledge:` and `document:` chips are tappable. The resolver answers
 /// `resolved: false` for every other namespace, and a chip that opens a drawer
 /// saying nothing is worse than a chip that stays put — so the rest keep the
 /// tooltip they have always had until the entity store gives them something to
 /// open.
+///
+/// `document:` was inert for the wrong reason. The bytes were stored under
+/// retention and served by an endpoint the whole time, and the console simply
+/// never asked: a run could say it read `document:doc_28fee8830bfcf03c` and
+/// there was no way anywhere to look at the receipt.
 class RefChips extends StatelessWidget {
   final ApiClient api;
   final List<String> refs;
@@ -34,6 +40,8 @@ class RefChips extends StatelessWidget {
   });
 
   static bool _isKnowledge(String ref) => ref.startsWith('knowledge:');
+
+  static bool _isDocument(String ref) => ref.startsWith('document:');
 
   /// Kicks the fetch off before the drawer opens so the request is made once,
   /// rather than once per rebuild of the drawer's body.
@@ -80,11 +88,19 @@ class RefChips extends StatelessWidget {
             message: _isKnowledge(ref)
                 ? 'Resolve this against the Library — what it is, and whether '
                       'the revision this run read is still the current one.'
+                : _isDocument(ref)
+                ? 'Open the artifact this step read, with the regions the '
+                      'extractor claims it found each value in.'
                 : tooltip.isEmpty
                 ? _describe(ref)
                 : tooltip,
             child: _isKnowledge(ref)
                 ? _TappableChip(ref: ref, onTap: () => _open(context, ref))
+                : _isDocument(ref)
+                ? _TappableChip(
+                    ref: ref,
+                    onTap: () => openDocumentDrawer(context, api, ref),
+                  )
                 : _InertChip(ref: ref, tone: tone),
           ),
       ],

@@ -69,6 +69,12 @@ class TaskView(Task):
 
     decidable: bool = False
     blocked_reason: str = ""
+    #: Whether this principal holds the desk at all — which is a different
+    #: question from whether they may decide right now. A client that had only
+    #: `decidable` could not tell "not your queue" from "somebody is working
+    #: it", and those want opposite affordances: one is a dead end, the other
+    #: is a Take-it-over button.
+    holds_queue: bool = False
     #: "free" · "yours" · "held" — what the lease looks like from here.
     claim_state: str = "free"
     #: Who could act on this, for a reason a screen can actually use: telling
@@ -108,6 +114,7 @@ def _view(task: Task, principal: Principal) -> TaskView:
         )
     return TaskView(
         **task.model_dump(),
+        holds_queue=principal.owns_queue(task.queue),
         decidable=not reason,
         blocked_reason=reason,
         claim_state=claim_state,

@@ -304,6 +304,22 @@ class RunJournalView extends StatelessWidget {
                 MetaPill('finished ${agoIso(run.finishedAtIso)}'),
             ],
           ),
+          if (run.inputs.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Text('INPUTS', style: CumulusText.statLabel),
+                const SizedBox(width: 10),
+                Text(
+                  'what the trigger was handed — the run reads these and '
+                  'nothing else',
+                  style: CumulusText.statCaption,
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            _RunInputs(inputs: run.inputs),
+          ],
           if (run.writes.isNotEmpty) ...[
             const SizedBox(height: 14),
             Row(
@@ -339,6 +355,96 @@ class RunJournalView extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+/// The trigger's own inputs, which the journal never showed.
+///
+/// The read-set, the write-set and every step were rendered here and the thing
+/// the run was actually *given* was not: a submitter's commentary is a governed
+/// input the projection reads and the journal quotes, and it was visible
+/// nowhere in the console.
+///
+/// Base64 is summarised rather than printed. It is the artifact, it is already
+/// held under retention with a `document:` ref pointing at it, and a screenful
+/// of it would bury the fields a person came here to read.
+class _RunInputs extends StatelessWidget {
+  final Map<String, dynamic> inputs;
+
+  const _RunInputs({required this.inputs});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: CumulusColors.surfaceMuted,
+        borderRadius: BorderRadius.circular(CumulusRadius.control),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final entry in inputs.entries)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(
+                    width: 150,
+                    child: Text(entry.key, style: CumulusText.mono),
+                  ),
+                  Expanded(
+                    child: Text(
+                      _render(entry.value),
+                      style: CumulusText.body,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  static String _render(dynamic value) {
+    if (value is List) {
+      return value.isEmpty
+          ? '(none)'
+          : value.map(_render).join('\n');
+    }
+    if (value is Map) {
+      final parts = <String>[];
+      value.forEach((key, item) {
+        if (item == null) return;
+        final text = '$item';
+        if (text.isEmpty) return;
+        // The artifact itself: named and measured, never printed. It is held
+        // under retention with a `document:` chip in the write-set pointing
+        // at it, which is the thing to click.
+        parts.add(
+          key == 'content_b64'
+              ? 'content: ${_approxBytes(text.length)} (stored — open the '
+                    'document chip below)'
+              : '$key: $text',
+        );
+      });
+      return parts.isEmpty ? '(empty)' : parts.join('  ·  ');
+    }
+    final text = '$value';
+    return text.isEmpty ? '(empty)' : text;
+  }
+
+  /// Base64 inflates by a third, so the decoded size is what to report.
+  static String _approxBytes(int base64Length) {
+    final size = (base64Length * 3) ~/ 4;
+    return size < 1024
+        ? '$size B'
+        : size < 1024 * 1024
+        ? '${(size / 1024).toStringAsFixed(1)} KB'
+        : '${(size / 1024 / 1024).toStringAsFixed(1)} MB';
   }
 }
 

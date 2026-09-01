@@ -59,6 +59,46 @@ class TaskDecision {
   );
 }
 
+/// The lease on a Task somebody is working right now.
+///
+/// A lease and not a lock: it expires, so an abandoned claim returns to the
+/// pool rather than putting the absence problem the Queue exists to solve back
+/// one level down. Mirrors `TaskClaim` in `server/app/tasks.py`.
+class TaskClaim {
+  final String holderUid;
+  final String holderEmail;
+  final String holderLabel;
+  final String claimedAtIso;
+  final String expiresAtIso;
+
+  /// Times this claim was taken from a live holder. On the task rather than
+  /// only in the log, because a case three people have wrestled over is a fact
+  /// about the case.
+  final int stealCount;
+
+  const TaskClaim({
+    required this.holderUid,
+    required this.holderEmail,
+    required this.holderLabel,
+    required this.claimedAtIso,
+    required this.expiresAtIso,
+    required this.stealCount,
+  });
+
+  String get who => holderLabel.isNotEmpty
+      ? holderLabel
+      : (holderEmail.isNotEmpty ? holderEmail : holderUid);
+
+  factory TaskClaim.fromJson(Map<String, dynamic> json) => TaskClaim(
+    holderUid: json['holder_uid'] as String? ?? '',
+    holderEmail: json['holder_email'] as String? ?? '',
+    holderLabel: json['holder_label'] as String? ?? '',
+    claimedAtIso: json['claimed_at_iso'] as String? ?? '',
+    expiresAtIso: json['expires_at_iso'] as String? ?? '',
+    stealCount: (json['steal_count'] as num? ?? 0).toInt(),
+  );
+}
+
 class QueueTask {
   final String id;
   /// The run this task suspended. Non-empty for anything a live flow raised.
@@ -79,6 +119,29 @@ class QueueTask {
   final String createdAtIso;
   final TaskDecision? decision;
 
+  /// Whether *this* principal may decide *this* task, computed server-side
+  /// from exactly the checks the decide endpoint runs. The console used to
+  /// render a live verdict row on every task in the deployment and discover
+  /// the refusal only after somebody had committed to one.
+  final bool decidable;
+
+  /// Why not, written to be shown verbatim.
+  final String blockedReason;
+
+  /// free · yours · held
+  final String claimState;
+
+  /// Whether you hold this desk at all — a different question from whether you
+  /// may decide right now. "Not your queue" is a dead end; "somebody is
+  /// working it" is a Take-it-over button.
+  final bool holdsQueue;
+
+  /// Who does hold this desk. Telling somebody a queue is not theirs without
+  /// naming whose leaves them nothing to do next.
+  final List<String> queueHolders;
+
+  final TaskClaim? claim;
+
   const QueueTask({
     required this.id,
     required this.runId,
@@ -96,7 +159,29 @@ class QueueTask {
     required this.resumes,
     required this.createdAtIso,
     required this.decision,
+    // Server-computed annotations rather than facts the task carries, so they
+    // default: a locally constructed QueueTask — a test double, an optimistic
+    // update — has no honest value for "may this principal decide it", and
+    // the safe default for a permission is no.
+    this.decidable = false,
+    this.blockedReason = '',
+    this.claimState = 'free',
+    this.holdsQueue = false,
+    this.queueHolders = const [],
+    this.claim,
   });
+
+  bool get isHeldByYou => claimState == 'yours';
+  bool get isHeldBySomeoneElse => claimState == 'held';
+
+  /// Take the lease. Offered on any open task on a desk you hold and are not
+  /// already holding — including one somebody else has, where it becomes a
+  /// takeover rather than a claim.
+  bool get canClaim => isOpen && holdsQueue && !isHeldByYou;
+
+  /// A takeover, which is recorded. Distinguished from a plain claim so the
+  /// button can say which one it is before it is pressed.
+  bool get claimWouldSteal => isHeldBySomeoneElse;
 
   bool get isOpen => status == 'open';
   bool get isHigh => priority == 'high';
@@ -131,6 +216,16 @@ class QueueTask {
     decision: json['decision'] == null
         ? null
         : TaskDecision.fromJson(json['decision'] as Map<String, dynamic>),
+    decidable: json['decidable'] as bool? ?? false,
+    blockedReason: json['blocked_reason'] as String? ?? '',
+    claimState: json['claim_state'] as String? ?? 'free',
+    holdsQueue: json['holds_queue'] as bool? ?? false,
+    queueHolders: (json['queue_holders'] as List<dynamic>? ?? const [])
+        .map((e) => e as String)
+        .toList(),
+    claim: json['claim'] == null
+        ? null
+        : TaskClaim.fromJson(json['claim'] as Map<String, dynamic>),
   );
 }
 

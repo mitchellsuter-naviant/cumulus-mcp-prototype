@@ -23,6 +23,7 @@ import '../widgets/ui_kit.dart';
 import 'asset_list_screen.dart';
 import 'employee_hub_screen.dart';
 import 'identities_screen.dart';
+import '../widgets/queues_view.dart';
 import 'flows_screen.dart';
 
 /// Section indices. The rail is not a one-to-one map onto them: Workspaces is
@@ -52,6 +53,7 @@ const int _knowledgeIndex = knowledgeIndex;
 const int _flowsIndex = flowsIndex;
 const int _identitiesIndex = identitiesIndex;
 const int _employeeHubIndex = employeeHubIndex;
+const int _queuesIndex = queuesIndex;
 
 /// The Library's tab index inside the Knowledge layer section. Named because
 /// the palette navigates to it and a bare `1` would not survive a reorder.
@@ -163,6 +165,17 @@ List<RailDestination> _destinations(int openTasks, Session? session) {
         icon: Icons.groups_outlined,
         label: 'Identities, access & keys',
         index: _identitiesIndex,
+      ),
+    // Beside identities and not inside it, because they answer adjacent
+    // questions that are not the same question: who someone *is* and what they
+    // may reach, against where work *lands* and who is accountable for it. The
+    // doctrine keeps them as two halves of one Role for now (point 230 leaves
+    // the divergence open) and the console had a screen for only one of them.
+    if (governs)
+      const RailDestination(
+        icon: Icons.workspaces_outline,
+        label: 'Desks',
+        index: _queuesIndex,
       ),
   ];
 }
@@ -335,6 +348,7 @@ class _HomeShellState extends State<HomeShell> {
     _systemStateIndex,
     _knowledgeIndex,
     _identitiesIndex,
+    _queuesIndex,
   };
 
   Widget _lazy(int index, Widget Function() build, Session? session) {
@@ -487,6 +501,20 @@ class _HomeShellState extends State<HomeShell> {
           ),
           _lazy(_flowsIndex, () => const FlowsSection(), session),
           _lazy(_identitiesIndex, () => const IdentitiesSection(), session),
+          _lazy(
+            _queuesIndex,
+            // Reading is any authenticated principal's right — knowing the AP
+            // desk exists and that three people hold it is how you know where
+            // to send something. Editing is admin, because a binding grants
+            // the authority to decide everything that routes there.
+            () => QueuesView(
+              api: _api,
+              canAdminister:
+                  session?.authority == 'admin' ||
+                  session?.authority == 'owner',
+            ),
+            session,
+          ),
           _lazy(
             _employeeHubIndex,
             () => EmployeeHubSection(api: _api),

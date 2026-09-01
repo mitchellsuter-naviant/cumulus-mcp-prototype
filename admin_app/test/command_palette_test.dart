@@ -292,6 +292,7 @@ void main() {
         'Knowledge layer': knowledgeIndex,
         'Flows': flowsIndex,
         'Identities, access & keys': identitiesIndex,
+        'Desks': queuesIndex,
         'Expense Reimbursement': expenseWorkspaceIndex,
         'Accounts Payable': payablesWorkspaceIndex,
         'Counterparty identity': identityWorkspaceIndex,

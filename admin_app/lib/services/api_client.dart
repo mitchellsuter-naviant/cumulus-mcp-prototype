@@ -20,6 +20,7 @@ import '../models/disagreement_screen.dart';
 import '../models/identity_screen.dart';
 import '../models/ontology_screen.dart';
 import '../models/payable.dart';
+import '../models/queue.dart';
 import '../models/reimbursement.dart';
 import '../models/run.dart';
 import '../models/session.dart';
@@ -816,6 +817,136 @@ class ApiClient {
   Future<QueueTask> getTask(String id) async {
     final resp = await _send(
       _http.get(_uri('/api/v1/tasks/$id'), headers: await _headers()),
+    );
+    _check(resp);
+    return QueueTask.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  // ---- queues ----
+
+  /// Every desk in the deployment, with who holds it and what is waiting.
+  Future<List<WorkQueue>> listQueues({bool includePersonal = true}) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/queues', {
+          if (!includePersonal) 'include_personal': 'false',
+        }),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((j) => WorkQueue.fromJson(j as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// The desks this credential holds — the answer to "why can I not decide
+  /// this", without the user reading the source.
+  Future<List<String>> myQueues() async {
+    final resp = await _send(
+      _http.get(_uri('/api/v1/queues/mine'), headers: await _headers()),
+    );
+    _check(resp);
+    return (jsonDecode(resp.body) as List<dynamic>)
+        .map((e) => e as String)
+        .toList();
+  }
+
+  Future<WorkQueue> createQueue({
+    required String slug,
+    required String name,
+    String description = '',
+    int claimTtlSeconds = 1200,
+  }) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/queues'),
+        headers: await _headers(),
+        body: jsonEncode({
+          'slug': slug,
+          'name': name,
+          'description': description,
+          'claim_ttl_seconds': claimTtlSeconds,
+        }),
+      ),
+    );
+    _check(resp);
+    return WorkQueue.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  Future<WorkQueue> updateQueue(
+    String slug, {
+    String? name,
+    String? description,
+    int? claimTtlSeconds,
+  }) async {
+    final resp = await _send(
+      _http.patch(
+        _uri('/api/v1/queues/$slug'),
+        headers: await _headers(),
+        body: jsonEncode({
+          if (name != null) 'name': name,
+          if (description != null) 'description': description,
+          if (claimTtlSeconds != null) 'claim_ttl_seconds': claimTtlSeconds,
+        }),
+      ),
+    );
+    _check(resp);
+    return WorkQueue.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  /// Bind a person to a desk. Admin-only server-side: this grants the
+  /// authority to decide everything that routes here.
+  Future<WorkQueue> addQueueMember(
+    String slug, {
+    required String email,
+    String label = '',
+  }) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/queues/$slug/members'),
+        headers: await _headers(),
+        body: jsonEncode({'email': email, 'label': label}),
+      ),
+    );
+    _check(resp);
+    return WorkQueue.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  Future<WorkQueue> removeQueueMember(String slug, String email) async {
+    final resp = await _send(
+      _http.delete(
+        _uri('/api/v1/queues/$slug/members/$email'),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return WorkQueue.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  // ---- claims ----
+
+  /// Take the lease on a pooled task. `steal` takes it from a live holder —
+  /// recorded on the task, and the only alternative to an admin ticket when
+  /// somebody claims six cases and goes home.
+  ///
+  /// Throws [ApiException] with a 409 when somebody else holds it.
+  Future<QueueTask> claimTask(String id, {bool steal = false}) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/tasks/$id/claim'),
+        headers: await _headers(),
+        body: jsonEncode({'steal': steal}),
+      ),
+    );
+    _check(resp);
+    return QueueTask.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  /// Put a claimed task back in the pool without deciding it.
+  Future<QueueTask> releaseTask(String id) async {
+    final resp = await _send(
+      _http.post(_uri('/api/v1/tasks/$id/release'), headers: await _headers()),
     );
     _check(resp);
     return QueueTask.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
