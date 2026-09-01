@@ -230,3 +230,28 @@ def test_journal_is_a_projection_of_the_steps(engine):
     assert [e["step_id"] for e in journal] == ["t1", "x1"]
     assert journal[1]["summary"] == "did a thing"
     assert all(e["at_iso"] for e in journal)
+
+
+def test_nested_arrays_survive_the_firestore_encoding():
+    """Firestore refuses an array inside an array; the store's codec wraps and
+    unwraps them so a step output like the state policy's tuple-of-tuples
+    table round-trips instead of killing the whole run's persist."""
+    from app.runs import _decode_nested_arrays, _encode_nested_arrays
+
+    payload = {
+        "disagreements": [["closed-won", "pending-approval", "won-not-released"]],
+        "deep": [[[1, 2], [3]], "flat"],
+        "untouched": {"a": [1, 2], "b": "x"},
+    }
+    encoded = _encode_nested_arrays(payload)
+
+    def no_nested(value):
+        if isinstance(value, dict):
+            return all(no_nested(v) for v in value.values())
+        if isinstance(value, list):
+            return all(not isinstance(v, list) and no_nested(v) for v in value)
+        return True
+
+    assert no_nested(encoded)
+    assert _decode_nested_arrays(encoded) == payload
+    assert encoded["untouched"] == {"a": [1, 2], "b": "x"}

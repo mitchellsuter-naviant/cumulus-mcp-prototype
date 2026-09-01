@@ -285,6 +285,43 @@ class InMemoryRunStore:
             return record
 
 
+# Firestore refuses an array directly inside an array, and a run journal
+# carries whatever a step output dumped to — the state sweep's policy holds a
+# tuple-of-tuples table, which model_dump renders as exactly that. The store
+# is where Firestore's shape rules live, not the flows, so inner arrays are
+# wrapped in a one-key map on write and unwrapped on read. The marker key is
+# implausible in real step output; a payload that used it literally would be
+# unwrapped on read, which is the accepted edge of keeping this lossless
+# without an escaping scheme nothing needs yet.
+_NESTED_LIST_KEY = "~nested-list"
+
+
+def _encode_nested_arrays(value):
+    if isinstance(value, dict):
+        return {k: _encode_nested_arrays(v) for k, v in value.items()}
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            encoded = _encode_nested_arrays(item)
+            if isinstance(encoded, list):
+                encoded = {_NESTED_LIST_KEY: encoded}
+            out.append(encoded)
+        return out
+    return value
+
+
+def _decode_nested_arrays(value):
+    if isinstance(value, dict):
+        if set(value) == {_NESTED_LIST_KEY} and isinstance(
+            value[_NESTED_LIST_KEY], list
+        ):
+            return _decode_nested_arrays(value[_NESTED_LIST_KEY])
+        return {k: _decode_nested_arrays(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode_nested_arrays(v) for v in value]
+    return value
+
+
 class FirestoreRunStore:
     def __init__(self, project: str | None, collection: str) -> None:
         from google.cloud import firestore  # deferred: not needed for local dev
@@ -296,7 +333,9 @@ class FirestoreRunStore:
         out: list[RunRecord] = []
         for doc in self._col.stream():
             try:
-                out.append(RunRecord.model_validate(doc.to_dict()))
+                out.append(
+                    RunRecord.model_validate(_decode_nested_arrays(doc.to_dict()))
+                )
             except Exception:
                 log.exception("Skipping unparseable run", extra={"docId": doc.id})
         return out
@@ -306,13 +345,15 @@ class FirestoreRunStore:
         if not snap.exists:
             return None
         try:
-            return RunRecord.model_validate(snap.to_dict())
+            return RunRecord.model_validate(_decode_nested_arrays(snap.to_dict()))
         except Exception:
             log.exception("Unparseable run", extra={"runId": run_id})
             return None
 
     def put(self, record: RunRecord) -> RunRecord:
-        self._col.document(record.id).set(record.model_dump(mode="json"))
+        self._col.document(record.id).set(
+            _encode_nested_arrays(record.model_dump(mode="json"))
+        )
         return record
 
 
