@@ -600,7 +600,19 @@ class GraphService:
     def _validate_link(
         self, link_type: str, from_record: ObjectRecord | None,
         to_record: ObjectRecord | None, from_id: str, to_id: str,
+        *,
+        inbound: list[LinkRecord] | None = None,
+        outbound: list[LinkRecord] | None = None,
     ) -> list[TBoxViolation]:
+        """Validate one edge against its declaration.
+
+        `inbound`/`outbound` are the endpoint's existing links when the caller
+        already holds them — the whole-graph sweep does, having just streamed
+        every link. Left as None, the cardinality checks query the store,
+        which is right for the single-write path (one point query) and was
+        quadratic in the sweep (two queries per link over the whole book: the
+        ontology screen took ~48s of Firestore round trips on ~2k links).
+        """
         declared = self.ontology.link_type(link_type)
         if declared is None:
             return [TBoxViolation(
@@ -631,8 +643,11 @@ class GraphService:
         constrain_in = declared.cardinality in ("one-to-many", "one-to-one")
         constrain_out = declared.cardinality in ("many-to-one", "one-to-one")
         if constrain_in:
+            candidates = (
+                inbound if inbound is not None else self.store.links_to(to_id)
+            )
             others = [
-                link for link in self.store.links_to(to_id)
+                link for link in candidates
                 if link.type == link_type and link.from_id != from_id and link.live
             ]
             if others:
@@ -644,8 +659,11 @@ class GraphService:
                     ),
                 ))
         if constrain_out:
+            candidates = (
+                outbound if outbound is not None else self.store.links_from(from_id)
+            )
             others = [
-                link for link in self.store.links_from(from_id)
+                link for link in candidates
                 if link.type == link_type and link.to_id != to_id and link.live
             ]
             if others:
@@ -685,10 +703,20 @@ class GraphService:
         objects = {o.id: o for o in self.store.objects()}
         for record in objects.values():
             violations.extend(self._validate_claims(record.type, record.claims))
+        # One stream, indexed both ways, so the cardinality check inside
+        # `_validate_link` reads its neighborhood from memory instead of
+        # issuing two store queries per link over the whole book.
+        links = self.store.links()
+        inbound: dict[str, list[LinkRecord]] = {}
+        outbound: dict[str, list[LinkRecord]] = {}
+        for link in links:
+            if link.live:
+                inbound.setdefault(link.to_id, []).append(link)
+                outbound.setdefault(link.from_id, []).append(link)
         # Children of a compositional edge must have one.
         parented: dict[str, set[str]] = {}
         owner_of_part: dict[str, str] = {}
-        for link in self.store.links():
+        for link in links:
             declared = self.ontology.link_type(link.type)
             if declared is None:
                 violations.append(TBoxViolation(
@@ -701,6 +729,8 @@ class GraphService:
             from_record, to_record = objects.get(link.from_id), objects.get(link.to_id)
             violations.extend(self._validate_link(
                 link.type, from_record, to_record, link.from_id, link.to_id,
+                inbound=inbound.get(link.to_id, []),
+                outbound=outbound.get(link.from_id, []),
             ))
             if declared.composes:
                 parented.setdefault(declared.to_type, set()).add(link.to_id)
