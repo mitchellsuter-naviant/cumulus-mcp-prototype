@@ -111,7 +111,16 @@ _memo: WeakKeyDictionary[RunEngine, dict[str, _MemoEntry]] = WeakKeyDictionary()
 
 def project_flow(engine: RunEngine, flow_id: str) -> FlowProjection:
     """The flow's projection onto the ontology, memoized on its run set."""
-    runs = engine.list(flow_id=flow_id)
+    return _project_with_memo(engine, flow_id, engine.list(flow_id=flow_id))
+
+
+def _project_with_memo(
+    engine: RunEngine, flow_id: str, runs: list[RunRecord]
+) -> FlowProjection:
+    """The memoized core, taking the runs so a caller that already fetched
+    them all — `project_flows` fetches once and groups — does not fetch again.
+    `runs` must arrive newest-first, which is the order `engine.list` answers
+    in, because `_project` scans only the first SCAN_LIMIT of them."""
     key = (len(runs), max((r.updated_at_iso for r in runs), default=""))
     cache = _memo.setdefault(engine, {})
     cached = cache.get(flow_id)
@@ -141,8 +150,24 @@ def known_flow_ids(engine: RunEngine) -> list[str]:
 
 
 def project_flows(engine: RunEngine) -> list[FlowProjection]:
-    """One projection per flow the engine can name."""
-    return [project_flow(engine, flow_id) for flow_id in known_flow_ids(engine)]
+    """One projection per flow the engine can name.
+
+    One fetch of the run store, grouped, rather than one per flow: the store
+    answers a flow-filtered list by streaming everything and filtering, so
+    projecting N flows through `project_flow` fetched every journal N+1 times
+    — the ontology screen's second-largest cost after the conformance sweep,
+    and one that grew with every estate pull. The grouping preserves the
+    newest-first order `engine.list` answers in, which `_project`'s scan
+    window depends on.
+    """
+    runs_by_flow: dict[str, list[RunRecord]] = {}
+    for run in engine.list():
+        runs_by_flow.setdefault(run.flow_id, []).append(run)
+    ids = sorted(set(engine.registered()) | set(runs_by_flow))
+    return [
+        _project_with_memo(engine, flow_id, runs_by_flow.get(flow_id, []))
+        for flow_id in ids
+    ]
 
 
 def _project(flow_id: str, runs: list[RunRecord]) -> FlowProjection:
