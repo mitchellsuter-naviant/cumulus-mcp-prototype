@@ -29,7 +29,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from . import data_collections
+from . import data_collections, media
 from .models import utcnow
 
 log = logging.getLogger("cumulus.documents")
@@ -230,13 +230,18 @@ class DocumentService:
                 self.store.put(existing)
             return existing
 
+        # Sniffed from the bytes, not read off the name: `filename` is
+        # optional on a submission, and an extension is the submitter's claim
+        # about the file rather than evidence of what it is.
+        sniffed = media.sniff(raw, filename, media_type)
         record = DocumentRecord(
             id=document_id,
             sha256=digest,
             filename=filename,
-            media_type=media_type or _guess_media_type(filename),
+            media_type=sniffed,
             byte_size=len(raw),
             kind=kind,
+            pages=media.page_count(raw, sniffed),
             content_b64=content_b64,
             collection_id=collection_id,
             retention_until_iso=data_collections.retention_until(collection_id),
@@ -309,19 +314,6 @@ class DocumentService:
             "expiring": len(self.expiring()),
             "with_regions": sum(1 for d in items if d.regions),
         }
-
-
-def _guess_media_type(filename: str) -> str:
-    lowered = (filename or "").lower()
-    if lowered.endswith(".png"):
-        return "image/png"
-    if lowered.endswith((".jpg", ".jpeg")):
-        return "image/jpeg"
-    if lowered.endswith(".pdf"):
-        return "application/pdf"
-    if lowered.endswith((".txt", ".csv")):
-        return "text/plain"
-    return "application/octet-stream"
 
 
 def build_document_service(

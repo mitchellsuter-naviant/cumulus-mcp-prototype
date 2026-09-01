@@ -48,6 +48,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field, field_validator
 
+from . import media
 from .anomaly import AnomalyService, parse_anomaly_thresholds
 from .auth import Principal, flow_principal
 from .dispatch import Dispatcher, InMemoryEventLog
@@ -230,13 +231,21 @@ freight, tax or discount). Respond with only a JSON object with those keys."""
 
 class InvoiceReader(Protocol):
     def read(
-        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+        self,
+        image: bytes | None,
+        filename: str,
+        hint: str,
+        *,
+        prompt: str = "",
+        media_type: str = "",
     ) -> InvoiceExtraction:
         """`prompt` is the governed instruction the flow read for this run.
 
         Passed in rather than held by the reader for the reason given on
         `reimbursements.ReceiptReader`: the instruction is knowledge and the
-        reader is machinery.
+        reader is machinery. `media_type` travels for the reason given there
+        too — a reader that re-derives the type from the filename is a second
+        copy of a decision the document store already made correctly.
         """
         ...
 
@@ -455,7 +464,13 @@ class StubInvoiceReader:
 
     # -- m1 ---------------------------------------------------------------
     def read(
-        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+        self,
+        image: bytes | None,
+        filename: str,
+        hint: str,
+        *,
+        prompt: str = "",
+        media_type: str = "",
     ) -> InvoiceExtraction:
         scenario = InvoiceScenario.parse(f"{filename} {hint}")
         base = hashlib.sha256(
@@ -592,16 +607,19 @@ class VertexInvoiceReader:
         self._client = genai.Client(vertexai=True, project=project, location=location)
         self._model = model
 
-    def _parts(self, image: bytes | None, filename: str, prompt: str):
+    def _parts(
+        self, image: bytes | None, filename: str, prompt: str, media_type: str = ""
+    ):
         from google.genai import types
 
         parts: list = []
         if image:
-            lowered = filename.lower()
-            mime = (
-                "application/pdf" if lowered.endswith(".pdf")
-                else "image/png" if lowered.endswith(".png")
-                else "image/jpeg"
+            # This branch used to guess from the extension and got PDFs right
+            # by having remembered to add a case; its sibling in
+            # `reimbursements` had not, which is the whole argument for the
+            # type being carried rather than re-derived per reader.
+            mime = media.require_model_readable(
+                media_type or media.sniff(image, filename), filename
             )
             parts.append(types.Part.from_bytes(data=image, mime_type=mime))
         parts.append(types.Part(text=prompt))
@@ -629,12 +647,20 @@ class VertexInvoiceReader:
         )
 
     def read(
-        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+        self,
+        image: bytes | None,
+        filename: str,
+        hint: str,
+        *,
+        prompt: str = "",
+        media_type: str = "",
     ) -> InvoiceExtraction:
         text = (prompt or DEFAULT_INVOICE_PROMPT) + (
             f"\n\nContext: {hint}" if hint else ""
         )
-        data, usage = self._generate(self._parts(image, filename, text), 0.0)
+        data, usage = self._generate(
+            self._parts(image, filename, text, media_type), 0.0
+        )
         lines = [
             InvoiceLineExtract(
                 sku=str(item.get("sku", "") or ""),
@@ -1337,7 +1363,10 @@ class PayableService:
         document_id: str,
         prompt: str,
     ) -> InvoiceExtraction:
-        extraction = self.reader.read(image, filename, hint, prompt=prompt)
+        extraction = self.reader.read(
+            image, filename, hint, prompt=prompt,
+            media_type=media.sniff(image, filename),
+        )
         if self.documents is not None and extraction.regions:
             self.documents.set_regions(document_id, extraction.regions)
         return extraction

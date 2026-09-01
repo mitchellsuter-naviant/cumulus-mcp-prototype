@@ -46,6 +46,11 @@ from .runs import InMemoryRunStore, RunEngine
 from .service import KnowledgeService
 from .storage import InMemoryRepository
 from .sync import SyncRequest, SyncService
+from .queues import (
+    InMemoryQueueDirectory,
+    QueueService,
+    bootstrap_from_roster as bootstrap_queues_from_roster,
+)
 from .tasks import InMemoryTaskDirectory, TaskService
 
 log = logging.getLogger("cumulus.eval_world")
@@ -81,6 +86,9 @@ class EvalWorld(BaseModel):
     expenses: Any
     payables: Any
     calendars: Any = None
+    #: This world's own desk registry. Isolated like everything else here: a
+    #: graded case may add a queue member, and that must not reach the console.
+    queues: Any = None
     #: The answering stack, with no generative backend — building it is what
     #: registers the `answer-question` body, so every world can start the flow
     #: a question becomes. A world whose backend is None still runs it and
@@ -131,6 +139,8 @@ def build_world(source_knowledge=None, *, seed_dir: str | None = None) -> EvalWo
         revisions = {a.id: getattr(a, "revision", 1) for a in repo.all()}
 
     tasks = TaskService(InMemoryTaskDirectory())
+    queues = QueueService(InMemoryQueueDirectory())
+    bootstrap_queues_from_roster(queues)
     engine = RunEngine(InMemoryRunStore(), tasks)
     graph = GraphService(InMemoryGraphStore())
     # One Gateway per world, for the same reason the graph is one per world: a
@@ -183,7 +193,7 @@ def build_world(source_knowledge=None, *, seed_dir: str | None = None) -> EvalWo
     return EvalWorld(
         knowledge=knowledge, tasks=tasks, engine=engine, graph=graph,
         gateway=gateway, dispatcher=dispatcher, documents=documents,
-        anomaly=anomaly, sync=sync,
+        anomaly=anomaly, sync=sync, queues=queues,
         expenses=expenses, payables=payables, calendars=calendars,
         answers=answers, estate=estate,
         knowledge_revisions=revisions,

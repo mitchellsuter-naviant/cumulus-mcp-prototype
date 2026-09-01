@@ -30,6 +30,7 @@ from .auth import (
 from .deps import (
     get_employee_service,
     get_payable_service,
+    get_queue_service,
     get_reimbursement_service,
     get_sync_service,
     get_task_service,
@@ -38,6 +39,7 @@ from .gateway import Refused
 from .tasks import (
     Task,
     TaskAlreadyDecidedError,
+    TaskClaimConflict,
     TaskKind,
     TaskNotFoundError,
     TaskStats,
@@ -48,6 +50,77 @@ from .tasks import (
 log = logging.getLogger("cumulus.tasks.api")
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
+
+
+class TaskView(Task):
+    """A Task plus the two answers the console needs before it draws a button.
+
+    The queue said who may act and the claim said who is acting, and neither
+    reached the client — so "My Tasks" rendered a live Approve/Correct/Reject
+    row on every task in the deployment and discovered the refusal only after
+    somebody had committed to a verdict. Offering work you have already decided
+    to refuse is worse than not listing it: it spends the user's judgment
+    before telling them it does not count.
+
+    `decidable` is computed from exactly the checks `decide` will run, in the
+    same order, so the greyed-out button and the 403 can never disagree.
+    `blocked_reason` is written to be shown verbatim.
+    """
+
+    decidable: bool = False
+    blocked_reason: str = ""
+    #: "free" · "yours" · "held" — what the lease looks like from here.
+    claim_state: str = "free"
+    #: Who could act on this, for a reason a screen can actually use: telling
+    #: somebody a desk is not theirs without naming whose it is leaves them
+    #: with nothing to do next.
+    queue_holders: list[str] = Field(default_factory=list)
+
+
+def _view(task: Task, principal: Principal) -> TaskView:
+    tasks = get_task_service()
+    live = tasks.claim_holder(task)
+    if live is None:
+        claim_state = "free"
+    elif live.holder_uid == principal.uid:
+        claim_state = "yours"
+    else:
+        claim_state = "held"
+
+    holders: list[str] = []
+    reason = ""
+    if task.status == "done":
+        reason = "Already decided — the record stands."
+    elif principal.key_id is not None:
+        reason = "A minted key cannot decide a Task; sign in as yourself."
+    elif not principal.owns_queue(task.queue):
+        holders = get_queue_service().holders_of(task.queue)
+        who = ", ".join(holders) if holders else "nobody yet"
+        reason = (
+            f"This sits on the '{task.queue}' desk, which you do not hold. "
+            f"Held by: {who}."
+        )
+    elif claim_state == "held" and live is not None:
+        who = live.holder_label or live.holder_email or live.holder_uid
+        reason = (
+            f"{who} claimed this and is working it now. You can take it over "
+            "if they have stopped."
+        )
+    return TaskView(
+        **task.model_dump(),
+        decidable=not reason,
+        blocked_reason=reason,
+        claim_state=claim_state,
+        queue_holders=holders,
+    )
+
+
+class ClaimRequest(BaseModel):
+    #: Take a live claim from its holder. Recorded on the Task and logged —
+    #: allowed because the alternative to "they went home, I am doing this" is
+    #: an admin ticket, and a coordination mechanism that needs an admin to
+    #: unstick it gets routed around instead of used.
+    steal: bool = False
 
 
 class TaskDecisionRequest(BaseModel):
@@ -123,7 +196,7 @@ def _visible(principal: Principal, queue: str, mine: bool) -> bool:
     return True
 
 
-@router.get("", response_model=list[Task])
+@router.get("", response_model=list[TaskView])
 def list_tasks(
     status: TaskStatus | None = Query(default=None),
     queue: str | None = Query(default=None),
@@ -132,7 +205,7 @@ def list_tasks(
         default=False, description="Only queues this persona is bound to"
     ),
     principal: Principal = Depends(get_principal),
-) -> list[Task]:
+) -> list[TaskView]:
     """The queue. `mine=true` is "My Tasks"; without it, what your scope reaches.
 
     An own-scoped persona sees only its own queues either way — showing a
@@ -141,7 +214,7 @@ def list_tasks(
     """
     require_reader(principal)
     tasks = get_task_service().list(status=status, queue=queue, kind=kind)
-    return [t for t in tasks if _visible(principal, t.queue, mine)]
+    return [_view(t, principal) for t in tasks if _visible(principal, t.queue, mine)]
 
 
 @router.get("/stats", response_model=TaskStats)
@@ -158,13 +231,84 @@ def task_stats(
     )
 
 
-@router.get("/{task_id}", response_model=Task)
-def get_task(task_id: str, principal: Principal = Depends(get_principal)) -> Task:
+@router.get("/{task_id}", response_model=TaskView)
+def get_task(
+    task_id: str, principal: Principal = Depends(get_principal)
+) -> TaskView:
     require_reader(principal)
     task = get_task_service().get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-    return task
+    return _view(task, principal)
+
+
+@router.post("/{task_id}/claim", response_model=TaskView)
+def claim_task(
+    task_id: str,
+    body: ClaimRequest | None = None,
+    principal: Principal = Depends(get_principal),
+) -> TaskView:
+    """Take the lease on a pooled Task, or learn who holds it.
+
+    The lease runs for the desk's own `claim_ttl_seconds` and lapses on its
+    own, so nothing here can wedge: the worst case is that a steward who walked
+    away keeps a case out of the pool for twenty minutes.
+
+    Re-claiming your own live lease is the heartbeat, not contention — a screen
+    calls this while somebody reads the evidence, and it renews rather than
+    conflicting.
+    """
+    require_reader(principal)
+    require_human(principal, "claim tasks; a claim says a person is working it")
+    tasks = get_task_service()
+    task = tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    require_queue(principal, task.queue)
+    try:
+        claimed = tasks.claim(
+            task_id,
+            principal.uid,
+            holder_email=principal.email,
+            holder_label=principal.email or principal.uid,
+            ttl_seconds=get_queue_service().claim_ttl(task.queue),
+            steal=bool(body and body.steal),
+        )
+    except TaskClaimConflict as conflict:
+        # 409 and not 403: nothing about this is a permission problem — the
+        # work is simply already in somebody's hands, and the caller's next
+        # move is to wait, pick another row, or take it over deliberately.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{conflict}. Re-send with steal=true to take it over; the "
+                "takeover is recorded on the task."
+            ),
+        ) from conflict
+    except TaskAlreadyDecidedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _view(claimed, principal)
+
+
+@router.post("/{task_id}/release", response_model=TaskView)
+def release_task(
+    task_id: str, principal: Principal = Depends(get_principal)
+) -> TaskView:
+    """Put a claimed Task back in the pool without deciding it."""
+    require_reader(principal)
+    tasks = get_task_service()
+    task = tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    require_queue(principal, task.queue)
+    try:
+        # An admin may free anyone's lease; everyone else frees their own.
+        released = tasks.release(
+            task_id, principal.uid, force=principal.outranks_or_is("admin")
+        )
+    except TaskClaimConflict as conflict:
+        raise HTTPException(status_code=409, detail=str(conflict)) from conflict
+    return _view(released, principal)
 
 
 @router.post("/{task_id}/decide", response_model=Task)
@@ -194,6 +338,17 @@ def decide_task(
         # 409, not idempotent-200: a second decider must learn the judgment
         # already happened, not be told their verdict was recorded.
         raise HTTPException(status_code=409, detail="Task already decided")
+    except TaskClaimConflict as conflict:
+        # Deciding acquires a free lease, so reaching here means somebody else
+        # holds a live one — the coordination the claim exists for, caught
+        # before the work is duplicated rather than after.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{conflict}. Claim it with steal=true first if they have "
+                "stopped working it."
+            ),
+        ) from conflict
 
     # The resume half of suspend/resume: a decision on a task raised by a live
     # runner resumes that run. `RESUME_HOOKS` says which hooks answer for this

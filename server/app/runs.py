@@ -72,6 +72,36 @@ class StepFailed(Exception):
         self.message = message
 
 
+#: Status codes worth trying again. Everything else in the 4xx range is the
+#: server telling us the *request* is wrong, and repeating it verbatim earns
+#: the same answer — 408 and 429 are the two that mean "not now" rather than
+#: "not ever".
+_RETRYABLE_CLIENT_CODES = frozenset({408, 429})
+
+
+def retryable(exc: Exception) -> bool:
+    """Whether trying this again could plausibly produce a different answer.
+
+    Retry-then-escalate is doctrine, but retrying a *deterministic* failure is
+    only a slower way to fail: a PDF sent to Vertex labelled `image/jpeg`
+    earned `400 Provided image is not valid` twice, at two calls' latency, and
+    told the reviewer nothing the first attempt had not.
+
+    Duck-typed on purpose. This module knows nothing about media types or
+    Vertex and should not: an exception declares itself permanent by carrying
+    `retryable = False`, and anything with an HTTP-shaped `code` is classified
+    the way HTTP already says to. Everything else stays retryable, because the
+    fail-safe direction here is to try again.
+    """
+    declared = getattr(exc, "retryable", None)
+    if declared is not None:
+        return bool(declared)
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int) and 400 <= code < 500:
+        return code in _RETRYABLE_CLIENT_CODES
+    return True
+
+
 class ModelUsage(BaseModel):
     """What one model call actually consumed, as the caller can report it.
 
@@ -386,13 +416,20 @@ class RunContext:
                 succeeded = True
             except Exception as exc:  # noqa: BLE001 — recorded, then re-raised
                 last_error = f"{type(exc).__name__}: {exc}"
+                permanent = not retryable(exc)
                 log.warning(
                     "Step attempt failed",
                     extra={
                         "runId": self.record.id, "stepId": step_id,
                         "attempt": attempts, "error": last_error,
+                        "permanent": permanent,
                     },
                 )
+                if permanent:
+                    # Escalate now. The retry budget exists for a flaky
+                    # network, not for a request the provider has already
+                    # judged malformed.
+                    break
 
         if not succeeded:
             self._record_step(StepRecord(

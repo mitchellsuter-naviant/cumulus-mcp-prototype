@@ -27,6 +27,7 @@ from .usage import AssetUsageStore, build_asset_usage_store
 from .users import UserDirectory, build_user_directory
 from .flows import FlowService, build_flow_service, seed_flows_if_empty
 from .calendars import CalendarService, build_calendar_service
+from .queues import QueueService, build_queue_service
 from .tasks import TaskService, build_task_service
 from .reimbursements import (
     ReimbursementService,
@@ -49,6 +50,7 @@ _team_service: TeamService | None = None
 _asset_usage: AssetUsageStore | None = None
 _flow_service: FlowService | None = None
 _task_service: TaskService | None = None
+_queue_service: QueueService | None = None
 _reimbursement_service: ReimbursementService | None = None
 _employee_service: EmployeeService | None = None
 _payable_service: PayableService | None = None
@@ -200,6 +202,20 @@ def get_flow_service() -> FlowService:
                 seed_flows_if_empty(service)
                 _flow_service = service
     return _flow_service
+
+
+def get_queue_service() -> QueueService:
+    global _queue_service
+    if _queue_service is None:
+        service = build_queue_service(
+            settings.storage_backend,
+            settings.firestore_project,
+            settings.queues_collection,
+        )
+        with _lock:
+            if _queue_service is None:
+                _queue_service = service
+    return _queue_service
 
 
 def get_task_service() -> TaskService:

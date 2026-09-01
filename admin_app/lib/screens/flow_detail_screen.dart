@@ -11,7 +11,7 @@ import '../theme/cumulus_theme.dart';
 import '../widgets/cumulus_shell.dart';
 import '../widgets/eval_panel.dart';
 import '../widgets/mini_charts.dart';
-import '../widgets/run_workbench.dart' show runTone;
+import '../widgets/run_workbench.dart' show RunJournalView, runTone;
 import '../widgets/side_drawer.dart';
 import '../widgets/ui_kit.dart';
 import '../widgets/flow_canvas.dart';
@@ -44,8 +44,63 @@ enum ChartMeasure {
   const ChartMeasure(this.label);
 }
 
-/// One definition, in three views: what it is and how it is doing, the graph
-/// with its runs, and how a candidate version measures up.
+/// How far back the run history reaches. The whole history arrives in one
+/// fetch, newest first, so a window is a cut on the list already in hand
+/// rather than another round trip.
+enum RunWindow {
+  all('All time', null),
+  day('Last 24 hours', Duration(hours: 24)),
+  week('Last 7 days', Duration(days: 7)),
+  month('Last 30 days', Duration(days: 30));
+
+  final String label;
+  final Duration? span;
+
+  const RunWindow(this.label, this.span);
+}
+
+/// Cut the run history by status, by time and by a free-text search over the
+/// fields a run is actually looked up by: the id someone pasted out of a
+/// ticket, the case it ran on, the person it ran for, the step it is stuck at,
+/// the error it failed with, a governed document it read.
+///
+/// Order is preserved, so the history stays newest-first through any filter.
+List<FlowRunSummary> filterRuns(
+  List<FlowRunSummary> runs, {
+  String? status,
+  RunWindow window = RunWindow.all,
+  String query = '',
+  DateTime? now,
+}) {
+  final needle = query.trim().toLowerCase();
+  final span = window.span;
+  final clock = now ?? DateTime.now();
+  return runs.where((run) {
+    if (status != null && run.status != status) return false;
+    if (span != null && !runWithin(run, clock, span)) return false;
+    if (needle.isEmpty) return true;
+    return [
+      run.id,
+      run.caseRef,
+      run.actor,
+      run.status,
+      run.suspendedAtStep,
+      run.error,
+      run.openTaskId,
+      ...run.refs,
+    ].any((field) => field.toLowerCase().contains(needle));
+  }).toList();
+}
+
+/// A run whose timestamp will not parse cannot be placed in a window, so it
+/// stays in every window. Dropping it would hide a run that exists.
+bool runWithin(FlowRunSummary run, DateTime now, Duration span) {
+  final started = DateTime.tryParse(run.startedAtIso);
+  return started == null || now.difference(started) <= span;
+}
+
+/// One definition, in four views: what it is and how it is doing, the graph,
+/// every run it has ever had, and how a candidate version measures up.
 class FlowDetailScreen extends StatefulWidget {
   final String flowId;
   final String myRole;
@@ -75,15 +130,26 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
   List<StepDiff> _canvasSteps = [];
   String? _selectedStepId;
 
-  /// The run being traced through the graph, and its journal.
+  /// The run whose journal is open, and the journal itself. One cache: the
+  /// Runs tab expands it inline and the canvas traces its path, and both of
+  /// them want the same fetch.
   FlowRunSummary? _selectedRun;
   FlowRun? _runDetail;
   bool _loadingRun = false;
 
-  ChartMeasure _measure = ChartMeasure.runs;
+  /// Whether the canvas is painting [_selectedRun]'s path. Opening a journal
+  /// to read it is not the same act as asking the graph to show the branch it
+  /// took: the second one moves the canvas onto the version that ran, and
+  /// doing that behind an expand would swap the version selector under you.
+  bool _tracing = false;
 
-  /// 0 = step definition, 1 = runs and their payloads.
-  int _rightTab = 0;
+  /// Run-history filters. The history is fetched once and cut in the client —
+  /// a few hundred rows is a list to narrow, not a query to re-issue.
+  final TextEditingController _runSearch = TextEditingController();
+  String? _runStatus;
+  RunWindow _runWindow = RunWindow.all;
+
+  ChartMeasure _measure = ChartMeasure.runs;
 
   bool _loading = true;
   String? _error;
@@ -101,18 +167,20 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
   FlowStep? get _selectedStep =>
       _canvasSteps.where((d) => d.step.id == _selectedStepId).firstOrNull?.step;
 
-  RunPath? get _runPath => _runDetail == null
+  RunPath? get _runPath => !_tracing || _runDetail == null
       ? null
       : RunPath.fromRun(_runDetail!, [for (final d in _canvasSteps) d.step]);
 
   @override
   void initState() {
     super.initState();
+    _runSearch.addListener(() => setState(() {}));
     _refresh();
   }
 
   @override
   void dispose() {
+    _runSearch.dispose();
     _api.close();
     super.dispose();
   }
@@ -127,7 +195,7 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
       final results = await Future.wait([
         _api.getFlow(id),
         _api.flowUsage(id),
-        _api.listRuns(flowId: id, limit: 40),
+        _api.listRuns(flowId: id, limit: _runHistoryLimit),
         _api.flowVersions(id),
         _api.flowRecommendations(id),
       ]);
@@ -196,28 +264,39 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
     }
   }
 
-  /// Tracing a run means looking at the version that ran, so selecting one
+  /// Open a run's journal. With [trace] the canvas paints its path too, and
+  /// because a path belongs to the version that ran, that — and only that —
   /// moves the canvas off any draft it was showing.
-  Future<void> _selectRun(FlowRunSummary? run) async {
+  Future<void> _selectRun(FlowRunSummary? run, {bool trace = false}) async {
     if (run == null) {
       setState(() {
         _selectedRun = null;
         _runDetail = null;
+        _tracing = false;
       });
       return;
     }
+    final alreadyLoaded = _selectedRun?.id == run.id && _runDetail != null;
     setState(() {
       _selectedRun = run;
-      _loadingRun = true;
+      _tracing = trace;
+      if (!alreadyLoaded) {
+        _runDetail = null;
+        _loadingRun = true;
+      }
     });
-    final active = _activeVersion;
-    if (active != null && _selectedVersion != active.version) {
-      setState(() => _selectedVersion = active.version);
-      await _loadCanvas();
+    if (trace) {
+      final active = _activeVersion;
+      if (active != null && _selectedVersion != active.version) {
+        setState(() => _selectedVersion = active.version);
+        await _loadCanvas();
+      }
     }
+    if (alreadyLoaded) return;
     try {
       final detail = await _api.getRun(run.id);
-      if (!mounted) return;
+      // A second row clicked while this one was in flight owns the panel now.
+      if (!mounted || _selectedRun?.id != run.id) return;
       setState(() {
         _runDetail = detail;
         _loadingRun = false;
@@ -227,6 +306,13 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
       setState(() => _loadingRun = false);
       _snack(e.message);
     }
+  }
+
+  /// The one thing the canvas shows that a journal cannot: which branch this
+  /// run took through the graph.
+  Future<void> _traceOnCanvas(FlowRunSummary run) async {
+    setState(() => _tab = 1);
+    await _selectRun(run, trace: true);
   }
 
   @override
@@ -267,6 +353,7 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
                       labels: const [
                         'Overview',
                         'Flow canvas',
+                        'Runs',
                         'Evaluation',
                       ],
                       selectedIndex: _tab,
@@ -286,6 +373,10 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
               children: _overviewBody(w),
             ),
             1 => _canvasBody(),
+            2 => PageBody(
+              padding: const EdgeInsets.fromLTRB(14, 16, 28, 48),
+              children: _runHistoryBody(),
+            ),
             _ => PageBody(
               padding: const EdgeInsets.fromLTRB(14, 16, 28, 48),
               children: [EvalPanel(api: _api, flowId: widget.flowId)],
@@ -316,6 +407,7 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
               // run's path belongs to the version that ran.
               _selectedRun = null;
               _runDetail = null;
+              _tracing = false;
               _tab = 1;
             });
             _loadCanvas();
@@ -627,104 +719,52 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
     );
   }
 
+  /// One subject: the step you clicked. The run history is a tab of its own
+  /// now, so nothing here competes with the step for the column — and when a
+  /// run is being traced, its journal entry for that step follows the step's
+  /// definition instead of hiding behind a second row of tabs.
   Widget _inspectorColumn() {
     return ColoredBox(
       color: CumulusColors.surface,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: SegmentedTabs(
-                labels: const ['Definition', 'Runs'],
-                selectedIndex: _rightTab,
-                onChanged: (i) => setState(() {
-                  _rightTab = i;
-                  // Leaving Runs drops the trace with it. The run highlight
-                  // belongs to the Runs tab; leaving it on while reading the
-                  // definition claims the graph is showing one execution when
-                  // nothing on screen says which.
-                  if (i != 1) {
-                    _selectedRun = null;
-                    _runDetail = null;
-                  }
-                }),
-              ),
-            ),
-          ),
-          const Divider(height: 1),
-          Expanded(
-            child: _rightTab == 0 ? _definitionPanel() : _runsPanel(),
-          ),
+          if (_tracing && _selectedRun != null) ...[
+            _traceBanner(),
+            const Divider(height: 1),
+          ],
+          Expanded(child: _definitionPanel()),
         ],
       ),
     );
   }
 
-  Widget _definitionPanel() {
-    final step = _selectedStep;
-    if (step == null) {
-      return const CumulusEmptyState(
-        icon: Icons.touch_app_outlined,
-        title: 'Select a step',
-        message:
-            'Click any node on the canvas to see its exported configuration — '
-            'the model it calls, the threshold it checks, where it routes.',
-      );
-    }
-    final diff = _canvasSteps.where((d) => d.step.id == step.id).firstOrNull;
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _StepHeader(step: step, diff: diff),
-          const SizedBox(height: 16),
-          _NodeConfiguration(step: step, diff: diff),
-        ],
-      ),
-    );
-  }
-
-  /// Two modes, not two panes. Browsing runs wants the full column; once one
-  /// is chosen the list collapses to a compact header with a way back, and
-  /// the payloads — the reason you picked the run — get the rest of the space.
-  Widget _runsPanel() {
-    if (_selectedRun == null) return _runList();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _selectedRunHeader(),
-        const Divider(height: 1),
-        Expanded(child: _stepPayloadPanel()),
-      ],
-    );
-  }
-
-  Widget _selectedRunHeader() {
+  /// The canvas is painting one execution's path; this says which, and gives
+  /// the way out. Without it the highlighted path is an unexplained colour.
+  Widget _traceBanner() {
     final run = _selectedRun!;
     return Container(
       color: CumulusColors.surfaceMuted.withValues(alpha: 0.6),
-      padding: const EdgeInsets.fromLTRB(10, 10, 16, 12),
+      padding: const EdgeInsets.fromLTRB(16, 10, 8, 12),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
             children: [
-              IconButton(
-                tooltip: 'Back to all runs',
-                visualDensity: VisualDensity.compact,
-                icon: const Icon(Icons.arrow_back, size: 17),
-                onPressed: () => _selectRun(null),
+              const Icon(
+                Icons.route_outlined,
+                size: 16,
+                color: CumulusColors.inkMuted,
               ),
-              const SizedBox(width: 2),
-              Text(
-                run.id,
-                style: CumulusText.mono.copyWith(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  run.id,
+                  overflow: TextOverflow.ellipsis,
+                  style: CumulusText.mono.copyWith(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
               const SizedBox(width: 8),
@@ -734,10 +774,17 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
                 dense: true,
                 uppercase: true,
               ),
+              const Spacer(),
+              IconButton(
+                tooltip: 'Stop tracing this run',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.close, size: 16),
+                onPressed: () => setState(() => _tracing = false),
+              ),
             ],
           ),
           Padding(
-            padding: const EdgeInsets.only(left: 12, top: 2),
+            padding: const EdgeInsets.only(left: 24, right: 8, top: 2),
             child: Text(
               '${_runSubject(run).isEmpty ? '' : '${_runSubject(run)} · '}'
               '${run.steps} step${run.steps == 1 ? '' : 's'}'
@@ -754,128 +801,49 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
     );
   }
 
-  Widget _runList() {
-    if (_runs.isEmpty) {
-      return const CumulusEmptyState(
-        icon: Icons.play_circle_outline,
-        title: 'No runs yet',
-        message: 'This definition has never executed.',
+  Widget _definitionPanel() {
+    final step = _selectedStep;
+    if (step == null) {
+      return CumulusEmptyState(
+        icon: Icons.touch_app_outlined,
+        title: 'Select a step',
+        message: _tracing && _selectedRun != null
+            ? 'Click any node on the traced path to see its configuration and '
+                  'what it read, wrote and returned in ${_selectedRun!.id}.'
+            : 'Click any node on the canvas to see its exported configuration '
+                  '— the model it calls, the threshold it checks, where it '
+                  'routes.',
       );
     }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
-          child: Row(
-            children: [
-              Text('RECENT RUNS', style: CumulusText.sectionTitle),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  'select one to trace its path through the graph',
-                  style: CumulusText.sectionSubtitle,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ],
-          ),
-        ),
-        Expanded(
-          child: ListView.separated(
-            padding: EdgeInsets.zero,
-            itemCount: _runs.length,
-            separatorBuilder: (_, _) => const Divider(height: 1),
-            itemBuilder: (context, i) {
-              final run = _runs[i];
-              // No selected state to paint: choosing a run replaces this list
-              // with the run's own header.
-              return Material(
-                color: Colors.transparent,
-                child: InkWell(
-                  onTap: () => _selectRun(run),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 20,
-                      vertical: 11,
-                    ),
-                    child: Row(
-                      children: [
-                        Container(
-                          width: 8,
-                          height: 8,
-                          decoration: BoxDecoration(
-                            color: runTone(run.status).dot,
-                            shape: BoxShape.circle,
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Text(
-                                    run.id,
-                                    style: CumulusText.mono.copyWith(
-                                      fontSize: 12,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  if (run.status != 'succeeded')
-                                    StatusBadge(
-                                      run.status,
-                                      tone: runTone(run.status),
-                                      dense: true,
-                                      uppercase: true,
-                                    ),
-                                ],
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                '${_runSubject(run).isEmpty ? '' : '${_runSubject(run)} · '}'
-                                '${run.steps} steps · ${run.modelCalls} MC'
-                                '${run.openTaskId.isEmpty ? '' : ' · task'}',
-                                style: CumulusText.meta,
-                              ),
-                            ],
-                          ),
-                        ),
-                        Text(
-                          '${run.durationMs}ms',
-                          style: const TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        SizedBox(
-                          width: 62,
-                          child: Text(
-                            agoIso(run.startedAtIso),
-                            textAlign: TextAlign.right,
-                            style: CumulusText.meta,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              );
-            },
-          ),
-        ),
-      ],
+    final diff = _canvasSteps.where((d) => d.step.id == step.id).firstOrNull;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _StepHeader(step: step, diff: diff),
+          const SizedBox(height: 16),
+          _NodeConfiguration(step: step, diff: diff),
+          if (_tracing && _selectedRun != null) ...[
+            const SizedBox(height: 22),
+            const Divider(height: 1),
+            const SizedBox(height: 16),
+            Text('IN THIS RUN', style: CumulusText.statLabel),
+            const SizedBox(height: 10),
+            _stepInRun(step),
+          ],
+        ],
+      ),
     );
   }
 
-  Widget _stepPayloadPanel() {
+  /// What the traced run did at this step. A looped node has one journal
+  /// entry per round; the newest is the state the canvas is painting, so it
+  /// is the one whose payload belongs here.
+  Widget _stepInRun(FlowStep step) {
     if (_loadingRun) return const CumulusLoading();
     final run = _runDetail;
     if (run == null) {
-      // Reachable only when the journal fetch failed — the panel is not shown
-      // at all until a run is selected.
       return CumulusEmptyState(
         icon: Icons.error_outline,
         title: 'Journal unavailable',
@@ -883,34 +851,294 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
             'The execution trail for ${_selectedRun?.id ?? 'this run'} could '
             'not be loaded.',
         action: OutlinedButton(
-          onPressed: () => _selectRun(_selectedRun),
+          onPressed: () => _selectRun(_selectedRun, trace: true),
           child: const Text('Retry'),
         ),
       );
     }
-    final nodeId = _selectedStepId;
     final nodeIds = {for (final d in _canvasSteps) d.step.id};
-    // A looped node has one journal entry per round; the newest is the state
-    // the canvas is painting, so it is the one whose payload belongs here.
-    final entry = nodeId == null
-        ? null
-        : run.steps
-              .where((s) => RunPath.canvasNode(s.stepId, nodeIds) == nodeId)
-              .lastOrNull;
+    final entry = run.steps
+        .where((s) => RunPath.canvasNode(s.stepId, nodeIds) == step.id)
+        .lastOrNull;
     if (entry == null) {
       return CumulusEmptyState(
-        icon: Icons.touch_app_outlined,
-        title: nodeId == null ? 'Select a step' : 'Not in this run',
-        message: nodeId == null
-            ? 'Click a step on the canvas to see what it read, wrote and '
-                  'returned in ${run.id}.'
-            : 'This step is not part of ${run.id} — the run took a different '
-                  'branch.',
+        icon: Icons.alt_route,
+        title: 'Not in this run',
+        message:
+            '${step.id} is not part of ${run.id} — the run took a different '
+            'branch.',
       );
     }
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
-      child: _StepRunDetail(step: entry, runId: run.id),
+    return _StepRunDetail(step: entry, runId: run.id);
+  }
+
+  // ---- Tab 3: run history -------------------------------------------------
+
+  /// Deep enough that the tab is the whole history rather than the last
+  /// screenful of it, and inside the endpoint's own ceiling of 500.
+  static const int _runHistoryLimit = 300;
+
+  List<FlowRunSummary> get _visibleRuns => filterRuns(
+    _runs,
+    status: _runStatus,
+    window: _runWindow,
+    query: _runSearch.text,
+  );
+
+  List<Widget> _runHistoryBody() {
+    final rows = _visibleRuns;
+    return [
+      _runFilterBar(),
+      ListCard(
+        title: 'Run history',
+        subtitle: _runs.isEmpty
+            ? 'this definition has never executed'
+            : '${rows.length} of ${_runs.length} run'
+                  '${_runs.length == 1 ? '' : 's'} · newest first · '
+                  'click one for its journal',
+        headerTrailing: TextButton.icon(
+          onPressed: _reloadRuns,
+          icon: const Icon(Icons.refresh, size: 15),
+          label: const Text('Refresh'),
+        ),
+        children: [
+          if (_runs.isEmpty)
+            const CumulusEmptyState(
+              icon: Icons.play_circle_outline,
+              title: 'No runs yet',
+              message: 'This definition has never executed.',
+            )
+          else if (rows.isEmpty)
+            CumulusEmptyState(
+              icon: Icons.search_off,
+              title: 'Nothing matches',
+              message:
+                  'No run matches the current filters. Clear the search, the '
+                  'status lens or the time window to widen the history.',
+              action: OutlinedButton(
+                onPressed: _clearRunFilters,
+                child: const Text('Clear filters'),
+              ),
+            )
+          else
+            for (final run in rows) ...[
+              _runHistoryRow(run),
+              if (_selectedRun?.id == run.id)
+                _loadingRun
+                    ? const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 18),
+                        child: CumulusLoading(),
+                      )
+                    : RunJournalView(api: _api, run: _runDetail),
+            ],
+        ],
+      ),
+    ];
+  }
+
+  /// Search, status and time on one row. The status counts are taken after
+  /// the time window but before the search, so a chip's number keeps meaning
+  /// "how many runs are in this state" while you type rather than counting
+  /// only what the query has already matched.
+  Widget _runFilterBar() {
+    final span = _runWindow.span;
+    final now = DateTime.now();
+    final inWindow = span == null
+        ? _runs
+        : _runs.where((run) => runWithin(run, now, span)).toList();
+    final counts = <String, int>{};
+    for (final run in inWindow) {
+      counts[run.status] = (counts[run.status] ?? 0) + 1;
+    }
+    // The four states runs.py stores lead, in that order; anything else the
+    // history holds still gets a lens rather than being unreachable. A lens
+    // that is selected stays on screen even once its count falls to zero —
+    // otherwise the only chip you could use to undo the filter vanishes.
+    const known = ['succeeded', 'suspended', 'failed', 'running'];
+    final present = <String>{
+      ...counts.keys,
+      if (_runStatus != null) _runStatus!,
+    };
+    final statuses = [
+      for (final status in known)
+        if (present.contains(status)) status,
+      for (final status in present)
+        if (!known.contains(status)) status,
+    ];
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        SizedBox(
+          width: 340,
+          child: TextField(
+            controller: _runSearch,
+            decoration: InputDecoration(
+              hintText: 'Search run id, case, actor, step, error…',
+              prefixIcon: const Icon(Icons.search, size: 16),
+              suffixIcon: _runSearch.text.isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.close, size: 14),
+                      onPressed: _runSearch.clear,
+                    ),
+            ),
+          ),
+        ),
+        LensChip(
+          label: 'All · ${inWindow.length}',
+          selected: _runStatus == null,
+          onTap: () => setState(() => _runStatus = null),
+        ),
+        for (final status in statuses)
+          LensChip(
+            label: '$status · ${counts[status] ?? 0}',
+            tone: runTone(status),
+            selected: _runStatus == status,
+            onTap: () => setState(
+              () => _runStatus = _runStatus == status ? null : status,
+            ),
+          ),
+        DropdownButtonHideUnderline(
+          child: DropdownButton<RunWindow>(
+            value: _runWindow,
+            style: const TextStyle(fontSize: 13, color: CumulusColors.ink),
+            borderRadius: BorderRadius.circular(CumulusRadius.control),
+            items: [
+              for (final window in RunWindow.values)
+                DropdownMenuItem<RunWindow>(
+                  value: window,
+                  child: Text(window.label),
+                ),
+            ],
+            onChanged: (window) =>
+                setState(() => _runWindow = window ?? RunWindow.all),
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _clearRunFilters() {
+    setState(() {
+      _runStatus = null;
+      _runWindow = RunWindow.all;
+    });
+    // Clearing the field fires the listener, which rebuilds.
+    _runSearch.clear();
+  }
+
+  /// The history is the one part of this screen that goes stale while you
+  /// read it — a run can land at any moment — so it refetches on its own,
+  /// without pulling the definition, its versions and its telemetry with it.
+  Future<void> _reloadRuns() async {
+    try {
+      final runs = await _api.listRuns(
+        flowId: widget.flowId,
+        limit: _runHistoryLimit,
+      );
+      if (!mounted) return;
+      setState(() => _runs = runs);
+    } on ApiException catch (e) {
+      _snack(e.message);
+    }
+  }
+
+  Widget _runHistoryRow(FlowRunSummary run) {
+    final tone = runTone(run.status);
+    final open = _selectedRun?.id == run.id;
+    return CumulusListRow(
+      onTap: () => _selectRun(open ? null : run),
+      leading: Container(
+        width: 34,
+        height: 34,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: tone.background,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Icon(
+          switch (run.status) {
+            'succeeded' => Icons.check,
+            'suspended' => Icons.pause,
+            'failed' => Icons.priority_high,
+            _ => Icons.play_arrow,
+          },
+          size: 17,
+          color: tone.foreground,
+        ),
+      ),
+      title: Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 8,
+        runSpacing: 4,
+        children: [
+          Text(_runSubject(run).isEmpty ? run.id : _runSubject(run)),
+          StatusBadge(run.status, tone: tone, dense: true, uppercase: true),
+          if (run.status == 'suspended' && run.suspendedAtStep.isNotEmpty)
+            StatusBadge('at ${run.suspendedAtStep}', dense: true),
+          if (run.openTaskId.isNotEmpty)
+            StatusBadge('task open', tone: CumulusTone.accent, dense: true),
+          if (run.resumeCount > 0)
+            Tooltip(
+              message:
+                  'The journal was re-entered ${run.resumeCount} time(s); '
+                  'completed steps replayed rather than re-running.',
+              child: StatusBadge(
+                '${run.resumeCount}× resumed',
+                tone: CumulusTone.accent,
+                dense: true,
+              ),
+            ),
+        ],
+      ),
+      subtitle: Text(
+        '${run.id} · ${run.steps} step${run.steps == 1 ? '' : 's'}'
+        ' · ${run.modelCalls} ModelCall${run.modelCalls == 1 ? '' : 's'}'
+        ' · ${run.refs.length} governed read${run.refs.length == 1 ? '' : 's'}'
+        '${run.costUsd > 0 ? ' · ${money(run.costUsd)}' : ''}'
+        '${run.actor.isEmpty ? '' : ' · ${run.actor}'}'
+        '${run.error.isEmpty ? '' : ' · ${run.error}'}',
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: [
+        SizedBox(
+          width: 92,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                agoIso(run.startedAtIso),
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: CumulusColors.ink,
+                ),
+              ),
+              Text(
+                // Every seeded run reports 0ms, and printing that claims a
+                // measurement of zero rather than none.
+                run.durationMs <= 0 ? 'not timed' : '${run.durationMs}ms',
+                style: CumulusText.statCaption,
+              ),
+            ],
+          ),
+        ),
+        IconButton(
+          tooltip: 'Trace this run on the canvas',
+          visualDensity: VisualDensity.compact,
+          icon: const Icon(Icons.account_tree_outlined, size: 17),
+          color: CumulusColors.inkMuted,
+          onPressed: () => _traceOnCanvas(run),
+        ),
+        Icon(
+          open ? Icons.expand_less : Icons.expand_more,
+          size: 20,
+          color: CumulusColors.inkMuted,
+        ),
+      ],
     );
   }
 
@@ -1022,6 +1250,7 @@ class _FlowDetailScreenState extends State<FlowDetailScreen> {
         _selectedVersion = applied.draft.version;
         _selectedRun = null;
         _runDetail = null;
+        _tracing = false;
       });
       await _loadCanvas();
       _snack(

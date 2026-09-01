@@ -151,12 +151,37 @@ def _verify_firebase_token(token: str) -> Principal:
     role = claims.get("role", "user")
     if role not in ROLES:
         role = "user"
-    return Principal(
-        uid=claims["uid"],
-        email=claims.get("email", ""),
-        role=role,
-        **personas.reach_for(role),
-    )
+    email = claims.get("email", "")
+    reach = personas.reach_for(role)
+    # Access from the credential; work from the roster. `reach_for` grants no
+    # queues to any role — correctly, since deciding a Task is work assignment
+    # and not authority — but it was reading the role and throwing the email
+    # away, so a real account was bound to nothing even when the roster names
+    # that exact person at a desk. See `queues_for_email`.
+    reach["queues"] = queues_for(email, role)
+    return Principal(uid=claims["uid"], email=email, role=role, **reach)
+
+
+def queues_for(email: str, role: str) -> tuple[str, ...]:
+    """Every desk a credential holds: declared on the roster, plus granted.
+
+    Two sources, unioned, because they answer to different owners. The
+    **roster** is Naviant's own fixture — the demo personas and the operator —
+    and moves when the code does. The **queue registry** is the customer's,
+    edited in the console by whoever administers the desk, and is the one that
+    matters in a real deployment. Neither is authoritative over the other;
+    holding a desk under either is holding it.
+    """
+    from .deps import get_queue_service  # deferred: queues imports auth
+
+    held = list(personas.queues_for_email(email))
+    try:
+        for slug in get_queue_service().queues_for(email):
+            if slug not in held:
+                held.append(slug)
+    except Exception:  # noqa: BLE001 — a registry outage must not lock everyone out
+        log.exception("Queue registry unreadable; falling back to the roster")
+    return tuple(held)
 
 
 # Path segments that are literals in our routes; anything else is an id and gets

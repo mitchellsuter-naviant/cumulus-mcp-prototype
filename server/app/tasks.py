@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Collection
+from datetime import timedelta
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -113,6 +114,57 @@ class TaskDecision(BaseModel):
     decided_at_iso: str = ""
 
 
+class TaskClaim(BaseModel):
+    """Who is working this Task right now, and until when.
+
+    A lease, not a lock, and the distinction is the whole design. Doctrine
+    routes a Task to a Queue precisely so that *every* bound Principal sees it
+    — which load-balances, and which also means two stewards can open the same
+    entity-resolution case and both do the work. The 409 on a second decision
+    catches that after both have spent the morning; a claim catches it before
+    either does.
+
+    It expires because the queue's own reason for existing is that work
+    survives absence. A claim that held until explicitly released would put the
+    absence problem back one level down: six cases locked at 09:02 by somebody
+    who is then out sick, and an admin needed to free each one. So the holder
+    keeps it by staying at the desk, and stops holding it by walking away.
+
+    Expiry is computed, never swept. `expires_at_iso` in the past *is* the
+    expired state — there is no background pass whose failure could leave a
+    stale lease standing, and no write required for a lease to lapse.
+    """
+
+    holder_uid: str
+    holder_email: str = ""
+    holder_label: str = ""
+    claimed_at_iso: str
+    expires_at_iso: str
+    #: Times this claim was taken from a live holder. Kept on the Task rather
+    #: than only in the log because a case that three people have wrestled over
+    #: is a fact about the case, visible to the fourth.
+    steal_count: int = 0
+
+    def live_at(self, now_iso: str) -> bool:
+        return self.expires_at_iso > now_iso
+
+    def held_by(self, uid: str, now_iso: str) -> bool:
+        return self.holder_uid == uid and self.live_at(now_iso)
+
+
+class TaskClaimConflict(Exception):
+    """Somebody else holds a live lease on this Task."""
+
+    def __init__(self, task_id: str, claim: TaskClaim) -> None:
+        who = claim.holder_label or claim.holder_email or claim.holder_uid
+        super().__init__(
+            f"{who} is working this task; their claim runs until "
+            f"{claim.expires_at_iso}"
+        )
+        self.task_id = task_id
+        self.claim = claim
+
+
 class Task(BaseModel):
     id: str
     kind: TaskKind
@@ -136,6 +188,10 @@ class Task(BaseModel):
     resumes: str = ""
     created_at_iso: str = ""
     decision: TaskDecision | None = None
+    #: The live lease, if anyone holds one. Absent is the normal state: most
+    #: Tasks are decided by whoever opens them first, and the claim only earns
+    #: its keep when two people reach for the same row.
+    claim: TaskClaim | None = None
 
 
 class TaskStats(BaseModel):
@@ -155,6 +211,19 @@ class TaskDirectory(Protocol):
     def get(self, task_id: str) -> Task | None: ...
     def put(self, task: Task) -> Task: ...
 
+    def mutate(self, task_id: str, fn: "Callable[[Task], Task]") -> Task:
+        """Read-modify-write the Task atomically.
+
+        `put` is a blind overwrite, which is correct for everything that writes
+        a Task from a position of authority — a Flow raising one, a hook
+        withdrawing a decision. It is exactly wrong for a claim: two stewards
+        pressing the same button a millisecond apart would both read no
+        holder, both write themselves, and the lock would have handed the case
+        to two people while reporting success to both. A lock that races is
+        worse than no lock, because it is believed.
+        """
+        ...
+
 
 class InMemoryTaskDirectory:
     def __init__(self) -> None:
@@ -173,6 +242,15 @@ class InMemoryTaskDirectory:
         with self._lock:
             self._items[task.id] = task
             return task
+
+    def mutate(self, task_id: str, fn: "Callable[[Task], Task]") -> Task:
+        with self._lock:
+            current = self._items.get(task_id)
+            if current is None:
+                raise TaskNotFoundError(task_id)
+            updated = fn(current)
+            self._items[task_id] = updated
+            return updated
 
 
 class FirestoreTaskDirectory:
@@ -205,6 +283,26 @@ class FirestoreTaskDirectory:
         self._col.document(task.id).set(task.model_dump(mode="json"))
         return task
 
+    def mutate(self, task_id: str, fn: "Callable[[Task], Task]") -> Task:
+        from google.cloud import firestore
+
+        ref = self._col.document(task_id)
+
+        @firestore.transactional
+        def _apply(transaction) -> Task:
+            snap = ref.get(transaction=transaction)
+            if not snap.exists:
+                raise TaskNotFoundError(task_id)
+            updated = fn(Task.model_validate(snap.to_dict()))
+            transaction.set(ref, updated.model_dump(mode="json"))
+            return updated
+
+        # Firestore retries the whole function on a contended commit, which is
+        # why `fn` has to be a pure decision over the Task it is handed rather
+        # than a closure over one read earlier: on the second attempt it must
+        # re-decide against what the winner just wrote.
+        return _apply(self._client.transaction())
+
 
 # ---------------------------------------------------------------------------
 # Service
@@ -216,6 +314,11 @@ class FirestoreTaskDirectory:
 #: declared is still work, and hiding it at the bottom would be worse than
 #: filing it in the middle.
 _PRIORITY_ORDER = {"high": 0, "normal": 1, "low": 2}
+
+#: Fallback when no queue was consulted. The real value is per-desk and lives
+#: on `queues.Queue`; this is what a caller that has not looked it up gets, and
+#: it deliberately matches `queues.DEFAULT_CLAIM_TTL_SECONDS`.
+_DEFAULT_CLAIM_TTL_SECONDS = 20 * 60
 
 
 def _sort_key(t: Task) -> tuple:
@@ -267,6 +370,100 @@ class TaskService:
             raise TaskNotFoundError(task_id)
         return task
 
+    # -- claims -------------------------------------------------------------
+
+    def claim(
+        self,
+        task_id: str,
+        holder_uid: str,
+        *,
+        holder_email: str = "",
+        holder_label: str = "",
+        ttl_seconds: int = 0,
+        steal: bool = False,
+    ) -> Task:
+        """Take the lease, or say who has it.
+
+        Re-claiming your own live lease renews it rather than conflicting —
+        that is the heartbeat a screen sends while somebody reads the evidence,
+        and treating it as contention would mean a steward loses the case they
+        are looking at to themselves.
+
+        `steal` takes a live lease from someone else. Permitted on purpose: the
+        alternative to a person being able to say "they went home, I am doing
+        this" is an admin ticket, and a coordination mechanism that needs an
+        admin to unstick it will be routed around. It is counted on the Task
+        and logged, which is the accountability that makes it safe to allow.
+        """
+        ttl = ttl_seconds if ttl_seconds > 0 else _DEFAULT_CLAIM_TTL_SECONDS
+        now = utcnow()
+        now_iso = now.isoformat()
+        expires_iso = (now + timedelta(seconds=ttl)).isoformat()
+
+        def take(task: Task) -> Task:
+            if task.status == "done":
+                raise TaskAlreadyDecidedError(task.id)
+            held = task.claim
+            mine = held is not None and held.holder_uid == holder_uid
+            if held is not None and held.live_at(now_iso) and not mine and not steal:
+                raise TaskClaimConflict(task.id, held)
+            stolen = (
+                held.steal_count + 1
+                if held is not None and held.live_at(now_iso) and not mine
+                else (held.steal_count if mine and held is not None else 0)
+            )
+            return task.model_copy(update={"claim": TaskClaim(
+                holder_uid=holder_uid,
+                holder_email=holder_email,
+                holder_label=holder_label,
+                claimed_at_iso=(
+                    held.claimed_at_iso if mine and held is not None else now_iso
+                ),
+                expires_at_iso=expires_iso,
+                steal_count=stolen,
+            )})
+
+        claimed = self.directory.mutate(task_id, take)
+        log.info(
+            "Task claimed",
+            extra={
+                "taskId": task_id, "queue": claimed.queue, "holder": holder_uid,
+                "expiresAt": expires_iso,
+                "steals": claimed.claim.steal_count if claimed.claim else 0,
+            },
+        )
+        return claimed
+
+    def release(self, task_id: str, holder_uid: str, force: bool = False) -> Task:
+        """Hand the lease back. A lease you no longer hold releases cleanly."""
+
+        def let_go(task: Task) -> Task:
+            held = task.claim
+            if held is None:
+                return task
+            if not force and held.holder_uid != holder_uid:
+                raise TaskClaimConflict(task.id, held)
+            return task.model_copy(update={"claim": None})
+
+        released = self.directory.mutate(task_id, let_go)
+        log.info(
+            "Task released",
+            extra={"taskId": task_id, "holder": holder_uid, "forced": force},
+        )
+        return released
+
+    def claim_holder(self, task: Task) -> TaskClaim | None:
+        """The claim if it is still live, None once it has lapsed.
+
+        Every reader goes through this rather than touching `task.claim`, so
+        "expired" is one definition in one place. A screen that rendered the
+        raw field would show a lock that the decide path would then ignore.
+        """
+        now_iso = utcnow().isoformat()
+        if task.claim is not None and task.claim.live_at(now_iso):
+            return task.claim
+        return None
+
     def decide(
         self,
         task_id: str,
@@ -282,31 +479,49 @@ class TaskService:
         real deployment this write is also the curation-ledger append and the
         signal that resumes the suspended run.
         """
-        task = self.require(task_id)
-        if task.status == "done":
-            raise TaskAlreadyDecidedError(task_id)
-        decided = task.model_copy(
-            update={
-                "status": "done",
-                "decision": TaskDecision(
-                    verdict=verdict,
-                    note=note,
-                    correction=correction,
-                    payload=payload or {},
-                    decided_by=decided_by,
-                    decided_at_iso=utcnow().isoformat(),
-                ),
-            }
-        )
-        self.directory.put(decided)
+        now_iso = utcnow().isoformat()
+
+        def settle(task: Task) -> Task:
+            if task.status == "done":
+                raise TaskAlreadyDecidedError(task.id)
+            held = task.claim
+            # Deciding *acquires* the lease when it is free. Requiring an
+            # explicit claim first would put a second click in front of every
+            # decision on every single-holder desk to solve a problem only
+            # shared desks have — so the claim costs nothing until it is
+            # actually contended, and then it costs exactly what it should.
+            if (
+                held is not None
+                and held.live_at(now_iso)
+                and held.holder_uid != decided_by
+            ):
+                raise TaskClaimConflict(task.id, held)
+            return task.model_copy(
+                update={
+                    "status": "done",
+                    "claim": None,
+                    "decision": TaskDecision(
+                        verdict=verdict,
+                        note=note,
+                        correction=correction,
+                        payload=payload or {},
+                        decided_by=decided_by,
+                        decided_at_iso=now_iso,
+                    ),
+                }
+            )
+
+        # One transaction for the claim check and the decision together. Split
+        # in two, a steward could pass the check and lose the race in the gap.
+        decided = self.directory.mutate(task_id, settle)
         log.info(
             "Task decided",
             extra={
                 "taskId": task_id,
                 "verdict": verdict,
                 "actor": decided_by,
-                "queue": task.queue,
-                "kind": task.kind,
+                "queue": decided.queue,
+                "kind": decided.kind,
             },
         )
         return decided

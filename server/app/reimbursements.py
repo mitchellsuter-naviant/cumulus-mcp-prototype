@@ -46,7 +46,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from . import data_collections
+from . import data_collections, media
 from .auth import Principal, flow_principal
 from .dispatch import Dispatcher, InMemoryEventLog
 from .documents import DOCUMENT_COLLECTION, DocumentService, Region
@@ -313,7 +313,13 @@ category, confidence, lines."""
 
 class ReceiptReader(Protocol):
     def read(
-        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+        self,
+        image: bytes | None,
+        filename: str,
+        hint: str,
+        *,
+        prompt: str = "",
+        media_type: str = "",
     ) -> ReceiptExtraction:
         """`prompt` is the governed instruction the flow read for this run.
 
@@ -321,6 +327,13 @@ class ReceiptReader(Protocol):
         reader is machinery. A reader with no model behind it ignores it and
         says so; the flow records the revision either way, because the flow
         really did read it.
+
+        `media_type` is passed in for the same reason and learned the hard way.
+        The document store sniffs the bytes once and records the answer; a
+        reader that re-derives it from the filename is a second, worse copy of
+        that decision, and the second copy is the one that sent a PDF to Vertex
+        labelled `image/jpeg`. Empty means "nobody told me", and a reader
+        sniffs for itself rather than assuming.
         """
         ...
 
@@ -373,7 +386,13 @@ class StubReceiptReader:
     name = "stub"
 
     def read(
-        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+        self,
+        image: bytes | None,
+        filename: str,
+        hint: str,
+        *,
+        prompt: str = "",
+        media_type: str = "",
     ) -> ReceiptExtraction:
         text = f"{filename} {hint}".lower()
         seed = hashlib.sha256(
@@ -453,13 +472,25 @@ class VertexReceiptReader:
         self._model = model
 
     def read(
-        self, image: bytes | None, filename: str, hint: str, *, prompt: str = ""
+        self,
+        image: bytes | None,
+        filename: str,
+        hint: str,
+        *,
+        prompt: str = "",
+        media_type: str = "",
     ) -> ReceiptExtraction:
         from google.genai import types
 
         parts: list = []
         if image:
-            mime = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
+            # Trust what the store sniffed; sniff only when nobody said. Then
+            # refuse here rather than at the provider: an unreadable format is
+            # a fact about the submission that a person can act on, and
+            # `400 Provided image is not valid` is not.
+            mime = media.require_model_readable(
+                media_type or media.sniff(image, filename), filename
+            )
             parts.append(types.Part.from_bytes(data=image, mime_type=mime))
         parts.append(
             types.Part(
@@ -1162,11 +1193,16 @@ class ReimbursementService:
         self, doc: SubmittedDocument, slot: DocumentSlot, prompt: str
     ) -> ReceiptExtraction:
         image = base64.b64decode(doc.content_b64) if doc.content_b64 else None
+        # The type the document store already decided, not a second guess. The
+        # slot has none only when no store is wired (a unit test, a hint-only
+        # run), and then the bytes answer for themselves.
+        media_type = slot.media_type or media.sniff(image, doc.filename)
         # The reader sees the submitter's note as well as the hint: with a real
         # multimodal extractor the note is genuinely useful context ("the wine
         # was mine"), and with the stub it is the hint that steers.
         extraction = self.reader.read(
-            image, doc.filename, f"{doc.hint} {doc.note}".strip(), prompt=prompt
+            image, doc.filename, f"{doc.hint} {doc.note}".strip(),
+            prompt=prompt, media_type=media_type,
         )
         if self.documents is not None and extraction.regions:
             self.documents.set_regions(slot.document_id, extraction.regions)

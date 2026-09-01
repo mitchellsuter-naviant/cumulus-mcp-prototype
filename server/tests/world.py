@@ -31,6 +31,7 @@ def build(*, seed_corpus: bool = True) -> EvalWorld:
 def install(world: EvalWorld) -> EvalWorld:
     deps._service = world.knowledge
     deps._task_service = world.tasks
+    deps._queue_service = world.queues
     deps._run_engine = world.engine
     deps._graph_service = world.graph
     deps._action_gateway = world.gateway

@@ -70,7 +70,9 @@ class MeteredReceiptReader:
     def __init__(self, model: str = "gemini-3.5-flash-lite") -> None:
         self.model = model
 
-    def read(self, image, filename, hint, *, prompt: str = "") -> ReceiptExtraction:
+    def read(
+        self, image, filename, hint, *, prompt: str = "", media_type: str = ""
+    ) -> ReceiptExtraction:
         return ReceiptExtraction(
             vendor="corner-bistro", date="2026-08-30", total_usd=42.00,
             category="meals", confidence=0.94, model=self.model,
@@ -84,7 +86,9 @@ class MeteredInvoiceReader:
     def __init__(self, model: str = "gemini-3.5-flash-lite") -> None:
         self.model = model
 
-    def read(self, image, filename, hint, *, prompt: str = "") -> InvoiceExtraction:
+    def read(
+        self, image, filename, hint, *, prompt: str = "", media_type: str = ""
+    ) -> InvoiceExtraction:
         return InvoiceExtraction(
             vendor_name="Acme Industrial Inc.", vendor_slug="acme-industrial",
             invoice_number="ACME-INV-20001", invoice_date="2026-08-30",

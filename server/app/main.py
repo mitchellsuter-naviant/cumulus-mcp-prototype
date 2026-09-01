@@ -29,6 +29,7 @@ from . import (
     reimbursements_api,
     employee_api,
     payables_api,
+    queues_api,
 )
 from .config import settings
 from .deps import (
@@ -45,6 +46,7 @@ from .deps import (
     get_run_engine,
     get_service,
     get_sync_service,
+    get_queue_service,
     get_team_service,
     get_flow_service,
     get_task_service,
@@ -142,6 +144,20 @@ async def lifespan(app: FastAPI):
     except Exception:
         log.exception("Team bootstrap failed")
 
+    # Every queue the persona roster names gets a registry entry, so the desk
+    # admin screen opens onto the desks that already exist rather than onto
+    # nothing. Idempotent, and the roster keeps its authority either way —
+    # `auth.queues_for` unions the two — so a failure here costs the console a
+    # screen, never anybody their access.
+    try:
+        from .queues import bootstrap_from_roster
+
+        created = bootstrap_from_roster(get_queue_service())
+        if created:
+            log.info("Queue registry bootstrapped", extra={"queuesCreated": created})
+    except Exception:
+        log.exception("Queue bootstrap failed")
+
     # Reconcile vectors against the corpus off the startup path: embedding a
     # large corpus can outlast the window a container has to report healthy,
     # and search works (lexically) throughout, sharpening as vectors land.
@@ -214,6 +230,7 @@ app.include_router(identities_api.router)
 app.include_router(teams_api.router)
 app.include_router(flows_api.router)
 app.include_router(tasks_api.router)
+app.include_router(queues_api.router)
 app.include_router(reimbursements_api.router)
 app.include_router(payables_api.router)
 app.include_router(employee_api.router)

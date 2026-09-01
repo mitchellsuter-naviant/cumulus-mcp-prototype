@@ -265,3 +265,45 @@ def reach_for(role: str) -> dict:
 
 def get(persona_id: str) -> Persona | None:
     return _BY_ID.get(persona_id)
+
+
+def for_email(email: str) -> Persona | None:
+    """The persona whose work email is this one, if the roster holds it.
+
+    The roster is keyed by `id` for switching and by `uid` for attribution,
+    and neither is what a credential presents: a Firebase token carries a
+    verified *email* and an opaque provider uid. So the operator signing in as
+    themselves and the `naviant-engineer` persona were the same human with the
+    same email and no edge between them — the persona held every desk and the
+    real account held none, and the console offered work it would then refuse.
+    """
+    if not email:
+        return None
+    lowered = email.strip().lower()
+    return next(
+        (p for p in ALL_PERSONAS if p.email and p.email.lower() == lowered), None
+    )
+
+
+def queues_for_email(email: str) -> tuple[str, ...]:
+    """Every desk the roster says this person holds.
+
+    A union rather than the first match: two roster entries may legitimately
+    name the same person (an operator persona and the customer-side identity
+    they also hold), and holding a desk under either one is holding it.
+
+    This is the *assignment* half of authority, and it deliberately does not
+    touch the *access* half. `reach_for` still decides what a credential may
+    read and write from its role; being on the roster adds work, never power.
+    DOCTRINE leaves "whether access-role and assignment-role ever need to
+    diverge" open at point 230 — here they plainly do: access is proven by the
+    credential, assignment is declared by the org.
+    """
+    if not email:
+        return ()
+    lowered = email.strip().lower()
+    found: list[str] = []
+    for persona in ALL_PERSONAS:
+        if persona.email and persona.email.lower() == lowered:
+            found.extend(q for q in persona.queues if q not in found)
+    return tuple(found)

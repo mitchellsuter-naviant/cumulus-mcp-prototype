@@ -95,6 +95,12 @@ class Settings:
         self.document_max_bytes: int = int(
             os.environ.get("DOCUMENT_MAX_BYTES", "700000")
         )
+        # The queue registry: desks, who holds them, and how long a claim on
+        # one lasts. Machinery rather than map — a queue is where work lands,
+        # not something the ontology models — so it sits beside tasks and runs.
+        self.queues_collection: str = os.environ.get(
+            "QUEUES_COLLECTION", "queues_v4"
+        )
         # Per-vendor rolling statistics behind the anomaly screen. Derived, so
         # rebuildable: delete it and the profile Flow recomputes from the graph.
         self.vendor_profiles_collection: str = os.environ.get(
