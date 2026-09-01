@@ -135,19 +135,39 @@ def get_run_steps(
 
 @router.post("/{run_id}/resume", response_model=RunRecord)
 def resume_run(
-    run_id: str, principal: Principal = Depends(get_principal)
+    run_id: str,
+    retry_failed: bool = Query(
+        default=False,
+        description="Re-enter a run that ended `failed` — after the bug its "
+                    "step hit has been fixed and deployed.",
+    ),
+    principal: Principal = Depends(get_principal),
 ) -> RunRecord:
-    """Drive a run that has a decided gate but was interrupted before resuming.
+    """Drive a run forward from its journal.
 
-    Admin-only, and idempotent by construction: completed steps replay, so a
-    run that is already finished or still genuinely waiting comes back
-    unchanged.
+    Two cases, and the second is why `retry_failed` exists.
+
+    A **suspended** run whose gate was decided but which was interrupted before
+    it could be driven — the process died between the decision write and the
+    resume — needs a way forward. That is the default, and it is idempotent by
+    construction: completed steps replay, so a run that is already finished or
+    still genuinely waiting comes back unchanged.
+
+    A **failed** run was unrecoverable. A step with no escalation queue raised,
+    the record went terminal, and nothing could re-enter it — so fixing the bug
+    and redeploying could not save the run, and resubmitting was the only path,
+    which loses the case's history and mints a second one. `retry_failed=true`
+    re-executes the failed step against the same journal. Deliberately explicit
+    rather than automatic: retrying is a judgment that the cause has been
+    addressed, and nobody but the operator can make it.
+
+    Admin-only either way.
     """
     require_role(principal, "admin")
     engine = deps.get_run_engine()
     if engine.get(run_id) is None:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-    record = engine.resume(run_id)
+    record = engine.resume(run_id, retry_failed=retry_failed)
     log.info(
         "Run resumed via API",
         extra={"runId": run_id, "status": record.status, "actor": principal.uid},

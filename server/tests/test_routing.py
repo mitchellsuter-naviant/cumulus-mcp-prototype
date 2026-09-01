@@ -228,3 +228,151 @@ def test_an_unreadable_file_is_only_attempted_once(world):
     assert len(attempts) == 1
     run = world.engine.get(request.run_id)
     assert "resubmit as PDF or JPEG" in run.step("m1").error
+
+
+# ---- recovering a run --------------------------------------------------------
+
+
+def test_a_suspended_run_retries_the_failed_step_and_replays_the_rest(world):
+    """The whole point of a durable journal: fix the cause, resume, and only
+    the step that broke runs again."""
+    from app.media import UnsupportedMediaError
+    from app.reimbursements import ReceiptExtraction, ExtractedLine
+
+    calls = {"n": 0}
+
+    class Flaky:
+        name = "flaky"
+
+        def read(self, image, filename, hint, *, prompt="", media_type=""):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise UnsupportedMediaError("image/heic", "IMG_9.HEIC")
+            return ReceiptExtraction(
+                vendor="corner-bistro", date="2026-09-01", total_usd=90.0,
+                category="meals", confidence=0.95, model="test",
+                lines=[ExtractedLine(
+                    vendor="corner-bistro", date="2026-09-01",
+                    category="meals", amount_usd=90.0, confidence=0.95,
+                )],
+            )
+
+    world.expenses.reader = Flaky()
+    request = _submit(world, VP_SALES, "total=90.00 category=meals")
+    run = world.engine.get(request.run_id)
+    assert run.status == "suspended" and run.step("m1").status == "failed"
+    replayed_before = [s.step_id for s in run.steps if s.status == "done"]
+
+    resumed = world.engine.resume(request.run_id)
+    assert resumed.step("m1").status == "done"
+    assert calls["n"] == 2  # the failed step ran again; nothing else did
+    for step_id in replayed_before:
+        assert resumed.step(step_id).status == "done"
+
+
+def test_resuming_settles_the_task_it_answered(world):
+    """A `POST /runs/{id}/resume` cleared the run's pointer to the task and
+    left the task itself open — a row in somebody's queue for work already
+    moving."""
+    from app.media import UnsupportedMediaError
+    from app.reimbursements import ExtractedLine, ReceiptExtraction
+
+    calls = {"n": 0}
+
+    class Fixed:
+        """Broken, then deployed. The point of the exception task is that the
+        engineer fixes the cause and resumes; a reader that stays broken
+        re-raises the same task, which is correct and tests nothing."""
+
+        name = "fixed"
+
+        def read(self, image, filename, hint, *, prompt="", media_type=""):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise UnsupportedMediaError("image/heic", "IMG_9.HEIC")
+            return ReceiptExtraction(
+                vendor="corner-bistro", date="2026-09-01", total_usd=90.0,
+                category="meals", confidence=0.95, model="test",
+                lines=[ExtractedLine(
+                    vendor="corner-bistro", date="2026-09-01",
+                    category="meals", amount_usd=90.0, confidence=0.95,
+                )],
+            )
+
+    world.expenses.reader = Fixed()
+    request = _submit(world, VP_SALES, "total=90.00 category=meals")
+    task_id = world.engine.get(request.run_id).open_task_id
+    assert world.tasks.get(task_id).status == "open"
+
+    world.engine.resume(request.run_id)
+    assert world.tasks.get(task_id).status == "done"
+    assert "Resumed directly" in (world.tasks.get(task_id).decision.note or "")
+
+
+def test_a_step_that_is_still_broken_raises_its_task_again(world):
+    """Resuming without fixing the cause must leave the work visible, not
+    quietly settle a task over a run that failed the same way twice."""
+    from app.media import UnsupportedMediaError
+
+    class Broken:
+        name = "broken"
+
+        def read(self, image, filename, hint, *, prompt="", media_type=""):
+            raise UnsupportedMediaError("image/heic", "IMG_9.HEIC")
+
+    world.expenses.reader = Broken()
+    request = _submit(world, VP_SALES, "total=90.00 category=meals")
+    world.engine.resume(request.run_id)
+
+    run = world.engine.get(request.run_id)
+    assert run.status == "suspended"
+    assert world.tasks.get(run.open_task_id).status == "open"
+
+
+def test_a_person_deciding_the_gate_keeps_their_own_verdict(world):
+    """The ordinary path is a person deciding and *that* resuming the run.
+    Settling the task on resume must not overwrite what they said."""
+    request = _submit(world, VP_SALES, "total=850.00 category=meals")
+    task_id = world.engine.get(request.run_id).open_task_id
+    world.tasks.decide(task_id, verdict="rejected", decided_by="diane",
+                       note="Out of budget this quarter.")
+    world.expenses.resume_for_task(world.tasks.get(task_id))
+
+    decision = world.tasks.get(task_id).decision
+    assert decision.verdict == "rejected"
+    assert decision.decided_by == "diane"
+    assert "Out of budget" in decision.note
+
+
+def test_a_terminally_failed_run_can_be_retried_once_the_cause_is_fixed(world):
+    """Without this the journal sat there, complete and correct, with no way to
+    re-enter it — and resubmitting loses the case's history and mints a second
+    one."""
+    from app.runs import RunContext
+
+    attempts = {"n": 0}
+
+    def body(ctx: RunContext, inputs: dict) -> dict:
+        ctx.event("t1", "Started", "began", kind="trigger")
+
+        def work():
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("the bug")
+            return {"ok": True}
+
+        return ctx.step("s1", "do-the-thing", "action", fn=work)
+
+    world.engine.register("retryable-flow", body)
+    run = world.engine.start("retryable-flow", {})
+    assert run.status == "failed" and run.error
+
+    # The old behaviour: a failed run came back untouched, and the step never
+    # ran again however many times you asked.
+    assert world.engine.resume(run.id).status == "failed"
+    assert attempts["n"] == 1
+
+    retried = world.engine.resume(run.id, retry_failed=True)
+    assert retried.status == "succeeded"
+    assert retried.step("t1").status == "done"   # replayed, not re-run
+    assert attempts["n"] == 2

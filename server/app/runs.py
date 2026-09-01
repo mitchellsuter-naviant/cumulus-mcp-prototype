@@ -681,11 +681,31 @@ class RunEngine:
         run_id: str,
         resume_input: dict | None = None,
         principal: Principal | None = None,
+        *,
+        retry_failed: bool = False,
     ) -> RunRecord | None:
+        """Drive a run forward from its journal.
+
+        `retry_failed` re-enters a run that ended `failed`. Without it such a
+        run was unrecoverable: a step with no escalation queue raised
+        `StepFailed`, the record went terminal, and this returned it untouched
+        — so the journal sat there, complete and correct, with no way to
+        re-enter it. Fixing the bug and redeploying could not save the run, and
+        a resubmission was the only path, which loses the case's history and
+        mints a second one.
+
+        Safe because the journal is what it always was: completed steps replay
+        from their recorded output, and only the step that failed re-executes.
+        Gated to an admin at the route rather than here, because "is this
+        person allowed to retry" is an authorization question and this is the
+        engine.
+        """
         record = self.store.get(run_id)
         if record is None:
             return None
-        if record.status in ("succeeded", "failed"):
+        if record.status == "succeeded":
+            return record
+        if record.status == "failed" and not retry_failed:
             return record
         body = self._bodies.get(record.flow_id)
         if body is None:
@@ -694,14 +714,50 @@ class RunEngine:
                 extra={"runId": run_id, "flowId": record.flow_id},
             )
             return record
+        # The Task this run suspended on is answered by the resume itself.
+        # Left open it becomes a row in somebody's queue for work that is
+        # already moving — and after a `POST /runs/{id}/resume` the console
+        # showed exactly that: the record cleared its pointer to the Task and
+        # nothing cleared the Task.
+        settled = record.open_task_id
         record.status = "running"
         record.resume_count += 1
         record.open_task_id = ""
         record.suspended_at_step = ""
+        record.error = ""
+        record.finished_at_iso = ""
         self.store.put(record)
+        if settled:
+            self._close_open_task(settled, run_id, principal)
         return self._drive(
             record, body, resume_input=resume_input, principal=principal
         )
+
+    def _close_open_task(
+        self, task_id: str, run_id: str, principal: Principal | None
+    ) -> None:
+        """Mark the gate's Task decided, if the resume is what decided it.
+
+        Only touches a Task still open: the ordinary path is a person deciding
+        the Task and *that* triggering the resume, and re-deciding it here
+        would overwrite their verdict with a machine's.
+        """
+        task = self.tasks.get(task_id)
+        if task is None or task.status != "open":
+            return
+        try:
+            self.tasks.decide(
+                task_id,
+                verdict="approved",
+                decided_by=principal.uid if principal else f"flow:{run_id}",
+                note="Resumed directly; the run was driven forward rather than "
+                     "the task being answered on its merits.",
+            )
+        except Exception:  # noqa: BLE001 — a stale task must not block a resume
+            log.exception(
+                "Could not settle the task a resume answered",
+                extra={"taskId": task_id, "runId": run_id},
+            )
 
     def resume_for_task(
         self,
