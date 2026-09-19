@@ -87,34 +87,53 @@ simultaneously. That is why this is a thesis for now and not a re-run of 2006.
 The evaluation argument
 
 [PROPOSED] The least-appreciated half of the thesis: **you cannot even specify
-correct autonomous behavior without a state model.** This prototype tried.
-Prose behavior specs were unfalsifiable; the evaluation design only stabilized
-when a spec became *assertions over graph state at checkpoints* — after the
-resolve step the Vendor must be linked and nothing extracted yet; at commit the
-Invoice, its lines, and the match must exist; a held invoice asserts its
-entities are absent. The ontology is not just the substrate for acting. It is
+correct autonomous behavior without a state model.** The first prototype
+tried. Prose behavior specs were unfalsifiable; the evaluation design only
+stabilized when a spec became *assertions over graph state at checkpoints* —
+after the resolve step the Vendor must be linked and nothing extracted yet; at
+commit the Invoice, its lines, and the match must exist; a held invoice asserts
+its entities are absent. The ontology is not just the substrate for acting. It is
 the substrate for *knowing whether the action was right*. A vendor of autonomy
 without a graph cannot test its own product.
 
-Small proofs from this prototype
+[PROPOSED] So a Flow should ship with its own evaluation: assertions over
+graph state at named checkpoints, declared beside the Flow and versioned with
+it, so that changing the Flow changes what it claims to be correct — and the
+correction set its Tasks produce, every raw reading beside what a person made
+of it, is its regression data. That is this argument one turn further on: if
+the graph is what makes correctness expressible at all, the expression belongs
+inside the artifact whose correctness is at stake, not in a document beside
+it. The doctrine carries the matching clause in Lens 7.
 
-The thesis will be won on demonstrations, not argument. Ones this codebase has
-already generated:
+Small proofs from the first prototype
+
+The thesis will be won on demonstrations, not argument. These four came out of
+the first prototype, `cumulus-mcp-prototype`, which is the guide and not the
+product; the clause on each says what the current build can do today.
 
 - "Do two sources disagree about Acme Industrial's name?" is a one-line query
-  here and **unaskable** in a system without claims-that-carry-sources.
+  there and **unaskable** in a system without claims-that-carry-sources. The
+  current build has no claims yet: a write keeps what it was not given rather
+  than erasing it, but the value that lost is not kept beside the winner.
 - "How much has this employee submitted in six months?" is a graph traversal
-  from a resolved Employee — not a search, and not re-extraction.
+  from a resolved Employee — not a search, and not re-extraction. The current
+  build does this, one hop: the invoices come back off the Employee's links,
+  and traversal past one hop waits for the flow that needs it.
 - A decision made months ago is explainable against the *revision of the
-  policy it actually read*, because reads pin revisions.
+  policy it actually read*, because reads pin revisions. Not yet in the
+  current build: a model call pins the configuration that answered it, by the
+  hash of its prompt, schema and provider block, and every retired version
+  stays readable — but a read of a policy document pins nothing.
 - Point-in-time reconstruction of "the world as of step z1" falls out of claims
-  recording the step that wrote them — provenance pays for evaluation.
+  recording the step that wrote them — provenance pays for evaluation. Not yet
+  in the current build: every write names the run and step that made it, in
+  the Ledger, and nothing rebuilds the world as it stood at one of them.
 
 The Palantir read
 
 Palantir is the right inspiration, read carefully. The ontology *idea* was not
 their innovation — it is decades old. What they proved is that an ontology only
-works **operationalized**: objects and links bound to *actions with
+works **operationalized**: entities and links bound to *actions with
 write-back*, built incrementally per use-case, paid for by workflow value, and
 co-managed by forward-deployed engineers. When LLMs arrived, their customers
 already had the substrate that gives a model safe, typed handles — which is why
@@ -125,8 +144,7 @@ per-wedge build, the FDE model.
 Where Cumulus differs — and the sharpest available differentiator:
 **ownership**. Their ontology is inseparable from their platform; leaving is
 famously brutal, and customers know it. The map-vs-machinery split — the
-customer keeps the ontology, the data, the definitions, and the curation
-ledger; only the engines go dark — converts the thesis's biggest buyer
+customer keeps the ontology, the data, the definitions, and the Ledger; only the engines go dark — converts the thesis's biggest buyer
 objection (lock-in fear) into the pitch: *the ontology you can leave with.*
 
 The economic argument
@@ -151,12 +169,13 @@ defenses:
    drifts unless corrections land as structure automatically. The flywheel is
    not a feature — it is the maintenance strategy. If it does not carry the
    curation load, the graph rots.
-3. **Over-modeling.** Not everything is an object. A telemetry feed turned
+3. **Over-modeling.** Not everything is an entity. A telemetry feed turned
    into a million ABox individuals is a failure exactly as bad as no graph.
-   The reify-vs-bind rule (see README, "The data & knowledge layer") is the
-   guardrail: reify a source row only when the row itself needs identity,
-   provenance, or human adjudication; otherwise bind at the column level and
-   resolve lazily.
+   The reify-or-bind rule is the guardrail. Reify a source row — give it an
+   id, a standing and a history of its own — only when the row itself needs
+   identity, provenance, or human adjudication; otherwise bind it as a
+   property of an entity that already exists, and leave the rest in the
+   source, resolved lazily when something asks.
 4. **"Only" is doing sales work.** The epistemically careful claim is "the
    only *safe, auditable, compounding* path currently visible." Keep the
    strong wording in the pitch and the careful wording in the engineering.
