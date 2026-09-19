@@ -313,3 +313,68 @@ A reader who wants to argue with the doctrine reads here first.
   state at named checkpoints — versioned with it, the correction set its
   regression data — is [PROPOSED] in both documents, in the thesis'
   evaluation argument and in Lens 7.
+
+## 2026-09-19, governed knowledge and policy
+
+- **Policy is governed knowledge stored as an Entity.** A `Knowledge` base on
+  `Entity` marks a type whose instances are declared in the map rather than
+  observed, and which is versioned by the hash of its content: a change at
+  the next deploy writes a new record superseding the old, every version
+  stays readable, and a run pins the versions it read. Everything else is
+  ordinary Entity machinery: standing, source, Ledger, links, `find`, the
+  future MCP read. `Policy(Knowledge)` supplies purpose, effective-from and
+  review-by; each concrete policy is its own type with its own fields. A
+  Policy type, its purpose and every field must carry a description, refused
+  at import otherwise, because an agent answering a person's question has
+  only those sentences to go on.
+- **ModelConfig stays as built until something reads it from the graph.** It
+  is the same kind of thing and will move onto `Knowledge` with its content
+  hash unchanged; today nothing consumes it there and the Models page shows
+  all of it, so the refactor waits for its first consumer.
+- **A model call names its policy by two facts, not a declared link.** The
+  call row records the fills it rendered; the run records the policy
+  versions `ctx.policy` read; every Ledger row the run writes copies them.
+  Field-level provenance is not recorded. The dependency between a prompt
+  and a policy is derived from those rows, never declared beside the fills,
+  which are the dependency the code enforces.
+- **Rule outcomes go to the Ledger at the moment they mattered, never onto
+  the entity.** The gate evaluates every rule a type declares when an action
+  runs and writes the findings on the act row beside the policy versions in
+  force; the findings a flow showed a person are in the Task's context, and
+  the decision row records the answer. The present is computed on demand.
+  A stored verdict is a claim about now that goes false; a Ledger row is a
+  fact about a moment.
+- **Console.** The Knowledge stop is renamed Ontology, since that is what it
+  shows. Policies get a stop of their own; the Models stop stays the LLM
+  insight surface (configs, versions, schemas, prompts, call sites, usage,
+  the policy versions each call ran under). Workspaces arrive under Work,
+  minimal, projecting only data the console already reads. The rail is
+  grouped: Work, Know, Audit.
+- **Expenses.** The flow takes a list of receipts and one run judges the
+  batch; the console's multi-file Start is punted as core API work, so the
+  console starts it with one receipt for now. Receipts stay flat and are
+  keyed by merchant, date and total so a duplicate is findable. No writeback.
+
+## 2026-09-19, pass 2 built
+
+- **What landed** (cumulus-vision, uncommitted): `Knowledge(Entity)` with
+  declared instances and content versions; `Policy` with required
+  descriptions; `ctx.policy` pinning versions on the run and on every Ledger
+  row the run writes; the rule contract (`Finding`; a boolean or a number
+  refused); the gate writing every rule's verdict on the act row; verdicts on
+  demand; `PostingLimits` and the over-limit doubt in the AP review; the
+  expense reimbursement map (Dataset, `Receipt`, `ExpenseReport`,
+  `ExpensePolicy`, the flow over a batch with one review, the `expenses`
+  queue) and its review screen; Workspaces as declared projections with four
+  panel kinds and two declared (Accounts payable, Expenses); the console's
+  Knowledge stop renamed Ontology, a Policies stop, verdicts on a record,
+  policy versions on model calls, the rail grouped Work, Know, Audit.
+- **Judgments worth keeping.** A rule names the Policy it needs by its
+  parameter's annotation and the gate hands it the whole record; chosen over
+  an `inputs=` at the act site because the verdicts route has no flow to
+  supply values. A policy's declared instance is a nested `class declared:`
+  of plain values, no import and no ceremony. Duplicate and stale receipts
+  are flow-level checks, because a rule can read neither the graph nor the
+  clock. Entity filters on the API are spelled `where.<property>=` so a
+  property can never collide with the route's own parameters.
+
