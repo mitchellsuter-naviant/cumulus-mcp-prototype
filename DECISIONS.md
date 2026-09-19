@@ -378,3 +378,69 @@ A reader who wants to argue with the doctrine reads here first.
   clock. Entity filters on the API are spelled `where.<property>=` so a
   property can never collide with the route's own parameters.
 
+
+## 2026-09-19, the entity explorer
+
+- **Identity gets its own section on a record**, first under the title,
+  with one row for the key as this graph holds it and one row per System the
+  type declares an Identity link into. A declared System with no edge is
+  drawn as "not matched" rather than left out, because a Vendor with no ERP
+  edge today shows nothing, which reads as "in no system of record" when it
+  may mean the sync never ran. Identity rows push nothing: the far end is a
+  row in the ERP. Standing, decidedBy and reversibleWith on identity edges
+  wait for the first flow that writes a proposed match.
+- **The Ontology page's right pane is one explorer: a stack of frames drawn
+  as a trail.** A table frame winnows (filter, find, sort, page); a record
+  frame follows (one record, every edge). A row is the door and pushes a
+  record; a record's many-side count pushes a table narrowed by that
+  relationship, with the type and the relationship pinned; a one-link row
+  pushes a record; back pops one and a crumb pops to it; following always
+  pushes, even to a record already in the trail. Before this the page held
+  one open id, so following a link replaced the record and back landed on
+  the type's list.
+- **The table is generated from the declaration in bands**: record (type,
+  standing, label) and provenance (source, written by, updated) for every
+  type; properties, links and identity between them once a type is chosen.
+  Common bands only across all types, which makes the table a search over
+  the whole graph. Eight declared properties before the picker starts
+  hiding. No per-type table code, ever.
+- **The Definition tab is demoted to a Declaration sheet** over whichever
+  frame is on top; property descriptions ride as header tooltips; a type
+  with no records shows its declaration in place of the empty table.
+  Systems and Policies keep their declaration tabs until one earns an
+  explorer.
+- **Not built, on purpose.** Selection and bulk operations (the user: no
+  idea what group selection is for); a rail stop for the explorer; hover-only
+  controls (hover may relabel the chevron, never hide the door); the
+  prototype's identity workbench, which is a Workspace fed by a Flow.
+- **API.** `GET /entities` takes `type` optionally (common fields across
+  every type without it), gains `via.<link id>=<entity id>` and
+  `identity.<system>=any|none`, and each row carries link and identity
+  summaries; `GET /entities/{id}` returns one-links, identity slots and
+  `link_groups` (count plus the three newest) instead of resolving every
+  edge, which on a Vendor with 5,000 orders was 5,000 reads. `by.run=` for a
+  Runs-page door is later. Design canvas: the "Cumulus Entity Explorer"
+  artifact, revision 3.
+
+## 2026-09-19, routing a Task to people
+
+- **A person is a Queue with one member.** Every Principal is bound to
+  `person:<email>`, a rule in the customer's queues module and nothing in
+  core. A Task for one person, the submitter who must correct receipts or the
+  manager a policy names, is routed to that queue and reaches them through
+  the Tasks page like any other. The doctrine's "never to a person" holds in
+  form; the coverage argument does not apply to a person's own corrections.
+- **Several Queues, first answer wins.** A Task names one or more Queues, is
+  listed for anyone bound to any of them, and the already-decided guard
+  settles a race. No new concept: a Task was always any bound Principal's to
+  take.
+- **Two contributions are two Tasks.** A Task is one judgment from one
+  person. Raised one after the other today, because a body runs as one line
+  and pauses at one point; an `ask_all` that suspends on several Tasks is the
+  extension if a case ever needs them raised at once. Not built.
+- **Escalation is a branch that reads a policy.** `ExpensePolicy` names the
+  approver queue, the controller queue and the amount above which the
+  controller takes it; the flow reads the policy it already pinned and picks.
+  A manager route is the same branch reading an Employee-to-Employee link the
+  HRIS feeds, the first caller for `follow`.
+
