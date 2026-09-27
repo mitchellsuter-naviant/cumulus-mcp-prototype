@@ -444,3 +444,45 @@ A reader who wants to argue with the doctrine reads here first.
   A manager route is the same branch reading an Employee-to-Employee link the
   HRIS feeds, the first caller for `follow`.
 
+## 2026-09-27, Access: one Human per person, authority curated here
+
+- **The hierarchy.** One canonical Human record per person in the graph,
+  curated in Cumulus; the identity provider and the HRIS are mapped onto it
+  by identity Links and never the source of its authority. Core declares the
+  base with the access fields (a minted `hid` as the key, because an email
+  changes and every link in the business points at the record; a unique
+  email; `relationship`; `access`; `platform_role`; the roles held as parts)
+  and the map subclasses it once, the way a policy subclasses Policy, to say
+  what the business knows about its people. `Employee` is gone: being an
+  employee is a relationship on the Human, having a sign-in is a Link on it.
+- **Principal is the caller, not a record**: resolved per request to one
+  Human (or, later, one Agent). The doctrine's Principal clause is rewritten.
+- **Authority per property, declared.** The HRIS owns what the map's
+  `authority` block says it owns, for a Human linked to an HRIS row; Cumulus
+  owns the access facts and the existence of Humans no HRIS knows. Day one
+  the HRIS leads and reads only; a conflict the sync cannot settle (identity
+  ambiguity, a leaver with open work) is handed from a step to a per-case
+  flow and becomes a Task at an `access` desk; reversal in the HRIS is a
+  later effect. Termination is a fact the sync writes; deactivation is a
+  declared rule (`ON_TERMINATION`).
+- **Roles.** One platform role per Human (admin, member, auditor) is the
+  access ladder, one table in core says what each may, and every route
+  declares its verb in its signature. Business roles are declared in the
+  map, bind desks and name startable flows, and are held as parts on the
+  Human rather than as Links, because a Role is a declaration like a Queue
+  and not a record. Direct queue binding is not built. Onboarding is a
+  tranche on the Access stop, not a per-customer admit rule. The open
+  question on access-role versus assignment-role is closed by this split.
+- **The door.** A verified token whose email is an active Human, else 403
+  not enrolled; the first administrators are a setting; sign-up is closed
+  and the deploy refuses to proceed while it is open; a member reads
+  everything until scoped reads flip the default to nothing.
+- **The stop is Access**, under an Admin heading beside Deployment, later a
+  tab of one Admin stop; the console hides and the server decides.
+- **A step hands a case to a flow** (`ctx.start`, keyed), the one engine
+  addition the sync needed; a Trigger still carries no payload.
+- **The first customer is Naviant itself**, against the demo estate's
+  `naviant` namespace, the owner seeded into its HRIS under the real
+  address. Recorded in cumulus-vision's `WORKPLAN-ACCESS.md` §14, steps A0
+  to A6 landed 2026-09-27; A7 (Entra), A8 (scoped reads), A9 (keys, Agents)
+  and A10 (onboarding as a flow, reversal) are planned there.
