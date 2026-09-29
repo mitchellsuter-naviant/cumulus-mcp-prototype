@@ -444,6 +444,104 @@ A reader who wants to argue with the doctrine reads here first.
   A manager route is the same branch reading an Employee-to-Employee link the
   HRIS feeds, the first caller for `follow`.
 
+
+## 2026-09-20, the sentence bar
+
+- **The Ontology page loses its left-hand type column.** The user found
+  it heavy, and a hand-made filter offered only a standing dropdown until a
+  type was chosen, which read as a missing feature. Four layouts were drawn
+  (the "Four Ways to Narrow the Graph" canvas): a 240 px facet rail, a
+  Filters popover, a sentence bar, a landing of type cards. **The sentence
+  bar was chosen.** The query is rendered across the top as words and
+  tokens in one fixed order — head type, `at` standing, `where` property =
+  value, a link's own name with the far record's label, `known to` or
+  `not known to` a system, `matching` find — every token a dropdown with
+  counts, the type token's menu carrying the old column (types by domain
+  with counts and a first sentence of description), and "+ and…" offering
+  what the type declares and the sentence does not yet say. Only five words
+  are prose and they are a lookup by clause kind; nouns come from the
+  declaration verbatim; nothing is parsed from typed text.
+- **Facet counts are computed in the client, so narrowing by standing,
+  property and identity moves there too.** The table asks the server for
+  `type` and `via` only (the link join is an index read) and applies the
+  equalities over the listing it already has, which is the same equality
+  the route does. A facet's counts are taken over the rows matching every
+  other clause, so a set facet still shows what its other values would
+  give. Workspace panels keep sending `where` to the server.
+- **One value per property.** The route has equality and no OR, so a
+  token holds one value; a menu is a single choice. An OR needs a route
+  change first.
+- **Rejected for now.** The rail (still a column); the popover (hides the
+  query behind a button); the landing (a screen before any table and a read
+  per type on arrival), kept as the pairing to add in front of the sentence
+  if the world-at-a-glance view is asked for.
+
+## 2026-09-20, later: a field token holds a condition
+
+- **The picker loses its connectives and its label.** "+ and…" becomes a
+  bare plus; its menu lists what the type declares as names with a kind
+  beside each — fields (key first), links, systems, record — never "where
+  x". The sentence supplies "where" once the token exists. A field already
+  in the sentence is greyed, not hidden. A search box over the rows appears
+  only when there are more than ten of them.
+- **A field's editor is chosen by kind and by cardinality.** A fixed set
+  (choice, boolean, standing) is checkboxes with counts, and two ticks read
+  "or"; money, number and date are two fields, from and to, either empty;
+  a string with twelve or fewer distinct values in the current match is a
+  set, above that a search with `contains` as the default and `is exactly`
+  a switch away; a document is present or none. Six conditions and no
+  seventh: equals, any of, contains, between (one or both ends), present.
+  Each has one token text and one encoding (`a|b`, `~text`, `min..max`,
+  `@none`) so a URL can carry it later.
+- **Standing is a set, and the "show retracted" switch goes.** Retracted
+  and superseded rows show when the set includes them; an empty set means
+  the two in use. One mechanism fewer.
+- **The MVP directive.** The user, approving the canvas: "do not add any
+  bells and whistles for the sake of UI/UX at this point, we want to keep
+  the app and the api very clean during this MVP stage." So the drawings'
+  histogram, distribution bars, presets (including the one read from a
+  Policy), named periods and the blank typed token are NOT built; the
+  function is. The API is untouched: every condition richer than equality
+  is a client rule over the listing the table already fetched.
+
+## 2026-09-20, later still: changing a flow under its open runs
+
+- **The question.** Approving a task on a run started yesterday returned a
+  409: the flow's integer had moved and a run is only ever driven by the
+  code that started it. What should happen to work in flight when the code
+  changes?
+- **The rule for the integer.** It moves only when replaying an old journal
+  through the new body would run a step twice or skip one (a rename), hand a
+  journaled output to code reading a new shape, refuse or reinterpret an
+  answer a person is about to give (an ask's type changed, or a new ask put
+  before the open one), or read the payload in a new shape. A new step, a fix
+  to an unreached step, a prompt edit or an optional answer field never move
+  it, because the journal is keyed by name and a run refused for the integer
+  alone is stranded for nothing. Applied at once: expense-reimbursement's
+  bump to 3 was compatible and went back to 2.
+- **Restart and supersede, built.** The exit the doctrine already named:
+  the old run closes as `superseded` naming its replacement, its open Tasks
+  close unanswered (not a decision), one `restart` Ledger row says who and
+  which versions, and a new run starts on the live version from the same
+  payload and the same `started_by`, with an empty journal. Nothing is
+  migrated.
+- **Then the user's challenge:** "why give the user a choice, shouldn't the
+  system determine one or the other? If we push changes shouldn't it just
+  automatically queue a restart?" Yes. A stranded waiting run is a fact the
+  server computes; a click adds toil and nothing else. So the tick sweeps
+  waiting runs whose version is not the registered one and queues one
+  restart each under `deploy:<revision>`, and deploy.sh ticks as soon as the
+  new revision serves. Failed runs are not swept: a failed run already waits
+  for a person, and restarting one somebody abandoned spends model calls on
+  nothing. The console offers Resume when versions match and Restart when
+  they differ, never both; the task-page notice and Restart button and the
+  task-row version chip, built that morning, were removed the same day.
+- **Held:** a computed hash of the flow's replay-relevant shape; old versions
+  deployable side by side (the prototype's vN packages). **Rejected:**
+  branching in the body on the pinned version. `VERSIONING.md` in
+  cumulus-vision is the authoritative account; the doctrine clause on
+  Tier-2 definitions was rewritten to match.
+
 ## 2026-09-27, Access: one Human per person, authority curated here
 
 - **The hierarchy.** One canonical Human record per person in the graph,
@@ -486,3 +584,191 @@ A reader who wants to argue with the doctrine reads here first.
   address. Recorded in cumulus-vision's `WORKPLAN-ACCESS.md` §14, steps A0
   to A6 landed 2026-09-27; A7 (Entra), A8 (scoped reads), A9 (keys, Agents)
   and A10 (onboarding as a flow, reversal) are planned there.
+
+## 2026-09-29, the frame: a bar, and workspaces as the doors
+
+- **One bar over every screen, four routes on it.** Home, Workspaces, My
+  Tasks and the person, with a search field in the middle that says it is
+  not wired rather than pretending to look. The rail of eleven stops under
+  four headings is gone from the frame: it asked a person to choose among
+  the platform's parts before they had chosen their work.
+- **Cumulus Admin is a Workspace.** The eleven stops live on inside it,
+  under Build (Flows, Queues), Knowledge (Ontology, Data, Policies),
+  Connect (Systems, Models) and Govern (Ledger, Access, Deployment), drawn
+  by the same rail a map workspace is drawn by, and first in the list of
+  workspaces. It is offered to every caller who may read the map — which
+  today is every rung — and its stops hide by the same verbs they always
+  did; who counts as a Cumulus administrator is the verbs, not a name, and
+  when scoped reads narrow a member's map (A8) the workspace narrows with
+  them. The alternative, gating the whole workspace on `access.manage`,
+  would take Start run off a clerk's screen, since Flows is where a run is
+  started.
+- **A map workspace is a rail of Views and Operate.** One view, Overview,
+  which is its declared panels; one operating stop, System health, which is
+  the flows and Systems its panels already name, read from the routes the
+  Flows and Systems stops read. Views of a workspace's own would be a
+  declaration on `Workspace` the map does not carry; the console shows what
+  is declared and nothing more.
+- **The assistant pane is a placeholder and says so.** One pane down the
+  right of any section but Home, one button on the bar, and it repeats what
+  is typed. Marked OPEN in the doctrine rather than built as a chat box.
+- **Styling is one configuration.** Every colour, tone, distance, radius
+  and fixed width the console draws with is a field of one const
+  (`console/lib/theme/tokens.dart`), carried as a `ThemeExtension` on the
+  theme built from it; the five tones every chip is drawn in read from it,
+  so no screen owns a colour.
+
+## 2026-09-29, later: a Workspace is read in views
+
+- **`View(name, panels)` joins the declaration.** The frame drew a map
+  workspace as one view because `Workspace` declared a flat list of panels;
+  asked to put accounts payable and expense reimbursement under one
+  Financial operations workspace, the console could have grouped them itself,
+  which would have been a grouping the map never declared. Instead the map
+  declares it: a Workspace is `views`, each a named list of panels, and the
+  bare `panels` is gone — one shape for one thing. A view carries no sentence
+  of its own; its name is what it says and its panels are what it is.
+- **Naviant declares one workspace, Financial operations,** with the two
+  former workspaces as its views, panel for panel. The doctrine's Workspace
+  clause now says so in place of the note that views were not yet carried.
+
+## 2026-09-29, later still: the bar holds still
+
+- **The assistant's button is the sparkle alone, on every route.** The word
+  beside it made the bar's right-hand side a different width on different
+  screens; its name lives on the tooltip and on the heading of the pane it
+  opens. The pane opens beside any section, Home included: a screen the
+  assistant will not open on is a screen a person learns not to ask about.
+- **The search is anchored, not centred.** Centred in whatever the routes
+  left over, it moved whenever anything on the right changed width. It now
+  sits beside the wordmark at one width and shrinks only when the window is
+  too narrow for it. A control a person aims at belongs in one place.
+
+## 2026-09-29, last: the workspace rail shuts
+
+- **One icon, in one place, both ways.** The rail is put away and brought
+  back by the same control in the same spot, rather than by a handle that
+  appears somewhere else once it is gone. Shut, it keeps the way back out of
+  the workspace: the rail was carrying that, and shutting the stops is not
+  asking to be stranded.
+- **Whether it is shut belongs to the console, not the page.** Like the
+  assistant's pane, it is one notifier: somebody who shut it meant it shut,
+  and giving it back on the next workspace is arguing with them.
+- **The way back is the supertitle, not an arrow beside it.** The word over
+  the workspace's name says what the thing under it is, and the list of them
+  is the same word, so it is the link: underlined and in the accent under the
+  pointer. An arrow beside it was a second control saying what the word
+  already said. Shut, where there is no supertitle, the arrow returns.
+
+
+## 2026-09-29, Case: a pattern, and the machinery it turned out to need
+
+- **A Case is a pattern, not a primitive and not a declaration.** The
+  question was whether case management — an Opportunity, a Handover, a claim
+  — needs a thing of its own beside Flow and Entity. A first draft gave it a
+  marker, a lifecycle declaration, parties bound to a queue of its own, runs
+  keyed to it and a declared page. Review took every one of those away: an
+  invoice is also mutated by things other than its flow and re-run; a stage
+  is a property with fixed values and a panel already narrows by one; people
+  on a record are links a business declares when it needs them; a flow asks
+  a person at the queue they already have; and nobody can say today what a
+  case page looks like. What is left is a word the doctrine uses so that an
+  engineer recognises the shape, and the sentence that guards it: state that
+  is not graph state, or logic that is not an Action or a Flow, is the
+  pattern being mistaken for a primitive.
+- **"A Case must not hold logic" was overstated.** A Case has Actions and
+  Rules because every Entity does; a button on a record calls an Action with
+  no Flow in the way. What an Action cannot do is the Flow's four powers, and
+  an Effect is a Flow's and never an Action's. The test is not "does it run
+  code" but "can it wait or reach outside".
+- **All that is needed is expanded Triggers, and one route.** Records emit
+  Events for exactly the types and kinds some Trigger names, so a type nobody
+  watches emits nothing. A Trigger on a record names a predicate, fires once
+  when it becomes true, keys the run it starts to the record so a fact
+  written twice starts one response, and may answer with a Flow or directly
+  with an Action — decided in review, because a checklist completing should
+  advance a stage without a flow in between. A Flow may wait on a record's
+  Event the way it waits on a Task. And a person can run an Action on a
+  record through the API, which is not case machinery at all: it is the gap
+  the first comment exposed, that other things mutate an invoice too.
+- **No locks.** Exclusivity between flows is a state on the record in the
+  business's words, set and cleared by Actions and checked as a Rule when
+  any other action runs; writes carry the version they read; a flow that
+  meets a gate waits or fails to a person, never rolls back, so the gate
+  goes before any Effect and what precedes it is proposals, harmless to
+  abandon. "Somebody is already on this" is a claim on a Task if a desk ever
+  needs one, never a lock on a record.
+- **Checklist is the one base type the discussion justified, and its items
+  are Parts.** A first cut made every checklist entry a record of its own
+  with an owner and a due date, on the argument that a person has to find
+  what they own without opening the record. That argument fell the moment
+  ownership moved onto the Task: the Task is what a person finds, and an
+  item only has to be findable from its checklist. So a Checklist is a core
+  base Entity, about one record, finished when every item is done, and its
+  items are Parts held inside it — a thing with no identity of its own,
+  exactly as an invoice line is. Core's because the console has to know the
+  shape; the map subclasses it to carry the Rules for items done by
+  evidence, and decides which checklist a record gets and when, in code.
+  One record per checklist, one Ledger row per action naming the item, and
+  a template is code that writes one record. Two limits, both wanted: an
+  item cannot be the source of a Link, and two people completing items on
+  one checklist at once contend for one record — which never happens on a
+  checklist of ten and would on a board of two hundred, which keeps a
+  Checklist a checklist.
+- **Assigning an item is a Task, and three things change about Task.**
+  Who owes an item and by when live in exactly one place. Assign is an
+  Action on the Checklist that raises a Task to a person's own queue or to a
+  desk, naming the checklist and the item key, with a due date; the answer
+  runs complete on that item; reassigning supersedes and raises again; an
+  item done by evidence raises none. A person has one list, My Tasks. To
+  carry this a Task gains a due date, may be raised by an Action as well as
+  a Flow's ask, and its answer has a consumer — a run to resume, or an
+  action on a record to run. Assigning to a team is free because Tasks
+  already go to desks; and the Handover flow no longer holds four questions
+  open, it writes the checklist, assigns, and ends.
+- **No generic board.** A Monday-shaped List of work about nothing was
+  considered and held: it is a product, not a type; it is where work goes to
+  escape modeling, which is the opposite of the knowledge layer's bet; and
+  the doctrine's answer to "a project" is a Project the map declares with a
+  Checklist about it. The question underneath — whether Cumulus is where a
+  team's unmodeled work lives or where modeled work runs — is the owner's,
+  and if the first is chosen, columns, comments and views belong on a
+  roadmap chosen on purpose.
+- **Evidence for a checkbox is a document reference on the part, or a Rule
+  over the record's own links.** Never a Link from the item, which has no
+  identity to link from; the signed contract is a Document the record links
+  to and the item's Rule reads that.
+- **Notifications are not a primitive.** Interest is a Link (the record's own
+  links, plus `watches` for following on purpose), what happened is the
+  Ledger, the Feed is one read joining them, computed and never stored,
+  shown on Home; a Surface delivers the same read later. Asking for work is
+  a Task at a person's own queue, so opportunities add no queues.
+- **The UI needs no concept of its own.** The map says what to show and the
+  app says how; a record's page is the record frame until a type needs a
+  screen, decided with the first one. A declared composition is a *view*
+  and code is a *screen*.
+- **The API stays one route per primitive.** The one new write is running
+  an Action on a record; a Checklist is a record and needs no route of its
+  own; the Feed is one read. Workspace-specific server code lives in the map
+  as Actions, Rules, System methods and Flows, never as routes. Core owns
+  routes; the map owns names.
+- **The first case-shaped record is a Handover in the HR space.** Its event
+  is live (the sync writes terminations hourly), it needs no new System, it
+  exercises Trigger to Flow, Trigger to Action, a Checklist assigned
+  through Tasks with evidence, and a workspace by stage, and it corrects a behaviour that is
+  wrong today: the sync deactivates a leaver on sight and ignores the
+  effective date. The Handover opens on the record, closes on the date, and
+  deactivation happens at close.
+- **The People workspace is built to absorb the HRIS.** Which system leads
+  on an employment fact is a declaration per property; a customer who wants
+  Cumulus to lead moves the names and declares the Actions, and the HRIS
+  becomes an Effect target or is retired. Regulated ledgers — payroll,
+  benefits, tax, statutory reporting — stay in a System for good. Every
+  function the first cut does not build is a named seam in
+  `WORKPLAN-CASE.md`. Access stays the platform's own lens on the same
+  Human record.
+- **Where this guidance lives.** The binding rules are the doctrine clauses
+  above; the reasoning is here; the steps and acceptance are the workplan;
+  and cumulus-vision's `CLAUDE.md` gets the authoring rules — gate before
+  Effects, a Checklist never a Task, no locks — when the steps that make them true
+  are built, because that file describes what is, not what is planned.
