@@ -560,13 +560,13 @@ A reader who wants to argue with the doctrine reads here first.
   owns the access facts and the existence of Humans no HRIS knows. Day one
   the HRIS leads and reads only; a conflict the sync cannot settle (identity
   ambiguity, a leaver with open work) is handed from a step to a per-case
-  flow and becomes a Task at an `access` desk; reversal in the HRIS is a
+  flow and becomes a Task at an `access` queue; reversal in the HRIS is a
   later effect. Termination is a fact the sync writes; deactivation is a
   declared rule (`ON_TERMINATION`).
 - **Roles.** One platform role per Human (admin, member, auditor) is the
   access ladder, one table in core says what each may, and every route
   declares its verb in its signature. Business roles are declared in the
-  map, bind desks and name startable flows, and are held as parts on the
+  map, bind queues and name startable flows, and are held as parts on the
   Human rather than as Links, because a Role is a declaration like a Queue
   and not a record. Direct queue binding is not built. Onboarding is a
   tranche on the Access stop, not a per-customer admit rule. The open
@@ -696,7 +696,7 @@ A reader who wants to argue with the doctrine reads here first.
   any other action runs; writes carry the version they read; a flow that
   meets a gate waits or fails to a person, never rolls back, so the gate
   goes before any Effect and what precedes it is proposals, harmless to
-  abandon. "Somebody is already on this" is a claim on a Task if a desk ever
+  abandon. "Somebody is already on this" is a claim on a Task if a queue ever
   needs one, never a lock on a record.
 - **Checklist is the one base type the discussion justified, and its items
   are Parts.** A first cut made every checklist entry a record of its own
@@ -718,13 +718,13 @@ A reader who wants to argue with the doctrine reads here first.
 - **Assigning an item is a Task, and three things change about Task.**
   Who owes an item and by when live in exactly one place. Assign is an
   Action on the Checklist that raises a Task to a person's own queue or to a
-  desk, naming the checklist and the item key, with a due date; the answer
+  queue, naming the checklist and the item key, with a due date; the answer
   runs complete on that item; reassigning supersedes and raises again; an
   item done by evidence raises none. A person has one list, My Tasks. To
   carry this a Task gains a due date, may be raised by an Action as well as
   a Flow's ask, and its answer has a consumer — a run to resume, or an
   action on a record to run. Assigning to a team is free because Tasks
-  already go to desks; and the Handover flow no longer holds four questions
+  already go to queues; and the Handover flow no longer holds four questions
   open, it writes the checklist, assigns, and ends.
 - **No generic board.** A Monday-shaped List of work about nothing was
   considered and held: it is a product, not a type; it is where work goes to
