@@ -772,3 +772,34 @@ A reader who wants to argue with the doctrine reads here first.
   and cumulus-vision's `CLAUDE.md` gets the authoring rules — gate before
   Effects, a Checklist never a Task, no locks — when the steps that make them true
   are built, because that file describes what is, not what is planned.
+
+## 2026-09-30, Workspaces: a record, a visibility, bindings at a scope
+
+- **The same three words at a workspace as at the platform.** The membership
+  plan asked what a workspace's rungs are called. The owner's answer: the
+  platform's words, admin, member, auditor, held at a scope — Google Cloud's
+  shape, where a thing has beside it the principals and the roles each holds
+  there. A held role gains a fourth fact, where. Business roles stay what
+  they are and may be bound at a workspace that links the queues they name.
+- **A Workspace has a record, for the one fact that is data.** Visibility is
+  a stored setting, default private, and it is an enum with a third value:
+  `hidden` is private and unlisted. Everything an engineer changes stays the
+  declaration. Membership is bindings on people, never a roster on the
+  record.
+- **The platform comes first.** A workspace administrator binds only people
+  who already have access; nobody is let into the platform from inside a
+  workspace, so platform roles are managed before Tasks are delegated or
+  workspace roles assigned.
+- **Visibility gates a page, not data**, until scoped reads. Said in the
+  clause so nobody mistakes a hidden workspace for a locked one.
+- **The People workspace is the HR team's dashboard, and the person menu is
+  the Employee Hub.** Two places for two seats: the team's work, and
+  everything about me.
+- **Roles and Queues may be one thing.** The owner asked whether the two
+  concepts collapse. Held as the next design conversation, with a
+  recommendation recorded in `WORKPLAN-WORKSPACES.md` §1: a Queue is a
+  Role's inbox, so `queues.py` disappears and "add somebody to a queue" is
+  exactly "bind them to the role". The plan is written to hold either way.
+- **Queue, never desk.** The owner struck the second word the same day: a
+  role-based queue called two things was confusing. Every document,
+  docstring and sentence on a screen now says queue.
