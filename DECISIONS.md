@@ -803,3 +803,32 @@ A reader who wants to argue with the doctrine reads here first.
 - **Queue, never desk.** The owner struck the second word the same day: a
   role-based queue called two things was confusing. Every document,
   docstring and sentence on a screen now says queue.
+
+## 2026-10-01, a Queue is a Role's inbox
+
+- **Roles and Queues collapse.** Two tables, one hop between them, and the
+  hop was where the confusion lived: a Task named a queue, a person held a
+  role that named the queue, and "who reads this" always went through the
+  role. In Naviant's map every queue was read by exactly one role, so the
+  two-table design was paying for a flexibility nothing used; and where a
+  Task needs two kinds of reader the engine already lets one Task name
+  several. So a Queue is a Role's inbox, named for it; a person's own queue
+  is the role only they hold; a Role bound at a Workspace has an inbox
+  there; nothing declares a queue. The queues file goes, a Workspace lists
+  the roles it binds, and a workspace administrator's power is said in one
+  hop.
+- **The stress test: thirty flows, two kinds of reader.** The owner asked
+  whether a queue per kind of flow was wanted once Financial operations ran
+  thirty flows for contributors and a CFO. No: the kind of work is a
+  dimension of the inbox, not a place work goes. Specialisation is a role;
+  "see invoice work apart from expense work" is a filter; "two clerks must
+  not open the same one" is a claim on a Task; measurement is off the
+  Task's own fields. Roles grow with the kinds of people, flows with the
+  kinds of work. The cost of the collapse is that the inbox has to be good,
+  and the chunk carries that: My Tasks by kind, a view's Tasks panel
+  narrowed to the flows it names, a role's inbox as a page, a claim, and
+  handing a Task on to a role or a person.
+- **The default address is the Role everywhere.** Today's flows do not know
+  which Workspace they serve and should not have to; a scoped inbox,
+  `role@workspace:<id>`, is for the one case that already wants it — the
+  administrators of this Workspace, which is where a request to join goes.
