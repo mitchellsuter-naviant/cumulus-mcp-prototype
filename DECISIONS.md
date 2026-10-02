@@ -654,6 +654,12 @@ A reader who wants to argue with the doctrine reads here first.
 - **Whether it is shut belongs to the console, not the page.** Like the
   assistant's pane, it is one notifier: somebody who shut it meant it shut,
   and giving it back on the next workspace is arguing with them.
+- **2026-10-01: the handle belongs on the bar, not on the rail.** A control
+  that lives on the thing it hides has to leave a stub of that thing behind.
+  Moving it to the far left of the top bar lets the rail go away whole, puts
+  it where a tray's handle belongs, and keeps it in one place on every screen
+  that has one. Its slot is held open whether or not there is a rail, because
+  a control appearing at that end of the bar moves everything right of it.
 - **The way back is the supertitle, not an arrow beside it.** The word over
   the workspace's name says what the thing under it is, and the list of them
   is the same word, so it is the link: underlined and in the accent under the
@@ -832,3 +838,54 @@ A reader who wants to argue with the doctrine reads here first.
   which Workspace they serve and should not have to; a scoped inbox,
   `role@workspace:<id>`, is for the one case that already wants it — the
   administrators of this Workspace, which is where a request to join goes.
+
+## 2026-10-01, later: the chrome is one surface
+
+- **Two things on screen, not three.** The bar and the rail are the same
+  quiet grey; what is set apart is the page, which is white with its corner
+  rounded away from the corner they make. A dark bar made the furniture the
+  loudest thing on a screen whose point is the work, and the ground should
+  recede so the work is the lit thing on it. Nothing divides the chrome from
+  itself: no rule under the bar, no edge down the rail.
+- **The wordmark is the way home**, so Home leaves the row of routes: the
+  name of a thing is where people press to get back to the start of it, and
+  having both was the same door twice.
+- **Workspaces is a menu as well as a route.** The fastest way to a
+  workspace is its name; the directory is for when you do not know which one
+  you want, so it is the row under the line rather than the only way in.
+- **A control that cannot be used is drawn and dead, not hidden.** The rail's
+  handle stays on every screen; hiding it would change the shape of the bar
+  from screen to screen, which is what every other decision here has been
+  spent on preventing.
+
+
+## 2026-10-02, the collapse undone: queues in code, roles as data, subqueues
+
+- **Roles are data, so queues must be code.** The collapse of 2026-10-01 made
+  a role the address a flow names; two days later the owner wanted a
+  workspace's administrator to create roles from a people-management seat,
+  and code cannot name what data creates. So the two come apart again,
+  with the division now stated from the requirement that forced it: queues
+  are the few stable places a business runs, declared in code, platform-
+  wide, what a flow asks; roles are the many groupings of people, data,
+  created and bound by whoever administers a scope, naming the queues their
+  holders read. Everything else built this week — bindings at a scope, the
+  Members stop, claims, handing on, the queue read by kind — carries over.
+- **Seniority lives in roles, not in flows.** Asked whether a review chain
+  wants two queues or one queue with levels encoded, the answer is a queue
+  with named **subqueues**: a Task names a queue or a part, a role binds a
+  queue or a part exactly, the policy says when a question needs more
+  authority, and whether managers also read what clerks read is a binding.
+  "At or above" was refused as a platform assumption that is false often
+  enough to matter.
+- **Subqueues carry no order.** Review by legal and review by finance sit
+  beside each other; a declared order would assert a ranking that is not
+  there. Where a chain exists the policy knows what comes next. One level
+  deep, spelled as a path, the bare queue meaning the whole.
+- **The word is subqueue.** Level pulls toward numbers, stage, rung, step
+  and gate are taken, lane says beside and not above, station reads as a
+  brand. Subqueue adds no second noun, which is principle six kept.
+- **Core's own queues.** The administrators of the platform and of each
+  workspace are reachable by a queue core names (`admin`,
+  `admin@workspace:<id>`), because a request to join has to go somewhere
+  code can name; the member and auditor rungs are not queues.
