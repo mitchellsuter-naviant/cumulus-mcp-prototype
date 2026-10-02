@@ -889,3 +889,32 @@ A reader who wants to argue with the doctrine reads here first.
   workspace are reachable by a queue core names (`admin`,
   `admin@workspace:<id>`), because a request to join has to go somewhere
   code can name; the member and auditor rungs are not queues.
+
+## 2026-10-02, later: Platform access, Workspace access, and a Role lives in a Workspace
+
+- **"Rung" goes.** The three fixed words (admin, member, auditor) were called
+  a rung of the platform ladder, and the metaphor had to be decoded every
+  time. They are one thing — how much somebody may do, at a scope — so the
+  word is the literal one: **Platform access** on the Human, **Workspace
+  access** held at a Workspace. Refused: *Platform Role* / *Workspace Role*,
+  because a Role is the thing a Workspace's administrator creates, and
+  "Workspace Role" is the most natural reading of exactly the wrong thing;
+  *standing*, taken by the graph; *access* alone, a queue and a page.
+- **A Role lives in one Workspace.** The Members stop's Roles tab had listed
+  the three access words beside the business roles, and read as three roles
+  with no queues; the conflation was in the data (`Human.hold` took either).
+  Roles are workspace-only; the platform has none; `grant` moves access and
+  `hold` moves roles.
+- **The platform's own workspace is a Workspace core declares, and is called Platform** (id `platform`; it had been drawn as Platform, then Platform Admin — renamed the same evening, before anything was deployed, so no binding is stranded at an old id). Once the platform has no
+  roles of its own, the platform's administration is a Workspace like any
+  other: a record, `hidden`, members, Roles, its administrators' queue — so
+  the bare `admin` queue, the visibility exemption and the platform-only
+  role routes all go. Its one special stop is Platform access, which is
+  about every Human and not about its members.
+- **Platform access and Platform membership are independent.** Asked
+  whether holding admin at the platform should put somebody in Cumulus
+  Admin: no. Derivation is a special case in `permitted()` and a holder the
+  Members stop cannot remove — the kind of exception this decision exists to
+  delete. Bootstrap sets both for the first administrators; afterwards each
+  is its own edit, and the oddity it permits (a platform administrator not
+  bound there) is harmless, since they hold `workspaces.manage` everywhere.
