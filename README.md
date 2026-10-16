@@ -27,7 +27,7 @@ Repo layout:
 | [admin_app/lib/tasks/](admin_app/lib/tasks/) | The UI mirror of `server/app/tasks/`: per-process, per-version task review screens (`accounts_payable/v6/extraction_review.dart`, `…/verify_three_way_match.dart`, `expense_reimbursement/v9/expense_review.dart`), each flow's workspace and case models, kind-keyed shared screens, and the one registry (`registry.dart`) that picks the screen for a task from `(flow_id, flow_version, kind)` |
 | [deploy/](deploy/) | `deploy.sh` (one-command deploy) and `bootstrap_owner.sh` (first owner account) |
 | [.devcontainer/](.devcontainer/) | Dev container with Flutter, Python, gcloud, and Firebase CLIs — see its [README](.devcontainer/README.md) |
-| [cumulus.code-workspace](cumulus.code-workspace) | Multi-root workspace: this repo plus `cumulus-demo-ecosystem/` (the simulation engine) and `cumulus-vision/` (Cumulus proper, rebuilt one step at a time with this prototype as the guide), which the dev container bind-mounts from sibling directories on the host — see [Three trees, one window](.devcontainer/README.md#three-trees-one-window) |
+| [cumulus.code-workspace](cumulus.code-workspace) | Multi-root workspace: this repo plus `cumulus-demo-ecosystem/` (the simulation engine), `cumulus-vision/` (Cumulus proper, rebuilt one step at a time with this prototype as the guide), and `customer-ai-projects/` (reference-only, read-only), which the dev container bind-mounts from sibling directories on the host — see [Three trees, one window](.devcontainer/README.md#three-trees-one-window) |
 | [firebase.json](firebase.json) | Firebase Hosting config; serves `admin_app/build/web` |
 
 ## Security posture

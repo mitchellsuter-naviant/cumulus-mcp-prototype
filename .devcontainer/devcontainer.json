@@ -7,25 +7,32 @@
 //   - Python FastAPI server in server/ (venv at server/.venv) exposing REST,
 //     MCP (Streamable HTTP), and A2A front doors; deployed to Cloud Run
 //
-// A second repo rides along: cumulus-demo-ecosystem/ — the simulation engine
-// this prototype talks to. It is bind-mounted from the sibling directory on the
-// host and opened as the second folder of a multi-root workspace, so both trees
-// are editable, searchable, and runnable from one window. See
-// `cumulus.code-workspace` and this folder's README.
+// More directories ride along, bind-mounted from sibling paths on the host
+// and opened as extra folders of a multi-root workspace, so all trees are
+// searchable from one window. See `cumulus.code-workspace` and this folder's
+// README.
+//   - cumulus-demo-ecosystem/ — the simulation engine this prototype talks to
+//   - cumulus-vision/         — Cumulus proper, rebuilt one step at a time with
+//                               this repo as the guide; its API runs on :8081 locally
+//   - cumulus-plan-review-workbench/ — the plan review workbench
+//   - customer-ai-projects/   — reference-only, mounted read-only
 //
 // GCP project: cumulus-mcp-prototype (set below via CLOUDSDK_CORE_PROJECT —
 // no `gcloud config set` needed, and the host's gcloud config is not mutated).
 //
 // Host prerequisites: Docker Desktop, the VS Code "Dev Containers" extension,
-// the cumulus-demo-ecosystem repo cloned *beside* this one (the container will
-// not start without it — Docker refuses a bind mount whose source is missing),
-// and gcloud auth on the HOST (credentials are bind-mounted in):
+// the cumulus-demo-ecosystem, cumulus-vision, cumulus-plan-review-workbench,
+// and customer-ai-projects
+// directories cloned/created *beside* this one (the container will not start
+// without them — Docker refuses a bind mount whose source is missing), and
+// gcloud auth on the HOST (credentials are bind-mounted in):
 //   gcloud auth login
 //   gcloud auth application-default login
 //
 // Day-to-day commands inside the container:
 //   cd admin_app && flutter run -d web-server --web-port 3000   # → localhost:3000
 //   cd server && .venv/bin/uvicorn app.main:app --port 8080     # API on :8080
+//   cd /workspaces/cumulus-vision/server && .venv/bin/uvicorn app.main:app --port 8081
 //   ./deploy/deploy.sh cumulus-mcp-prototype                    # full deploy
 // =============================================================================
 {
@@ -42,6 +49,14 @@
         // host. Bind-mounted (not copied) so edits and git history are shared
         // with the host checkout. If it lives elsewhere, change this source path.
         "source=${localWorkspaceFolder}/../cumulus-demo-ecosystem,target=/workspaces/cumulus-demo-ecosystem,type=bind,consistency=cached",
+        // Cumulus proper, built one step at a time with this repo as the guide,
+        // cloned beside it on the host. Same bind-mount treatment as above.
+        "source=${localWorkspaceFolder}/../cumulus-vision,target=/workspaces/cumulus-vision,type=bind,consistency=cached",
+        // The plan review workbench, cloned beside this repo on the host.
+        "source=${localWorkspaceFolder}/../cumulus-plan-review-workbench,target=/workspaces/cumulus-plan-review-workbench,type=bind,consistency=cached",
+        // Reference-only: another project directory, mounted read-only since
+        // nothing in this workspace edits or runs it.
+        "source=${localWorkspaceFolder}/../customer-ai-projects,target=/workspaces/customer-ai-projects,type=bind,consistency=cached,readonly",
         // Host gcloud config, so ADC and `gcloud` work without re-auth.
         "source=${localEnv:HOME}${localEnv:USERPROFILE}/.config/gcloud,target=/root/.config/gcloud,type=bind",
         // Persist Claude Code state (sessions, memory, login) across rebuilds.
@@ -51,7 +66,7 @@
         // Cache pub packages; seeded from the image so the FlutterFire CLI survives.
         "source=cumulus-mcp-prototype-pub-cache,target=/root/.pub-cache,type=volume"
     ],
-    // Open both repos at once. Pointing workspaceFolder at a .code-workspace
+    // Open the related repos at once. Pointing workspaceFolder at a .code-workspace
     // file makes VS Code open that multi-root workspace on attach; the default
     // workspaceMount (this repo -> /workspaces/cumulus-mcp-prototype) is unchanged.
     "workspaceFolder": "/workspaces/cumulus-mcp-prototype/cumulus.code-workspace",
@@ -112,16 +127,18 @@
         }
     },
     // Resolve dependencies for whichever halves of the repo exist yet:
-    // admin_app/ (Flutter web admin) and server/ (FastAPI + MCP + A2A).
+    // admin_app/ (Flutter web admin) and server/ (FastAPI + MCP + A2A), plus
+    // the venv in cumulus-vision/server once that tree has one to build.
     // Paths are absolute: with workspaceFolder pointing at a .code-workspace
     // file, the cwd lifecycle commands inherit is not worth relying on.
     // cumulus-demo-ecosystem/ bootstraps itself — see its own README.
-    "postCreateCommand": "git config --global --add safe.directory /workspaces/cumulus-mcp-prototype && git config --global --add safe.directory /workspaces/cumulus-demo-ecosystem && { [ -f /workspaces/cumulus-mcp-prototype/admin_app/pubspec.yaml ] && (cd /workspaces/cumulus-mcp-prototype/admin_app && flutter pub get); [ -f /workspaces/cumulus-mcp-prototype/server/requirements.txt ] && (cd /workspaces/cumulus-mcp-prototype/server && python -m venv .venv && .venv/bin/pip install -r requirements.txt); true; }",
+    "postCreateCommand": "git config --global --add safe.directory /workspaces/cumulus-mcp-prototype && git config --global --add safe.directory /workspaces/cumulus-demo-ecosystem && git config --global --add safe.directory /workspaces/cumulus-vision && git config --global --add safe.directory /workspaces/cumulus-plan-review-workbench && git config --global --add safe.directory /workspaces/customer-ai-projects && { [ -f /workspaces/cumulus-mcp-prototype/admin_app/pubspec.yaml ] && (cd /workspaces/cumulus-mcp-prototype/admin_app && flutter pub get); [ -f /workspaces/cumulus-mcp-prototype/server/requirements.txt ] && (cd /workspaces/cumulus-mcp-prototype/server && python -m venv .venv && .venv/bin/pip install -r requirements.txt); [ -f /workspaces/cumulus-vision/server/requirements-dev.txt ] && (cd /workspaces/cumulus-vision/server && python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt); [ -f /workspaces/cumulus-vision/console/pubspec.yaml ] && (cd /workspaces/cumulus-vision/console && flutter pub get); true; }",
     // Sign commits with the host's SSH key via the forwarded agent.
     "postStartCommand": "bash /workspaces/cumulus-mcp-prototype/.devcontainer/setup-git-signing.sh || true",
     "forwardPorts": [
         3000,
-        8080
+        8080,
+        8081
     ],
     "portsAttributes": {
         "3000": {
@@ -130,6 +147,9 @@
         },
         "8080": {
             "label": "Cumulus API / MCP (local)"
+        },
+        "8081": {
+            "label": "cumulus-vision API (local)"
         }
     }
 }

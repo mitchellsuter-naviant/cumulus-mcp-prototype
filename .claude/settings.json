@@ -1,7 +1,9 @@
 {
   "permissions": {
     "additionalDirectories": [
-      "/workspaces/cumulus-demo-ecosystem"
+      "/workspaces/cumulus-demo-ecosystem",
+      "/workspaces/cumulus-vision",
+      "/workspaces/customer-ai-projects"
     ]
   }
 }

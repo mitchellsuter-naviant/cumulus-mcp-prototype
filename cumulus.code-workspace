@@ -1,14 +1,17 @@
 // =============================================================================
 // Cumulus — multi-root workspace
 //
-// Two repos, one window:
+// Five trees, one window:
 //   cumulus-mcp-prototype   this repo (FastAPI + MCP + A2A server, Flutter admin)
 //   cumulus-demo-ecosystem  the simulation engine we code against
+//   cumulus-vision          Cumulus proper, rebuilt one step at a time with this repo as the guide
+//   cumulus-plan-review-workbench  plan review workbench
+//   customer-ai-projects    reference-only, mounted read-only
 //
 // The dev container opens this file (see `.devcontainer/devcontainer.json`'s
-// `workspaceFolder`), and bind-mounts the second repo from the sibling directory
-// on the host to /workspaces/cumulus-demo-ecosystem. Outside the container the
-// same relative path works whenever the two repos are cloned side by side.
+// `workspaceFolder`), and bind-mounts the other four directories from sibling
+// paths on the host. Outside the container the same relative paths work
+// whenever the five directories are cloned/created side by side.
 //
 // Folder-scoped settings use `${workspaceFolder:<name>}` — a bare
 // `${workspaceFolder}` is ambiguous in a multi-root window.
@@ -22,6 +25,18 @@
         {
             "name": "cumulus-demo-ecosystem",
             "path": "../cumulus-demo-ecosystem"
+        },
+        {
+            "name": "cumulus-vision",
+            "path": "../cumulus-vision"
+        },
+        {
+            "name": "cumulus-plan-review-workbench",
+            "path": "../cumulus-plan-review-workbench"
+        },
+        {
+            "name": "customer-ai-projects",
+            "path": "../customer-ai-projects"
         }
     ],
     "settings": {
