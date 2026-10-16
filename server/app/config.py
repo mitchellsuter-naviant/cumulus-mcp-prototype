@@ -75,6 +75,14 @@ class Settings:
         self.ledger_collection: str = os.environ.get(
             "LEDGER_COLLECTION", "curation_ledger"
         )
+        # The ModelCall ledger: append-only, one document per model invocation
+        # — which model ran, under which run and step, and what it cost. Its
+        # own collection for the curation ledger's reason, and it is a sibling
+        # of that one rather than part of it: that ledger records what a person
+        # decided, this one records what a model was asked.
+        self.modelcalls_collection: str = os.environ.get(
+            "MODELCALLS_COLLECTION", "model_calls"
+        )
         # The event log: append-only, one document per Event the Dispatcher
         # recorded or a Flow emitted. Its own collection for the ledger's
         # reason — a fact outlives the run it caused, and the run journals are
@@ -105,6 +113,13 @@ class Settings:
         # rebuildable: delete it and the profile Flow recomputes from the graph.
         self.vendor_profiles_collection: str = os.environ.get(
             "VENDOR_PROFILES_COLLECTION", "vendor_profiles"
+        )
+        # The correction set: one row per field a clerk changed, raw beside
+        # corrected. Its own collection because it is knowledge rather than a
+        # record of work — the pairs outlive the invoices they came off, and
+        # are the input to a future prompt revision or eval set.
+        self.corrections_collection: str = os.environ.get(
+            "CORRECTIONS_COLLECTION", "field_corrections"
         )
         # "none" (default, local dev: everyone is owner) or "firebase".
         self.auth_backend: str = os.environ.get("AUTH_BACKEND", "none")
@@ -268,6 +283,31 @@ class Settings:
         # about, and a golden set graded against two different models is
         # measuring two systems.
         self.model: str = os.environ.get("MODEL", "gemini-3.5-flash-lite")
+        # The one exception to the rule above, and it is an exception on
+        # purpose. Locating a handful of fields on a page is a different job
+        # from reading the page — geometry, not content — and it is asked
+        # separately so it appears in the ModelCall ledger as its own line, can
+        # be swapped or switched off without touching the extraction a posting
+        # decision rests on, and never runs at all on an invoice with nothing
+        # in doubt. Priced by the same governed rate sheet as everything else.
+        self.locate_model: str = os.environ.get(
+            "LOCATE_MODEL", "gemini-3.7-flash"
+        )
+        # The second exception, and it is the same kind of exception. A receipt
+        # is a photograph of a crumpled piece of paper taken in a restaurant,
+        # and the person who has to live with a misread total is the submitter
+        # confirming it — so this reading is asked of a stronger model than the
+        # one that reads a clean vendor PDF. Its own setting so the expense
+        # flow's spend is its own line in the ledger and can be moved without
+        # touching every other ModelCall in the system.
+        #
+        # The v10 flow package *declares* this string in its `extract-receipt`
+        # step config, and a test pins the declaration to this value: a map
+        # naming a model the deployment does not run is the transparency bar
+        # lying, which is worse than not drawing it.
+        self.expense_model: str = os.environ.get(
+            "EXPENSE_MODEL", "gemini-3.7-flash"
+        )
         # `global`-only, for the same reason as the encoder above.
         self.model_location: str = os.environ.get(
             "MODEL_LOCATION", os.environ.get("VERTEX_LOCATION", "global")

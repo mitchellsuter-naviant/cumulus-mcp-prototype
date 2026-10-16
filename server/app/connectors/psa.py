@@ -49,15 +49,16 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 
-from .graph import Claim, GraphWriter, normalize_key
-from .identity_sweep import _domain
-from .resolution import (
+from ..graph import Claim, GraphWriter, normalize_key
+from ..identity_sweep import _domain
+from ..ontology import names as onto
+from ..resolution import (
     ResolutionOutcome,
     ResolutionThresholds,
     read_resolution_thresholds,
     resolve,
 )
-from .runs import RunContext
+from ..runs import RunContext
 from .sync import (
     PSA_EVENT,
     PSA_FLOW_ID,
@@ -70,18 +71,9 @@ from .sync import (
     _authority,
     _slug,
 )
-from .sync_commerce import _CompanyIndex, _apply_counterparty, _count
+from .commerce import _CompanyIndex, _apply_counterparty, _count
 
 log = logging.getLogger("cumulus.sync.psa")
-
-
-def register(service: SyncService) -> None:
-    """Bind the body to the engine `SyncService` was handed."""
-    if service.engine is None:
-        return
-    service.engine.register(
-        PSA_FLOW_ID, lambda ctx, inputs: psa_body(service, ctx, inputs)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +166,7 @@ def psa_body(service: SyncService, ctx: RunContext, inputs: dict) -> dict:
         "z1", "resolve-records", "resolve",
         fn=lambda: [
             resolve(
-                service.graph, "Company", [c.name], thresholds,
+                service.graph, onto.COMPANY, [c.name], thresholds,
                 source=source, source_external_id=c.external_id,
             ).model_dump()
             for c in clients
@@ -408,7 +400,7 @@ def _apply_delivery_book(
                                 source=claim_source))
 
         project = graph.upsert(
-            "Project", _project_key(source, record), claims,
+            onto.PROJECT, _project_key(source, record), claims,
             label=record.name or record.project_code or record.external_id,
             provenance=f"synced by {run_id}",
         )
@@ -462,7 +454,7 @@ def _apply_delivery_book(
             claims.append(Claim(field="billable_hours",
                                 value=round(stage[1], 2), source=claim_source))
         phase = graph.upsert(
-            "ProjectPhase", _phase_key(project_id, record.external_id), claims,
+            onto.PROJECT_PHASE, _phase_key(project_id, record.external_id), claims,
             label=record.name or record.external_id,
             provenance=f"synced by {run_id}",
         )
@@ -486,7 +478,7 @@ def _phase_key(project_id: str, external_id: str) -> str:
 def _known_project(service: SyncService, source: str, external_id: str) -> str:
     """A project this delta did not carry but an earlier one landed.
 
-    Asked of the store by the property the way `sync_commerce` asks for an
+    Asked of the store by the property the way `connectors.commerce` asks for an
     item, rather than reading the whole delivery book to place one phase — and
     scoped by source, because a PSA id is only an id inside the PSA that
     minted it.
@@ -494,7 +486,7 @@ def _known_project(service: SyncService, source: str, external_id: str) -> str:
     if not external_id:
         return ""
     found = service.graph.find(
-        "Project",
+        onto.PROJECT,
         prop_equals={"external_id": external_id, "source": source},
         limit=1,
     )

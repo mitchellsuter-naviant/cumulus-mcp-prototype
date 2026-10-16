@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 
 from .auth import Principal
 from .models import utcnow
-from .tasks import Task, TaskDecision, TaskService
+from .task_queue import Task, TaskDecision, TaskService
 
 log = logging.getLogger("cumulus.runs")
 
@@ -206,6 +206,12 @@ class StepRecord(BaseModel):
 class RunRecord(BaseModel):
     id: str
     flow_id: str
+    # Which shipped version of the flow drove this run. Pinned at start and
+    # honored on resume: a run suspended under v6 finishes under v6 even if v7
+    # went live while it waited, because the journal it replays was written by
+    # v6's shape. Zero means "the only version there is" — a body registered
+    # without one, or a run from before versions existed.
+    flow_version: int = 0
     status: RunStatus = "running"
     case_ref: str = ""
     actor: str = ""
@@ -492,6 +498,7 @@ class RunContext:
                     queue=escalate_queue,
                     priority="high",
                     flow_id=self.record.flow_id,
+                    flow_version=self.record.flow_version,
                     run_id=self.record.id,
                     case_ref=self.record.case_ref,
                     resumes=f"this run resumes at {step_id}",
@@ -579,6 +586,11 @@ class RunContext:
 
         task = build_task()
         task.run_id = self.record.id
+        # The version is the run's fact, not the task builder's: every gate in
+        # a v6 run raises a v6 task, and the console picks the review screen
+        # shipped for v6. Stamped here so no flow author can forget it.
+        if not task.flow_version:
+            task.flow_version = self.record.flow_version
         # A gate has to be able to find its own Task again on the next pass, so
         # the id cannot be optional. Flows normally set a meaningful one; when
         # one is missing the engine derives it from the run and the step, which
@@ -639,7 +651,19 @@ class RunEngine:
     def __init__(self, store: RunStore, tasks: TaskService) -> None:
         self.store = store
         self.tasks = tasks
-        self._bodies: dict[str, FlowBody] = {}
+        # flow id → shipped version → body. Version 0 is the unversioned
+        # registration every feed uses; a process package registers one body
+        # per `v<N>/` directory it ships.
+        self._bodies: dict[str, dict[int, FlowBody]] = {}
+        # The version a flow's registrar declared as its default — what runs
+        # when nothing (no stored live pointer, no pin) says otherwise.
+        self._defaults: dict[str, int] = {}
+        # Which version is *live* for a flow, asked at start time. Set by the
+        # composition root to read the stored flow definition, the same way
+        # `emit` is set by the Dispatcher: a structural attribute, because the
+        # flows module imports this one and the engine must not import it
+        # back. None means "no opinion" — the default version runs.
+        self.live_version: Callable[[str], int] | None = None
         # Where an Event a running flow emits goes, beyond its own journal.
         # Set by `dispatch.Dispatcher`, which registers itself: a structural
         # attribute rather than an import, because `dispatch` imports this
@@ -647,8 +671,48 @@ class RunEngine:
         # journal as the only record, which is what it was before.
         self.emit: Callable[[str, str, RunRecord], Any] | None = None
 
-    def register(self, flow_id: str, body: FlowBody) -> None:
-        self._bodies[flow_id] = body
+    def register(
+        self, flow_id: str, body: FlowBody, *,
+        version: int = 0, default: bool = False,
+    ) -> None:
+        self._bodies.setdefault(flow_id, {})[version] = body
+        if default or flow_id not in self._defaults:
+            self._defaults[flow_id] = version
+
+    def _resolve_body(
+        self, flow_id: str, pinned: int | None = None
+    ) -> tuple[int, FlowBody] | None:
+        """The body that should drive a run, and the version it carries.
+
+        Order of authority: the run's own pin (a resume must replay the shape
+        that wrote the journal), then the stored live pointer, then the
+        registrar's declared default, then whatever is registered. A pinned
+        version whose package is gone falls through rather than failing — the
+        run is worth more than the pin.
+        """
+        table = self._bodies.get(flow_id)
+        if not table:
+            return None
+        if pinned is not None and pinned in table:
+            return pinned, table[pinned]
+        # An unversioned body registered over a versioned fleet is a deliberate
+        # override — nothing in production does it, and a test harness or a
+        # hotfix shim that does means it. It outranks the stored live pointer.
+        if 0 in table and len(table) > 1:
+            return 0, table[0]
+        if self.live_version is not None:
+            try:
+                live = int(self.live_version(flow_id) or 0)
+            except Exception:  # noqa: BLE001 — a broken resolver must not stop runs
+                log.exception("Live-version resolver failed", extra={"flowId": flow_id})
+                live = 0
+            if live in table:
+                return live, table[live]
+        default = self._defaults.get(flow_id, 0)
+        if default in table:
+            return default, table[default]
+        version = max(table)
+        return version, table[version]
 
     # -- reads --------------------------------------------------------------
 
@@ -706,12 +770,14 @@ class RunEngine:
         principal: Principal | None = None,
         caused_by: str = "",
     ) -> RunRecord:
-        body = self._bodies.get(flow_id)
-        if body is None:
+        resolved = self._resolve_body(flow_id)
+        if resolved is None:
             raise ValueError(f"No registered body for flow {flow_id}")
+        version, body = resolved
         rid = run_id or self.mint_run_id(flow_id, inputs, actor)
         record = RunRecord(
-            id=rid, flow_id=flow_id, case_ref=case_ref or rid,
+            id=rid, flow_id=flow_id, flow_version=version,
+            case_ref=case_ref or rid,
             actor=actor, inputs=inputs, caused_by=caused_by,
         )
         self.store.put(record)
@@ -748,13 +814,24 @@ class RunEngine:
             return record
         if record.status == "failed" and not retry_failed:
             return record
-        body = self._bodies.get(record.flow_id)
-        if body is None:
+        resolved = self._resolve_body(
+            record.flow_id, pinned=record.flow_version or None
+        )
+        if resolved is None:
             log.warning(
                 "Cannot resume: no registered body",
                 extra={"runId": run_id, "flowId": record.flow_id},
             )
             return record
+        version, body = resolved
+        if record.flow_version and version != record.flow_version:
+            log.warning(
+                "Resuming under a different shipped version than the run pinned",
+                extra={
+                    "runId": run_id, "flowId": record.flow_id,
+                    "pinned": record.flow_version, "running": version,
+                },
+            )
         # The Task this run suspended on is answered by the resume itself.
         # Left open it becomes a row in somebody's queue for work that is
         # already moving — and after a `POST /runs/{id}/resume` the console

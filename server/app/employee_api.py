@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from .auth import Principal, get_principal, require_human, require_reader
 from .deps import get_employee_service
-from .employee import EmployeeProfile, HrChatReply, PtoRequest
+from .employee import EmployeeProfile, HrChatReply, HrTurn, PtoRequest
 
 log = logging.getLogger("cumulus.employee.api")
 
@@ -33,6 +33,12 @@ class PtoSubmit(BaseModel):
 
 class HrChatMessage(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+    #: The conversation so far, oldest first, replayed by the client. The
+    #: server keeps no session: a surface that answers from somebody's own
+    #: health plan and PTO is the last place to accumulate a transcript store,
+    #: and "new chat" is only honest if the history it drops was never ours.
+    #: Capped so one conversation cannot grow into an unbounded prompt.
+    history: list[HrTurn] = Field(default_factory=list, max_length=20)
 
 
 @router.get("/me", response_model=EmployeeProfile)
@@ -67,4 +73,6 @@ def hr_chat(
     body: HrChatMessage, principal: Principal = Depends(get_principal)
 ) -> HrChatReply:
     require_reader(principal)
-    return get_employee_service().chat(principal.email, body.message)
+    return get_employee_service().chat(
+        principal.email, body.message, body.history
+    )

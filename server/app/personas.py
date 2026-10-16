@@ -4,20 +4,30 @@ The doctrine's Role primitive confers two things at once: **permissions**
 (what you may touch) and **queue-bindings** (what work is yours). This module
 is the whole of that, for the platform kind of Role.
 
-The roster, and the shape of each entry is two facts plus its queues:
+The roster itself lives one level down, in `app/casts/`: one module per
+customer namespace, selected here from `settings.estate_namespace`, with
+`""` and any unknown value selecting `naviant`. `casts/naviant.py` carries the
+roster this console was built against; `casts/wick.py` carries Wick Buildings.
+Each cast declares the two Naviant personas (the field engineer operating the
+deployment and the support engineer diagnosing it — the platform's people, not
+the customer's org chart), its own customer admin, and its own customer users.
+The shape of every entry is two facts plus its queues:
 
     persona            authority   scope     acts as
-    naviant-engineer   owner       platform  Mitchell Suter — operates the deployment
+    naviant-engineer   owner       platform  the field engineer, in every cast
     naviant-support    user        platform  nobody — not in the org chart
-    customer-admin     admin       tenant    Nathan Pryce, IT Manager
-    customer-user      user        own       Raymond · Connie · Karen · Diane · John
+    customer-admin     admin       tenant    the customer's own systems owner
+    customer-user:*    user        own       the customer's people, one desk each
 
-**Everybody below the two Naviant rows is a real Naviant employee**, at the
-work address the estate's HRIS actually holds for them. The invented cast that
-used to sit here (`@customer.example`) was replaced when the estate became the
-only world: a persona whose email resolves to nothing opens onto an empty hub
-and an empty calendar, and every screen it is used to test then tests the
-fallback rather than the screen.
+**The selection happens here, and not in the callers.** Every module that
+needs a persona already imports `personas` — `auth` to build a Principal,
+`queues` to bootstrap desk membership, `ui_api` to draw the switcher — so
+making them ask a cast for a roster would add a second selection mechanism
+without removing the first, and a second mechanism is the thing that drifts:
+one caller reading the environment, another holding a cast it captured at
+import, and a Task offered to somebody the other half of the server does not
+believe exists. One selector, at the name everything already imports, means a
+deployment can only have one answer to "who is here".
 
 `authority` is a rung on the existing write ladder, so every `require_role`
 call in the server keeps working unchanged. `scope` is the orthogonal read
@@ -37,206 +47,56 @@ the only thing an audit reader needs that the rewrite would otherwise lose.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from . import casts, desks
+#: Re-exported, not redefined: `personas.Persona` is the name the rest of the
+#: server type-hints against (`auth.principal_for`, `ui_api._option`), and the
+#: dataclass belongs beside the casts that instantiate it — otherwise a cast
+#: module would have to import this one, and this one selects the casts.
+from .casts import Persona  # noqa: F401  (re-export)
+
+#: The cast this deployment runs with. Resolved once, at import, because a
+#: roster that changed under a running server would mean two requests in one
+#: session disagreeing about who may decide a Task. `casts.active()` is the
+#: live answer for anything that legitimately wants to re-ask.
+_CAST = casts.active()
 
 #: The console's operator: whoever signs in to this deployment. It used to live
 #: in `workforce.py` beside an invented org chart; that module was the mock
-#: world and went with it, and the operator's identity belongs here anyway —
-#: `ENGINEER` below is the same fact with the rest of the answer attached.
-OPERATOR_EMAIL = "masuter@naviant.com"
+#: world and went with it, and the operator's identity belongs with the roster
+#: anyway — `ENGINEER` below is the same fact with the rest of the answer
+#: attached. The same address in every cast: the operator is the field
+#: engineer who built the deployment, not one of the customer's people.
+OPERATOR_EMAIL = _CAST.OPERATOR_EMAIL
 
-#: Every queue Tasks actually route to. Declared here because a persona binds
-#: to queues and nothing else in the system enumerates them — `tasks.py` only
-#: ever sees the one name a caller hands it.
-ALL_QUEUES: tuple[str, ...] = (
-    "expense-review",       # reimbursements.REVIEW_QUEUE
-    "ap-clerk",             # payables.CLERK_QUEUE
-    "vendor-stewardship",   # sync.STEWARD_QUEUE
-    # sync.DATA_STEWARD_QUEUE — the counterparty book. Separate from vendor
-    # stewardship because the two answer different questions: one decides who
-    # Cumulus pays, the other decides who Cumulus thinks it is dealing with,
-    # and the desks are not interchangeable even where one person sits at both.
-    "data-stewardship",
-    # disagreement_sweep.ORDER_DESK_QUEUE — where a two-system disagreement
-    # about an order lands. Deliberately not `ap-clerk` and deliberately not
-    # either stewardship desk: releasing an order is a revenue decision, and
-    # the authority that approves what Cumulus *pays* is not the authority
-    # that decides what it *bills*. Keeping them apart is what makes "Connie
-    # may not release revenue" a fact the system enforces rather than a
-    # sentence in a runbook.
-    "order-desk",
-    "hr",                   # employee.HR_QUEUE
-    "knowledge-curation",
-    "eval-review",
-    # The band above the routing table's top threshold. A desk rather than a
-    # bigger number on the existing one, because the governed policy has always
-    # said a VP signs for spend over $5,000 and the flow has always sent it to
-    # the same reviewer as a $210 dinner — the document and the machinery
-    # disagreeing in the customer's favour is still a disagreement.
-    "expense-review-exec",
-    # routing.OPS_QUEUE — where a *step that threw* goes, as distinct from a
-    # business escalation. A Vertex 400 about a file format used to land on the
-    # finance approver's desk: the Controller cannot fix a mime type, and the
-    # person who can was not looking at that queue.
-    "platform-operations",
-)
-
-
-@dataclass(frozen=True)
-class Persona:
-    """A platform Role, plus the identity to act as when impersonating it."""
-
-    id: str
-    label: str
-    #: Rung on the write ladder in auth.ROLES — what `require_role` compares.
-    authority: str
-    #: Read reach: "platform" (the whole deployment), "tenant" (the customer's
-    #: own map), or "own" (this person's work and nothing else).
-    scope: str
-    #: Queues whose Tasks are this persona's to decide. Empty means none.
-    queues: tuple[str, ...] = ()
-    #: One line describing what this persona is for, shown in the switcher.
-    blurb: str = ""
-    #: The graph `Employee` natural key this persona acts as.
-    email: str = ""
-    uid: str = ""
-    #: The seeded person behind the persona, empty when there is none.
-    person: str = ""
-    title: str = ""
-
+#: Every queue Tasks route to, read off the desk declarations rather than
+#: restated here. This list used to be the vocabulary — ten slugs, half of them
+#: a second spelling of a constant in the module that routes to the desk — and
+#: the registry bootstrapped from it, so the roster silently decided which
+#: desks existed at all. `desks.py` decides that now; a persona binds to what
+#: is declared and can no longer bind to a queue nothing files work to.
+#:
+#: Not per-namespace, for the reason `desks.py`'s docstring gives: a desk is a
+#: work destination, and one that nothing routes to in this deployment is a
+#: desk with no work rather than a desk that does not exist.
+ALL_QUEUES: tuple[str, ...] = desks.ALL_SLUGS
 
 # ---------------------------------------------------------------------------
-# The roster
+# The roster, from the selected cast
 # ---------------------------------------------------------------------------
 #
-# Every customer persona is a real person in the estate's HRIS, because a
-# persona with no `Employee` behind it opens onto an empty hub, an empty
-# calendar and no expense history — which teaches you nothing about the screen
-# you are testing. The two **Naviant** personas are the honest exceptions:
-# neither the engineer operating the deployment nor a support engineer
-# diagnosing a ticket is in the customer's org chart, and their hub should say
-# so rather than invent a record.
-#
-# The customer-user personas differ from each other in the *queues* they bind
-# to, which is the whole point. "Can Connie post this invoice" and "can John
-# post this invoice" are different questions with different answers, and the
-# write ladder cannot tell them apart — they sit on the same rung and own
-# different work.
+# Read `app/casts/<namespace>.py` for the people and the reasoning about them.
+# What is asserted here is what holds in *every* cast: the two Naviant
+# personas exist, there is exactly one customer admin, the customer users are
+# distinguished from each other by the desks they hold, and the default is the
+# engineer.
 
-ENGINEER = Persona(
-    id="naviant-engineer",
-    label="Naviant Engineer",
-    authority="owner",
-    scope="platform",
-    queues=ALL_QUEUES,
-    email=OPERATOR_EMAIL,
-    uid="persona_naviant_engineer",
-    person="Mitchell Suter",
-    title="Director, Platform & Operations",
-    blurb="Builds and operates the deployment. Sees every plane, decides "
-          "anything, and is the only persona that may act as another. Not in "
-          "the customer's HRIS, so the personal surfaces say so.",
-)
-
-SUPPORT = Persona(
-    id="naviant-support",
-    label="Naviant Support",
-    authority="user",
-    scope="platform",
-    queues=(),
-    email="support@naviant.com",
-    uid="persona_naviant_support",
-    person="",
-    title="Support Engineer",
-    blurb="Reads everything to diagnose a customer's problem and decides "
-          "nothing on their behalf. Use it to ask whether support could have "
-          "answered a ticket from what the console shows.",
-)
-
-CUSTOMER_ADMIN = Persona(
-    id="customer-admin",
-    label="Customer Admin",
-    authority="admin",
-    scope="tenant",
-    queues=("knowledge-curation", "eval-review"),
-    email="nathan.pryce@naviant.com",
-    uid="persona_customer_admin",
-    person="Nathan Pryce",
-    title="IT Manager",
-    blurb="Governs the customer's own map — knowledge, flows, connectors, "
-          "access — and sees none of Naviant's platform internals. The IT "
-          "owner, not a finance approver: the master-data desks belong to the "
-          "Controller, who is accountable for what they decide.",
-)
-
-# (persona slug, work email, person, title, queues, blurb). The slug is written
-# out rather than sliced off the email because these ids are typed into a
-# header by hand — `customer-user:controller` says which desk is being tested,
-# where `customer-user:raymond.fitzgerald` says only who sits at it.
-_USERS: tuple[tuple[str, str, str, str, tuple[str, ...], str], ...] = (
-    (
-        "controller", "raymond.fitzgerald@naviant.com", "Raymond Fitzgerald",
-        "Controller",
-        ("ap-clerk", "expense-review", "vendor-stewardship",
-         "data-stewardship", "order-desk"),
-        "The finance decision-maker: approves the spend, owns both "
-        "master-data desks — who Cumulus pays, and who it thinks it is "
-        "dealing with — and is the only persona who may release an order the "
-        "CRM says was won. Test a reimbursement above the policy limit, a "
-        "posting gate, a steward call on a vendor that will not resolve, and "
-        "a disagreement between the CRM and the ERP about one commitment.",
-    ),
-    (
-        "ap", "connie.alberts@naviant.com", "Connie Alberts",
-        "Accounts Payable Specialist",
-        ("ap-clerk",),
-        "Works the AP queue and nothing else. Test the posting gate and a "
-        "three-way match that misses — then the same act as the Controller, "
-        "who may also rule on the vendor behind it.",
-    ),
-    (
-        "hr", "karen.boothe@naviant.com", "Karen Boothe", "HR Generalist",
-        ("hr",),
-        "The only persona bound to the HR queue, so a PTO request routed "
-        "there has an owner. Her worker status is On Leave in the live HRIS, "
-        "which is a fact the hub should show rather than smooth over.",
-    ),
-    (
-        "ceo", "diane.vogel@naviant.com", "Diane Vogel",
-        "Chief Executive Officer",
-        ("expense-review", "expense-review-exec"),
-        "The org-wide read. Every department rolls up here, so it is the "
-        "persona for a view that should span the whole company.",
-    ),
-    (
-        "ae", "john.smith@naviant.com", "John Smith", "Account Executive",
-        (),
-        "Submits expenses and owns no queue at all. The persona that proves "
-        "scoping works: everything an approver can do is refused here.",
-    ),
-)
-
-CUSTOMER_USERS: tuple[Persona, ...] = tuple(
-    Persona(
-        id=f"customer-user:{slug}",
-        label=name,
-        authority="user",
-        scope="own",
-        queues=queues,
-        email=email,
-        uid=f"persona_{slug}",
-        person=name,
-        title=title,
-        blurb=blurb,
-    )
-    for slug, email, name, title, queues, blurb in _USERS
-)
+ENGINEER = _CAST.ENGINEER
+SUPPORT = _CAST.SUPPORT
+CUSTOMER_ADMIN = _CAST.CUSTOMER_ADMIN
+CUSTOMER_USERS: tuple[Persona, ...] = _CAST.CUSTOMER_USERS
 
 #: Grouped the way the switcher shows them.
-GROUPS: tuple[tuple[str, tuple[Persona, ...]], ...] = (
-    ("Naviant", (ENGINEER, SUPPORT)),
-    ("Customer", (CUSTOMER_ADMIN,) + CUSTOMER_USERS),
-)
+GROUPS: tuple[tuple[str, tuple[Persona, ...]], ...] = _CAST.GROUPS
 
 ALL_PERSONAS: tuple[Persona, ...] = tuple(
     p for _, group in GROUPS for p in group
@@ -250,6 +110,10 @@ _BY_ID = {p.id: p for p in ALL_PERSONAS}
 #: surfaces open on their not-in-the-workforce state — which is the state a
 #: deployed operator actually sees, and therefore the one worth developing
 #: against. Switch to a customer persona to work a populated hub.
+#:
+#: Derived from the cast rather than declared by it, so "the default is the
+#: engineer" is a property of the platform and not a per-customer choice a new
+#: cast could get wrong.
 DEFAULT_PERSONA = ENGINEER
 
 
@@ -266,6 +130,10 @@ def reach_for(role: str) -> dict:
     An owner may read everything and still owns no queue until it acts as
     somebody — which is stricter than the console's local default and correct
     for a deployed one.
+
+    Cast-independent on purpose. What a role reaches is a platform rule; who
+    holds which desk is a customer fact, and this function is asked the first
+    question by credential paths that have never heard of a persona.
     """
     if role == "owner":
         return {"scope": "platform", "queues": ()}

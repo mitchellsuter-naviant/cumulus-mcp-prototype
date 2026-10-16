@@ -88,7 +88,7 @@ def _require_corpus_reach(principal: Principal, surface: str) -> None:
 
     The split is deliberate and it is the same one the console draws. Reading
     *this* policy is how an own-scoped screen renders the clause a run cited —
-    the posting limit on the AP composer, the PTO window on the hub — so
+    the posting limit on the AP submission panel, the PTO window on the hub — so
     `GET /assets/{id}` and `GET /refs/{ref}` stay open to any reader. Reading
     the *list* is browsing the whole governed corpus across every team, which
     is a governance act: the console drops the Knowledge layer stop for an

@@ -15,7 +15,7 @@ folders somebody made by hand before the namespace was seeded, which carry no
 import pytest
 
 from app.graph import object_id
-from app.sync import DMS_FLOW_ID, EMPLOYMENT_EVENT_FLOW_ID, SyncRequest
+from app.connectors.sync import DMS_FLOW_ID, EMPLOYMENT_EVENT_FLOW_ID, SyncRequest
 from tests import estate_fixtures as fx
 from tests import world as test_world
 
@@ -543,7 +543,7 @@ def test_the_dms_authority_is_its_own_bucket():
     """Without it the DMS falls through to `flow`, and a customer's own filing
     tree would have been recorded as something Cumulus guessed at."""
     from app.ontology import ONTOLOGY
-    from app.sync import _authority
+    from app.connectors.sync import _authority
 
     assert _authority("dms-library") == "dms"
     order = ONTOLOGY.precedence

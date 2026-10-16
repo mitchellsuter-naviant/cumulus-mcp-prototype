@@ -31,13 +31,21 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 # nothing — IDF already discounts them for ranking — and stops them
 # manufacturing lexical evidence that isn't there.
 #
+# Bare quantifiers — "much", "many", "most", "lot" — are here for the same
+# reason and one more: they are what makes a short question look uncovered.
+# "How much PTO do I have" is two words after the classic stoplist, one of
+# which no policy is about, so the PTO policy covered half the question and got
+# reported as maybe-not-the-answer. A word that cannot be the topic must not be
+# counted as part of it.
+#
 # The index keeps every token, so this changes what is asked, not what is
 # stored, and needs no reindex to adjust.
 _STOPWORDS = frozenset(
     """
     a about all am an and any are as at be been being but by can cannot could
     did do does doing for from get gets getting had has have having he her him
-    his how i if in into is it its me my no nor not of off on once only or
+    his how i if in into is it its lot lots me most much many my no nor not
+    of off on once only or
     other our out over own same she should so some such than that the their
     them then there these they this those through to too under until up us was
     we were what when where which while who whom why will with would you your
@@ -49,15 +57,69 @@ def tokenize(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower())
 
 
+#: A run of digits followed by letters, or the reverse — "401k", "10k", "w2".
+#: The index splits on non-alphanumerics only, so "401(k)" is stored as "401"
+#: and "k" while a person typing "401k" produces one token that matches
+#: neither. Splitting the mixed token at query time makes the two spellings the
+#: same question. Query-side like the stopword list, and for the same reason:
+#: it changes what is asked, not what is stored, so it needs no reindex.
+_MIXED_RE = re.compile(r"(\d+)([a-z]+)|([a-z]+)(\d+)")
+
+
+def _expand_mixed(term: str) -> list[str]:
+    """A mixed alphanumeric token, plus the parts of it worth searching for.
+
+    A numeric part needs three digits to come along. "401k" splits usefully
+    because "401" is the topic; "10k" does not, because "10" appears in every
+    document that mentions ten of anything and would report a PTO policy as
+    half an answer to a question about invoices over ten thousand dollars.
+    """
+    match = _MIXED_RE.fullmatch(term)
+    if match is None:
+        return [term]
+    parts = [
+        part
+        for part in match.groups()
+        if part and len(part) >= (3 if part.isdigit() else 2)
+    ]
+    return [term, *parts]
+
+
+def query_term_groups(query: str) -> list[list[str]]:
+    """A query as the *things it asks about*, each with its spellings.
+
+    One group per word the person typed; a mixed token brings its parts along
+    as alternatives inside the same group. The grouping is what coverage needs
+    and ranking does not: "401k" and "401" are two ways to say one thing, so a
+    document holding either has covered that part of the question once, and
+    flattening them first would charge a document for missing a spelling of a
+    word it does have.
+    """
+    groups = [_expand_mixed(token) for token in tokenize(query)]
+    meaningful = [g for g in groups if g[0] not in _STOPWORDS]
+    return meaningful or groups
+
+
 def query_terms(query: str) -> list[str]:
     """Tokenize a query, dropping stopwords when anything else remains.
 
     The fallback matters: a query that is *only* stopwords ("how do I") should
     still search for them rather than silently match nothing.
     """
-    terms = tokenize(query)
-    meaningful = [t for t in terms if t not in _STOPWORDS]
-    return meaningful or terms
+    return [term for group in query_term_groups(query) for term in group]
+
+
+#: Coverage matches on a prefix this long when an exact token match fails, so
+#: "reimbursed" covers a document that says "reimbursement" and "flight" covers
+#: one that says "flights". Five characters is long enough that "kombucha" and
+#: "compliance" still share nothing, and this never touches the index or the
+#: BM25 score — a looser rule for *did this document address the word* than for
+#: *how well*, which is the right asymmetry: coverage is a recall test.
+_STEM_CHARS = 5
+
+
+def _stem(term: str) -> str:
+    return term[:_STEM_CHARS]
 
 
 def _searchable_text(asset: Asset) -> str:
@@ -139,6 +201,14 @@ class SearchIndex:
             for term in terms:
                 docs = self._postings.get(term)
                 if not docs:
+                    # A word no document contains *exactly* falls back to its
+                    # stem, so "reimbursed" reaches the guideline that says
+                    # "reimbursement" and "flight" the one that says "flights".
+                    # Deliberately narrow: the fallback fires only where the
+                    # term was scoring nothing for anybody, so it can add
+                    # matches and never reshuffle ones that already matched.
+                    docs, _ = self._stem_match_locked(term, "")
+                if not docs:
                     continue
                 df = len(docs)
                 idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
@@ -150,6 +220,107 @@ class SearchIndex:
                     )
             ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
             return ranked if limit is None else ranked[:limit]
+
+
+    def coverage(self, query: str, doc_id: str) -> float:
+        """The share of a question's *information* one document contains."""
+        return self.coverages(query, [doc_id]).get(doc_id, 0.0)
+
+    def coverages(self, query: str, doc_ids: list[str]) -> dict[str, float]:
+        """Coverage for a whole candidate set, resolving each word once.
+
+        Not the share of a question's *words*. "How much PTO do I have" is one
+        topic word after stopwording, so a memo that merely says "much" covers
+        half of it by count — and a floor built on that number would let the
+        memo through while it answered nothing. Weighting each word by its IDF
+        says what a reader means: the document has "pto", or it does not.
+
+        A word no document contains is counted at the corpus's highest observed
+        IDF and never as covered, which is what makes a query of invented words
+        score near zero everywhere instead of picking a winner. Capped at an
+        observed value rather than the unbounded df=0 figure, so one unfamiliar
+        proper noun cannot sink an otherwise well-covered question.
+
+        Batched because the stem fallback scans the term dictionary: resolving
+        it once per word rather than once per (word, document) is the
+        difference between a scan and fifty of them.
+        """
+        groups = query_term_groups(query)
+        with self._lock:
+            n = len(self._doc_len)
+            if not n or not groups:
+                return {doc_id: 0.0 for doc_id in doc_ids}
+            # df=1 is the rarest a word can be and still be in the corpus, so
+            # it is the ceiling an absent word is charged at.
+            unknown_idf = math.log(1 + (n - 1 + 0.5) / 1.5)
+
+            # Per group: the weight it contributes, and the documents that
+            # cover it under any of its spellings.
+            resolved: list[tuple[float, set[str]]] = []
+            for group in groups:
+                best_idf = 0.0
+                holders: set[str] = set()
+                for term in group:
+                    exact = self._postings.get(term)
+                    if exact:
+                        df = len(exact)
+                        best_idf = max(
+                            best_idf, math.log(1 + (n - df + 0.5) / (df + 0.5))
+                        )
+                        holders.update(exact)
+                    # The stem always contributes here, even when the exact
+                    # word exists somewhere. Coverage asks whether *this*
+                    # document addressed the word, and the travel guideline
+                    # saying "reimbursement" has addressed "reimbursed"
+                    # whether or not some other document happens to spell it
+                    # the way the question did. Ranking is where the exact
+                    # match earns its extra weight; this is a recall test, and
+                    # being generous is the correct bias.
+                    stemmed, _ = self._stem_match_locked(term, "")
+                    if stemmed:
+                        holders.update(stemmed)
+                        if not exact:
+                            df = len(stemmed)
+                            best_idf = max(
+                                best_idf,
+                                math.log(1 + (n - df + 0.5) / (df + 0.5)),
+                            )
+                resolved.append((best_idf or unknown_idf, holders))
+
+            total = sum(weight for weight, _ in resolved)
+            if not total:
+                return {doc_id: 0.0 for doc_id in doc_ids}
+            out: dict[str, float] = {}
+            for doc_id in doc_ids:
+                if doc_id not in self._doc_len:
+                    out[doc_id] = 0.0
+                    continue
+                covered = sum(
+                    weight for weight, holders in resolved if doc_id in holders
+                )
+                out[doc_id] = round(covered / total, 4)
+            return out
+
+    def _stem_match_locked(self, term: str, doc_id: str):
+        """Postings for any indexed word sharing this one's stem, and whether
+        `doc_id` is among them.
+
+        A scan of the term dictionary, which is the right cost at this corpus
+        size and the wrong one at a hundred thousand documents — a stem->terms
+        map built alongside the postings is the change to make if it ever
+        matters. Only reached for a word no document contains exactly, and now
+        once per word rather than once per candidate.
+        """
+        if len(term) < _STEM_CHARS:
+            return None, False
+        stem = _stem(term)
+        merged: dict[str, int] = {}
+        for other, docs in self._postings.items():
+            if other.startswith(stem):
+                merged.update(docs)
+        if not merged:
+            return None, False
+        return merged, doc_id in merged
 
 
 class VectorIndex:
@@ -363,9 +534,51 @@ def is_weak_hit(
     return similarity < background + lead * SEMANTIC_RETAIN_FRACTION
 
 
-def mark_weak_hits(hits: list) -> list:
-    """Stamp `weak` on each hit, judged against the rest of the ranking."""
-    profile = semantic_profile([h.similarity for h in hits])
+def semantic_strength(
+    similarity: float | None, profile: tuple[float, float] | None
+) -> float:
+    """How far up the ranking's lead this hit sits, in [0, 1].
+
+    The semantic half of grounding, and the reason it has to exist: `coverage`
+    is a lexical measure, so on a hybrid deployment a document the embedder
+    found and the words missed scores zero — "how do I get money back for a
+    flight" against a guideline that says *reimbursement* and *airfare*. A
+    grounding floor built on coverage alone would drop exactly the hits
+    embeddings were added to catch, which would make hybrid retrieval worse
+    than lexical rather than better.
+
+    Measured against the pack rather than as an absolute cosine, for the reason
+    written at length above `MIN_SEMANTIC_LEAD`: unrelated documents score
+    0.48-0.58 against anything, and what separates signal from noise is how far
+    the best result leads. A ranking with no lead at all has no strength to
+    report and returns zero everywhere, which is what nonsense should score.
+    """
+    if similarity is None or profile is None:
+        return 0.0
+    background, lead = profile
+    if lead < MIN_SEMANTIC_LEAD:
+        return 0.0
+    return round(max(0.0, min(1.0, (similarity - background) / lead)), 4)
+
+
+def mark_weak_hits(hits: list, profile: tuple[float, float] | None = None) -> list:
+    """Stamp `weak` and `semantic_strength` on each hit.
+
+    `profile` is the pack the hits are judged against, and passing the *whole
+    candidate set's* profile is what makes the numbers mean anything. Derived
+    from the page instead — which is what this did — a `limit=3` request
+    profiles three similarities that are by construction the three closest
+    together in the corpus, the lead collapses under `MIN_SEMANTIC_LEAD`, and
+    every hit is reported as having no lead at all. Observed on the deployed
+    corpus: a squarely-answering guideline at cosine 0.65, three rows from a
+    background of 0.55, scored a semantic strength of zero.
+
+    Falls back to profiling the page when no profile is supplied, so a caller
+    holding hits and nothing else still gets a judgement rather than an error.
+    """
+    if profile is None:
+        profile = semantic_profile([h.similarity for h in hits])
     for hit in hits:
         hit.weak = is_weak_hit(hit.retrieval, hit.similarity, profile)
+        hit.semantic_strength = semantic_strength(hit.similarity, profile)
     return hits

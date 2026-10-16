@@ -17,26 +17,42 @@ what an expense submission actually is:
   needs a real gate, several of them, and a journal to replay from — which is
   what `runs.RunEngine` provides.
 
-The flow body below is the whole thing, and it reads as straight-line code
-because the engine hides the replay. Steps:
+The flow body lives in a version package, and it reads as straight-line code
+because the engine hides the replay. Two versions are shipped.
+
+**v10 — the live shape.** Submit → extract → the submitter confirms → the graph.
 
   t1 trigger → s1 store-documents (Action, into the audit-documents
-  Collection) → x0 read-prompt (the ModelCall's own governed knowledge, at the
-  revision read) → m{i} extract-receipt per document (ModelCall) → x1
-  read-policy (governed values, at the revision read) → x2 project-lines
-  (documents + extractions + commentary → facts) → then a loop: r{n}
-  needs-elevation (Rule)
-  x2r resolve-approver (which desk, per the governed routing table)
-  → k{n} elevate-review (gate) → x{2+n} apply-correction → back to the Rule → a1
-  record-expense (Action: writes the graph) → e1 ExpenseRecorded (Event).
+  Collection) → x0 read-knowledge (the prompt, the policy values and the
+  routing table, each at the revision read) → m{i} extract-receipt per document
+  (ModelCall) → x1 project-lines (documents + extractions + commentary → facts)
+  → x2 resolve-reviewer (which desk, per the governed routing table) → then a
+  loop: r{n} policy-check (Rule) → k{n} confirm-values (gate) → x{2+n}
+  apply-correction → back to the Rule → a1 record-expense (Action: writes the
+  graph) → e1 ExpenseRecorded (Event).
+
+v10's gate is **always** raised, and the governed table routes it back to the
+submitter: confirming an extraction is the submitter's own work, because nobody
+else can say whether the number on the receipt is the number on the receipt.
+The Rule still runs and still says what it found, but its findings annotate the
+Task ("why this is worth a second look") rather than choosing a different desk.
+
+**v9 — still shipped, still selectable.** Its shape is the older one, where the
+Rule chose between auto-approval and an elevation to somebody else's desk:
+
+  t1 → s1 → x0 read-prompt → m{i} extract-receipt → x1 read-policy → x2
+  project-lines → x2r resolve-approver → r{n} needs-elevation → k{n}
+  elevate-review → x{2+n} apply-correction → a1 → e1.
 
 Everything non-deterministic — model calls, id minting, clock reads — happens
 inside a step, so a replay is exact.
 
-The correction rounds own `x3`, `x4`, `x5` — the projection scans those ids to
-find the newest facts — which is why the routing step is `x2r` and not the next
-number along. A step id is part of the journal's shape: picked once, and never
-renumbered because a resumed run would then replay nothing.
+The correction rounds own `x3`, `x4`, `x5` in both versions — the projection
+scans those ids to find the newest facts — which is why v9's routing step is
+`x2r` and not the next number along. A step id is part of the journal's shape:
+picked once, and never renumbered, because a resumed run would then replay
+nothing. That is also why v10 renumbers rather than inserting: it is a
+different version, with its own journal shape, and `_project` below reads both.
 """
 
 from __future__ import annotations
@@ -47,29 +63,41 @@ import json
 import logging
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
-from . import data_collections, media, routing
-from .auth import Principal, flow_principal
-from .dispatch import Dispatcher, InMemoryEventLog
-from .documents import DOCUMENT_COLLECTION, DocumentService, Region
-from .gateway import ActionGateway, InMemoryLedgerStore
-from .graph import Claim, GraphService, GraphWriter, InMemoryGraphStore
-from .models import utcnow
-from .flows import read_model_rates
-from .prompts import GovernedPrompt, read_prompt
-from .runs import ModelUsage, RunContext, RunEngine, RunRecord
-from .tasks import Task, TaskEvidence, TaskProposal, TaskService
+from ... import data_collections, desks, media, modelcall, routing
+from ...auth import Principal, flow_principal
+from ...dispatch import Dispatcher, InMemoryEventLog
+from ...documents import DOCUMENT_COLLECTION, DocumentService, Region
+from ...gateway import ActionGateway, InMemoryLedgerStore
+from ...graph import Claim, GraphService, GraphWriter, InMemoryGraphStore
+from ...modelcall import GovernedModelClient
+from ...models import utcnow
+from ...ontology import names as onto
+from ...flows import read_model_rates
+from ...prompts import GovernedPrompt, read_prompt
+from ...routing import RoutingPolicy
+from ...runs import ModelUsage, RunContext, RunEngine, RunRecord
+from ...task_queue import Task, TaskEvidence, TaskProposal, TaskService
+# The one fact both flows emit when a human moves a value the model read. Named
+# from its declaration rather than retyped: a fourth spelling of an event string
+# is a flywheel that silently stops turning.
+from ..ap_corrections.domain import CORRECTION_EVENT
 
 log = logging.getLogger("cumulus.reimbursements")
 
 FLOW_ID = "expense-reimbursement"
+DEFAULT_VERSION = 10
 POLICY_ASSET_ID = "expense-approval-policy"
 PROMPT_ASSET_ID = "receipt-extraction-prompt"
-REVIEW_QUEUE = "expense-review"
+#: What each of this flow's ModelCalls is *for*, on its ledger row. One row per
+#: document, which is why the step id matters here more than anywhere: without
+#: it a three-receipt request is three rows nobody can tell apart.
+EXTRACT_PURPOSE = "extract-receipt"
+REVIEW_QUEUE = desks.EXPENSE_REVIEW
 
 #: Who records an expense that no approver saw. A clean request under the
 #: governed limit is committed on the Flow's own authority, bound to the queue
@@ -77,12 +105,58 @@ REVIEW_QUEUE = "expense-review"
 #: both, and un-binding this stops auto-approval rather than exempting it.
 EXPENSE_FLOW = flow_principal(FLOW_ID, REVIEW_QUEUE)
 
+
+def expense_flow_principal(*queues: str) -> Principal:
+    """`EXPENSE_FLOW`, additionally bound to the desks this case was routed to.
+
+    v10 routes every review to the submitter's own desk, which is a different
+    queue for every case — so a module-level constant cannot name it, and
+    `record-expense` would refuse the Flow's own commit on a run resumed with
+    no live principal (a seed, an operator's `POST /runs/{id}/resume`). The
+    binding is still declared and still bounded: the standing expense desk,
+    plus the one desk this run's Task was actually raised to, and nothing else.
+    Un-bind it and those resumes stop rather than being waved through.
+    """
+    return flow_principal(FLOW_ID, REVIEW_QUEUE, *[q for q in queues if q])
+
 # Correction rounds before the flow stops asking and denies. A reviewer who
 # has corrected the same request three times is telling us the submission is
 # wrong, not that the checks are.
 MAX_REVIEW_ROUNDS = 3
 
 ReimbursementState = Literal["approved", "pending", "denied"]
+
+# ---------------------------------------------------------------------------
+# The category vocabulary
+# ---------------------------------------------------------------------------
+#
+# One declaration, because there were three and they were already disagreeing
+# in ways nothing would have caught: the stub picked from a six-word list, the
+# fallback prompt asked the model for a ten-word one, and the restricted trio
+# was typed out separately in both. A category the extractor can return and the
+# policy does not screen is extracted and then never reviewed, which is the
+# failure the receipt-extraction prompt warns its editor about in prose.
+#
+# **The governed policy is the source at run time.** `parse_policy` reads
+# "Restricted categories:" off the asset and a run screens against what it
+# found there; `RESTRICTED_BY_DEFAULT` is what answers before the corpus has
+# seeded, and the same words the seeded asset carries.
+
+#: Reimbursable on their own. Ordered as the prompt asks for them.
+ORDINARY_CATEGORIES: tuple[str, ...] = (
+    "meals", "travel", "lodging", "mileage", "supplies", "software",
+)
+
+#: Always elevated for a human, whatever the amount. The fallback for
+#: `PolicyValues.restricted` — the governed asset overrides it on every run
+#: that finds one.
+RESTRICTED_BY_DEFAULT: tuple[str, ...] = ("alcohol", "gifts", "entertainment")
+
+#: Everything the extractor may return. `other` last, because it is the
+#: catch-all and reads as one at the end of the list.
+ALL_CATEGORIES: tuple[str, ...] = (
+    *ORDINARY_CATEGORIES, *RESTRICTED_BY_DEFAULT, "other",
+)
 
 # Why a request was elevated. Typed rather than prose because the three
 # escalations need three different review screens: fixing an extraction is not
@@ -173,12 +247,44 @@ class PolicyValues(BaseModel):
     limit_usd: float = 200.0
     min_confidence: float = 0.8
     restricted: list[str] = Field(
-        default_factory=lambda: ["alcohol", "gifts", "entertainment"]
+        default_factory=lambda: list(RESTRICTED_BY_DEFAULT)
     )
     purpose_required_above_usd: float = 75.0
     requested_tolerance_usd: float = 0.5
     source_ref: str = f"knowledge:{POLICY_ASSET_ID}"
     found_asset: bool = False
+
+
+class GovernedReads(BaseModel):
+    """Everything v10 reads out of the knowledge layer, in one step.
+
+    One step and not three, because it is one *read*: the same asset carries
+    the limits the Rule consumes and the table the routing transform answers,
+    and the prompt beside them is read at the same moment for the same run. A
+    step per asset would put three rows in the journal saying the same thing
+    about the same revision, and — worse — would let a console edit land
+    between two of them, so a run could check a receipt against rev 3's limit
+    and route it by rev 4's table.
+
+    The refs are collected here rather than derived by the reader, because
+    "what this run read" is a claim about the run and the run is the only thing
+    that knows it read the fallback.
+    """
+
+    prompt: GovernedPrompt = Field(default_factory=GovernedPrompt)
+    policy: PolicyValues = Field(default_factory=PolicyValues)
+    # `RoutingPolicy` imported by name and not written `routing.RoutingPolicy`:
+    # the field below is called `routing`, and a deferred annotation would
+    # resolve the module name against the class body and find the field.
+    routing: RoutingPolicy = Field(default_factory=RoutingPolicy)
+
+    def refs(self) -> list[str]:
+        """The read-set, de-duplicated: the policy and the table are one asset."""
+        out: list[str] = []
+        for ref in (self.prompt.source_ref, self.policy.source_ref):
+            if ref and ref not in out:
+                out.append(ref)
+        return out
 
 
 class JournalEvent(BaseModel):
@@ -196,19 +302,35 @@ class JournalEvent(BaseModel):
 
 
 class SubmittedDocument(BaseModel):
-    """One artifact in a submission, with the submitter's note about it.
+    """One artifact in a submission, with the submitter's memo about it.
 
-    `note` is the human's own words about this document and is a real input to
-    the run — the projection reads a stated claim out of it and the journal
-    quotes it. `hint` is a local-dev steering string for the stub reader
-    (`total=110 vendor=… compound`) and carries no meaning in a deployment with
-    a real extractor; keeping them apart stops a demo knob from being mistaken
-    for evidence.
+    `memo` is the human's own words about this document and is a real input to
+    the run — the projection reads a stated claim out of it, the confirm screen
+    shows it back, and the journal quotes it. It is **not** given to the
+    extractor. It was: the API's `note` was concatenated into the reader's hint
+    and the stub reader regex-parsed it, so a submitter who typed
+    `total=500 vendor=corner-bistro` steered the extraction of their own
+    receipt, and one who wrote a sentence containing the word "blurry" dropped
+    its confidence below the policy floor. Accounts payable closed the same
+    door in v8 (`payables_api.PayableSubmit`); this is that door on this side.
+    Hence the rename: the field the wire carries has one job now, and its name
+    says which.
+
+    `hint` is the local-dev steering string for the stub reader
+    (`total=110 vendor=… compound`). It is not on the wire at all — no REST
+    body can set it — and reaches this model only from a test, a fixture or the
+    seed. See `StubReceiptReader`.
     """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     content_b64: str = ""
     filename: str = ""
-    note: str = ""
+    #: `note` is accepted as an input alias so a run recorded before the rename
+    #: still replays: `RunRecord.inputs` is stored JSON, and a resumed v9 run
+    #: whose documents were written under the old key would otherwise come back
+    #: with the submitter's words missing.
+    memo: str = Field(default="", validation_alias=AliasChoices("memo", "note"))
     hint: str = ""
 
 
@@ -231,11 +353,20 @@ class ResolvedDesk(BaseModel):
 
 
 class DocumentSlot(BaseModel):
-    """A stored document as the run refers to it afterwards."""
+    """A stored document as the run refers to it afterwards.
+
+    `memo` rides here because it is a property of the document, not of the
+    submission: three receipts in one envelope each get their own sentence, and
+    the confirm screen shows each one beside the extraction it is about.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     document_id: str
     filename: str = ""
-    note: str = ""
+    memo: str = Field(default="", validation_alias=AliasChoices("memo", "note"))
+    #: Carried so a replayed step is exact and so the journal can say a run was
+    #: steered. Never read by anything but the stub reader.
     hint: str = ""
     byte_size: int = 0
     media_type: str = ""
@@ -325,14 +456,18 @@ class ReimbursementStats(BaseModel):
 # copy is `seed/receipt-extraction-prompt.md`, whose fenced block is this text;
 # the two are expected to diverge the first time a customer edits the asset,
 # which is the whole point of the asset existing.
-DEFAULT_RECEIPT_PROMPT = """\
+#
+# The category list is interpolated rather than typed out, because it was typed
+# out — a fourth copy of the vocabulary, in the one place a drift is invisible:
+# a prompt that offers a word the policy does not screen produces receipts that
+# are extracted and never reviewed.
+DEFAULT_RECEIPT_PROMPT = f"""\
 Extract from this receipt: vendor (lowercase slug), date (ISO), total_usd
-(number), category (one of meals, travel, lodging, mileage, supplies, software,
-alcohol, gifts, entertainment, other), your confidence 0-1, and lines: an array
-of the distinct charges on the receipt, each with vendor, date, category,
-amount_usd and description. If the receipt covers only one charge, return a
-single line. Respond with only a JSON object with keys vendor, date, total_usd,
-category, confidence, lines."""
+(number), category (one of {", ".join(ALL_CATEGORIES)}), your confidence 0-1,
+and lines: an array of the distinct charges on the receipt, each with vendor,
+date, category, amount_usd and description. If the receipt covers only one
+charge, return a single line. Respond with only a JSON object with keys vendor,
+date, total_usd, category, confidence, lines."""
 
 
 class ReceiptReader(Protocol):
@@ -362,8 +497,20 @@ class ReceiptReader(Protocol):
         ...
 
 
-_CATEGORIES = ["meals", "travel", "lodging", "mileage", "supplies", "software"]
-_VENDORS = [
+# ---------------------------------------------------------------------------
+# STUB FIXTURES — invented, and read by `StubReceiptReader` and nothing else
+# ---------------------------------------------------------------------------
+#
+# Six merchant slugs that no customer ever billed, so an offline run produces a
+# receipt that looks like one. Quarantined under a `_STUB_` prefix so a
+# reviewer can grep for the invented vocabulary; nothing on a production path
+# reads it, and a deployment with a real extractor never reaches this block.
+#
+# The categories are *not* a fixture and are not restated here: what the stub
+# may return has to be what the policy screens, or a local run cannot exercise
+# the escalation it exists to demonstrate.
+
+_STUB_VENDORS = [
     "corner-bistro",
     "transit-authority",
     "harbor-hotel",
@@ -423,15 +570,17 @@ class StubReceiptReader:
             (image or b"") + filename.encode() + hint.encode()
         ).digest()
 
-        def pick(options: list[str], salt: int) -> str:
+        def pick(options: Sequence[str], salt: int) -> str:
             return options[seed[salt] % len(options)]
 
         total_match = re.search(r"total[=\-_ ]?\$?(\d+(?:\.\d{1,2})?)", text)
         amount_match = total_match or re.search(r"\$(\d+(?:\.\d{1,2})?)", text)
         vendor_match = re.search(r"vendor[=\-_]([a-z0-9\-]+)", text)
+        # Every category the vocabulary names except `other`, which is a
+        # substring of ordinary English and would match a filename saying
+        # "another".
         category_match = next(
-            (c for c in _CATEGORIES + ["alcohol", "gifts", "entertainment"] if c in text),
-            None,
+            (c for c in ALL_CATEGORIES if c != "other" and c in text), None
         )
         split_match = re.search(r"split[=\-_]([\d.,]+)", text)
 
@@ -442,8 +591,10 @@ class StubReceiptReader:
         )
         confidence = 0.55 if "blurry" in text else 0.86 + (seed[2] % 12) / 100
         confidence = round(min(confidence, 0.99), 2)
-        vendor = vendor_match.group(1) if vendor_match else pick(_VENDORS, 3)
-        category = category_match or pick(_CATEGORIES, 4)
+        vendor = vendor_match.group(1) if vendor_match else pick(_STUB_VENDORS, 3)
+        # An unhinted receipt is an ordinary one: picking a restricted
+        # category at random would elevate half of local development.
+        category = category_match or pick(ORDINARY_CATEGORIES, 4)
         date = utcnow().date().isoformat()
 
         amounts: list[float] = []
@@ -462,7 +613,7 @@ class StubReceiptReader:
         lines = [
             ExtractedLine(
                 vendor=vendor, date=date,
-                category=category if i == 0 else pick(_CATEGORIES, 5),
+                category=category if i == 0 else pick(ORDINARY_CATEGORIES, 5),
                 amount_usd=amount,
                 description=f"line {i + 1} of {len(amounts)}" if len(amounts) > 1 else "",
                 confidence=confidence,
@@ -479,20 +630,21 @@ class StubReceiptReader:
 
 
 class VertexReceiptReader:
-    """Multimodal extraction on Vertex AI via google-genai.
+    """Multimodal extraction on Vertex AI, through the governed model client.
 
-    Same client and Application Default Credentials as the embedder and the
-    answer backend, so enabling this adds no new secret. Asks for lines as well
-    as a total: a compound receipt is the interesting case and the model can
-    see it.
+    Asks for lines as well as a total: a compound receipt is the interesting
+    case and the model can see it.
+
+    The client is shared with the invoice reader and the answer planner rather
+    than built here. Three readers each holding their own was three chances for
+    one of them to drift out of the ledger, which is exactly what had already
+    happened to the embedder.
     """
 
     name = "vertex"
 
-    def __init__(self, project: str | None, location: str, model: str) -> None:
-        from google import genai
-
-        self._client = genai.Client(vertexai=True, project=project, location=location)
+    def __init__(self, model: str, client: GovernedModelClient) -> None:
+        self._client = client
         self._model = model
 
     def read(
@@ -524,12 +676,13 @@ class VertexReceiptReader:
                 )
             )
         )
-        response = self._client.models.generate_content(
+        response, usage = self._client.generate(
             model=self._model,
             contents=[types.Content(role="user", parts=parts)],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json", temperature=0.0
             ),
+            purpose=EXTRACT_PURPOSE,
         )
         data = json.loads(response.text or "{}")
         total = float(data.get("total_usd", 0) or 0)
@@ -553,7 +706,6 @@ class VertexReceiptReader:
                 category=str(data.get("category", "other")), amount_usd=total,
                 confidence=confidence,
             )]
-        usage = ModelUsage.from_vertex(self._model, response)
         return ReceiptExtraction(
             vendor=str(data.get("vendor", "")),
             date=str(data.get("date", "")),
@@ -568,10 +720,24 @@ class VertexReceiptReader:
 
 
 def build_receipt_reader(
-    backend: str, project: str | None, location: str, model: str
+    backend: str,
+    project: str | None,
+    location: str,
+    model: str,
+    *,
+    client: GovernedModelClient | None = None,
 ) -> ReceiptReader:
+    """`client` is the deployment's governed client; None builds a private one.
+
+    See `accounts_payable.domain.build_invoice_reader`: a reader constructed
+    without one still meters and still ledgers, into a store nobody serves —
+    and a backend nobody chose is refused rather than answered with the stub.
+    """
     if backend == "vertex":
-        return VertexReceiptReader(project, location, model)
+        return VertexReceiptReader(
+            model, client or modelcall.vertex_client(project, location)
+        )
+    modelcall.require_stub_opt_in(backend, "receipt reader")
     return StubReceiptReader()
 
 
@@ -779,7 +945,17 @@ class ReimbursementService:
             Dispatcher(engine, InMemoryEventLog()) if engine is not None else None
         )
         if engine is not None:
-            engine.register(FLOW_ID, self._body)
+            from .. import shipped_versions
+
+            for number, module in sorted(shipped_versions(FLOW_ID).items()):
+                # `metered` puts the run and the step in scope for the
+                # ModelCalls the body makes — see the same registration in
+                # payables. It matters more here: this flow files one call per
+                # document, and without the step id they are indistinguishable.
+                engine.register(
+                    FLOW_ID, modelcall.metered(module.build_body(self)),
+                    version=number, default=(number == DEFAULT_VERSION),
+                )
 
     # -- reads --------------------------------------------------------------
 
@@ -865,6 +1041,21 @@ class ReimbursementService:
     def read_prompt(self) -> GovernedPrompt:
         return read_prompt(self.knowledge, PROMPT_ASSET_ID, DEFAULT_RECEIPT_PROMPT)
 
+    def _read_knowledge(self) -> GovernedReads:
+        """Everything v10's run reads out of the corpus, in one pass.
+
+        One pass, and one *moment*: the policy values and the routing table are
+        two sections of one asset, so reading them separately would let a
+        console edit land between them and produce a run that checked a receipt
+        against one revision's limit and routed it by another revision's table.
+        """
+        content = self.read_policy_content()
+        return GovernedReads(
+            prompt=self.read_prompt(),
+            policy=self.read_policy(),
+            routing=routing.parse_routing(content, default_fallback=REVIEW_QUEUE),
+        )
+
     # -- the entry point ----------------------------------------------------
 
     def submit(
@@ -875,26 +1066,42 @@ class ReimbursementService:
         *,
         image_b64: str = "",
         filename: str = "",
+        memo: str = "",
         hint: str = "",
         run_id: str | None = None,
         submitted_at_iso: str = "",
     ) -> ReimbursementRequest:
         """Start one run of the flow. Returns the row the run produced.
 
-        The single-document arguments (`image_b64`, `filename`, `hint`) are
+        The single-document arguments (`image_b64`, `filename`, `memo`) are
         still accepted: a one-receipt submission is the common case and there
-        is no reason to make a caller wrap it in a list.
+        is no reason to make a caller wrap it in a list. `hint` is the stub
+        reader's steering seam and lands in the document's `hint`, never in its
+        `memo` — it used to land in the memo, which is how a demo knob and a
+        submitter's own words became one field.
+
+        **A submission with no document is refused.** There used to be a
+        `docs = [SubmittedDocument()]` fallback here, and it meant a caller
+        with no file at all could describe a receipt in prose and get back an
+        extraction, a set of lines and a graph write — evidence-free facts,
+        indistinguishable afterwards from ones a receipt supported. Accounts
+        payable refused the same shape at `_resolve_document`; this is that
+        refusal on this side. The REST door refuses it earlier and more
+        politely (400); this is the floor under every caller.
         """
         docs = [
             d if isinstance(d, SubmittedDocument) else SubmittedDocument.model_validate(d)
             for d in (documents or [])
         ]
-        if not docs and (image_b64 or filename or hint):
+        if not docs and (image_b64 or filename or memo or hint):
             docs = [SubmittedDocument(
-                content_b64=image_b64, filename=filename, note=hint
+                content_b64=image_b64, filename=filename, memo=memo, hint=hint
             )]
         if not docs:
-            docs = [SubmittedDocument()]
+            raise ValueError(
+                "an expense submission needs at least one document: "
+                "commentary alone is not evidence"
+            )
 
         inputs = {
             "employee": employee,
@@ -923,6 +1130,7 @@ class ReimbursementService:
         """
         if task.flow_id != FLOW_ID or self.engine is None:
             return None
+        self._emit_correction(task)
         record = self.engine.resume_for_task(task.id, principal=principal)
         return self._project(record) if record else None
 
@@ -932,312 +1140,66 @@ class ReimbursementService:
     ) -> ReimbursementRequest | None:
         return self.resume_for_task(task, principal)
 
-    # -- the flow body ------------------------------------------------------
+    # -- the flywheel -------------------------------------------------------
 
-    def _body(self, ctx: RunContext, inputs: dict) -> dict:
-        employee = inputs["employee"]
-        commentary = inputs.get("commentary", "")
-        submitted_at = inputs.get("submitted_at_iso") or utcnow().isoformat()
-        submitted = [SubmittedDocument.model_validate(d) for d in inputs["documents"]]
+    def _emit_correction(self, task: Task) -> None:
+        """Announce what the submitter changed, then get on with the expense.
 
-        ctx.event(
-            "t1", "ExpenseSubmitted",
-            f"{len(submitted)} document(s) submitted by {employee}"
-            + (f" · commentary: \"{_clip(commentary)}\"" if commentary else ""),
-            kind="trigger",
+        The same mechanism accounts payable uses, on the same event, into the
+        same Collection — deliberately the same, and deliberately not a second
+        flow. Doctrine's flywheel clause names the route: a human correction
+        flows back **decoupled, via an Event, not inline**. So this emits
+        `ExtractionCorrected` and returns; the Trigger table answers it with an
+        `ap-corrections` run that appends the raw→corrected pairs, and the
+        expense below carries on recording whether or not that lands.
+
+        Nothing is promoted. The pairs are the prerequisite for teaching the
+        receipt prompt something; deciding that it has been taught stays a
+        human decision behind a curation Task, and this lane does not make it.
+
+        Emitted before the resume, deliberately: the resume applies the patch,
+        and afterwards the reading the submitter was looking at is gone. What is
+        wanted is the *pair*, and only one of its halves survives the round.
+        """
+        decision = task.decision
+        if (
+            decision is None
+            or decision.verdict != "corrected"
+            or self.dispatcher is None
+            or self.engine is None
+        ):
+            return
+        record = self.engine.get(task.run_id)
+        if record is None or record.status != "suspended":
+            # The decision has already been carried into the run. Two callers
+            # reach for the same task — the API hook and a seeding script —
+            # and the same pair must not be appended twice; "is this run still
+            # waiting" is the fact that tells them apart.
+            return
+        pairs = _correction_pairs(
+            _lines_of(record), decision.payload, _flagged_ordinals(record)
         )
-
-        # s1 · Action — the artifacts land in the audit-documents Collection,
-        # which is what stamps their two-year retention.
-        slots = ctx.step(
-            "s1", "store-documents", "action",
-            fn=lambda: [
-                slot.model_dump()
-                for slot in self._store_documents(submitted, employee, ctx.record.id)
-            ],
-            writes=lambda out: [
-                f"document:{slot['document_id']}" for slot in (out or [])
-            ],
-            summary=lambda out: (
-                f"{len(out)} document(s) stored in "
-                f"`{DOCUMENT_COLLECTION}` · retention "
-                f"{data_collections.get(DOCUMENT_COLLECTION).retention}"
-                if out else "no documents attached (hint-driven run)"
-            ),
-        )
-        slot_models = [DocumentSlot.model_validate(s) for s in slots]
-
-        # x0 · transform — the governed read the ModelCall runs on. A prompt is
-        # knowledge, so it is read here at a revision rather than compiled in,
-        # and the revision travels onto every extraction step below.
-        prompt = GovernedPrompt.model_validate(ctx.step(
-            "x0", "read-prompt", "transform",
-            fn=lambda: self.read_prompt().model_dump(),
-            summary=lambda out: (
-                f"{out['source_ref']}: {len(out['text'])} characters"
-                + ("" if out["found_asset"]
-                   else " — not in the corpus, running on the built-in default")
-            ),
-        ))
-        ctx.note_refs(prompt.source_ref)
-
-        # The price sheet the extractions below are metered against. Read once
-        # for the run rather than per document, and carried onto each ModelCall
-        # step's read-set: the rates do not change what the flow *does*, only
-        # what its journal says a call cost, so this is a ref on the metered
-        # step rather than a governed read a Rule consumes.
-        rates = read_model_rates(self.knowledge)
-
-        # m{i} · ModelCall — one step per document, so a retry, a correction or
-        # a cost lands on the document it belongs to.
-        extractions: list[ReceiptExtraction] = []
-        for index, (slot, doc) in enumerate(zip(slot_models, submitted), start=1):
-            raw = ctx.step(
-                f"m{index}", f"extract-receipt[{index}]", "modelcall",
-                fn=lambda d=doc, s=slot: self._extract(d, s, prompt.text).model_dump(),
-                summary=lambda out: (
-                    f"{out['model']}: {out['vendor']} · ${out['total_usd']:,.2f} · "
-                    f"{out['category']} · {len(out['lines'])} line(s) · "
-                    f"confidence {out['confidence']:.2f}"
-                ),
-                # The extraction already knows which model read the receipt,
-                # so the step takes its accounting off the output rather than
-                # off the reader's name — which is the backend ("vertex"), not
-                # a model, and was being filed as one.
-                meter=lambda out: rates.priced(ModelUsage(
-                    model=str(out.get("model") or ""),
-                    input_tokens=int(out.get("input_tokens") or 0),
-                    output_tokens=int(out.get("output_tokens") or 0),
-                )),
-                refs=[
-                    f"document:{slot.document_id}", prompt.source_ref,
-                    rates.source_ref,
-                ],
-                retries=1,
-                # A step that *threw* goes to the operations desk, not to the
-                # approver's. This escalated to `expense-review` and put a
-                # Vertex 400 about a file format in front of the Controller,
-                # who cannot fix a mime type — while the engineer who can was
-                # not looking at that queue. The business escalations below
-                # still route to a reviewer, and that difference is the point:
-                # one of these is somebody's judgment to give and the other is
-                # a bug.
-                escalate_queue=routing.OPS_QUEUE,
-            )
-            extractions.append(ReceiptExtraction.model_validate(raw))
-
-        # x1 · transform — the governed read. The Rule never fetches.
-        policy_raw = ctx.step(
-            "x1", "read-policy", "transform",
-            fn=lambda: self.read_policy().model_dump(),
-            summary=lambda out: (
-                f"{out['source_ref']}: limit ${out['limit_usd']:,.2f} · "
-                f"min confidence {out['min_confidence']:.2f} · "
-                f"purpose above ${out['purpose_required_above_usd']:,.2f} · "
-                f"restricted {', '.join(out['restricted'])}"
-            ),
-        )
-        policy = PolicyValues.model_validate(policy_raw)
-        ctx.note_refs(policy.source_ref)
-
-        # x2 · transform — documents + extractions + commentary become facts.
-        lines_raw = ctx.step(
-            "x2", "project-lines", "transform",
-            fn=lambda: [
-                line.model_dump()
-                for line in project_lines(slot_models, extractions, commentary)
-            ],
-            summary=lambda out: (
-                f"{len(out)} line(s) projected · requested "
-                f"${sum(line['requested_usd'] for line in out):,.2f}"
-                + (
-                    " · submitter's own split honored"
-                    if any(
-                        line["requested_usd"] < line["document_total_usd"] - 0.001
-                        for line in out
-                    )
-                    else ""
-                )
-            ),
-        )
-        lines = [ExpenseLine.model_validate(line) for line in lines_raw]
-
-        # x3 · transform — which desk an elevated request would land on.
-        #
-        # A *transform* and not part of the Rule, because answering it means
-        # walking the org chart and DOCTRINE point 199 is explicit that a Rule
-        # never fetches: the caller gathers the inputs and hands them in. So
-        # the graph walk happens here, once, and the Rule below is handed a
-        # concrete queue.
-        #
-        # Resolved before the loop rather than at the gate so that the *reason*
-        # is in the journal whether or not anybody was ultimately asked — "this
-        # would have gone to Diane" is worth knowing about a request that
-        # auto-approved, and it is what makes the routing table auditable
-        # rather than merely effective.
-        requested_total = round(sum(line.requested_usd for line in lines), 2)
-        restricted_here = any(
-            line.category in policy.restricted for line in lines
-        )
-        routed = ResolvedDesk.model_validate(ctx.step(
-            "x2r", "resolve-approver", "transform",
-            fn=lambda: self._resolve_desk(
-                employee, requested_total, restricted_here
-            ).model_dump(),
-            summary=lambda out: out["explanation"],
-            refs=[policy.source_ref],
-        ))
-        ctx.note_refs(f"queue:{routed.queue}")
-
-        # The review loop. Each round is its own Rule step and its own gate, so
-        # the journal shows exactly how many times a person was asked.
-        state: ReimbursementState = "approved"
-        reason = "auto-approved within governed policy"
-        escalations: list[Escalation] = []
-        override = False
-        decided_by = ""
-        decision_note = ""
-        rounds = 0
-
-        for round_number in range(1, MAX_REVIEW_ROUNDS + 1):
-            checked = ctx.step(
-                f"r{round_number}", "needs-elevation", "rule",
-                fn=lambda ln=lines: _check(ln, policy),
-                summary=lambda out: (
-                    "elevate: " + "; ".join(e["detail"] for e in out["escalations"])
-                    if out["escalations"]
-                    else "approve: within limit, allowed category, confident "
-                         "extraction, purpose stated"
-                ),
-                refs=[policy.source_ref],
-            )
-            escalations = [Escalation.model_validate(e) for e in checked["escalations"]]
-            rounds = round_number
-            if not escalations:
-                if round_number > 1:
-                    reason = (
-                        f"approved after {round_number - 1} review round(s) — "
-                        f"corrected by {decided_by}"
-                    )
-                break
-
-            decision = ctx.gate(
-                f"k{round_number}", "elevate-review",
-                build_task=lambda rn=round_number, esc=escalations, ln=lines: (
-                    self._build_review_task(
-                        ctx.record, ln, esc, policy, rn, employee, routed
-                    )
-                ),
-            )
-            decided_by = decision.decided_by
-            decision_note = decision.note or decision.correction
-
-            if decision.verdict == "rejected":
-                state = "denied"
-                reason = decision.note or "denied on review"
-                break
-            if decision.verdict == "approved":
-                # The reviewer looked at the flags and accepted them. Re-running
-                # the Rule would raise the same flags forever, so the override
-                # is recorded and the loop ends.
-                override = True
-                state = "approved"
-                reason = (
-                    "approved on review despite: "
-                    + "; ".join(e.detail for e in escalations)
-                )
-                break
-
-            patched = ctx.step(
-                f"x{2 + round_number}", "apply-correction", "transform",
-                fn=lambda ln=lines, d=decision: [
-                    line.model_dump()
-                    for line in apply_correction(ln, d.payload, d.decided_by)
-                ],
-                summary=lambda out: (
-                    f"reviewer supplied {len(out)} line(s) — re-checking against "
-                    "the same governed values"
-                ),
-            )
-            lines = [ExpenseLine.model_validate(line) for line in patched]
-        else:
-            # Fell out of the loop still flagged: stop asking.
-            state = "denied"
-            reason = (
-                f"unresolved after {MAX_REVIEW_ROUNDS} review rounds: "
-                + "; ".join(e.detail for e in escalations)
-            )
-
-        # a1 · Action — the graph write, through the Gateway.
-        request = ReimbursementRequest(
-            id=ctx.record.case_ref or ctx.record.id,
-            run_id=ctx.record.id,
-            employee=employee,
-            submitted_at_iso=submitted_at,
-            commentary=commentary,
-            documents=slot_models,
-            lines=lines,
-            state=state,
-            verdict_reason=reason,
-            escalations=escalations if state != "approved" or override else [],
-            review_rounds=rounds - 1 if rounds else 0,
-            human_override=override,
-            policy_ref=policy.source_ref,
-            policy_limit_usd=policy.limit_usd,
-            model=extractions[0].model if extractions else "",
-            task_id=next(
-                (s.task_id for s in ctx.record.steps if s.task_id), ""
-            ),
-            decided_by=decided_by,
-            decision_note=decision_note,
-        ).refresh_projections()
-
-        # Who commits it: the approver who released the last gate, or the Flow
-        # itself when a clean request cleared the governed limit with no gate
-        # at all. Crediting the submitter with a decision nobody made would be
-        # the ledger's first lie.
-        commit = self.gateway.action(
-            "record-expense", ctx.principal or EXPENSE_FLOW,
-            run=ctx.record, step_id="a1",
-            task_id=request.task_id, decided_by=decided_by,
-        )
-        written = ctx.step(
-            "a1", "record-expense", "action",
-            fn=lambda: commit.commit(
-                lambda w: self._write_graph(request, policy, decided_by, w)
-            ),
-            writes=lambda _out: commit.writes,
-            summary=lambda out: (
-                f"{request.state} · ${request.requested_usd:,.2f} · "
-                f"{out['objects']} object(s) and {out['links']} link(s) written "
-                f"· ledger {commit.entry.id}"
-            ),
-        )
-        request.graph_ref = written.get("request_ref", "")
-        for line, ref in zip(request.lines, written.get("line_refs", [])):
-            line.graph_ref = ref
-        request.journal = [JournalEvent.model_validate(e) for e in ctx.record.journal()]
-        self.directory.put(request)
-
-        ctx.event("e1", "ExpenseRecorded", f"emitted on commit · {request.state}")
-        request.journal = [JournalEvent.model_validate(e) for e in ctx.record.journal()]
-        self.directory.put(request)
-
-        log.info(
-            "Expense request recorded",
-            extra={
-                "reimbursementId": request.id, "runId": ctx.record.id,
-                "state": request.state, "amount": request.requested_usd,
-                "lines": len(request.lines), "actor": employee,
-                "reviewRounds": request.review_rounds,
+        if not pairs:
+            return
+        self.dispatcher.emit(
+            CORRECTION_EVENT,
+            {
+                "pairs": pairs,
+                # One expense can carry several receipts, so the document a
+                # pair is about is named on the pair rather than on the run —
+                # see `_correction_pairs`. This is the run-level default for a
+                # single-document submission, which is the common case.
+                "document_id": _primary_document(record),
+                "flow_id": record.flow_id,
+                "flow_version": record.flow_version,
+                "run_id": record.id,
+                "case_ref": record.case_ref or record.id,
+                "task_id": task.id,
+                "decided_by": decision.decided_by,
             },
+            actor=decision.decided_by,
+            case_ref=record.case_ref or record.id,
         )
-        return {
-            "request_id": request.id,
-            "state": request.state,
-            "requested_usd": request.requested_usd,
-            "lines": len(request.lines),
-        }
 
     # -- steps' internals ---------------------------------------------------
 
@@ -1251,7 +1213,7 @@ class ReimbursementService:
                 # the slot still exists so the rest of the flow is unchanged.
                 slots.append(DocumentSlot(
                     document_id=f"doc_inline_{index}",
-                    filename=doc.filename, note=doc.note, hint=doc.hint,
+                    filename=doc.filename, memo=doc.memo, hint=doc.hint,
                 ))
                 continue
             record = self.documents.put_bytes(
@@ -1260,27 +1222,54 @@ class ReimbursementService:
             )
             slots.append(DocumentSlot(
                 document_id=record.id, filename=doc.filename or record.filename,
-                note=doc.note, hint=doc.hint, byte_size=record.byte_size,
+                memo=doc.memo, hint=doc.hint, byte_size=record.byte_size,
                 media_type=record.media_type,
             ))
         return slots
 
     def _extract(
-        self, doc: SubmittedDocument, slot: DocumentSlot, prompt: str
+        self,
+        doc: SubmittedDocument,
+        slot: DocumentSlot,
+        prompt: str,
+        *,
+        hint: str = "",
+        store_regions: bool = True,
     ) -> ReceiptExtraction:
+        """Read one document. `hint` is whatever the caller chose to steer with.
+
+        Taken as a parameter rather than assembled here, and that is the whole
+        fix. This used to build `f"{doc.hint} {doc.memo}"` itself, so the
+        submitter's own sentence was concatenated into the extractor's steering
+        string on every run: `StubReceiptReader` regex-parses that string, so a
+        submitter could type `total=500` into the memo box and extract whatever
+        they liked out of their own receipt. v10 passes `doc.hint` alone — a
+        field no REST body can set — and v9 keeps its historical behaviour,
+        because a shipped version's runs have to replay as they ran.
+
+        `store_regions=False` is v10's, and it is the one thing v10 drops
+        rather than inherits. The only regions any reader on this side produces
+        are the stub's invented geometry (`_regions_for`, labelled synthetic in
+        the reader's own note); the Vertex reader emits none, and there is no
+        locate step for receipts. Persisting them put made-up boxes on a real
+        photograph and drew them on a reviewer's screen as if a model had found
+        something there. Accounts payable's v8 refused exactly this — see
+        `accounts_payable.domain.PayableService._extract`.
+        """
         image = base64.b64decode(doc.content_b64) if doc.content_b64 else None
         # The type the document store already decided, not a second guess. The
         # slot has none only when no store is wired (a unit test, a hint-only
         # run), and then the bytes answer for themselves.
         media_type = slot.media_type or media.sniff(image, doc.filename)
-        # The reader sees the submitter's note as well as the hint: with a real
-        # multimodal extractor the note is genuinely useful context ("the wine
-        # was mine"), and with the stub it is the hint that steers.
-        extraction = self.reader.read(
-            image, doc.filename, f"{doc.hint} {doc.note}".strip(),
-            prompt=prompt, media_type=media_type,
-        )
-        if self.documents is not None and extraction.regions:
+        # The prompt revision the ledger files this call against — off the
+        # step's own declared read-set, not a second read of the asset. See the
+        # same line in payables for why the second read would be wrong.
+        with modelcall.reading(modelcall.governed_ref(PROMPT_ASSET_ID)):
+            extraction = self.reader.read(
+                image, doc.filename, hint,
+                prompt=prompt, media_type=media_type,
+            )
+        if store_regions and self.documents is not None and extraction.regions:
             self.documents.set_regions(slot.document_id, extraction.regions)
         return extraction
 
@@ -1299,26 +1288,142 @@ class ReimbursementService:
         policy_asset = self.read_policy_content()
         table = routing.parse_routing(policy_asset, default_fallback=REVIEW_QUEUE)
         target = table.target_for(amount_usd, restricted)
+        # No `if self.queues is None` branch, and its absence is the fix rather
+        # than an omission. There was one, and it treated any non-`manager-of`
+        # target as a literal slug — which with the `submitter` resolver would
+        # have minted a shared desk called "submitter" and piled every
+        # submitter's own review into it. `routing.resolve` degrades on an
+        # absent or unreachable registry by itself, onto the policy's own
+        # fallback desk with `fell_back` set, which is the answer the document
+        # already names for a resolver that cannot answer.
         resolved = routing.resolve(
             target,
             submitter_email=employee,
             graph=self.graph,
             queues=self.queues,
             fallback=table.fallback,
+            # No `submitter_name`: this flow holds an address and not a display
+            # name, so the org chart answers it — and where the org chart has
+            # never heard of the person, their address is printed on their own
+            # desk rather than the routing failing over a label.
         )
-        if self.queues is None:
-            # No registry wired (a unit test): the table still decides, and a
-            # resolver that needed one falls back rather than raising.
-            resolved = routing.ResolvedQueue(
-                queue=table.fallback if target == routing.MANAGER_OF else target,
-                target=target,
-                fell_back=target == routing.MANAGER_OF,
-                explanation=f"routed to '{target}' by the governed table",
-            )
         return ResolvedDesk(
             queue=resolved.queue, target=resolved.target,
             explanation=resolved.explanation, fell_back=resolved.fell_back,
             amount_usd=amount_usd, restricted=restricted,
+        )
+
+    def _build_confirm_task(
+        self,
+        record: RunRecord,
+        lines: list[ExpenseLine],
+        slots: list[DocumentSlot],
+        extractions: list[ReceiptExtraction],
+        escalations: list[Escalation],
+        policy: PolicyValues,
+        round_number: int,
+        employee: str,
+        routed: ResolvedDesk,
+    ) -> Task:
+        """v10's gate: the submitter confirming what the model read.
+
+        Raised on **every** run, which is what makes it a different task from
+        v9's. v9 asked somebody else, and only when a check fired, so its title
+        led with the exception and its summary explained the escalation. Here
+        the question is always the same one — *are these the numbers on your
+        receipt?* — and the Rule's findings are context on the answer rather
+        than the reason for asking. A person who is told "confirm this" and a
+        person who is told "this was flagged" read the same screen differently,
+        and only one of those two sentences is true of every run.
+
+        The proposal carries one row per document (§4's contract): the stored
+        artifact, the submitter's own memo about it, and the extraction summary
+        for it. The lines themselves are on the request row the screen already
+        reads, unchanged from v9 — a second copy on the Task would be the same
+        facts able to disagree with themselves.
+        """
+        total = round(sum(line.requested_usd for line in lines), 2)
+        title_vendor = lines[0].vendor if lines else "expense"
+        kinds = sorted({e.kind for e in escalations})
+        return Task(
+            # Named for the step that raised it, suffix and all, so a journal
+            # row and a Task id read as the same event rather than as two.
+            id=f"task_{record.id}_k1_{round_number}",
+            kind="decision",
+            title=f"Confirm your expense: {title_vendor} ${total:,.2f}",
+            summary=(
+                "Check what was read off your receipt"
+                + ("s" if len(slots) > 1 else "")
+                + ". Correct anything that is wrong — an amount, a category, a "
+                "missing purpose — or split a receipt into several lines. "
+                + (
+                    "Worth a second look: "
+                    + "; ".join(e.detail for e in escalations)
+                    + "."
+                    if escalations
+                    else "Nothing was flagged against the governed policy."
+                )
+            ),
+            queue=routed.queue,
+            #: Who the case is *about*, first-class rather than display text in
+            #: an evidence row. Here it is also who the Task was routed to, and
+            #: that coincidence is the point of the version.
+            subject_email=employee,
+            priority="high" if total > policy.limit_usd * 5 else "normal",
+            flow_id=FLOW_ID,
+            run_id=record.id,
+            case_ref=record.case_ref or record.id,
+            refs=[policy.source_ref]
+            + [f"document:{slot.document_id}" for slot in slots]
+            + [f"queue:{routed.queue}"],
+            evidence=[
+                TaskEvidence(label="Submitted by", value=employee),
+                TaskEvidence(label="Documents", value=str(len(slots))),
+                TaskEvidence(label="Lines", value=str(len(lines))),
+                TaskEvidence(label="Requested", value=f"${total:,.2f}"),
+                TaskEvidence(
+                    label="Document total",
+                    value=f"${sum(line.document_total_usd for line in lines):,.2f}",
+                ),
+                TaskEvidence(
+                    label="Why elevated",
+                    value=", ".join(kinds) if kinds else "nothing flagged",
+                ),
+                TaskEvidence(
+                    label="Auto-approval limit",
+                    value=f"${policy.limit_usd:,.2f} (governed)",
+                ),
+                TaskEvidence(label="Routed", value=routed.explanation),
+                TaskEvidence(label="Review round", value=str(round_number)),
+            ],
+            proposal=TaskProposal(
+                action="record-expense",
+                target="expense-records",
+                summary=f"Record {record.case_ref or record.id} as approved",
+                # One row per document. `fields` is untyped by contract — the
+                # flow that raised the Task is the only thing that reads it —
+                # and what this flow puts there is the evidence beside its
+                # reading, which is the pairing the confirm screen is for.
+                fields=[
+                    {
+                        "document_id": slot.document_id,
+                        "filename": slot.filename,
+                        "memo": slot.memo,
+                        "extraction": {
+                            "vendor": extraction.vendor,
+                            "date": extraction.date,
+                            "total_usd": extraction.total_usd,
+                            "category": extraction.category,
+                            "confidence": extraction.confidence,
+                        },
+                    }
+                    for slot, extraction in zip(slots, extractions)
+                ],
+            ),
+            resumes=(
+                f"this run resumes at k1_{round_number} and re-runs the check"
+            ),
+            created_at_iso=utcnow().isoformat(),
         )
 
     def _build_review_task(
@@ -1396,12 +1501,12 @@ class ReimbursementService:
 
         source = f"flow:{FLOW_ID}"
         employee_obj = graph.upsert(
-            "Employee", request.employee,
+            onto.EMPLOYEE, request.employee,
             [Claim(field="email", value=request.employee, source=source)],
             label=request.employee, provenance=f"seen submitting {request.id}",
         )
         request_obj = graph.upsert(
-            "ExpenseRequest", request.run_id or request.id,
+            onto.EXPENSE_REQUEST, request.run_id or request.id,
             [
                 Claim(field="submitted_at", value=request.submitted_at_iso, source=source),
                 Claim(field="commentary", value=request.commentary, source=source),
@@ -1437,7 +1542,7 @@ class ReimbursementService:
             line_obj = graph.upsert(
                 # Keyed off the run rather than the request object's generated
                 # id, so a person — or an eval expectation — can write it.
-                "ExpenseLine", f"{request.run_id or request.id}#{line.ordinal}",
+                onto.EXPENSE_LINE, f"{request.run_id or request.id}#{line.ordinal}",
                 [
                     Claim(field="vendor", value=line.vendor, source=line_source),
                     Claim(field="date", value=line.date, source=line_source),
@@ -1465,7 +1570,7 @@ class ReimbursementService:
             links += 1
             if line.document_id:
                 document_obj = graph.upsert(
-                    "Document", line.document_id,
+                    onto.DOCUMENT, line.document_id,
                     [
                         Claim(field="kind", value="receipt", source=source),
                         Claim(
@@ -1494,7 +1599,7 @@ class ReimbursementService:
 
         if decided_by:
             decider = graph.upsert(
-                "Employee", decided_by,
+                onto.EMPLOYEE, decided_by,
                 [Claim(field="email", value=decided_by, source=source)],
                 label=decided_by, provenance=f"decided {request.id}",
             )
@@ -1536,22 +1641,8 @@ class ReimbursementService:
             return existing
 
         inputs = record.inputs
-        stored = record.step("s1")
-        slots = [
-            DocumentSlot.model_validate(s) for s in (stored.output or [])
-        ] if stored else []
-
-        # The newest projection of the lines wins: after a correction the facts
-        # live in the round's `apply-correction` step, and showing the original
-        # extraction would tell a reviewer their edit vanished.
-        lines: list[ExpenseLine] = []
-        for step_id in [
-            f"x{2 + n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)
-        ] + ["x2"]:
-            step = record.step(step_id)
-            if step is not None and step.output:
-                lines = [ExpenseLine.model_validate(line) for line in step.output]
-                break
+        slots = _slots_of(record)
+        lines = _lines_of(record)
 
         # Likewise the newest Rule pass: an escalation the reviewer already
         # resolved is not why the run is still waiting.
@@ -1566,11 +1657,7 @@ class ReimbursementService:
         decided_gates = [
             s for s in record.steps if s.kind == "task" and s.decision
         ]
-        policy_step = record.step("x1")
-        policy = (
-            PolicyValues.model_validate(policy_step.output)
-            if policy_step and policy_step.output else PolicyValues()
-        )
+        policy = _policy_of(record)
         state: ReimbursementState = (
             "pending" if record.status in ("running", "suspended")
             else ("denied" if record.status == "failed" else "approved")
@@ -1613,6 +1700,208 @@ def _clip(text: str, limit: int = 90) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reading a run's journal — shared by the projection and the flywheel
+# ---------------------------------------------------------------------------
+#
+# Two shipped versions number their transforms differently (v9 projects lines at
+# `x2` and reads the policy at `x1`; v10 projects at `x1` and reads all its
+# governed knowledge at `x0`), and both are read back here. So these ask *what a
+# step produced* rather than *which step it was*: the newest step whose output is
+# a list of lines is the newest projection of the facts, in either version, and a
+# version table keyed on `record.flow_version` would be a third place for the
+# same arithmetic to be got wrong. Correction rounds own `x3`–`x5` in both.
+
+
+def _step_output(record: RunRecord, step_id: str) -> dict:
+    step = record.step(step_id)
+    output = step.output if step is not None else None
+    return output if isinstance(output, dict) else {}
+
+
+def _slots_of(record: RunRecord) -> list[DocumentSlot]:
+    stored = record.step("s1")
+    if stored is None or not isinstance(stored.output, list):
+        return []
+    return [DocumentSlot.model_validate(slot) for slot in stored.output]
+
+
+def _lines_of(record: RunRecord) -> list[ExpenseLine]:
+    """The newest projection of the facts this run is working from.
+
+    Newest first: after a correction the facts live in that round's
+    `apply-correction` step, and showing the original extraction would tell a
+    reviewer their edit vanished.
+    """
+    for step_id in _PROJECTION_STEPS:
+        step = record.step(step_id)
+        if step is None or not isinstance(step.output, list) or not step.output:
+            continue
+        try:
+            return [ExpenseLine.model_validate(line) for line in step.output]
+        except Exception:  # noqa: BLE001 — a step of some other shape, not an error
+            continue
+    return []
+
+
+#: Where each shipped version leaves its facts, newest first. v10 suffixes its
+#: correction rounds (`x3_1`…) as accounts payable does; v9 numbered them along
+#: (`x3`, `x4`, `x5`). The base projection is v9's `x2` and v10's `x1`, and the
+#: `isinstance(output, list)` guard above is what keeps v10's `x2` — a resolved
+#: desk, a dict — from being read as a set of lines.
+_PROJECTION_STEPS: tuple[str, ...] = tuple(
+    [f"x3_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)]
+    + [f"x{2 + n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)]
+    + ["x2", "x1"]
+)
+
+
+def _policy_of(record: RunRecord) -> PolicyValues:
+    """The governed values this run judged its lines against.
+
+    v9 reads them into `x1` on their own; v10 reads them at `x0` beside the
+    prompt and the routing table, under a `policy` key. Both are tried, and a
+    run that has not reached either yet gets the defaults — which is what a row
+    projected mid-flight has always shown.
+    """
+    for step_id in ("x1", "x0"):
+        payload = _step_output(record, step_id)
+        if not payload:
+            continue
+        if "policy" in payload:
+            payload = payload["policy"] or {}
+        try:
+            return PolicyValues.model_validate(payload)
+        except Exception:  # noqa: BLE001 — a partial run is not an error
+            continue
+    return PolicyValues()
+
+
+def _primary_document(record: RunRecord) -> str:
+    slots = _slots_of(record)
+    return slots[0].document_id if slots else ""
+
+
+def _flagged_ordinals(record: RunRecord) -> set[int]:
+    """Which lines the newest check pass raised something about.
+
+    The newest, because an escalation the submitter already answered is not
+    what the run is still saying about the facts. Read off the Rule's own
+    output rather than off the Task, so it is the check's answer and not a
+    rendering of it.
+    """
+    for step in reversed(record.steps):
+        if step.kind != "rule" or not isinstance(step.output, dict):
+            continue
+        return {
+            int(item.get("line_ordinal") or 0)
+            for item in step.output.get("escalations", [])
+            if int(item.get("line_ordinal") or 0)
+        }
+    return set()
+
+
+# ---------------------------------------------------------------------------
+# The flywheel's pairs
+# ---------------------------------------------------------------------------
+
+
+def _correction_pairs(
+    lines: list[ExpenseLine], payload: dict, flagged: set[int] | None = None
+) -> list[dict]:
+    """The raw→corrected pairs one decision produced, in line order.
+
+    The raw side comes off the lines the person was *shown* — the projection
+    the gate suspended on — so a pair is a claim about what the model read even
+    when nothing had flagged the field. A submitter who quietly fixes a total
+    nobody doubted is the most interesting row in the set: it is a miss the
+    confidence score did not catch.
+
+    Paths are the canonical fact paths for this flow, keyed the way accounts
+    payable keys its own (`invoice.total_usd`, `line_items[2].amount_usd`) so
+    the two sides of the correction set can be read by one tool: zero-based
+    index, dotted field. `add_lines` produce no pairs — a line the extraction
+    missed entirely has no raw side to pair against, and inventing an empty one
+    would teach a future prompt that the model had read a blank.
+    """
+    by_ordinal = {line.ordinal: line for line in lines}
+    pairs: list[dict] = []
+    for patch in payload.get("lines") or []:
+        ordinal = int(patch.get("ordinal", 0) or 0)
+        line = by_ordinal.get(ordinal)
+        if line is None:
+            continue
+        for field in _CORRECTABLE_FIELDS:
+            if field not in patch or patch[field] is None:
+                continue
+            corrected = _render(patch[field])
+            raw = _render(getattr(line, field, ""))
+            # An emptied field is not read as a correction — the same rule
+            # `apply_correction` applies. "Delete what the model read" is a
+            # real thing somebody might mean and a blank input is not evidence
+            # they meant it.
+            if not corrected.strip() or _same_value(raw, corrected):
+                continue
+            pairs.append({
+                "path": f"expense.lines[{ordinal - 1}].{field}",
+                "label": f"Line {ordinal} {field.replace('_', ' ')}",
+                "raw": raw,
+                "corrected": corrected,
+                # What the check had said about this line before the person
+                # answered, so a later pass can ask the question that matters:
+                # were the lines we flagged the lines that were actually
+                # wrong? A pair with an empty status is the interesting one —
+                # a value nobody doubted and the submitter fixed anyway.
+                "status": "flagged" if line.ordinal in (flagged or set()) else "",
+                "confidence": line.confidence,
+                # Which receipt the pair is about. One expense can carry
+                # several, so it rides the pair rather than the run.
+                "document_id": line.document_id,
+            })
+    return pairs
+
+
+#: The fields a correction can move that are worth a pair. `document_id` is a
+#: re-filing rather than a re-reading, and `purpose` is something the model was
+#: never asked for — neither teaches an extractor anything about a receipt.
+_CORRECTABLE_FIELDS: tuple[str, ...] = (
+    "vendor", "date", "category", "description", "document_total_usd",
+    "requested_usd",
+)
+
+
+def _render(value: object) -> str:
+    """One value as a person would have typed it.
+
+    Strings on both sides of a pair: a correction is what somebody wrote, and
+    coercing "4,182.50" to a float here would make the pair a record of this
+    code's parsing rather than of their answer.
+    """
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{float(value):.2f}"
+    return str(value or "")
+
+
+def _same_value(raw: str, corrected: str) -> bool:
+    """Whether these two are the same answer, punctuation aside.
+
+    Numerically when both sides are numbers, because `1200` and `1200.00` are
+    one value and a correction set full of reformattings is one nobody can
+    learn from.
+    """
+    if raw.strip() == corrected.strip():
+        return True
+    try:
+        return abs(
+            float(raw.replace(",", "").replace("$", ""))
+            - float(corrected.replace(",", "").replace("$", ""))
+        ) < 0.005
+    except ValueError:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Pure transforms — no I/O, so they are testable and replay-safe
 # ---------------------------------------------------------------------------
 
@@ -1641,9 +1930,9 @@ def project_lines(
             category=extraction.category, amount_usd=extraction.total_usd,
             confidence=extraction.confidence,
         )]
-        note_claim = parse_requested_amount(slot.note)
+        note_claim = parse_requested_amount(slot.memo)
         purpose = ""
-        for text in (slot.note, commentary):
+        for text in (slot.memo, commentary):
             if looks_like_purpose(text):
                 purpose = text.strip()
                 break
@@ -1662,7 +1951,13 @@ def project_lines(
                 vendor=candidate.vendor or extraction.vendor,
                 date=candidate.date or extraction.date,
                 category=candidate.category,
-                description=candidate.description,
+                # The submitter's own memo about this receipt, where the
+                # extraction described nothing. It is the only place their
+                # words land on a fact — and it is why the memo needs no other
+                # channel into the run: it is read for a stated claim above,
+                # read for a purpose above, and shown here. What it must never
+                # be is the extractor's steering string, which is what it was.
+                description=candidate.description or _clip(slot.memo, 120),
                 document_total_usd=document_total,
                 requested_usd=requested,
                 purpose=purpose,

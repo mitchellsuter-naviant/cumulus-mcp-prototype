@@ -274,6 +274,23 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
                       "Employee carries one: a worker row names its "
                       "department by id, and the slug it keys on is derived "
                       "from a name the delta may not have carried"),
+            # Beside `external_id` and deliberately not instead of it. A
+            # department has an id in the system that holds it *and* an
+            # accounting code, the two are not the same string, and a business
+            # that names its crews by the code writes the code — not the id —
+            # in every other system it owns. `erp-jobs` binds
+            # `crew_id → Team` on this field, which is why the fact belongs on
+            # the type: the alternative is a department whose primary id is
+            # the bare string `12`, which is not what an HRIS looks like, and
+            # which would make the join depend on a seeding accident rather
+            # than on something the graph holds.
+            FieldSpec("cost_center", "string",
+                      "the accounting code the HRIS keeps beside the "
+                      "department — and, where a business names a unit by its "
+                      "code, the string another system writes when it means "
+                      "this team. Most departments carry none, and an empty "
+                      "one is perfectly ordinary: nothing may read the "
+                      "absence as a defect"),
         ),
         authoritative=True,
         collection="workforce",
@@ -470,6 +487,15 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
                       "is not a broken link — it resolves, and answers with "
                       "content nobody has read since. Empty for a row we hold "
                       "the bytes of, which has no revisions but its own"),
+            FieldSpec("read_version", "number",
+                      "which revision the `sha256` beside it was taken from. "
+                      "The pair is what makes `has anybody read this file` "
+                      "answerable: a hash alone cannot tell an unread "
+                      "document from one whose owner reissued it, and a "
+                      "reissued invoice — corrected after a dispute, filed at "
+                      "the same id — is exactly the case where reading the "
+                      "hash alone would report a stale reading as a current "
+                      "one"),
         ),
         collection="audit-documents",
         tags=("expenses", "payables", "evidence"),
@@ -1123,6 +1149,477 @@ OBJECT_TYPES: tuple[ObjectType, ...] = (
         ),
         collection="delivery-records",
     ),
+    # ---- the plant floor: what is being built, by whom, on what -----------
+    #
+    # Declared for a discrete manufacturer, not for one of them. A shop that
+    # takes an order, splits it across the departments that make its parts,
+    # schedules a day's work against a crew's capacity, and may not run a
+    # truck or a lift whose paperwork has lapsed, has all four of these types
+    # whatever it builds — which is the standard the ontology is held to: it
+    # grows slowly and generally, and a type named for the customer who asked
+    # for it first is a type the next deployment has to work around.
+    ObjectType(
+        name="Job",
+        label="Job",
+        summary=(
+            "One thing the plant is building: a structure with dimensions, a "
+            "date it has to leave the yard, a crew it is assigned to, and a "
+            "production state made of the departments that still owe work on "
+            "it. Deliberately not a SalesOrder. An order is a commercial "
+            "commitment — what was sold, at what price, to whom — and this is "
+            "the manufacturing one, which has a load date, a hold flag and a "
+            "shop floor. A business that has both should be able to say so "
+            "with an edge, rather than by widening one type until it answers "
+            "neither 'what did we agree to charge' nor 'can we cut it "
+            "tomorrow'."
+        ),
+        natural_key=(
+            "source + job number — source-scoped for the reason an "
+            "opportunity id is: two plants' systems can both issue `250661` "
+            "and mean different buildings"
+        ),
+        fields=(
+            FieldSpec("job_number", "string",
+                      "the number the plant says out loud and files "
+                      "everything under"),
+            FieldSpec("name", "string", "the job's own name at the source"),
+            FieldSpec("customer_name", "string",
+                      "denormalized from job_for, for cheap reads — and the "
+                      "only answer there is until the match is resolved"),
+            # The three plain strings below are landed observations awaiting
+            # promotion, and deliberately not `ref:` fields either: nothing
+            # traverses them yet. `crew_id` is bound to a `Team` by the
+            # Mapping and read back through `assigned_to`; the two display
+            # names are what the source prints, and joining a printed name to
+            # an entity is a fuzzy match with a steward at the end of it. The
+            # day a competency question has to walk one of them, it becomes a
+            # Link — that is the doctrine's rule, and it is why this comment
+            # is here rather than a later reader "fixing" the type.
+            FieldSpec("builder_name", "string",
+                      "the builder of record as the source names them; a "
+                      "landed observation, not yet resolved to a Company"),
+            FieldSpec("plant_site", "string",
+                      "which of the enterprise's plants is building it"),
+            FieldSpec("status", "enum",
+                      "the source's own word for where the job stands — "
+                      "Scheduled | In Progress | … — kept as the source's "
+                      "vocabulary and not reinterpreted into ours"),
+            FieldSpec("load_date", "date",
+                      "when the finished job is due to leave the yard, which "
+                      "is the date every schedule is sequenced by"),
+            FieldSpec("shipment_date", "date",
+                      "when it is due at the site, where the source "
+                      "distinguishes the two"),
+            FieldSpec("week_position", "number",
+                      "which week of the production window the source places "
+                      "it in; 0 when it places it in none"),
+            # The vocabulary here is the governed table's, not this
+            # declaration's, and that ordering is deliberate: the words a
+            # source's flags become are a customer's to edit, so the type
+            # names the shape (one word, from a closed set) and the `##
+            # Source vocabulary` table in `plant-scheduling-parameters` names
+            # the set. Wick's table yields `released` and `not released`;
+            # `held` and `staged` are the words a source that distinguishes
+            # them would map onto, and this deployment's table maps a hold
+            # onto `hold_reason` instead. A flow that wrote `staged` where the
+            # page says `not released` would have translated twice, the second
+            # time invisibly, which is the whole failure this field exists to
+            # avoid.
+            FieldSpec("release_state", "enum",
+                      "one word for whether the floor may build it, derived "
+                      "from the source's own flags by the governed vocabulary "
+                      "table — that table declares the words, and this "
+                      "deployment's are `released` and `not released`"),
+            FieldSpec("hold_reason", "string",
+                      "verbatim, because a hold code is the customer's "
+                      "vocabulary and not ours"),
+            FieldSpec("foreman_name", "string",
+                      "as the source prints it; the display half of a crew "
+                      "reference nobody has resolved yet"),
+            FieldSpec("crew_id", "string",
+                      "the source's crew identifier; bound to a Team by the "
+                      "Mapping"),
+            FieldSpec("shipment_type", "string",
+                      "how it ships, in the source's words — a whole load, a "
+                      "share of one, picked up"),
+            FieldSpec("combined_with", "string",
+                      "the shipment this one consolidates with, as the "
+                      "source names it"),
+            FieldSpec("trailer_number", "string",
+                      "the trailer it is staged onto, where the source holds "
+                      "one"),
+            FieldSpec("width", "number",
+                      "the primary structure's dimensions as the source holds "
+                      "them"),
+            FieldSpec("length", "number"),
+            FieldSpec("height", "number"),
+            FieldSpec("secondary_dimensions", "string",
+                      "dimensions of attached structures the source records "
+                      "separately, kept verbatim because which of them a "
+                      "labor formula sums is a governed decision and not ours"),
+            FieldSpec("upstream_done", "string",
+                      "the production stages the source marks complete, as "
+                      "it names them — department slugs, so a downstream "
+                      "department can ask whether its input exists yet "
+                      "without either side learning the other's spelling"),
+            FieldSpec("documents_complete", "enum",
+                      "yes | no — whether the whole governed set of field "
+                      "documents was found at its latest revision on the "
+                      "last pass. A cached answer to a question the graph can "
+                      "always re-ask, kept because the answer is what a "
+                      "screen filters on"),
+            FieldSpec("packet_label", "string",
+                      "the label the governed naming convention derives for "
+                      "this job's document packet. Claimed rather than "
+                      "computed on read, because the convention has "
+                      "collision rules and the label a crew was actually "
+                      "handed is the one worth being able to look up"),
+            FieldSpec("site_address", "string",
+                      "where it is going, where the source carries it"),
+            FieldSpec("external_id", "string",
+                      "the source's own record id, for the reason every "
+                      "synced type carries one: a sibling row references this "
+                      "job by id and not by number"),
+            FieldSpec("source", "string",
+                      "the feed that landed it — the key is source-scoped, so "
+                      "every lookup has to be too"),
+        ),
+        # The production system owns the job; we mirror it. The alert stamps a
+        # flow writes here — `documents_complete`, `packet_label` — are `flow`
+        # claims on a non-authoritative type, exactly as `Document.sha256` is.
+        authoritative=False,
+        collection="production-records",
+        tags=("jobs", "production", "scheduling"),
+        competency_questions=(
+            "Which jobs are scheduled to load in the next two weeks?",
+            "What is {label}'s production state, and which departments still "
+            "have work on it?",
+            "Which crew is {label} assigned to now, which crews held it "
+            "before, and are its required documents current?",
+        ),
+    ),
+    ObjectType(
+        name="JobTask",
+        label="Job task",
+        summary=(
+            "One department's share of one job: the hours it owes, what the "
+            "hours were computed from, and whether its input is ready. A "
+            "**part** of the job in the strict sense — a `truss-fab` share "
+            "means nothing outside the job that has one, and it dies with it "
+            "— and the unit a day's schedule is actually filled out of. It is "
+            "a type rather than ten columns on `Job` for the ordinary reason: "
+            "hours, a basis, a confidence and a state are facts about the "
+            "share, and a plant that adds a department should be adding rows, "
+            "not a migration."
+        ),
+        natural_key="job key + department slug",
+        fields=(
+            # The department is the `Team` slug and stays a plain string on
+            # purpose: the department's `Team` is reached through
+            # `ScheduleDay.scheduled_by`, so nothing traverses this field, and
+            # a ref field a competency question does not walk is a chip that
+            # buys nothing.
+            FieldSpec("department", "string",
+                      "the department that owes the work, as its Team slug"),
+            FieldSpec("labor_hours", "number",
+                      "what this share is expected to take"),
+            FieldSpec("hours_basis", "string",
+                      "which governed formula produced the hours, and at "
+                      "which asset revision, named so a number can be "
+                      "checked"),
+            FieldSpec("demand_summary", "string",
+                      "what the department is being asked for, in the "
+                      "source's own units — the sentence a supervisor reads "
+                      "beside the hours"),
+            FieldSpec("source_page", "string",
+                      "which page of the source document the demand was read "
+                      "off"),
+            FieldSpec("confidence", "number",
+                      "how sure the extraction was, per share rather than per "
+                      "document: one unreadable grid should not put a whole "
+                      "job in doubt"),
+            FieldSpec("upstream_state", "enum",
+                      "blocked | ready | scheduled | done — whether this "
+                      "share can be worked yet, which is a question about the "
+                      "departments before it and not about this one"),
+            FieldSpec("out_of_band", "enum",
+                      "yes | no — whether the computed hours fall outside the "
+                      "governed expected band for this department. A verdict "
+                      "carried on the row, so a number a person accepted "
+                      "anyway still reads as unusual six months later"),
+        ),
+        collection="production-records",
+    ),
+    ObjectType(
+        name="ScheduleDay",
+        label="Schedule day",
+        summary=(
+            "One department's work for one day: the rows it will run, the "
+            "hours they add to, the capacity limits that stopped the fill, "
+            "and who approved it. **The one authoritative type here, and the "
+            "load-bearing claim of the whole design:** Cumulus is the system "
+            "of record for a plant schedule, because nothing else is. A "
+            "schedule that lives in a spreadsheet is not a record of anything "
+            "— it cannot be asked what it deferred, it cannot say who signed "
+            "it, and it is overwritten every morning. Declaring it "
+            "authoritative here is what makes the day's approval a control "
+            "point rather than a formality, and what makes the exported "
+            "workbook a derivative of the record instead of the record itself."
+        ),
+        natural_key="department slug + date",
+        fields=(
+            # Same reasoning as `JobTask.department`: the Team is reached
+            # through `scheduled_by`, so the slug is a slug.
+            FieldSpec("department", "string",
+                      "whose day this is, as the department's Team slug"),
+            FieldSpec("schedule_date", "date", "the day being scheduled"),
+            FieldSpec("status", "enum",
+                      "proposed | pending_approval | approved | rejected — and "
+                      "the gate is real: nothing leaves the graph as a "
+                      "Dataset before `approved`"),
+            FieldSpec("total_hours", "number", "what the placed rows add to"),
+            FieldSpec("goal_max_hours", "number",
+                      "the governed target the fill stops at"),
+            FieldSpec("abs_max_hours", "number",
+                      "the governed hard stop, which the fudge band may not "
+                      "reach past"),
+            FieldSpec("fudge_hours", "number",
+                      "the governed slack above the goal a fill may use, kept "
+                      "on the day because the number that was in force is "
+                      "part of why the day looks as it does"),
+            FieldSpec("headcount", "number",
+                      "how many people the department actually has, counted "
+                      "off the org chart rather than typed"),
+            FieldSpec("headcount_as_of", "date",
+                      "when the workforce feed last landed; a headcount is "
+                      "only as current as the feed behind it"),
+            FieldSpec("incentive_per_hour", "number",
+                      "computed: the governed starting figure plus the "
+                      "governed rate times the day's hours. Negative until "
+                      "the day clears the threshold"),
+            FieldSpec("approved_by", "string",
+                      "the person whose Task decision approved the day"),
+            FieldSpec("approved_at", "date"),
+            FieldSpec("deferred_count", "number",
+                      "how much candidate work did not fit or was not "
+                      "eligible — reported on the day, because a day that "
+                      "looks comfortable while deferring nine jobs is not "
+                      "comfortable"),
+        ),
+        authoritative=True,
+        collection="production-records",
+        tags=("scheduling", "capacity", "production"),
+        competency_questions=(
+            "Is {label} approved, and who signed it?",
+            "How far is {label} from its goal, and from its absolute maximum?",
+            "What did {label} defer, and why?",
+        ),
+    ),
+    ObjectType(
+        name="ScheduleEntry",
+        label="Schedule entry",
+        summary=(
+            "One row on one department's day: a job, its hours, where it "
+            "falls in the sequence, and who put it there. A **part** of the "
+            "day — its sequence only means anything inside one, and it dies "
+            "with it. `placed_by` is the field that makes the type worth "
+            "having rather than a list on the day: a row a supervisor placed "
+            "by hand and a row the fill computed are the same shape and must "
+            "never be treated the same way, and a re-run that cannot tell "
+            "them apart would quietly undo somebody's judgment."
+        ),
+        natural_key="schedule day key + job number",
+        fields=(
+            FieldSpec("job_number", "string",
+                      "the job this row is about, denormalized from "
+                      "scheduled_for for cheap reads"),
+            FieldSpec("job_label", "string",
+                      "the per-department abbreviation convention's output"),
+            FieldSpec("ticket_number", "string",
+                      "the shop ticket the row is worked against, where the "
+                      "department issues one"),
+            FieldSpec("labor_hours", "number",
+                      "the hours this row contributes to the day's total"),
+            FieldSpec("sequence", "number", "where it falls in the day"),
+            FieldSpec("basis", "string",
+                      "why the row is here and why for these hours — the "
+                      "rule that placed it, named so a supervisor can argue "
+                      "with it"),
+            FieldSpec("row_kind", "enum",
+                      "job | nailing | girts | consolidated | placeholder — "
+                      "not every row on a plant's day is a job, and a "
+                      "consolidated or placeholder row that had to pretend to "
+                      "be one would corrupt every count taken over the day"),
+            FieldSpec("vehicle_ref", "string",
+                      "the truck or trailer a loading row consolidates onto, "
+                      "where the schedule has one"),
+            FieldSpec("placed_by", "enum",
+                      "flow | human — `human` only ever comes from a "
+                      "supervisor's Task correction, and is what the flow "
+                      "must never overwrite"),
+        ),
+        # Authoritative with its owner, and the only part in the model that
+        # is: a row on an approved day is the record of what a department was
+        # told to run, minted here because no other system holds it.
+        authoritative=True,
+        collection="production-records",
+    ),
+    ObjectType(
+        name="Credential",
+        label="Credential",
+        summary=(
+            "One thing a person holds that expires: a certification, a "
+            "licence, a medical card, a clearance, a completed training. "
+            "Deliberately not `Capability`, and the distinction is the whole "
+            "reason for a second type — a capability is a *skill* somebody "
+            "has, with no date on it, and the question it answers is 'who can "
+            "do this'. A credential is a *permission* somebody holds until a "
+            "date, and the question it answers is 'who may still do this next "
+            "month'. Putting an expiry on a capability would make the skills "
+            "catalogue lapse; putting a skill here would make the compliance "
+            "sweep chase things that never expire."
+        ),
+        natural_key=(
+            "source + the source's own record id — one row of training or one "
+            "dated qualification, kept per record rather than per person and "
+            "type, because a renewal is a new record and the history is the "
+            "point"
+        ),
+        fields=(
+            FieldSpec("credential_type", "string",
+                      "what it is, in the issuing system's words"),
+            FieldSpec("category", "enum",
+                      "certification | licence | medical | clearance | "
+                      "training — one type whatever department tracks it, "
+                      "because a thing that expires and gets renewed behaves "
+                      "identically in all five cases"),
+            FieldSpec("holder_email", "string",
+                      "denormalized from holds_credential, for cheap reads"),
+            FieldSpec("assigned_on", "date",
+                      "the original award date, which does not move when a "
+                      "renewal is recorded"),
+            FieldSpec("completed_on", "date",
+                      "when the holder actually satisfied it"),
+            FieldSpec("expires_on", "date",
+                      "the date the permission lapses, and the field every "
+                      "notice stage is computed from"),
+            FieldSpec("result", "enum",
+                      "pass | fail | pending — a training record that exists "
+                      "is not a training record that was passed, and "
+                      "conflating the two is how a matrix reports coverage it "
+                      "does not have"),
+            FieldSpec("provider", "string", "who issued or delivered it"),
+            FieldSpec("status", "enum",
+                      "valid | expiring | expired | withdrawn — derived from "
+                      "the dates against the governed stages, and claimed so "
+                      "a screen can filter on it"),
+            FieldSpec("last_notified_on", "date",
+                      "when somebody was last told about this credential"),
+            FieldSpec("last_notice_stage", "string",
+                      "which governed notice stage was last sent, so a cycle "
+                      "does not repeat one"),
+            FieldSpec("retain_until", "date",
+                      "how long the record is kept after it stops mattering "
+                      "to anybody's roster — a regulator's horizon, and the "
+                      "reason this type is not a part of Employee"),
+            FieldSpec("external_id", "string", "the issuing system's row id"),
+            FieldSpec("source", "string", "the feed that landed it"),
+        ),
+        authoritative=False,
+        collection="compliance-records",
+        tags=("people", "compliance", "credentials"),
+        competency_questions=(
+            "When does {label} expire, and who has been told?",
+            "Whose {label} expires in the next 60 days?",
+        ),
+    ),
+    ObjectType(
+        name="Equipment",
+        label="Equipment",
+        summary=(
+            "A physical asset the business operates and is answerable for: a "
+            "truck, a trailer, a lift, a machine. It earns a type because the "
+            "questions asked of it are asked of the thing and not of a "
+            "department's list — is this unit legal to run today, when is it "
+            "next due, which site is it at — and because an inspection has to "
+            "hang off something with an identity. Deliberately thin: no "
+            "utilization, no hours, no maintenance history beyond the "
+            "inspections that decide whether it may be used. Where a unit is "
+            "at this minute is a fact about a moment, and putting it here "
+            "would make the type wrong the instant it was written."
+        ),
+        natural_key="source + equipment id",
+        fields=(
+            FieldSpec("equipment_id", "string",
+                      "the tag painted on it, and what every other system "
+                      "calls it"),
+            FieldSpec("name", "string", "what people call it"),
+            FieldSpec("category", "enum",
+                      "vehicle | trailer | lift | machine | other"),
+            FieldSpec("make", "string"),
+            FieldSpec("model", "string"),
+            FieldSpec("year", "number"),
+            FieldSpec("identifier", "string",
+                      "VIN, serial, whatever the source keys the physical "
+                      "asset by"),
+            FieldSpec("home_site", "string",
+                      "the site it is based out of, denormalized from "
+                      "operated_by for cheap reads"),
+            FieldSpec("inspection_tracked", "enum",
+                      "yes | no — derived once, on the way in, from whether "
+                      "the source holds a next-due date at all. A machine "
+                      "with a null due date is *not tracked*, which is a fact "
+                      "about the asset and not a gap in the feed, and saying "
+                      "so on the row is what stops a compliance sweep "
+                      "reporting it as overdue forever"),
+            FieldSpec("external_id", "string", "the source's own record id"),
+            FieldSpec("source", "string", "the feed that landed it"),
+        ),
+        authoritative=False,
+        collection="equipment-register",
+        tags=("equipment", "operations", "compliance"),
+        competency_questions=(
+            "When was {label} last inspected, and when is it next due?",
+            "Which equipment at {label}'s site is out of inspection?",
+        ),
+    ),
+    ObjectType(
+        name="Inspection",
+        label="Inspection",
+        summary=(
+            "One dated examination of one piece of equipment, and what it "
+            "found. A **part** of the equipment rather than a type of its "
+            "own: an inspection is identified through the unit it was "
+            "performed on — the same date means nothing without it — it "
+            "cannot exist without one, and there is nothing left to keep once "
+            "the unit is gone. It is also why `Equipment` does not simply "
+            "carry two dates: a unit has a history of inspections, each with "
+            "its own result and its own notice trail, and a pair of columns "
+            "can only ever hold the most recent one."
+        ),
+        natural_key="equipment key + inspection date",
+        fields=(
+            FieldSpec("inspected_on", "date"),
+            FieldSpec("next_due_on", "date",
+                      "when the unit must be looked at again — the field the "
+                      "compliance sweep reads"),
+            FieldSpec("result", "enum",
+                      "pass | fail | conditional — `conditional` is not a "
+                      "flourish: a unit that may be run with a restriction is "
+                      "neither of the other two, and rounding it to `pass` is "
+                      "how a restriction gets lost"),
+            FieldSpec("inspector", "string", "who performed it"),
+            FieldSpec("notes", "string", "what they wrote"),
+            FieldSpec("last_notified_on", "date",
+                      "when somebody was last told this unit is coming due"),
+            FieldSpec("last_notice_stage", "string",
+                      "which governed notice stage was last sent, so a cycle "
+                      "does not repeat one"),
+            FieldSpec("external_id", "string",
+                      "the source's row id for this inspection"),
+        ),
+        collection="compliance-records",
+    ),
 )
 
 LINK_TYPES: tuple[LinkType, ...] = (
@@ -1360,6 +1857,80 @@ LINK_TYPES: tuple[LinkType, ...] = (
              "order sits unreleased. Carries the class, the correlation "
              "confidence, the signals that produced it, the states both rows "
              "held when it was found, and a status the order desk moves"),
+    # ---- the plant floor ---------------------------------------------------
+    #
+    # Declared with the types above, and — like the org-chart and
+    # counterparty edges — ahead of some of their writers: the production,
+    # credential and equipment sync flows are the named triggers. Until those
+    # land these read "0 in the graph", which is the honest state of a promise
+    # nothing has kept yet.
+    LinkType("has_job_task", "Job", "JobTask", "one-to-many",
+             "the department shares of a job — what a day's schedule is "
+             "filled out of, and what makes 'which departments still owe work "
+             "on this' a traversal rather than a scan of ten columns",
+             nature="composition"),
+    LinkType("job_for", "Job", "Company", "many-to-one",
+             "the customer a job is built for. One, and a second is a "
+             "resolution bug rather than two customers sharing a building — "
+             "the fourth edge into the counterparty book, beside `sold_to`, "
+             "`pursued_with` and `delivered_for`"),
+    LinkType("assigned_to", "Job", "Team", "many-to-many",
+             "the crew a job is scheduled with. Many-to-many is doing real "
+             "work here: a job that moves between crews **withdraws** one "
+             "edge — validity ended, never deleted — and draws another, so "
+             "'which crew has it now, and who held it before' is one "
+             "traversal over one record. The pair *is* the reconciliation, "
+             "which is why no periodic job has to go looking for the "
+             "difference"),
+    LinkType("documented_by", "Job", "Document", "many-to-many",
+             "the artifacts a job's facts were read out of — the mirror of "
+             "`evidenced_by_document` on Invoice, and many because a job's "
+             "packet is several documents and each has revisions: the "
+             "superseded edge is withdrawn rather than dropped, so what a "
+             "crew was working from last week is still answerable"),
+    LinkType("job_folder", "Job", "Folder", "many-to-many",
+             "the document-system folders holding this job's artifacts. Many, "
+             "because a plant files the same job under more than one root — "
+             "the office's job documents and the floor's cut sheets are two "
+             "trees with two retention rules — and a packet is then a query "
+             "over these edges rather than a folder somebody has to create, "
+             "copy into and remember to delete"),
+    LinkType("has_schedule_entry", "ScheduleDay", "ScheduleEntry",
+             "one-to-many", "the rows on the day, in sequence",
+             nature="composition"),
+    LinkType("scheduled_for", "ScheduleEntry", "Job", "many-to-one",
+             "the job a row is about. One, and this is the edge that makes a "
+             "schedule auditable: a row whose job cannot be named is a row "
+             "nobody can check the hours of"),
+    LinkType("scheduled_by", "ScheduleDay", "Team", "many-to-one",
+             "the department whose day this is. What turns 'which "
+             "departments is this supervisor responsible for' into a "
+             "traversal, and how the day's headcount is counted — off the "
+             "`member_of` edges of this team, rather than typed in by "
+             "whoever opened the workbook"),
+    # An association on purpose, and the one place in this group where the
+    # distinction is load-bearing. A credential **outlives the currency of
+    # the employment record**: a regulator's retention horizon keeps a
+    # terminated worker's certification on file for years after they leave,
+    # and a composition would say the opposite — that the credential is
+    # identified through the employee, cannot exist without them, and dies
+    # with them. That is exactly what the retention rule forbids, so the edge
+    # is an association between two independent things and `retain_until`
+    # lives on the credential.
+    LinkType("holds_credential", "Employee", "Credential", "one-to-many",
+             "a dated permission this person holds — a certification, a "
+             "licence, a medical card. One holder per credential; several "
+             "credentials per person, and the record of one survives the "
+             "employment it was earned under"),
+    LinkType("has_inspection", "Equipment", "Inspection", "one-to-many",
+             "the dated examinations of this unit, most recent last — the "
+             "history a pair of columns on the unit could not hold",
+             nature="composition"),
+    LinkType("operated_by", "Equipment", "Team", "many-to-one",
+             "the department that runs this unit. How 'which equipment at "
+             "this site is out of inspection' becomes a traversal instead of "
+             "a string match on a home-site column, and how an overdue unit "
+             "finds the person who has to hear about it"),
 )
 
 # Ordered highest-authority first. A human correction outranks every system;
@@ -1408,6 +1979,20 @@ LINK_TYPES: tuple[LinkType, ...] = (
 # filename, which is at least written down when a document is filed. It ranks
 # above `procurement` only because `procurement`'s rows are second-hand
 # supplier records from systems this estate does not run.
+#
+# The plant-floor types above added no authority and needed none, which is
+# worth stating where a reader would go looking for the change. Every claim
+# they carry comes from a source already ranked here: a job, its dimensions
+# and its production flags are the production system's (`erp`), a
+# credential is the HRIS's (`hris`), a filed document is the document
+# system's (`dms`), and the stamps a flow derives — a packet label, a
+# tracked/not-tracked verdict, a computed hour figure — are `flow` claims
+# that should lose to any of them. `erp` already outranks `hris`, `dms`,
+# `flow` and `model`, and `human` already outranks all four, which is the
+# right order for each of those disagreements. A schedule, the one thing
+# Cumulus is the book of record for, is not adjudicated by precedence at
+# all — it is authoritative on the type, and a supervisor's correction to a
+# row arrives as `human` regardless.
 #
 # Both claims are always retained, so this order is a read-time decision: the
 # CRM/ERP disagreement the demo turns on is visible *because* neither claim was
@@ -1665,7 +2250,6 @@ def ontology_asset_fields() -> dict:
         "path": "platform/ontology/enterprise",
         "title": "Enterprise ontology",
         "kind": "schema-export",
-        "scope": "org",
         "owner": "platform-eng",
         "tags": ["ontology", "governed-knowledge", "graph"],
         "status": "published",

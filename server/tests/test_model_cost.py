@@ -23,6 +23,8 @@ backend, `model` is the model, and it reports tokens — is what proves the fix
 on the real flow path.
 """
 
+import base64
+
 import pytest
 
 import app.deps as deps
@@ -36,8 +38,8 @@ from app.flows import (
     usage_series,
 )
 from app.models import AskStep, AssetUpdate
-from app.payables import InvoiceExtraction
-from app.reimbursements import ReceiptExtraction, SubmittedDocument
+from app.tasks.accounts_payable.domain import InvoiceExtraction
+from app.tasks.expense_reimbursement.domain import ReceiptExtraction, SubmittedDocument
 from app.runs import ModelUsage
 from tests import world as test_world
 
@@ -145,6 +147,9 @@ def test_the_ap_step_records_its_model_too(world):
     world.payables.reader = MeteredInvoiceReader()
     record = world.payables.submit(
         submitted_by="ap.clerk@naviant.com", filename="inv.pdf", hint="",
+        # A page to read: from v9 a run with no artifact behind it is refused
+        # before any model is asked anything.
+        image_b64=base64.b64encode(b"%PDF-1.4\n% an invoice\n%%EOF\n").decode(),
     )
     step = model_step(world, record)
     assert step.model == "gemini-3.5-flash-lite"

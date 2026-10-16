@@ -37,7 +37,7 @@ from app.eval_specs import (
     _IDENTITY_ERP_SALES,
     _IDENTITY_ERP_VENDORS,
 )
-from app.sync import SyncRequest
+from app.connectors.sync import SyncRequest
 from app.ui_api import get_identity_principal, get_ui_principal
 from tests import world as test_world
 

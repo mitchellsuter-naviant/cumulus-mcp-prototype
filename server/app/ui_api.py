@@ -29,9 +29,13 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from . import data_collections, deps, flows, payables, personas
+from . import data_collections, deps, desks, flows, personas
+from .tasks.accounts_payable import domain as payables
+from .tasks.credential_tracking import domain as compliance
+from .tasks.department_scheduling import domain as scheduling
+from .tasks.field_documents import domain as packets
 from .auth import (
     Principal,
     get_principal,
@@ -55,9 +59,13 @@ from .identity_sweep import IDENTITY_SWEEP_FLOW_ID, SCANS, SCAN_BY_LINK
 from .mappings import MAPPINGS, Mapping, steward_queue_for_type, validate_mappings
 from .models import utcnow
 from .ontology import ONTOLOGY
-from .order_release import BY_CUMULUS, DISMISSED, EXTERNALLY, read_write_policy
+from .ontology import names as onto
+from .queues import personal_slug
+from .schedule_api import week_dates
+from .tasks.order_release.domain import BY_CUMULUS, DISMISSED, EXTERNALLY, read_write_policy
 from .resolution import read_sweep_thresholds
-from .sync import _slug
+from .task_screens import TaskScreenManifest, build_manifest
+from .connectors.sync import _slug
 
 log = logging.getLogger("cumulus.ui.api")
 
@@ -86,6 +94,8 @@ class PersonaOption(BaseModel):
     #: acting as John Smith" rather than only that impersonation is happening.
     uid: str
     label: str
+    #: The HRIS's title where the graph holds this person, the roster's
+    #: declared one where it does not. See `_titled`.
     title: str
     person: str
     email: str
@@ -101,6 +111,103 @@ class PersonaOption(BaseModel):
 class PersonaGroup(BaseModel):
     label: str
     personas: list[PersonaOption]
+
+
+class WorkspaceAvailability(BaseModel):
+    """Whether this deployment has a workspace at all, and why not when it does not.
+
+    The console used to answer this with compiled booleans — one per
+    workspace, each a second copy of a rule the server already holds. A
+    console shipped against a deployment that does not run the app behind a
+    workspace would draw the stop, fetch it, and render an empty table that
+    reads as "nothing is happening" when the truth is "this estate has no such
+    system". Two facts with opposite meanings, drawn identically.
+
+    So the BFF answers it, from the two things that actually decide it: whether
+    anybody in this deployment's cast holds the desk the workspace *is*, and
+    whether estate discovery says the namespace runs the app it rests on. The
+    reason is written to be shown verbatim, and the second half of it is
+    `_sync_now_refusal`'s own sentence rather than a second one composed here.
+    """
+
+    slug: str
+    available: bool
+    reason: str = ""
+
+
+#: `(slug, desk, estate app, what to call it)` — one row per workspace the rail
+#: can offer. The slug is the console's section slug, so the two halves of a
+#: navigation decision are keyed on one string.
+#:
+#: The app is the system the workspace *rests* on, and empty where there is
+#: none to name: Accounts Payable and Expense Reimbursement are fed by
+#: documents a person uploads as well as by a feed, so a namespace without an
+#: ERP still has an invoice book worth opening. The three plant workspaces are
+#: not: a packet with no document system behind it, a compliance book with no
+#: HRIS and a plant schedule with no production system are each a screen about
+#: rows that cannot exist.
+WORKSPACES: tuple[tuple[str, str, str, str], ...] = (
+    ("expenses", desks.EXPENSE_REVIEW, "", "Expense Reimbursement"),
+    ("payables", desks.AP_CLERK, "", "Accounts Payable"),
+    ("field-documents", desks.FIELD_OPERATIONS, "dms", "Field Documents"),
+    ("compliance", desks.HR_SAFETY, "hris", "Compliance"),
+    ("plant-schedule", desks.PLANT_SUPERVISOR, "erp", "Plant Schedule"),
+)
+
+
+def _cast_holds(desk: str) -> bool:
+    """Does anybody in this deployment's cast hold this desk?
+
+    The cast is namespace-selected, so a Wick deployment declares plant and
+    safety desks and a naviant one does not have to. A workspace whose desk
+    nobody holds is a screen whose Tasks would arrive on a queue with no
+    reader — which is a fact about the deployment and belongs in the answer.
+    """
+    return any(desk in persona.queues for persona in personas.ALL_PERSONAS)
+
+
+def _workspace_availability() -> list[WorkspaceAvailability]:
+    """One answer per workspace, derived once for the session that asked.
+
+    Read through `registration()` for `_estate_view`'s reason — it never
+    raises — and the app half is skipped entirely when no estate is
+    registered. Discovery answering "the namespace does not run that app" and
+    there being no estate to ask are opposite findings, and only the first is
+    a statement about the customer's systems; a deployment running against no
+    estate at all still has every workspace its cast staffs.
+    """
+    view = deps.get_estate_connector().registration()
+    detail = view.get("namespace_detail") or {}
+    apps = {str(app) for app in detail.get("apps") or ()}
+    registered = bool(view.get("registered"))
+    namespace = str(view.get("namespace") or "")
+    discovery_error = str(view.get("discovery_error") or "")
+
+    out: list[WorkspaceAvailability] = []
+    for slug, desk, app, label in WORKSPACES:
+        if not _cast_holds(desk):
+            reason = (
+                f"No persona in this deployment holds the `{desk}` desk, so "
+                f"nothing routes to {label} and nobody would answer it."
+            )
+        elif app and registered:
+            # `may_sync=True` because pulling authority is not what is being
+            # asked here — the two answers wanted are the unreachable estate
+            # and the absent app, in that order, and they are that function's
+            # first two branches. Composing a second sentence for them is how
+            # the console ends up telling an operator two different things
+            # about one finding.
+            reason = _sync_now_refusal(
+                active=app in apps, may_sync=True,
+                discovery_error=discovery_error,
+                namespace=namespace, app=app,
+            )
+        else:
+            reason = ""
+        out.append(WorkspaceAvailability(
+            slug=slug, available=not reason, reason=reason,
+        ))
+    return out
 
 
 class Session(BaseModel):
@@ -126,28 +233,50 @@ class Session(BaseModel):
     #: counterparty desk — and a stop that can only ever 403 is worse than no
     #: stop. See `may_open_identity`.
     may_open_identity: bool
+    #: One entry per workspace the rail can offer — see [WorkspaceAvailability].
+    #: The console builds its Workspaces dropdown from this rather than from a
+    #: compiled boolean per workspace, so a deployment that does not run the
+    #: system behind one says so in a sentence instead of drawing an empty
+    #: table.
+    workspaces: list[WorkspaceAvailability]
     groups: list[PersonaGroup]
 
 
-def _in_workforce(email: str) -> bool:
+def _employee(email: str) -> ObjectRecord | None:
     if not email:
-        return False
-    return get_graph_service().get(object_id("Employee", email)) is not None
+        return None
+    return get_graph_service().get(object_id(onto.EMPLOYEE, email))
+
+
+def _titled(persona: personas.Persona, person: ObjectRecord | None) -> str:
+    """The persona's job title, preferring the one the HRIS actually landed.
+
+    The roster's titles were authored beside the personas and then the HRIS
+    feed started landing real ones — so a promotion in the customer's HR system
+    left the switcher printing last year's job, and a title Naviant made up
+    read as the customer's own record. The declared title is now the fallback
+    it should always have been: it answers on a cold deployment, and it answers
+    for the two Naviant personas, who are deliberately not in the org chart.
+    """
+    if person is None:
+        return persona.title
+    return str(person.props.get("title") or "") or persona.title
 
 
 def _option(p: personas.Persona) -> PersonaOption:
+    person = _employee(p.email)
     return PersonaOption(
         id=p.id,
         uid=p.uid,
         label=p.label,
-        title=p.title,
+        title=_titled(p, person),
         person=p.person,
         email=p.email,
         authority=p.authority,
         scope=p.scope,
         queues=list(p.queues),
         blurb=p.blurb,
-        in_workforce=_in_workforce(p.email),
+        in_workforce=person is not None,
     )
 
 
@@ -175,20 +304,22 @@ def session(principal: Principal = Depends(get_ui_principal)) -> Session:
         or principal.impersonated_by is not None
         or principal.outranks_or_is("owner")
     )
+    signed_in = _employee(principal.email)
     return Session(
         uid=principal.uid,
         email=principal.email,
         persona_id=acting.id if acting else "",
         label=acting.label if acting else principal.email,
         person=acting.person if acting else "",
-        title=acting.title if acting else "",
+        title=_titled(acting, signed_in) if acting else "",
         authority=principal.role,
         scope=principal.scope,
         queues=list(principal.queues),
-        in_workforce=_in_workforce(principal.email),
+        in_workforce=signed_in is not None,
         impersonated_by=principal.impersonated_by,
         may_switch_persona=may_switch,
         may_open_identity=may_open_identity(principal),
+        workspaces=_workspace_availability(),
         groups=[
             PersonaGroup(label=label, personas=[_option(p) for p in group])
             for label, group in personas.GROUPS
@@ -197,14 +328,49 @@ def session(principal: Principal = Depends(get_ui_principal)) -> Session:
 
 
 # ---------------------------------------------------------------------------
-# The Knowledge layer — Ontology, Library, Sources
+# Task screens — the other call the shell makes before a queue is drawn
+# ---------------------------------------------------------------------------
+
+
+@router.get("/task-screens", response_model=TaskScreenManifest)
+def task_screens(
+    principal: Principal = Depends(get_ui_principal),
+) -> TaskScreenManifest:
+    """Which review screen answers which task, resolved against what shipped.
+
+    Not scoped to the reader: this is the deployment's own shape, the same for
+    every persona, and a clerk who can see a task has to be able to open it.
+
+    The console used to decide this from a table compiled into it, alongside
+    its own copy of the "newest package at or below the task's version" rule.
+    That let a console be shipped believing in a version arrangement this
+    server does not have — and let the version rule be corrected on one side
+    only. Both are answered here, where the set of shipped `v<N>/` packages is
+    a fact rather than a belief.
+
+    Every version is listed already resolved, so the client performs no version
+    arithmetic: it looks up the task's version, or takes `fallback` for a
+    version this deployment never shipped.
+    """
+    return build_manifest()
+
+
+# ---------------------------------------------------------------------------
+# The Knowledge layer — Ontology, Library, Data, Systems
 # ---------------------------------------------------------------------------
 #
-# Three screens, three routes. Before this the layer rendered from a five-call
-# fan-out per screen, which fetched the mapping registry three times and the
-# ontology, the invariant report, the Collection registry, the source list and
-# the graph stats twice each on every visit. None of that stitching was a
-# decision; it was the shape of `/api/v1` showing through.
+# Four screens, four routes — four questions. Ontology: what do we know.
+# Library: what must be obeyed. Data: what do we hold, under what policy.
+# Systems: who do we talk to, and on what terms. Before this the layer
+# rendered from a five-call fan-out per screen, which fetched the mapping
+# registry three times and the ontology, the invariant report, the Collection
+# registry, the source list and the graph stats twice each on every visit.
+# None of that stitching was a decision; it was the shape of `/api/v1`
+# showing through.
+#
+# (The Systems screen's route is still spelled `/sources` — the feeds are its
+# spine and the console is the only caller, so the rename is not worth a
+# second spelling while another change is in flight against the client.)
 
 
 def governance_door(surface: str):
@@ -249,6 +415,10 @@ get_library_principal = governance_door(
 )
 get_sources_principal = governance_door(
     "The source registry covers the whole deployment."
+)
+get_data_principal = governance_door(
+    "The data plane is every Collection, document and retention horizon in "
+    "the deployment."
 )
 get_dashboard_principal = governance_door(
     "System state reads every collection, feed, desk and ledger entry at once."
@@ -363,21 +533,27 @@ class OntologyScreen(BaseModel):
 
 def _graph_counts(
     graph: GraphService,
+    *,
+    objects: list[ObjectRecord] | None = None,
+    links: list[LinkRecord] | None = None,
 ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
     """Instances, conflicted instances and edges, in one pass over the store.
 
     `graph.stats()` walks every object and calls `conflicts()` on it already;
     asking it for the totals and then walking again for the per-type conflict
     split would resolve every claim twice for one number.
+
+    A caller holding a pass over the store already may hand it in rather than
+    paying for another; both default to reading the store.
     """
     by_type: dict[str, int] = {}
     conflicted: dict[str, int] = {}
-    for obj in graph.store.objects():
+    for obj in graph.store.objects() if objects is None else objects:
         by_type[obj.type] = by_type.get(obj.type, 0) + 1
         if obj.conflicts():
             conflicted[obj.type] = conflicted.get(obj.type, 0) + 1
     by_link: dict[str, int] = {}
-    for link in graph.store.links():
+    for link in graph.store.links() if links is None else links:
         if link.live:
             by_link[link.type] = by_link.get(link.type, 0) + 1
     return by_type, conflicted, by_link
@@ -408,7 +584,15 @@ def ontology(
     governs anything.
     """
     graph = deps.get_graph_service()
-    by_type, conflicted, by_link = _graph_counts(graph)
+    # One walk of the store, shared. The counts and the conformance sweep both
+    # need every object and every live link, and this route is the only place
+    # that wants both — reading the book twice for one screen is a cost the
+    # tenant pays for nothing.
+    objects = list(graph.store.objects())
+    links = list(graph.store.links())
+    by_type, conflicted, by_link = _graph_counts(
+        graph, objects=objects, links=links
+    )
 
     # One pass decides both the node's cluster and the cluster's membership,
     # so the two can never disagree. A type no Collection claims lands in
@@ -496,7 +680,9 @@ def ontology(
             for p in projections
         ],
         conformance=(
-            len(graph.check_invariants()) if principal.sees_everything else None
+            len(graph.check_invariants(objects=objects, links=links))
+            if principal.sees_everything
+            else None
         ),
     )
 
@@ -509,22 +695,33 @@ def ontology(
 ARTIFACT_WINDOW = 20
 
 
+class ContractIdentity(BaseModel):
+    """One identity binding: which column names which object, by which key."""
+
+    column: str
+    object_type: str
+    key: str
+
+
 class SourceContract(BaseModel):
     """The Mapping a feed lands under — the declared half of the arrangement."""
 
     id: str
     system: str
+    summary: str
     transport: str
     payload: str
     strategy: str
     lands_as: str
     resolves_to: list[str]
+    identity: list[ContractIdentity]
     match_policy: str
     precedence_source: str
     freshness: str
     custody: str
     collection: str
     escalation: str
+    notes: str
 
 
 class SourceArtifact(BaseModel):
@@ -645,9 +842,82 @@ class EstateCard(BaseModel):
     feeds_active: int
 
 
+class WriteTransition(BaseModel):
+    """One legal move: from the value the estate holds, to the values we may set."""
+
+    from_value: str
+    to_values: list[str]
+
+
+class WritableTargetView(BaseModel):
+    """One row of the `WRITABLE` table — every write this system can make."""
+
+    id: str
+    app: str
+    resource: str
+    field: str
+    action: str
+    transitions: list[WriteTransition]
+
+
+class WriteJournalRow(BaseModel):
+    """One outbound write, from intent to however it settled.
+
+    The journal's own fields, unre-derived: a row here may be the only
+    surviving statement that Cumulus changed somebody's data, and the screen
+    quotes it rather than reconstructing it from runs that may not exist.
+    """
+
+    id: str
+    target: str
+    app: str
+    resource: str
+    record_id: str
+    field: str
+    observed: str
+    value: str
+    state: str
+    verified: str
+    action: str
+    run_id: str
+    actor: str
+    intended_at: str
+    settled_at: str
+    error: str
+    echo_pulls: int
+
+
+class WritePlane(BaseModel):
+    """What Cumulus may change out there, and everything it ever has.
+
+    On the Systems screen because it is the other half of the terms a
+    registered system is talked to on: the feeds are what it tells us, the
+    table is what we may tell it, and the journal is what we actually said.
+    """
+
+    #: Whether the live door exists at all. Off means the writer holds no
+    #: callable that could reach a network — not a polite refusal in front
+    #: of one that could.
+    enabled: bool
+    targets: list[WritableTargetView]
+    journal: list[WriteJournalRow]
+    #: What the window is a window onto, `artifacts_total`'s way.
+    journal_total: int
+    #: Rows the estate may be holding that the graph has not yet seen come
+    #: home — `applied` and `unverified`, what the echo pass walks.
+    open_writes: int
+
+
+#: Journal rows shipped to the screen. The table is a closed set and the
+#: journal grows one row per decision, so the window is generous — but it is
+#: still a window, and the total says so.
+WRITE_JOURNAL_WINDOW = 50
+
+
 class SourcesScreen(BaseModel):
     sources: list[SourceRow]
     estate: EstateCard
+    writes: WritePlane
     #: Mappings naming a type or Collection that does not exist. Same reading
     #: as `conformance`, and withheld from a tenant for the same reason.
     problems: list[str] | None
@@ -712,14 +982,61 @@ def _contract(mapping: Mapping | None) -> SourceContract | None:
     if mapping is None:
         return None
     return SourceContract(
-        id=mapping.id, system=mapping.system,
+        id=mapping.id, system=mapping.system, summary=mapping.summary,
         transport=mapping.transport, payload=mapping.payload,
         strategy=mapping.strategy, lands_as=mapping.lands_as,
         resolves_to=list(mapping.resolves_to),
+        identity=[
+            ContractIdentity(
+                column=b.column, object_type=b.object_type, key=b.key
+            )
+            for b in mapping.identity
+        ],
         match_policy=mapping.match_policy,
         precedence_source=mapping.precedence_source,
         freshness=mapping.freshness, custody=mapping.custody,
         collection=mapping.collection, escalation=mapping.escalation,
+        notes=mapping.notes,
+    )
+
+
+def _write_plane() -> WritePlane:
+    """The outbound half of the screen: the table, and the journal against it.
+
+    Read off the writer's own journal rather than a run store — see
+    `EstateWriteRecord`: the row this surface exists for is the one whose run
+    died between the PATCH and its own bookkeeping.
+    """
+    from .estate_writes import OPEN_STATES, WRITABLE
+
+    entries = deps.get_estate_writer().journal.list()
+    entries.sort(key=lambda e: e.intended_at, reverse=True)
+    return WritePlane(
+        enabled=settings.estate_writes_enabled,
+        targets=[
+            WritableTargetView(
+                id=t.id, app=t.app, resource=t.resource, field=t.field,
+                action=t.action,
+                transitions=[
+                    WriteTransition(from_value=k, to_values=list(v))
+                    for k, v in t.transitions.items()
+                ],
+            )
+            for t in WRITABLE
+        ],
+        journal=[
+            WriteJournalRow(
+                id=e.id, target=e.target, app=e.app, resource=e.resource,
+                record_id=e.record_id, field=e.field, observed=e.observed,
+                value=e.value, state=e.state, verified=e.verified,
+                action=e.action, run_id=e.run_id, actor=e.actor,
+                intended_at=e.intended_at, settled_at=e.settled_at,
+                error=e.error, echo_pulls=e.echo_pulls,
+            )
+            for e in entries[:WRITE_JOURNAL_WINDOW]
+        ],
+        journal_total=len(entries),
+        open_writes=sum(1 for e in entries if e.state in OPEN_STATES),
     )
 
 
@@ -886,6 +1203,7 @@ def sources(
     return SourcesScreen(
         sources=_source_rows(pulls),
         estate=estate,
+        writes=_write_plane(),
         problems=validate_mappings() if principal.sees_everything else None,
     )
 
@@ -897,16 +1215,15 @@ def sync_source_now(
 ) -> SyncNowOutcome:
     """Pull one feed now, and answer with the row the screen redraws.
 
-    Gated on `admin` because that is what `POST /api/v1/estate/feeds/{feed}/
-    sync-now` gates on — this proxies that act, and a console door that let a
-    weaker principal through would be a second, quieter authorization policy.
-    The answer is also given in advance: `PullState.sync_now_allowed` tells the
-    screen not to draw the control, so a persona that may not pull reads a
-    sentence rather than pressing a button that refuses.
+    The only door onto an on-demand pull, and gated on `admin` because a pull
+    writes through the delivery door. The answer is also given in advance:
+    `PullState.sync_now_allowed` tells the screen not to draw the control, so a
+    persona that may not pull reads a sentence rather than pressing a button
+    that refuses.
 
-    The pull itself is `estate_api.pull_feed_now` — the same function the
-    machine route calls, so the 404/400/502 an operator gets is the same
-    refusal whichever door they came through. What this route adds is the row.
+    The pull itself is `estate_api.pull_feed_now`, which owns the act's three
+    refusals — 404 for a feed nobody registers, 400 for no estate at all, 502
+    for an estate that is down. What this route adds is the row.
     """
     require_role(principal, "admin")
     outcome = pull_feed_now(source, principal.uid)
@@ -937,7 +1254,6 @@ class LibraryRow(BaseModel):
     kind: str
     origin: str
     authority_level: str | None
-    scope: str
     owner: str
     tags: list[str]
     status: str
@@ -979,7 +1295,7 @@ def library(
         rows.append(LibraryRow(
             id=asset.id, path=asset.path, title=asset.title, kind=asset.kind,
             origin=asset.origin, authority_level=asset.authority_level,
-            scope=asset.scope, owner=asset.owner, tags=list(asset.tags),
+            owner=asset.owner, tags=list(asset.tags),
             status=asset.status, revision=asset.revision,
             updated_at_iso=asset.updated_at.isoformat(),
             reads=used.reads if used else 0,
@@ -992,6 +1308,107 @@ def library(
             ),
         ))
     return LibraryScreen(days=days, assets=rows)
+
+
+# ---- Data --------------------------------------------------------------------
+
+
+class DataCollectionRow(BaseModel):
+    """One Collection: what it holds, under what policy, counted honestly.
+
+    The registry's own declaration joined with a live count — `rows` is
+    `None`, deliberately not zero, when the store cannot be counted honestly,
+    and the screen draws the two differently.
+    """
+
+    id: str
+    name: str
+    summary: str
+    role: str  # data · knowledge
+    kind: str
+    origin: str
+    container: str
+    custody: str
+    retention: str
+    retention_note: str
+    authoritative: bool
+    legal_hold: bool
+    object_types: list[str]
+    written_by: list[str]
+    read_by: list[str]
+    rows: int | None
+    rows_caption: str
+
+
+class DataScreen(BaseModel):
+    """What we hold, and under what policy — the custody half of the layer.
+
+    The Systems screen answers "who do we talk to"; this one answers "what do
+    we keep". The Collections carry the governance (retention, custody,
+    authoritativeness — properties of a *set*, never a row), and the expiring
+    list is the retention policy read back against what is actually held.
+    """
+
+    collections: list[DataCollectionRow]
+    #: Stored artifacts, and their bytes — the audit-documents store's own
+    #: numbers, not a re-count.
+    documents: int
+    stored_bytes: int
+    #: Past their Collection's retention horizon. Reported, not swept: the
+    #: purge pass is not built, and `purge_built` says so rather than letting
+    #: an empty list imply enforcement.
+    expiring: list[SourceArtifact]
+    expiring_total: int
+    purge_built: bool
+
+
+#: Expiring documents shipped to the screen, `ARTIFACT_WINDOW`'s way.
+EXPIRING_WINDOW = 50
+
+
+@router.get("/data", response_model=DataScreen)
+def data(principal: Principal = Depends(get_data_principal)) -> DataScreen:
+    """Every Collection against its live count, and retention read back.
+
+    The declarations come from the registry (`data_collections.COLLECTIONS`)
+    and the counts from the stores that actually hold the rows — the same
+    join `/api/v1/collections` makes, composed here with the document store's
+    stats so the screen is one call.
+    """
+    from .data_api import _live_counts
+
+    counts = _live_counts()
+    collections = [
+        DataCollectionRow(
+            id=c.id, name=c.name, summary=c.summary, role=c.role, kind=c.kind,
+            origin=c.origin, container=c.container, custody=c.custody,
+            retention=c.retention, retention_note=c.retention_note,
+            authoritative=c.authoritative, legal_hold=c.legal_hold,
+            object_types=list(c.object_types),
+            written_by=list(c.written_by), read_by=list(c.read_by),
+            rows=counts.get(c.id, (None, ""))[0],
+            rows_caption=counts.get(c.id, (None, ""))[1],
+        )
+        for c in data_collections.COLLECTIONS
+    ]
+    stats = deps.get_document_service().stats()
+    expiring = deps.get_document_service().expiring()
+    return DataScreen(
+        collections=collections,
+        documents=int(stats.get("documents", 0)),
+        stored_bytes=int(stats.get("stored_bytes", 0)),
+        expiring=[
+            SourceArtifact(
+                id=d.id, filename=d.filename, kind=d.kind,
+                uploaded_at_iso=d.uploaded_at_iso,
+                region_count=d.region_count,
+                retention_until_iso=d.retention_until_iso,
+            )
+            for d in expiring[:EXPIRING_WINDOW]
+        ],
+        expiring_total=len(expiring),
+        purge_built=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2895,94 +3312,35 @@ def dashboard(
 
 
 # ---------------------------------------------------------------------------
-# Accounts Payable — the workspace, its composer, and one submission
+# Accounts Payable — the workspace and one submission
 # ---------------------------------------------------------------------------
 #
-# The screen used to ask a clerk to type `vendor=acme-industrial total=1840
-# invoice=ACME-INV-20881 po=PO-7741` into a free-text box, which is developer
-# scaffolding wearing a business screen's clothes. The string was never the
-# problem — it is the case-authoring language of the flow, and it drives the
-# seeded world and the eval triggers as well as a manual submission. What was
-# wrong was where it came from.
+# The screen used to compose an invoice: pick a vendor, pick one of its orders,
+# step the quantities, tick a deviation, and the console serialized the choices
+# into the hint string a stub extractor reads. Every control was a real graph
+# row, and it was still an invoice nobody had written and no model had read —
+# a request path that could manufacture an extraction out of a form.
 #
-# So the composer is served from here: every control is a real row out of the
-# graph — the vendor master, that vendor's purchase orders, that order's lines
-# — and the string is *generated* from the choices. You learn the vocabulary by
-# watching it assemble, which is the one thing reading `payables.py` gives you
-# and a text field never could.
+# What is left is the one door that carries evidence: an upload. Real bytes go
+# into the document store, the ModelCall reads the page, and the screen names
+# the extractor that will do it — because with `MODEL_BACKEND` set to the stub
+# that reader still reads the *filename*, and a person is owed that fact before
+# they draw a conclusion from what comes back. Invoices in a deployed estate do
+# not arrive here at all: they arrive through `ap-intake`, out of the folders
+# the customer files them in.
 
 
-class ComposerSource(BaseModel):
-    """One external system's id for a vendor. The reason a vendor is an entity
-    rather than a slug, shown where choosing one is the reason you care."""
+class SubmissionPanel(BaseModel):
+    """What the submission door needs to say for itself.
 
-    source: str
-    external_id: str
-    live: bool
-
-
-class ComposerLine(BaseModel):
-    """A line a composed invoice can bill, as the graph holds it."""
-
-    sku: str
-    description: str
-    unit_price_usd: float
-    #: What the purchase order ordered. The quantity stepper defaults here, so
-    #: the un-touched composition is the invoice that matches exactly.
-    quantity_ordered: float = 1.0
-    #: What the receiving reports booked in, summed over this order's receipts.
-    #: Carried so "bill more than was received" is visible rather than a
-    #: promise: `-1` means nothing has been received against this line yet.
-    quantity_received: float = -1.0
-
-
-class ComposerOrder(BaseModel):
-    po_number: str
-    status: str
-    ref: str
-    lines: list[ComposerLine]
-    receipts: list[str]
-
-
-#: A purchase order nothing more can be billed against. The composer offers the
-#: complement and the vendor card counts it, so "N open PO(s)" is a count of
-#: orders that are open — it used to include the closed and the fully-billed,
-#: which made the number and the word disagree on every vendor.
-#:
-#: Named as the closed set rather than the open one because the ERP's
-#: vocabulary is the source's and grows: a status this deployment has not seen
-#: yet is more safely read as still-open than silently dropped from the picker.
-CLOSED_PO_STATUSES = frozenset({"cancelled", "closed", "fully-billed"})
-
-
-class ComposerVendor(BaseModel):
-    label: str
-    slug: str
-    status: str
-    tax_id: str
-    payment_terms: str
-    invoices: int
-    ref: str
-    sources: list[ComposerSource]
-    orders: list[ComposerOrder]
-
-
-class Composer(BaseModel):
-    """Everything the compose path picks from, and the values a run will read.
-
-    `catalog` is the line source for an invoice with no purchase order behind
-    it — a vendor we do not know, billing us for the first time. It is the same
-    catalog the seeded orders were built from, which is why a local three-way
-    match is a real match rather than a coincidence.
+    Two facts and no controls. The governed clauses are here because the rule
+    that will judge the upload is a document a person can read, and the
+    extractor because what reads the page decides what the answer is worth:
+    `vertex` read the document, `stub` read the filename, and the screen says
+    which rather than letting a person believe a page was understood.
     """
 
-    vendors: list[ComposerVendor]
-    catalog: list[ComposerLine]
-    twists: list[payables.ScenarioTwist]
     policy: list[payables.PolicyClause]
-    #: The extractor wired behind the ModelCall. The upload path says what
-    #: `stub` means — it reads the filename, not the page — rather than
-    #: letting a person believe a document was understood.
     extractor: str
 
 
@@ -3016,99 +3374,26 @@ class PayableOutcome(BaseModel):
     gate: OutcomeGate | None
     #: The governed clauses this run read, with the deciding one marked.
     policy: list[payables.PolicyClause]
-    #: The hint string the run was composed from, when this console composed
-    #: it. Empty for a historical row: the string lives on the run's inputs and
-    #: fetching every run to fill a column nobody reads is a poor trade.
-    hint: str = ""
 
 
 class PayablesScreen(BaseModel):
     invoices: list[PayableOutcome]
     stats: payables.PayableStats
-    composer: Composer
+    submission: SubmissionPanel
 
 
-def _composer() -> Composer:
-    """The vendor master and its orders, walked once.
+def _ap_live_version() -> int | None:
+    """The stored live pointer, so the clause list matches the version that
+    runs — a deployment still on v8 keeps its anomaly clauses on screen."""
+    defn = deps.get_flow_service().get(payables.FLOW_ID)
+    return defn.version if defn is not None else None
 
-    Walked here rather than reused from `_gather_match_context`: that reads
-    the legs of *one* match into the matcher's shape, and this reads every
-    vendor's orders into a picker's. Sharing them would make one of the two
-    lie about what it is for.
-    """
-    graph = deps.get_graph_service()
-    vendors: list[ComposerVendor] = []
-    for vendor in graph.find("Vendor"):
-        if vendor.status == "superseded":
-            continue
-        orders: list[ComposerOrder] = []
-        for _, order in graph.neighbors(vendor.id, "ordered_from", "in"):
-            if str(order.props.get("status") or "") in CLOSED_PO_STATUSES:
-                continue
-            received: dict[str, float] = {}
-            receipts: list[str] = []
-            for _, report in graph.neighbors(order.id, "receives_against", "in"):
-                receipts.append(
-                    str(report.props.get("receipt_number") or report.label)
-                )
-                for _, line in graph.neighbors(
-                    report.id, "has_receiving_line", "out"
-                ):
-                    sku = str(line.props.get("sku") or "")
-                    received[sku] = received.get(sku, 0.0) + float(
-                        line.props.get("quantity_received") or 0
-                    )
-            # Kept in the order's own ordinal order, not sorted. The twists
-            # are worded "the first line", and the first line of a purchase
-            # order is line 1 of that document — not whichever SKU sorts first.
-            lines = []
-            for link, line in graph.neighbors(order.id, "has_po_line", "out"):
-                sku = str(line.props.get("sku") or "")
-                lines.append((
-                    int(link.props.get("ordinal", 0) or 0),
-                    ComposerLine(
-                        sku=sku,
-                        description=str(line.props.get("description") or ""),
-                        unit_price_usd=float(line.props.get("unit_price_usd") or 0),
-                        quantity_ordered=float(line.props.get("quantity_ordered") or 0),
-                        quantity_received=received.get(sku, -1.0),
-                    ),
-                ))
-            orders.append(ComposerOrder(
-                po_number=str(order.props.get("po_number") or order.label),
-                status=str(order.props.get("status") or ""),
-                ref=order.ref(),
-                lines=[line for _, line in sorted(lines, key=lambda p: p[0])],
-                receipts=sorted(set(receipts)),
-            ))
-        vendors.append(ComposerVendor(
-            label=vendor.label,
-            slug=str(vendor.props.get("slug") or ""),
-            status=str(vendor.props.get("status") or vendor.status),
-            tax_id=str(vendor.props.get("tax_id") or ""),
-            payment_terms=str(vendor.props.get("payment_terms") or ""),
-            invoices=len(graph.neighbors(vendor.id, "issued", "out")),
-            ref=vendor.ref(),
-            sources=[
-                ComposerSource(
-                    source=str(other.props.get("source") or ""),
-                    external_id=str(other.props.get("external_id") or ""),
-                    live=link.live,
-                )
-                for link, other in graph.neighbors(
-                    vendor.id, "identified_as", "out", include_reversed=True
-                )
-            ],
-            orders=sorted(orders, key=lambda o: o.po_number),
-        ))
-    return Composer(
-        vendors=sorted(vendors, key=lambda v: v.label.lower()),
-        catalog=[
-            ComposerLine(sku=sku, description=description, unit_price_usd=price)
-            for sku, description, price in payables.CATALOG
-        ],
-        twists=list(payables.SCENARIO_TWISTS),
-        policy=payables.read_policy_clauses(deps.get_service()),
+
+def _submission_panel() -> SubmissionPanel:
+    return SubmissionPanel(
+        policy=payables.read_policy_clauses(
+            deps.get_service(), version=_ap_live_version()
+        ),
         extractor=getattr(deps.get_payable_service().reader, "name", ""),
     )
 
@@ -3117,13 +3402,11 @@ def _outcome(
     record: payables.InvoiceRecord,
     principal: Principal,
     clauses: list[payables.PolicyClause],
-    hint: str = "",
 ) -> PayableOutcome:
     return PayableOutcome(
         invoice=record,
         gate=_gate(record, principal),
         policy=payables.clauses_cited_by(clauses, record.verdict_reason),
-        hint=hint,
     )
 
 
@@ -3144,16 +3427,26 @@ def _gate(record: payables.InvoiceRecord, principal: Principal) -> OutcomeGate |
         (s for s in (run.steps if run else []) if s.task_id == task.id), None
     )
     bound = ", ".join(principal.queues) or "no queue"
+    # Own the desk, *or* be the person whose desk it is. The second clause is
+    # not a widening: a personal desk's slug is a pure function of the address,
+    # so "this is my own desk" is answerable without the registry — which
+    # matters exactly once, on the response to the submission that minted it.
+    # The principal was built at the start of that request, before v9's routing
+    # opened the submitter a desk, so a strict registry read would tell someone
+    # they may not decide the review that was just routed to them and be wrong
+    # by one request. `require_queue` agrees on every request after this one.
+    may_decide = principal.owns_queue(task.queue) or (
+        bool(principal.email) and task.queue == personal_slug(principal.email)
+    )
     return OutcomeGate(
         step_id=step.step_id if step else "",
         step_name=step.name if step else "",
         task_id=task.id,
         task_title=task.title,
         queue=task.queue,
-        may_decide=principal.owns_queue(task.queue),
+        may_decide=may_decide,
         why_not=(
-            ""
-            if principal.owns_queue(task.queue)
+            "" if may_decide
             else f"this is in {task.queue}; you are bound to {bound}"
         ),
     )
@@ -3165,11 +3458,10 @@ def get_payables_principal(
     """The AP workspace's door: the clerk queue, or read reach past yourself.
 
     The rows were already scoped — `PayableService.list` narrows an own-scoped
-    reader to their own — but the screen is more than its rows. The composer is
-    the vendor master, every open purchase order, the posting policy and a
-    control that runs the flow, none of which is anybody's *own* work, and all
-    of which an AE with no queue could open. So the same rule the rail draws
-    with gates the route behind it: own the desk, or read past yourself.
+    reader to their own — but the screen is more than its rows. The posting
+    policy and a control that runs the flow are nobody's *own* work, and an AE
+    with no queue could open both. So the same rule the rail draws with gates
+    the route behind it: own the desk, or read past yourself.
     """
     if principal.reads_beyond_self or principal.owns_queue(payables.CLERK_QUEUE):
         return principal
@@ -3177,9 +3469,9 @@ def get_payables_principal(
         status_code=403,
         detail=(
             "The Accounts Payable workspace is the "
-            f"`{payables.CLERK_QUEUE}` desk — the vendor master, its open "
-            "orders and the posting policy. You are not bound to it, and your "
-            "access is to your own work."
+            f"`{payables.CLERK_QUEUE}` desk — the invoice book and the posting "
+            "policy that judges it. You are not bound to it, and your access "
+            "is to your own work."
         ),
     )
 
@@ -3188,36 +3480,34 @@ def get_payables_principal(
 def payables_screen(
     principal: Principal = Depends(get_payables_principal),
 ) -> PayablesScreen:
-    """The AP workspace: the rows this reader is accountable for, and the
-    composer that starts a new run against real graph rows."""
+    """The AP workspace: the rows this reader is accountable for, the governed
+    clauses that judged them, and the door a document comes in through."""
     service = deps.get_payable_service()
-    clauses = payables.read_policy_clauses(deps.get_service())
+    clauses = payables.read_policy_clauses(
+        deps.get_service(), version=_ap_live_version()
+    )
     return PayablesScreen(
         invoices=[
             _outcome(record, principal, clauses)
             for record in service.list(principal=principal)
         ],
         stats=service.stats(principal=principal),
-        composer=_composer(),
+        submission=_submission_panel(),
     )
 
 
 class PayableSubmission(BaseModel):
-    """Two ways in, and they are not variations of each other.
+    """One way in: a document.
 
-    An **upload** is a document: bytes, a filename, and no hints — with no
-    model configured the extractor reads the filename rather than the page,
-    and the screen says so instead of implying otherwise.
-
-    A **composition** is a case: structured choices made against the vendor
-    master and its orders, which serialize to the hint string on the way out.
-    The string is built by `InvoiceScenario.to_hint` on this side, so the one
-    the console previews and the one the run receives cannot diverge.
+    There is deliberately no field here a caller can put *content* in. This
+    used to accept a composed scenario, which serialized to a hint string and
+    produced an extraction from a form — an invoice nobody wrote and no model
+    read, indistinguishable in the ledger from one that was. Bytes, and the
+    name the file arrived under, are the whole of it.
     """
 
     image_base64: str = ""
     filename: str = ""
-    scenario: payables.InvoiceScenario | None = None
 
 
 @router.post("/payables/submissions", response_model=PayableOutcome, status_code=201)
@@ -3235,22 +3525,908 @@ def submit_payable(
     `require_queue` draws for a Task decision.
     """
     require_queue(principal, payables.CLERK_QUEUE)
-    hint = body.scenario.to_hint() if body.scenario is not None else ""
-    if not hint and not body.image_base64 and not body.filename:
+    if not body.image_base64:
+        # A filename with no bytes behind it used to be enough, because the
+        # stub extractor could read a case out of the name. That is exactly
+        # the door this endpoint should not hold open.
         raise HTTPException(
             status_code=400,
-            detail="Upload a document or compose an invoice.",
+            detail="Upload a document: this door carries bytes, not a case.",
         )
     record = deps.get_payable_service().submit(
         submitted_by=principal.email,
         image_b64=body.image_base64,
         filename=body.filename,
-        hint=hint,
     )
     log.info(
         "Invoice submitted from the console",
         extra={"invoiceId": record.id, "state": record.state, "actor": principal.uid},
     )
     return _outcome(
-        record, principal, payables.read_policy_clauses(deps.get_service()), hint
+        record, principal,
+        payables.read_policy_clauses(deps.get_service(), version=_ap_live_version()),
     )
+
+
+# ---------------------------------------------------------------------------
+# The three plant workspaces — field documents, compliance, plant schedule
+# ---------------------------------------------------------------------------
+#
+# `payables_screen`'s shape, three more times: the rows a desk is accountable
+# for, the governed clauses that judged them, and the counts a person opens the
+# page for — composed once here rather than stitched in Dart out of four
+# resource routes.
+#
+# All three are reads and none of them writes. That is not an oversight: the
+# decision each of these screens is *about* happens on a Task, through
+# `require_queue`, and a second write door beside the table would be a way to
+# change a governed record without the judgment being recorded as one. So the
+# doors below gate reading, and nothing here needs a second gate.
+
+
+class GovernedClause(BaseModel):
+    """One governed value a screen shows, named where a person can read it.
+
+    `payables.PolicyClause` without the posting rule's two attribution fields.
+    The clauses on these screens are not competing to be the one that decided a
+    verdict — they are the page a supervisor argues with — so a `deciding` flag
+    here would be a claim nothing computes.
+    """
+
+    id: str
+    label: str
+    value: str
+    #: The governed document, at the revision it was read.
+    ref: str
+
+
+def _clause(id_: str, label: str, value: object, ref: str) -> GovernedClause:
+    return GovernedClause(id=id_, label=label, value=str(value), ref=ref)
+
+
+def _door(principal: Principal, desk: str, what: str, holds: str) -> Principal:
+    """`get_payables_principal`'s rule, for a desk named by the caller.
+
+    Own the desk, or read past yourself. Written once because the three plant
+    workspaces answer it identically and a copy per route is how one of them
+    quietly widens: the rows are scoped either way, but a workspace is more
+    than its rows — it carries the governed pages that judged them — and those
+    are nobody's *own* work.
+    """
+    if principal.reads_beyond_self or principal.owns_queue(desk):
+        return principal
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"The {what} workspace is the `{desk}` desk — {holds}. You are "
+            "not bound to it, and your access is to your own work."
+        ),
+    )
+
+
+# -- Field Documents ---------------------------------------------------------
+#
+# **Packets, not folders.** Nothing on this screen creates, copies, moves or
+# deletes a folder, and the shape says so: a packet is `Job —documented_by→
+# Document` at the latest revision of each governed type, a crew move is a
+# withdrawn edge that is still on the record, and "superseded" is a revision
+# whose edge ended rather than a file somebody removed.
+
+
+class CrewRef(BaseModel):
+    team_slug: str
+    name: str
+    foreman: str = ""
+
+
+class FormerCrew(BaseModel):
+    team_slug: str
+    name: str
+    #: When the edge ended. A crew that held this job before is *still on the
+    #: record* — this is the validity that closed, never a deletion.
+    until_iso: str = ""
+
+
+class PacketDocumentRow(BaseModel):
+    kind: str
+    filename: str
+    version: str = ""
+    filed_at: str = ""
+    #: True for a revision this job's packet has moved past. Its edge is
+    #: withdrawn and its row is kept, because a crew that already printed it
+    #: should be able to find out what they are holding.
+    superseded: bool = False
+
+
+class FieldJobRow(BaseModel):
+    job_number: str
+    packet_label: str = ""
+    #: The convention rule that derived the label, off the claim's own note —
+    #: read rather than restated, so the screen cannot describe a rule the run
+    #: did not apply.
+    label_rule: str = ""
+    customer: str = ""
+    builder: str = ""
+    plant_site: str = ""
+    status: str = ""
+    load_date: str = ""
+    current_crew: CrewRef | None = None
+    former_crews: list[FormerCrew] = Field(default_factory=list)
+    #: Set when the job names a crew that resolves to no `Team`. The identity
+    #: question, kept apart from the document one for the reason the flow keeps
+    #: them apart: no document question was asked about this job.
+    unresolved_crew_id: str = ""
+    documents: list[PacketDocumentRow] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    complete: bool = False
+    #: How many consecutive windows have found none of the governed types.
+    empty_windows: int = 0
+    last_run_id: str = ""
+    last_run_at_iso: str = ""
+    object_ref: str = ""
+
+
+class CrewRow(BaseModel):
+    team_slug: str
+    name: str
+    foreman: str = ""
+    jobs: int = 0
+    complete: int = 0
+
+
+class FieldDocumentsStats(BaseModel):
+    jobs: int = 0
+    in_horizon: int = 0
+    packets_complete: int = 0
+    missing: int = 0
+    unresolved_crews: int = 0
+
+
+class FieldDocumentsScreen(BaseModel):
+    jobs: list[FieldJobRow] = Field(default_factory=list)
+    crews: list[CrewRow] = Field(default_factory=list)
+    stats: FieldDocumentsStats = Field(default_factory=FieldDocumentsStats)
+    policy_clauses: list[GovernedClause] = Field(default_factory=list)
+    #: The open aggregate Tasks this flow raised, so the screen can send
+    #: somebody to the question rather than describing it.
+    gap_task_ids: list[str] = Field(default_factory=list)
+    #: The governed page, at the revision this screen read it.
+    policy_ref: str = ""
+    #: False when the corpus holds no such page and the built-in default is
+    #: standing in — said out loud for the reason the flow says it out loud.
+    policy_found: bool = False
+
+
+def get_field_documents_principal(
+    principal: Principal = Depends(get_ui_principal),
+) -> Principal:
+    return _door(
+        principal, desks.FIELD_OPERATIONS, "Field Documents",
+        "the packets scheduled jobs are filed under and the governed "
+        "convention that names them",
+    )
+
+
+def _field_clauses(policy: packets.FieldDocumentPolicy) -> list[GovernedClause]:
+    ref = policy.source_ref
+    return [
+        _clause("document-types", "Document types",
+                ", ".join(policy.type_names), ref),
+        _clause("folder-root", "Folder root", policy.folder_root, ref),
+        _clause("statuses", "Statuses in scope",
+                ", ".join(policy.statuses), ref),
+        _clause("horizon", "Horizon", f"{policy.horizon_days} day(s)", ref),
+        _clause("latest-revision", "Latest revision decided by",
+                f"{policy.latest_by}, tiebreak {policy.tiebreak}", ref),
+        _clause("label-pattern", "Naming convention",
+                policy.label_pattern, ref),
+        _clause("stopwords", "Stopwords",
+                ", ".join(policy.stopwords) or "none", ref),
+        _clause("collision", "Collision rule", policy.collision_rule, ref),
+        _clause("partial-packet", "A partial packet is",
+                policy.partial_packet, ref),
+        _clause("recurrence", "Recurrence threshold",
+                f"{policy.missing_windows} consecutive window(s) with none of "
+                f"the {len(policy.type_names)} governed types", ref),
+        _clause("crew-rule", "Unresolved crew", policy.crew_rule, ref),
+        _clause("window", "Window bound",
+                f"{policy.window_limit} job(s) per window", ref),
+        _clause("desk", "Desk", policy.routing.fallback, ref),
+    ]
+
+
+def _crew_of(graph: GraphService, record: ObjectRecord) -> CrewRef | None:
+    """The crew this job is assigned to *now*, and its foreman."""
+    live = graph.neighbors(record.id, "assigned_to", "out")
+    if not live:
+        return None
+    team = live[0][1]
+    lead = graph.neighbors(team.id, "led_by", "out")
+    return CrewRef(
+        team_slug=team.natural_key,
+        name=team.label or team.natural_key,
+        foreman=(
+            (lead[0][1].label or lead[0][1].natural_key) if lead
+            else str(record.props.get("foreman_name") or "")
+        ),
+    )
+
+
+def _former_crews(graph: GraphService, record: ObjectRecord) -> list[FormerCrew]:
+    """The crews that held it before — withdrawn edges, still on the record."""
+    out: list[FormerCrew] = []
+    for link, team in graph.neighbors(
+        record.id, "assigned_to", "out", include_reversed=True,
+    ):
+        if link.live:
+            continue
+        out.append(FormerCrew(
+            team_slug=team.natural_key,
+            name=team.label or team.natural_key,
+            until_iso=link.valid_to_iso or link.reversed_at_iso,
+        ))
+    out.sort(key=lambda row: row.until_iso, reverse=True)
+    return out
+
+
+def _packet_documents(
+    graph: GraphService, record: ObjectRecord, policy: packets.FieldDocumentPolicy
+) -> tuple[list[PacketDocumentRow], list[str]]:
+    """The four types at their latest revision, plus what a revision replaced.
+
+    Read off the `documented_by` edges rather than re-derived: the edge carries
+    the governed type it was drawn for and the revision it was drawn at, so the
+    screen shows the determination the run actually made instead of making a
+    second one that could disagree with it.
+    """
+    rows: list[PacketDocumentRow] = []
+    live_kinds: set[str] = set()
+    for link, document in graph.neighbors(
+        record.id, "documented_by", "out", include_reversed=True,
+    ):
+        kind = str(link.props.get("document_type") or "")
+        if link.live:
+            live_kinds.add(kind)
+        rows.append(PacketDocumentRow(
+            kind=kind,
+            filename=str(
+                document.props.get("filename") or document.label
+                or document.natural_key
+            ),
+            version=str(
+                link.props.get("revision")
+                or document.props.get(policy.version_field) or ""
+            ),
+            filed_at=document.created_at_iso,
+            superseded=not link.live,
+        ))
+    order = {name: index for index, name in enumerate(policy.type_names)}
+    rows.sort(key=lambda row: (
+        row.superseded, order.get(row.kind, len(order)), row.filename
+    ))
+    missing = [name for name in policy.type_names if name not in live_kinds]
+    return rows, missing
+
+
+@router.get("/field-documents", response_model=FieldDocumentsScreen)
+def field_documents_screen(
+    principal: Principal = Depends(get_field_documents_principal),
+) -> FieldDocumentsScreen:
+    """Every scheduled job's packet, as the graph holds it after the last pass.
+
+    Read from what the flow *wrote* — the `documented_by` edges, the
+    `packet_label` claim and its note, the `documents_complete` claim — rather
+    than by re-running the resolution. A screen that re-derived the packet
+    would be a second implementation of the governed convention, free to
+    disagree with the label a crew was actually handed.
+    """
+    service = deps.get_field_documents_service()
+    graph = deps.get_graph_service()
+    policy = service.read_policy()
+    statuses = {word.strip().lower() for word in policy.statuses if word.strip()}
+    today = utcnow().date()
+    horizon = today + timedelta(days=max(0, policy.horizon_days))
+    empty_windows = service.empty_window_history()
+
+    jobs: list[FieldJobRow] = []
+    crews: dict[str, CrewRow] = {}
+    in_horizon = 0
+    unresolved: set[str] = set()
+    for record in sorted(graph.find(onto.JOB), key=lambda o: o.natural_key):
+        if record.status == "superseded":
+            continue
+        props = record.props
+        documents, missing = _packet_documents(graph, record, policy)
+        current = _crew_of(graph, record)
+        crew_id = str(props.get("crew_id") or "").strip()
+        label_claim = next(
+            (
+                claim for claim in reversed(record.claims)
+                if claim.field == "packet_label"
+            ),
+            None,
+        )
+        complete = str(props.get("documents_complete") or "") == "yes"
+        load_date = str(props.get("load_date") or "")
+        parsed = packets.read_date(load_date)
+        if (
+            str(props.get("status") or "").lower() in statuses
+            and parsed is not None
+            and today <= parsed <= horizon
+        ):
+            in_horizon += 1
+        if current is None and crew_id:
+            unresolved.add(crew_id)
+        row = FieldJobRow(
+            job_number=str(props.get("job_number") or record.natural_key),
+            packet_label=str(props.get("packet_label") or ""),
+            label_rule=label_claim.note if label_claim is not None else "",
+            customer=str(props.get("customer_name") or ""),
+            builder=str(props.get("builder_name") or ""),
+            plant_site=str(props.get("plant_site") or ""),
+            status=str(props.get("status") or ""),
+            load_date=load_date,
+            current_crew=current,
+            former_crews=_former_crews(graph, record),
+            unresolved_crew_id="" if current is not None else crew_id,
+            documents=documents,
+            missing=missing,
+            complete=complete,
+            empty_windows=empty_windows.get(record.natural_key, 0),
+            last_run_id=label_claim.run_id if label_claim is not None else "",
+            last_run_at_iso=(
+                label_claim.at_iso if label_claim is not None else ""
+            ),
+            object_ref=record.ref(),
+        )
+        jobs.append(row)
+        if current is not None:
+            held = crews.setdefault(current.team_slug, CrewRow(
+                team_slug=current.team_slug, name=current.name,
+                foreman=current.foreman,
+            ))
+            held.jobs += 1
+            held.complete += 1 if complete else 0
+
+    return FieldDocumentsScreen(
+        jobs=jobs,
+        crews=sorted(crews.values(), key=lambda crew: crew.name),
+        stats=FieldDocumentsStats(
+            jobs=len(jobs),
+            in_horizon=in_horizon,
+            packets_complete=sum(1 for row in jobs if row.complete),
+            missing=sum(1 for row in jobs if row.missing),
+            unresolved_crews=len(unresolved),
+        ),
+        policy_clauses=_field_clauses(policy),
+        gap_task_ids=[
+            task.id for task in deps.get_task_service().list(status="open")
+            if task.case_ref.startswith("field-documents-gap:")
+        ],
+        policy_ref=policy.source_ref,
+        policy_found=policy.found_asset,
+    )
+
+
+# -- Compliance --------------------------------------------------------------
+
+
+class ComplianceRow(BaseModel):
+    kind: str
+    subject: str = ""
+    subject_kind: str = ""
+    credential_type: str = ""
+    category: str = ""
+    expires_on: str = ""
+    days_to_expiry: int | None = None
+    status: str = ""
+    last_notified_on: str = ""
+    last_notice_stage: int | None = None
+    #: Every governed stage at or wider than the one last sent. The stamp on
+    #: the row is the *narrowest* stage sent, so this is derived from it rather
+    #: than kept as a second list somebody could edit out of agreement.
+    stages_sent: list[int] = Field(default_factory=list)
+    supervisor: str = ""
+    #: The exception class this row fell into, or empty. One class per row, the
+    #: same order the flow screens them in.
+    exception: str = ""
+    retain_until: str = ""
+    object_ref: str = ""
+
+
+class UntrackedAsset(BaseModel):
+    """A unit the register holds no next-due date for.
+
+    Named as untracked rather than shown as overdue, which is the whole point
+    of the row: a machine with a null due date is a fact about the asset, and a
+    sweep that reported it as out of inspection would chase it forever.
+    """
+
+    equipment_id: str
+    name: str = ""
+    category: str = ""
+    home_site: str = ""
+    why: str = ""
+    object_ref: str = ""
+
+
+class ComplianceStats(BaseModel):
+    rows: int = 0
+    expiring_60: int = 0
+    expiring_30: int = 0
+    expiring_15: int = 0
+    expired: int = 0
+    untracked: int = 0
+    exceptions_by_class: dict[str, int] = Field(default_factory=dict)
+    retention_flagged: int = 0
+
+
+class ComplianceScreen(BaseModel):
+    rows: list[ComplianceRow] = Field(default_factory=list)
+    untracked_assets: list[UntrackedAsset] = Field(default_factory=list)
+    stats: ComplianceStats = Field(default_factory=ComplianceStats)
+    policy_clauses: list[GovernedClause] = Field(default_factory=list)
+    exception_task_ids: list[str] = Field(default_factory=list)
+    #: The date a record older than this is retained past — the horizon the
+    #: fourth exception class is measured against. Nothing is ever deleted.
+    retention_horizon: str = ""
+    policy_ref: str = ""
+    policy_found: bool = False
+
+
+def get_compliance_principal(
+    principal: Principal = Depends(get_ui_principal),
+) -> Principal:
+    return _door(
+        principal, desks.HR_SAFETY, "Compliance",
+        "the credential and inspection book, and the governed stages that "
+        "decide who is told and when",
+    )
+
+
+def _compliance_clauses(policy: compliance.AlertPolicy) -> list[GovernedClause]:
+    ref = policy.source_ref
+    return [
+        _clause("stages", "Notice stages",
+                ", ".join(f"{stage} day" for stage in policy.stages), ref),
+        _clause("sla-floor", "SLA floor", f"{policy.sla_floor_days} day(s)"
+                + ("" if policy.honors_sla_floor
+                   else " — the stages no longer reach it"), ref),
+        _clause("categories", "Categories tracked",
+                ", ".join(policy.categories), ref),
+        _clause("untracked", "An asset is untracked when",
+                policy.untracked_when, ref),
+        _clause("retention", "Retention",
+                f"{policy.retention_years} year(s) — {policy.past_horizon}. "
+                "Nothing is deleted.", ref),
+        _clause("cadence", "Cadence", policy.cadence, ref),
+        _clause("window", "Window bound",
+                f"{policy.window_limit} row(s) per window", ref),
+        _clause("desk", "Desk", policy.routing.fallback, ref),
+    ]
+
+
+@router.get("/compliance", response_model=ComplianceScreen)
+def compliance_screen(
+    principal: Principal = Depends(get_compliance_principal),
+) -> ComplianceScreen:
+    """Credentials and inspections by days-to-expiry, ascending.
+
+    Gathered through the flow's own `gather` and screened through its own
+    `screen_exceptions`, so what a person reads here and what the sweep decided
+    are one derivation. A screen that walked the graph itself would be a second
+    opinion about which rows are in scope, and the first thing it would get
+    wrong is the untracked assets — which are excluded at the *unit*, not at
+    the examination.
+    """
+    service = deps.get_credential_tracking_service()
+    graph = deps.get_graph_service()
+    policy = service.read_policy()
+    today = utcnow().date()
+    gathered = service.gather(policy, today)
+    tracked = [
+        compliance.TrackedRow.model_validate(row) for row in gathered["rows"]
+    ]
+    screened = compliance.screen_exceptions(tracked, policy, today)
+    by_key = {
+        row["natural_key"]: name
+        for name, rows in screened["classes"].items()
+        for row in rows
+    }
+
+    rows: list[ComplianceRow] = []
+    for row in tracked:
+        stage = row.last_notice_stage
+        rows.append(ComplianceRow(
+            kind=row.kind,
+            subject=row.subject_label,
+            subject_kind="employee" if row.kind == "credential" else "equipment",
+            credential_type=row.credential_type,
+            category=row.category,
+            expires_on=row.date_text,
+            days_to_expiry=row.days_remaining,
+            status=row.status,
+            last_notified_on=row.last_notified_on,
+            last_notice_stage=stage,
+            stages_sent=(
+                [] if stage is None
+                else sorted(
+                    (s for s in policy.stages if s >= stage), reverse=True
+                )
+            ),
+            supervisor=row.supervisor_name or row.supervisor_email,
+            exception=by_key.get(row.natural_key, ""),
+            retain_until=row.retain_until,
+            object_ref=row.object_ref,
+        ))
+
+    untracked = [
+        UntrackedAsset(
+            equipment_id=str(unit.props.get("equipment_id") or unit.natural_key),
+            name=unit.label or unit.natural_key,
+            category=str(unit.props.get("category") or ""),
+            home_site=str(unit.props.get("home_site") or ""),
+            why=policy.untracked_when,
+            object_ref=unit.ref(),
+        )
+        for unit in sorted(
+            graph.find(onto.EQUIPMENT), key=lambda o: o.natural_key
+        )
+        if unit.status != "superseded"
+        and str(unit.props.get("inspection_tracked") or "") != "yes"
+    ]
+
+    def _within(days: int) -> int:
+        return sum(
+            1 for row in rows
+            if row.days_to_expiry is not None
+            and 0 <= row.days_to_expiry <= days
+        )
+
+    return ComplianceScreen(
+        rows=rows,
+        untracked_assets=untracked,
+        stats=ComplianceStats(
+            rows=len(rows),
+            expiring_60=_within(60),
+            expiring_30=_within(30),
+            expiring_15=_within(15),
+            expired=sum(
+                1 for row in rows
+                if row.days_to_expiry is not None and row.days_to_expiry < 0
+            ),
+            untracked=len(untracked),
+            exceptions_by_class=dict(screened["counts"]),
+            retention_flagged=int(
+                screened["counts"].get(compliance.RETAINED_PAST_HORIZON, 0)
+            ),
+        ),
+        policy_clauses=_compliance_clauses(policy),
+        exception_task_ids=[
+            task.id for task in deps.get_task_service().list(status="open")
+            if task.case_ref.startswith("compliance-exception:")
+        ],
+        retention_horizon=str(screened["horizon"]),
+        policy_ref=policy.source_ref,
+        policy_found=policy.found_asset,
+    )
+
+
+# -- Plant Schedule ----------------------------------------------------------
+
+
+class ScheduleEntryRow(BaseModel):
+    job_number: str = ""
+    job_label: str = ""
+    labor_hours: float = 0.0
+    basis: str = ""
+    sequence: float = 0.0
+    row_kind: str = ""
+    vehicle_ref: str = ""
+    placed_by: str = "flow"
+    object_ref: str = ""
+
+
+class DeferredRow(BaseModel):
+    job_number: str = ""
+    #: The machine-readable governed clause that deferred it, and the sentence
+    #: a supervisor reads. Both, because "why is 260118 not on Tuesday" has to
+    #: answer as a clause and as English.
+    clause: str = ""
+    reason: str = ""
+    labor_hours: float = 0.0
+
+
+class ScheduleDayCell(BaseModel):
+    """One department's one day.
+
+    **No `exported_at`.** An export is regenerated on request and stored
+    nowhere, so a date here would be a record of reads the graph does not keep.
+    What the cell says instead is whether the day is *exportable* — which is
+    exactly `status == approved`, the same answer `/api/v1/schedule/export`
+    gives — and where the export is.
+    """
+
+    department: str
+    date: str
+    status: str = ""
+    exists: bool = False
+    total_hours: float = 0.0
+    goal_max_hours: float | None = None
+    abs_max_hours: float | None = None
+    fudge_hours: float = 0.0
+    #: The capacity row the fill chose, with the crew size beside it — the
+    #: first number a supervisor disputes.
+    capacity_row: str = ""
+    #: `start + rate × hours`, the three numbers and the answer, so the
+    #: out-of-the-hole indicator can be argued with rather than believed.
+    incentive_per_hour: float = 0.0
+    incentive_basis: str = ""
+    incentive_start_usd: float | None = None
+    incentive_rate_usd_per_hour: float | None = None
+    incentive_crossing_hours: float | None = None
+    out_of_the_hole: bool = False
+    below_capacity: bool = False
+    stopped_at: str = ""
+    headcount: float = 0.0
+    headcount_as_of: str = ""
+    headcount_stale: bool = False
+    entries: list[ScheduleEntryRow] = Field(default_factory=list)
+    deferred: list[DeferredRow] = Field(default_factory=list)
+    approved_by: str = ""
+    approved_at: str = ""
+    pending_task_id: str = ""
+    run_id: str = ""
+    #: Live only on an approved day. The screen must not offer a control the
+    #: server will answer 409 to.
+    exportable: bool = False
+    export_url: str = ""
+    object_ref: str = ""
+
+
+class PlantScheduleStats(BaseModel):
+    days: int = 0
+    pending_approval: int = 0
+    approved: int = 0
+    deferred: int = 0
+    below_capacity: int = 0
+
+
+class PlantScheduleScreen(BaseModel):
+    week: str
+    departments: list[str] = Field(default_factory=list)
+    dates: list[str] = Field(default_factory=list)
+    cells: list[ScheduleDayCell] = Field(default_factory=list)
+    stats: PlantScheduleStats = Field(default_factory=PlantScheduleStats)
+    policy_clauses: list[GovernedClause] = Field(default_factory=list)
+    policy_ref: str = ""
+    policy_found: bool = False
+
+
+def get_plant_schedule_principal(
+    principal: Principal = Depends(get_ui_principal),
+) -> Principal:
+    return _door(
+        principal, desks.PLANT_SUPERVISOR, "Plant Schedule",
+        "the day a department is told to run, and the signature that makes it "
+        "exportable",
+    )
+
+
+def _plant_clauses(params) -> list[GovernedClause]:
+    ref = params.source_ref
+    return [
+        _clause("capacity", "Capacity rows",
+                f"{len(params.capacity.rows)} row(s) by crew size", ref),
+        _clause("fudge", "Fudge band",
+                params.capacity.fudge_applies_to or "not stated", ref),
+        _clause("fudge-overrun", "Exceeding the absolute max within the fudge",
+                params.capacity.exceeding_absolute_max_within_fudge
+                or "not stated", ref),
+        _clause("below-capacity", "Below capacity",
+                params.capacity.below_capacity or "not stated", ref),
+        _clause("incentive-model", "Incentive", params.incentive_model
+                or "start + rate × hours", ref),
+        _clause("incentive-fill", "Filled by the incentive",
+                ", ".join(params.incentive_decides_the_fill) or "no department",
+                ref),
+        _clause("headcount", "Headcount",
+                f"{params.headcount.source or 'the workforce feed'}"
+                + (
+                    f", fresh within {params.headcount.freshness_hours:g} h"
+                    if params.headcount.freshness_hours is not None else ""
+                ), ref),
+        _clause("desk", "Approval desk", params.approval.fallback, ref),
+    ]
+
+
+def _last_fill(run) -> dict:
+    """The last `r2` the run executed — the fill a supervisor is looking at.
+
+    A corrected day re-fills, so `r2_2` is what the day currently is and `r2`
+    is what it was before somebody edited it. Reading the last one is the only
+    way the deferred list on the screen matches the rows beside it.
+    """
+    found: dict = {}
+    for step in (run.steps if run is not None else ()):
+        if step.step_id.startswith("r2") and isinstance(step.output, dict):
+            found = step.output
+    return found
+
+
+def _cell(
+    graph: GraphService, params, department: str, day: str, record, tasks,
+) -> ScheduleDayCell:
+    week = scheduling._iso_week(day)
+    export_url = (
+        f"/api/v1/schedule/export?week={week}&department={department}"
+    )
+    incentive = params.incentives.get(department)
+    if record is None:
+        # A day nothing has opened. Drawn, and drawn as *absent* rather than as
+        # a zero: a department with no schedule and a department scheduled for
+        # nothing are opposite facts and a blank cell reads as the second.
+        return ScheduleDayCell(
+            department=department, date=day, status="", exists=False,
+            export_url=export_url,
+            incentive_start_usd=incentive.start_usd if incentive else None,
+            incentive_rate_usd_per_hour=(
+                incentive.rate_usd_per_hour if incentive else None
+            ),
+        )
+    props = record.props
+    run_id = next(
+        (claim.run_id for claim in reversed(record.claims) if claim.run_id), ""
+    )
+    run = deps.get_run_engine().get(run_id) if run_id else None
+    fill = _last_fill(run)
+    limits = fill.get("limits") or {}
+    total = float(props.get("total_hours") or 0.0)
+    status = str(props.get("status") or "")
+    entries = [
+        ScheduleEntryRow(
+            job_number=str(entry.props.get("job_number") or ""),
+            job_label=str(entry.props.get("job_label") or ""),
+            labor_hours=float(entry.props.get("labor_hours") or 0.0),
+            basis=str(entry.props.get("basis") or ""),
+            sequence=float(entry.props.get("sequence") or 0.0),
+            row_kind=str(entry.props.get("row_kind") or ""),
+            vehicle_ref=str(entry.props.get("vehicle_ref") or ""),
+            placed_by=str(entry.props.get("placed_by") or "flow"),
+            object_ref=entry.ref(),
+        )
+        for _link, entry in graph.neighbors(
+            record.id, "has_schedule_entry", "out"
+        )
+    ]
+    entries.sort(key=lambda row: (row.sequence, row.job_number))
+    task_id = deps.get_department_scheduling_service().open_approval_task_id(
+        scheduling.day_key(department, day)
+    )
+    return ScheduleDayCell(
+        department=department,
+        date=day,
+        status=status,
+        exists=True,
+        total_hours=total,
+        goal_max_hours=_optional_float(props.get("goal_max_hours")),
+        abs_max_hours=_optional_float(props.get("abs_max_hours")),
+        fudge_hours=float(props.get("fudge_hours") or 0.0),
+        capacity_row=str(limits.get("row_note") or limits.get("row") or ""),
+        incentive_per_hour=float(props.get("incentive_per_hour") or 0.0),
+        incentive_basis=str(fill.get("incentive_sentence") or ""),
+        incentive_start_usd=incentive.start_usd if incentive else None,
+        incentive_rate_usd_per_hour=(
+            incentive.rate_usd_per_hour if incentive else None
+        ),
+        incentive_crossing_hours=_optional_float(limits.get("crossing")),
+        out_of_the_hole=bool(fill.get("out_of_the_hole")),
+        below_capacity=bool(fill.get("below_capacity")),
+        stopped_at=str(fill.get("stopped_at") or ""),
+        headcount=float(props.get("headcount") or 0.0),
+        headcount_as_of=str(props.get("headcount_as_of") or ""),
+        headcount_stale=bool(
+            run is not None and _headcount_stale(run)
+        ),
+        entries=entries,
+        deferred=[
+            DeferredRow(
+                job_number=str(row.get("job_number") or ""),
+                clause=str(row.get("clause") or ""),
+                reason=str(row.get("reason") or ""),
+                labor_hours=float(row.get("labor_hours") or 0.0),
+            )
+            for row in (fill.get("deferred") or [])
+        ],
+        approved_by=str(props.get("approved_by") or ""),
+        approved_at=str(props.get("approved_at") or ""),
+        pending_task_id=task_id,
+        run_id=run_id,
+        exportable=status == "approved",
+        export_url=export_url,
+        object_ref=record.ref(),
+    )
+
+
+def _headcount_stale(run) -> bool:
+    """Whether `x1` found the workforce feed behind its governed window."""
+    for step in run.steps:
+        if step.step_id == "x1" and isinstance(step.output, dict):
+            return bool(step.output.get("headcount_stale"))
+    return False
+
+
+def _optional_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@router.get("/plant-schedule", response_model=PlantScheduleScreen)
+def plant_schedule_screen(
+    week: str = Query(
+        default="",
+        description="ISO week, `YYYY-Www`. Defaults to the current week.",
+    ),
+    principal: Principal = Depends(get_plant_schedule_principal),
+) -> PlantScheduleScreen:
+    """A department × day grid for one week, and everything a signature needs.
+
+    The grid is drawn over the departments the governed page declares rather
+    than over the days that happen to exist, because a department with no day
+    is the finding: a row of absent cells is a plant that scheduled nothing,
+    and a grid assembled from what exists could not say so.
+    """
+    service = deps.get_department_scheduling_service()
+    graph = deps.get_graph_service()
+    params = service.read_parameters()
+    dates = week_dates(week or _current_week())
+    iso = week or _current_week()
+
+    departments = params.slugs or sorted({
+        str(record.props.get("department") or "")
+        for record in graph.find(onto.SCHEDULE_DAY)
+        if record.props.get("department")
+    })
+    tasks = deps.get_task_service()
+    cells: list[ScheduleDayCell] = []
+    for department in departments:
+        for day in dates:
+            iso_day = day.isoformat()
+            record = graph.get(
+                object_id(
+                    onto.SCHEDULE_DAY, scheduling.day_key(department, iso_day)
+                ),
+                follow=False,
+            )
+            cells.append(
+                _cell(graph, params, department, iso_day, record, tasks)
+            )
+
+    written = [cell for cell in cells if cell.exists]
+    return PlantScheduleScreen(
+        week=iso,
+        departments=departments,
+        dates=[day.isoformat() for day in dates],
+        cells=cells,
+        stats=PlantScheduleStats(
+            days=len(written),
+            pending_approval=sum(
+                1 for cell in written if cell.status == "pending_approval"
+            ),
+            approved=sum(1 for cell in written if cell.status == "approved"),
+            deferred=sum(len(cell.deferred) for cell in written),
+            below_capacity=sum(1 for cell in written if cell.below_capacity),
+        ),
+        policy_clauses=_plant_clauses(params),
+        policy_ref=params.source_ref,
+        policy_found=params.found_asset,
+    )
+
+
+def _current_week() -> str:
+    year, number, _ = utcnow().date().isocalendar()
+    return f"{year}-W{number:02d}"

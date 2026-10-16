@@ -17,9 +17,11 @@ from . import (
     graph_api,
     ledger_api,
     mappings_api,
+    modelcalls_api,
     identities_api,
     rest_api,
     runs_api,
+    schedule_api,
     teams_api,
     ui_api,
     worlds_api,
@@ -51,6 +53,12 @@ from .deps import (
     get_flow_service,
     get_task_service,
     get_reimbursement_service,
+    get_ap_intake_service,
+    get_credential_tracking_service,
+    get_department_scheduling_service,
+    get_extraction_service,
+    get_field_documents_service,
+    get_plant_eligibility_service,
     get_payable_service,
 )
 from .logging_config import RequestContextMiddleware, configure_logging, request_id
@@ -100,6 +108,34 @@ async def lifespan(app: FastAPI):
     get_sync_service()  # registers the four inbound sync bodies
     get_reimbursement_service()  # hydrate the table (and seed decided history)
     get_payable_service()  # hydrate the AP world (vendors, POs, invoices)
+    # After payables, and that ordering is load-bearing: intake's whole output
+    # is accounts-payable runs, and it must not be startable before the flow
+    # it starts is registered.
+    get_ap_intake_service()
+    # Registers `credential-tracking`. Reaches no network and seeds
+    # nothing; it is built here so a compliance window can be closed on a
+    # cold box, and because the Trigger that closes one does not guard a
+    # missing body.
+    get_credential_tracking_service()
+    # Registers `field-documents`, and this one is not optional on a cold
+    # box: its two Triggers sit on `JobRecordsDelivered` and
+    # `DocumentsDelivered`, both of which arrive through the delivery door,
+    # and `Dispatcher.emit` starts every matched Trigger without guarding a
+    # missing body — so an unregistered flow here would 500 the next delivery
+    # for every feed rather than fail quietly in one run.
+    get_field_documents_service()
+    # The plant spine, in dependency order: the extraction registers first
+    # because the sweep's whole output is extraction runs, and the sweep must
+    # not be startable before the flow it starts is registered — `ap-intake`
+    # and `accounts-payable` in the same order, for the same reason. Both are
+    # built on a cold box because `plant-window-closed` is a timer and
+    # `job-eligible` is emitted from inside the window it would fail.
+    get_extraction_service()
+    # And the day the extraction's demand rows are filled into, registered
+    # before the sweep for the same reason: `department-day-opened` is a
+    # declared Trigger and the sweep emits its fact from inside itself.
+    get_department_scheduling_service()
+    get_plant_eligibility_service()
     # Registers `answer-question`. Built here rather than on the first /ask so
     # a question arriving at the HR agent — which emits into the same flow and
     # holds no AnswerService of its own — cannot find the body missing.
@@ -238,8 +274,13 @@ app.include_router(calendar_api.router)
 app.include_router(graph_api.router)
 app.include_router(ledger_api.router)
 app.include_router(mappings_api.router)
+app.include_router(modelcalls_api.router)
 app.include_router(runs_api.router)
 app.include_router(data_api.router)
+# The plant schedule's own door. Tier-1 rather than a console endpoint,
+# because a customer pulling their own approved schedule with a script
+# they wrote is a platform capability and not a screen's concern.
+app.include_router(schedule_api.router)
 app.include_router(estate_api.router)
 app.include_router(evals_api.router)
 app.include_router(worlds_api.router)

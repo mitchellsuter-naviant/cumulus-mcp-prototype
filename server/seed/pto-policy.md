@@ -3,7 +3,6 @@ id: pto-policy
 path: people/policies/pto
 title: Paid Time Off Policy
 authority_level: policy
-scope: org
 owner: people-team
 tags: pto, time-off, vacation, hr
 status: published

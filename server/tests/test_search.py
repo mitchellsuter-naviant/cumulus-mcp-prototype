@@ -506,18 +506,21 @@ def test_vertex_embedder_raises_when_a_response_is_short():
     `embed_documents` pairs the result positionally with its inputs.
     """
     from app.embeddings import VertexEmbedder
-
-    embedder = VertexEmbedder.__new__(VertexEmbedder)
-    embedder.model = "pretend-fusing-model"
-    embedder.dimensions = 0
-    embedder._lock = __import__("threading").Lock()
+    from app.flows import ModelRates
+    from app.modelcall import GovernedModelClient, InMemoryModelCallStore
 
     class _OneVector:
         embeddings = [type("E", (), {"values": [0.0, 1.0]})()]
 
-    embedder._client = type(
+    wire = type(
         "C", (), {"models": type("M", (), {"embed_content": lambda *a, **k: _OneVector()})()}
     )()
+    embedder = VertexEmbedder.__new__(VertexEmbedder)
+    embedder.model = "pretend-fusing-model"
+    embedder.dimensions = 0
+    embedder._client = GovernedModelClient(
+        wire, InMemoryModelCallStore(), ModelRates
+    )
 
     with pytest.raises(RuntimeError, match="fuses batched inputs"):
         embedder._embed(["one", "two", "three"], "RETRIEVAL_DOCUMENT")
@@ -597,3 +600,168 @@ def test_mark_weak_hits_stamps_every_hit():
         hit("d", "semantic", 0.543),
     ])
     assert [h.weak for h in hits] == [False, True, True, True]
+
+
+# ---- Coverage: is the top of the ranking about the question at all? ---------
+#
+# Every ranking has a best row, and `score` cannot say whether that row is an
+# answer. Coverage can, and the HR agent uses it to decide whether it is
+# allowed to call anything a governing document.
+
+
+def _covered(assets, query, doc_id):
+    from app.search import SearchIndex
+
+    index = SearchIndex()
+    index.rebuild(assets)
+    return index.coverage(query, doc_id)
+
+
+def _asset(asset_id, title, content, path="x/y/z"):
+    from app.models import Asset
+
+    return Asset(id=asset_id, path=path, title=title, content=content)
+
+
+def test_coverage_weighs_information_not_word_count():
+    """Two meaningful words, one of them the topic. A document holding only the
+    filler has not covered half the question — it has covered none of it, and a
+    floor built on the count would let it through."""
+    corpus = [
+        _asset("pto-policy", "Paid Time Off Policy", "Employees accrue PTO days."),
+        _asset("memo", "A memo", "There is much to say about much of this."),
+        _asset("other-1", "Other", "Much of the estate is much like this."),
+        _asset("other-2", "Other", "Much again, and much more besides."),
+    ]
+    assert _covered(corpus, "how much PTO do I have", "pto-policy") == 1.0
+    assert _covered(corpus, "how much PTO do I have", "memo") == 0.0
+
+
+def test_a_query_of_words_nobody_has_covers_nothing_anywhere():
+    """The failure this exists to stop: nonsense picking a winner. Every
+    ranking has a first row; a floor is what stops it being reported as one."""
+    corpus = [
+        _asset("benefits", "Benefits Overview", "The vision allowance is $200."),
+        _asset("pto", "PTO", "Twenty days per year."),
+        _asset("vpn", "VPN", "Split tunnelling is disabled."),
+    ]
+    assert _covered(corpus, "zzzz quarterly kombucha allowance", "benefits") < 0.34
+
+
+def test_a_spelling_is_not_a_different_question():
+    """`401(k)` indexes as "401" and "k"; a person types "401k". Splitting the
+    mixed token at query time makes them the same question, and the parts count
+    as one thing covered rather than one thing covered and one missed."""
+    from app.search import query_term_groups
+
+    assert query_term_groups("what is the 401k match") == [["401k", "401"], ["match"]]
+    # A short number is not a topic: "10k" must not drag in every document
+    # that mentions ten of something.
+    assert query_term_groups("invoices over 10k") == [["invoices"], ["10k"]]
+
+    corpus = [
+        _asset("benefits", "Benefits", "The 401(k) match is 4%, vested at once."),
+        _asset("pto", "PTO", "Twenty days per year."),
+        _asset("vpn", "VPN", "Split tunnelling is disabled."),
+    ]
+    assert _covered(corpus, "what is the 401k match", "benefits") == 1.0
+
+
+def test_a_word_nobody_has_exactly_falls_back_to_its_stem():
+    """"Reimbursed" must reach the guideline that says "reimbursement".
+
+    Narrow on purpose: the fallback fires only for a term scoring nothing for
+    anybody, so it adds matches and never reshuffles ones that already matched.
+    """
+    from app.search import SearchIndex
+
+    index = SearchIndex()
+    index.rebuild(
+        [
+            _asset("travel", "Travel", "Reimbursement for flights books through Concur."),
+            _asset("vpn", "VPN", "Split tunnelling is disabled."),
+        ]
+    )
+    assert [d for d, _ in index.search("reimbursed flight")] == ["travel"]
+    assert index.coverage("reimbursed flight", "travel") == 1.0
+
+
+def test_grounding_takes_whichever_retriever_found_the_answer():
+    """Coverage is lexical, and on a hybrid deployment that is half the story.
+
+    "How do I get money back for a flight I booked" shares no word with the
+    guideline that says *reimbursement* and *airfare* — coverage zero, and a
+    grounding floor read off that number alone would drop exactly the hit
+    embeddings were added to catch, making hybrid retrieval worse than lexical
+    rather than better. Found live on the deployed corpus, where every hit for
+    a paraphrased question came back at coverage 0.0.
+    """
+    from app.models import SearchHit
+    from app.search import mark_weak_hits, semantic_strength, semantic_profile
+
+    def hit(asset_id, similarity, coverage=0.0):
+        return SearchHit(
+            asset=_asset(asset_id, asset_id, "").summary(),
+            score=1.0, snippet="", retrieval="semantic",
+            similarity=similarity, coverage=coverage,
+        )
+
+    hits = mark_weak_hits(
+        [hit("travel", 0.756), hit("vpn", 0.574), hit("pto", 0.560),
+         hit("incident", 0.552)]
+    )
+    lead = next(h for h in hits if h.asset.id == "travel")
+    tail = next(h for h in hits if h.asset.id == "incident")
+
+    # The document that led the ranking is grounded on the semantic evidence
+    # alone, at coverage zero.
+    assert lead.coverage == 0.0
+    assert lead.semantic_strength == 1.0
+    assert lead.grounding == 1.0
+    assert lead.weak is False
+
+    # The pack behind it is not, which is what keeps the floor a floor.
+    assert tail.grounding < 0.34
+
+    # A ranking with no lead has no strength to report anywhere — which is
+    # what a query of invented words produces.
+    flat = semantic_profile([0.545, 0.540, 0.535, 0.508])
+    assert semantic_strength(0.545, flat) == 0.0
+
+    # And a perfect lexical match is never dragged under by an embedder that
+    # happened not to rank it. The max is the point.
+    lexical_only = hit("expense-approval-policy", None, coverage=1.0)
+    assert lexical_only.grounding == 1.0
+
+
+def test_the_pack_a_hit_is_judged_against_is_the_candidate_set_not_the_page():
+    """A `limit=3` request must not report that nothing led the ranking.
+
+    The top few similarities in any ranking are by construction the closest
+    together in the corpus, so profiling the page collapses the lead under
+    `MIN_SEMANTIC_LEAD` and stamps every hit as having none. Observed on the
+    deployed corpus: a squarely-answering guideline at cosine 0.65, three rows
+    above a background of 0.55, scored a semantic strength of zero.
+    """
+    from app.models import SearchHit
+    from app.search import mark_weak_hits, semantic_profile
+
+    def hit(asset_id, similarity):
+        return SearchHit(
+            asset=_asset(asset_id, asset_id, "").summary(),
+            score=1.0, snippet="", retrieval="hybrid", similarity=similarity,
+        )
+
+    page = [hit("travel", 0.6513), hit("receipt", 0.6169), hit("invoice", 0.5686)]
+
+    # Judged against itself, the page has no lead and says so — wrongly.
+    from_page = mark_weak_hits([h.model_copy() for h in page])
+    assert all(h.semantic_strength == 0.0 for h in from_page)
+
+    # Judged against the candidates the ranking was actually cut from, the
+    # document that led it is grounded.
+    candidates = [0.6513, 0.6169, 0.5686, 0.55, 0.548, 0.54, 0.535, 0.52, 0.51]
+    against_pack = mark_weak_hits(page, semantic_profile(candidates))
+    assert against_pack[0].semantic_strength == 1.0
+    assert against_pack[0].grounding == 1.0
+    assert against_pack[-1].semantic_strength < against_pack[0].semantic_strength

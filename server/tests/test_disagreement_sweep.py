@@ -50,7 +50,7 @@ from app.graph import link_id, object_id
 from app.models import AssetUpdate
 from app.ontology import ONTOLOGY
 from app.resolution import parse_state_policy, read_state_policy
-from app.sync import SyncRequest
+from app.connectors.sync import SyncRequest
 from tests import world as test_world
 
 #: The three books, in the order the fixture declares them: the CRM's half

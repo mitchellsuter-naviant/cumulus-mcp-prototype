@@ -3,7 +3,6 @@ id: onboarding-checklist
 path: people/how-to/onboarding-checklist
 title: New Hire Onboarding Checklist
 authority_level: how-to
-scope: org
 owner: people-team
 tags: onboarding, new-hire, hr
 status: published

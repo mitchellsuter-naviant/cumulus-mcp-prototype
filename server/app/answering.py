@@ -31,8 +31,10 @@ import json
 import logging
 from typing import Any, Callable, Protocol
 
+from . import modelcall
 from .config import settings
 from .flows import read_model_rates
+from .modelcall import GovernedModelClient
 from .models import (
     AskAnswer,
     AskStep,
@@ -53,8 +55,17 @@ ANSWER_FLOW_ID = "answer-question"
 #: the same shape, bound to the same Flow — see `dispatch.TRIGGERS`.
 QUESTION_EVENT = "QuestionAsked"
 HR_QUESTION_EVENT = "HrQuestionAsked"
+#: What each planner turn is *for*, on its ledger row. The planner is the one
+#: call site whose step and ledger rows are one-to-many, so this is also the
+#: label that says which rows to add up before comparing them to a journal.
+PLAN_PURPOSE = "plan-answer"
 
 
+#: `{precedence}` is filled from the governed `retrieval-authority` asset —
+#: see `system_instruction`. Leaving the order written out here as a literal
+#: is the same drift the PTO window had: a deployment that decides a guideline
+#: outranks a standard would edit the document, the ranking would follow, and
+#: the planner would still be told the old order in its own instructions.
 SYSTEM_INSTRUCTION = """\
 You are Cumulus, the answering layer over an enterprise knowledge corpus.
 
@@ -78,7 +89,7 @@ Rules:
 - Cite documents by their exact asset id in square brackets, like [expense-
   approval-policy]. Cite the ids you actually used, nothing else.
 - When two documents conflict, say so and prefer the higher authority level
-  (policy > standard > guideline > how-to > note).
+  ({precedence}).
 - Flag drafts and deprecated documents when you rely on them; they are
   retrievable but not authoritative.
 - If the corpus does not answer the question, say exactly that and name the
@@ -86,6 +97,23 @@ Rules:
   knowledge.
 - Be brief. A few sentences, or a short markdown list for a set of documents.
 """
+
+
+def system_instruction(knowledge=None) -> str:
+    """The planner's instructions, carrying the precedence actually in force.
+
+    Read rather than written out, so the one sentence telling a model which
+    document wins a conflict is the same sentence the ranking obeys. A missing
+    or unreadable asset falls back to the built-in order, which is what the
+    seeded document says anyway.
+    """
+    from .authority import AuthorityPolicy, read_authority_policy
+
+    policy = (
+        read_authority_policy(knowledge) if knowledge is not None
+        else AuthorityPolicy()
+    )
+    return SYSTEM_INSTRUCTION.format(precedence=policy.describe())
 
 
 class AnswerBackend(Protocol):
@@ -131,6 +159,13 @@ class Toolbox:
         self.touched: dict[str, str] = {}
         self.usage = ModelUsage()
         self._documents_read = 0
+
+    @property
+    def knowledge(self):
+        """The corpus this toolbox reads. The planner's instructions are
+        derived from it, so it cannot be told a precedence the ranking does
+        not use."""
+        return self._service
 
     # -- accounting -------------------------------------------------------
 
@@ -767,31 +802,31 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
 
 
 class VertexAnswerBackend:
-    """Gemini function-calling loop on Vertex AI, via the google-genai client.
-
-    Same client library and same Application Default Credentials as
-    VertexEmbedder, so enabling this adds no dependency and no new secret — the
-    Cloud Run service account already has `roles/aiplatform.user`.
+    """Gemini function-calling loop on Vertex AI, through the governed client.
 
     The loop is bounded on two axes: `answer_max_steps` model turns, and
     `answer_max_documents` full documents (enforced inside the Toolbox). A
     planner that never stops calling tools produces a truncated answer flagged
     as such, rather than an unbounded bill.
+
+    **One question is one journal row and several ledger rows.** The turns are
+    summed onto the Toolbox and reach `StepRecord` once, because the fleet
+    counts questions and not sentences; the ledger keeps them apart, because
+    "this question took four turns" is the fact an operator needs when a bill
+    moves and it is invisible in a sum. The two agree by construction: the
+    ledger rows for one step add up to what the step recorded.
     """
 
     name = "vertex"
 
     def __init__(
         self,
-        project: str | None,
-        location: str,
         model: str,
+        client: GovernedModelClient,
         max_steps: int,
         max_output_tokens: int,
     ) -> None:
-        from google import genai
-
-        self._client = genai.Client(vertexai=True, project=project, location=location)
+        self._client = client
         self._model = model
         self._max_steps = max_steps
         self._max_output_tokens = max_output_tokens
@@ -802,7 +837,10 @@ class VertexAnswerBackend:
         from google.genai import types
 
         config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
+            # Through the Toolbox, which is the one handle on this corpus that
+            # is always in scope here — the precedence is a fact about the
+            # documents being answered from, not about the deployment.
+            system_instruction=system_instruction(tools.knowledge),
             tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
             max_output_tokens=self._max_output_tokens,
             temperature=0.2,
@@ -813,16 +851,19 @@ class VertexAnswerBackend:
         ]
 
         for _ in range(self._max_steps):
-            response = self._client.models.generate_content(
-                model=self._model, contents=contents, config=config
+            # One purpose for every turn: a purpose is a *kind* of call, and
+            # numbering them here would fragment the by-purpose rollup into as
+            # many buckets as the planner was verbose. The turns are already
+            # distinguishable — they are separate rows, in order, under one step.
+            response, usage = self._client.generate(
+                model=self._model, contents=contents, config=config,
+                purpose=PLAN_PURPOSE,
             )
             # Every turn, including the ones that only call tools and the last
             # one before a budget exhaustion — a question that ran out of
             # steps still cost what it cost, and dropping those tokens would
             # under-report exactly the questions worth noticing.
-            tools.record_model_turn(
-                ModelUsage.from_vertex(self._model, response)
-            )
+            tools.record_model_turn(usage)
             candidate = (response.candidates or [None])[0]
             if candidate is None or candidate.content is None:
                 break
@@ -871,15 +912,26 @@ def build_answer_backend(
     model: str,
     max_steps: int,
     max_output_tokens: int,
+    *,
+    client: GovernedModelClient | None = None,
 ) -> AnswerBackend | None:
-    """None means "no generation" — /ask degrades to ranked documents."""
-    if backend == "none":
+    """None means "no generation" — /ask degrades to ranked documents.
+
+    `client` is the deployment's governed client; without one the backend
+    builds a private one whose ledger nobody serves, for the reason given on
+    `accounts_payable.domain.build_invoice_reader`.
+    """
+    if backend in modelcall.STUB_BACKENDS:
+        # Both spellings, because they say the same thing here: there is no
+        # generative backend, and `/ask` hands back ranked documents. Unlike a
+        # document reader, that degradation invents nothing — which is why
+        # this one is a real answer rather than the fallback `deps` refuses to
+        # make for the extractors.
         return None
     if backend == "vertex":
         return VertexAnswerBackend(
-            project=project,
-            location=location,
-            model=model,
+            model,
+            client or modelcall.vertex_client(project, location),
             max_steps=max_steps,
             max_output_tokens=max_output_tokens,
         )
@@ -920,10 +972,22 @@ class AnswerService:
         self._graph = graph
         self._dispatcher = dispatcher
         if engine is not None:
-            engine.register(
-                ANSWER_FLOW_ID,
-                lambda ctx, inputs: answer_body(self, ctx, inputs),
-            )
+            # Registered through the versioned package contract, like every
+            # other flow: the body stays here, the shipped shape lives under
+            # `app/tasks/answer_question/`. Deferred — the package binds back
+            # to this module's `answer_body`.
+            from .tasks import default_version, shipped_versions
+
+            default = default_version(ANSWER_FLOW_ID)
+            for number, module in sorted(shipped_versions(ANSWER_FLOW_ID).items()):
+                # `metered` puts the run and the step in scope for the ledger
+                # — see the same registration in the two extraction flows. The
+                # planner needs it most: several turns land under one step, and
+                # the step id is what says they belong to the same question.
+                engine.register(
+                    ANSWER_FLOW_ID, modelcall.metered(module.build_body(self)),
+                    version=number, default=(number == default),
+                )
 
     @property
     def enabled(self) -> bool:

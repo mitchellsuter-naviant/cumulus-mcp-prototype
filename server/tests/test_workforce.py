@@ -167,7 +167,7 @@ def test_the_hris_mapping_binds_rather_than_reifies():
 def test_an_unresolved_reference_escalates_as_one_aggregate(world):
     """A batch feed never suspends per row: a dangling manager email is
     counted and reported once for the delivery."""
-    from app.sync import SyncRequest
+    from app.connectors.sync import SyncRequest
 
     outcomes = world.sync.deliver(
         SyncRequest.model_validate({

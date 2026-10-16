@@ -49,7 +49,7 @@ from app.eval_specs import (
     _IDENTITY_ERP_VENDORS,
 )
 from app.gateway import Refused
-from app.sync import SyncRequest
+from app.connectors.sync import SyncRequest
 from app.ui_api import get_ui_principal
 from tests import demo_world
 from tests import estate_fixtures as fx
@@ -302,10 +302,15 @@ def test_records_landed_and_entities_held_are_both_reported(estate_client):
         == estate_client.world.graph.stats()["by_type"]["Employee"]
     )
     # The Employee book is shared: the mail and calendar feeds resolve against
-    # it without ever minting one, so `instances` is not this feed's output and
-    # the row is entitled to say so.
-    assert entities["Employee"]["feeds"] == 3
-    assert entities["Team"]["feeds"] == 1
+    # it without ever minting one, and so does the credential feed — a
+    # certification names its holder by the same work email. `instances` is
+    # therefore not this feed's output, and the row is entitled to say so.
+    assert entities["Employee"]["feeds"] == 4
+    # Three for Team, and none of the other two writes one: the production
+    # feed binds a crew id to a department the HRIS landed, and the equipment
+    # feed binds a home site to one. A contract that *resolves* a type is
+    # counted here whether or not it ever mints an instance of it.
+    assert entities["Team"]["feeds"] == 3
 
 
 def test_a_bind_feed_reports_no_disposition_rather_than_three_zeros(
@@ -516,11 +521,11 @@ def test_feeds_under_no_contract_are_named_once_and_read_twice(client):
 
     assert named == sorted(s for s, f in feeds.items() if not f["contract_id"])
     assert body["governance"]["feeds_without_contract"] == named
-    # The AP fixture's three deliveries: systems the estate does not run, so
-    # the map lost their Mappings when the mock world died.
-    assert set(named) == {
-        "procurement-coupa", "legacy-ap-extract", "wms-receiving",
-    }
+    # The AP fixture's two remaining deliveries: systems the estate does not
+    # run, so the map lost their Mappings when the mock world died. The
+    # receiving leg is no longer among them — it lands under `erp-receiving`,
+    # the contract the estate grew.
+    assert set(named) == {"procurement-coupa", "legacy-ap-extract"}
     assert all(feeds[s]["records_landed"] > 0 for s in named)
 
 
@@ -590,7 +595,7 @@ def test_a_queue_holding_work_that_nobody_is_bound_to_is_a_finding(client):
     """Tasks route to a queue and never to a person so work survives absence —
     which also means an unbound desk accumulates where no personal inbox would
     ever surface it."""
-    from app.tasks import Task
+    from app.task_queue import Task
 
     deps.get_task_service().create(Task(
         id="task_orphan_desk", kind="curation", title="Nobody holds this",

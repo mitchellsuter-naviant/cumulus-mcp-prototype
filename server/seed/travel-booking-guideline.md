@@ -3,7 +3,6 @@ id: travel-booking-guideline
 path: finance/guidelines/travel-booking
 title: Corporate Travel Booking Guideline
 authority_level: guideline
-scope: org
 owner: finance-ops
 parent: expense-approval-policy
 tags: travel, booking, expenses

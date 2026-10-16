@@ -26,7 +26,21 @@ def utcnow() -> datetime:
 
 
 class Asset(BaseModel):
-    """A single text asset in the knowledge layer."""
+    """A single text asset in the knowledge layer.
+
+    Two dials used to sit here and are gone. `scope` ("org", always) authorized
+    nothing — reach is decided by the Principal's own scope and the path
+    prefixes the callers check — and `supersedes` was written by the editor and
+    read by nobody, while `superseded_by` below is the half that is actually
+    read (the MCP fetch refuses a superseded document with it). A field that
+    nothing consults is a claim to a reader that something does.
+
+    Removing them is deliberately a *tolerant* removal: these models keep
+    pydantic's default `extra="ignore"`, so a stored document and an older
+    client that still sends `scope` or `supersedes` both validate, and the keys
+    are simply dropped. Forbidding extras here would turn a stale console tab
+    into a 422.
+    """
 
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9\-]*$")
     path: str = Field(
@@ -41,12 +55,10 @@ class Asset(BaseModel):
     authority_level: AuthorityLevel | None = "note"
     kind: AssetKind = "document"
     origin: AssetOrigin = "authored"
-    scope: str = "org"
     owner: str = ""
     tags: list[str] = Field(default_factory=list)
     parent: str | None = None
     related: list[str] = Field(default_factory=list)
-    supersedes: str | None = None
     superseded_by: str | None = None
     status: Status = "draft"
     # Bumps on every content/metadata write. This is what `knowledge:{id}@revN`
@@ -85,7 +97,6 @@ class Asset(BaseModel):
             authority_level=self.authority_level,
             kind=self.kind,
             origin=self.origin,
-            scope=self.scope,
             owner=self.owner,
             tags=self.tags,
             status=self.status,
@@ -102,7 +113,6 @@ class AssetSummary(BaseModel):
     authority_level: AuthorityLevel | None
     kind: AssetKind = "document"
     origin: AssetOrigin = "authored"
-    scope: str
     owner: str
     tags: list[str]
     status: Status
@@ -119,12 +129,10 @@ class AssetCreate(BaseModel):
     authority_level: AuthorityLevel | None = "note"
     kind: AssetKind = "document"
     origin: AssetOrigin = "authored"
-    scope: str = "org"
     owner: str = ""
     tags: list[str] = Field(default_factory=list)
     parent: str | None = None
     related: list[str] = Field(default_factory=list)
-    supersedes: str | None = None
     superseded_by: str | None = None
     status: Status = "draft"
 
@@ -141,12 +149,10 @@ class AssetUpdate(BaseModel):
     content: str | None = None
     content_type: ContentType | None = None
     authority_level: AuthorityLevel | None = None
-    scope: str | None = None
     owner: str | None = None
     tags: list[str] | None = None
     parent: str | None = None
     related: list[str] | None = None
-    supersedes: str | None = None
     superseded_by: str | None = None
     status: Status | None = None
 
@@ -175,6 +181,35 @@ class SearchHit(BaseModel):
     # Computed server-side (see search.mark_weak_hits) so the console, the MCP
     # tools and the usage counters all draw the line in the same place.
     weak: bool = False
+    # The fraction of the question's meaningful words that appear anywhere in
+    # this document. Deliberately a *fact* on the hit rather than a verdict:
+    # every ranking has a best row, and `score` cannot say whether that row is
+    # about the question at all. The floor it is judged against is governed
+    # knowledge (`authority.AuthorityPolicy.min_coverage`), so a caller about
+    # to claim "the governing document is X" has something to check first.
+    coverage: float = 0.0
+    # Places this hit climbed because of its authority level, under the
+    # governed precedence. Shown rather than hidden: a reader who sees a policy
+    # above a closer match deserves to know that is the rule working.
+    authority_lift: int = 0
+    # The semantic half of the same question `coverage` asks lexically: how far
+    # up this ranking's lead the hit sits, in [0, 1]. Both exist because either
+    # retriever alone can be the one that found the answer — a question phrased
+    # in none of the document's words has coverage 0 and can still be squarely
+    # answered by it, which is the case embeddings were added for.
+    semantic_strength: float = 0.0
+
+    @property
+    def grounding(self) -> float:
+        """How well this hit is grounded, by whichever retriever found it.
+
+        The max rather than a blend: these are two independent pieces of
+        evidence that the document is about the question, and a document with
+        strong evidence of one kind is grounded whether or not it also has the
+        other. Averaging would let a perfect lexical match be dragged under a
+        floor by an embedder that happened not to rank it.
+        """
+        return max(self.coverage, self.semantic_strength)
 
 
 class AssetFilter(BaseModel):

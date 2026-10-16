@@ -3,6 +3,7 @@ import pytest
 import app.deps as deps
 from app.service import KnowledgeService, seed_if_empty
 from app.storage import InMemoryRepository
+from app.identities import IdentityService, InMemoryMachineIdentityDirectory
 from app.users import InMemoryUserDirectory
 from app.config import settings
 from app.service import parse_seed_file
@@ -17,26 +18,40 @@ def client(_client):
 
     publish_generated_assets(deps._service)
     deps._user_directory = InMemoryUserDirectory()
+    # The identity service *projects* people out of the user directory, so
+    # swapping one without the other leaves it reading a directory this test
+    # no longer writes to — and `/identities`, which is where managing a
+    # person lives, would answer about the previous module's world.
+    deps._identity_service = IdentityService(
+        deps._user_directory, InMemoryMachineIdentityDirectory()
+    )
     return _client
 
 
 def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    # 10 seed documents + 2 seeded extraction prompts + 4 generated
+    # 17 seed documents + 5 seeded prompts + 1 seeded config + 4 generated
     # schema-exports (ontology, collections, mappings, eval specs) — the
-    # fixture publishes them like startup does.
-    # fixture publishes them like startup does. The tenth document is
-    # `model-pricing`: what a model call costs is governed knowledge now, so
-    # it sits in the Library beside the policies rather than in a dict.
-    assert resp.json()["assets"] == 17
+    # fixture publishes them like startup does. `model-pricing` is a document
+    # because what a model call costs is governed knowledge now, so it sits in
+    # the Library beside the policies rather than in a dict, and so is
+    # `retrieval-authority`, which says what a document's authority is worth
+    # when two of them answer the same question. The plant, field and
+    # compliance policies Wick's flows read are documents on the same footing:
+    # `field-documents-policy`, `certification-alert-policy`,
+    # `plant-scheduling-parameters` and `labor-hour-formulas`. The one config
+    # is `truss-standards` — a span/member lookup that used to be a spreadsheet
+    # read fresh on every run, which is why it is governed but argues with
+    # nothing.
+    assert resp.json()["assets"] == 27
 
 
 def test_list_and_prefix_filter(client):
-    assert len(client.get("/api/v1/assets").json()) == 17
+    assert len(client.get("/api/v1/assets").json()) == 27
     # The kind filter carves the Library out of the corpus: documents only.
     docs = client.get("/api/v1/assets", params={"kind": "document"}).json()
-    assert len(docs) == 11
+    assert len(docs) == 17
     assert all(a["kind"] == "document" for a in docs)
     # And it carves out the governed prompts, which are knowledge without being
     # documents: they instruct a ModelCall rather than arguing with a policy.
@@ -44,6 +59,9 @@ def test_list_and_prefix_filter(client):
     assert {a["id"] for a in prompts} == {
         "receipt-extraction-prompt",
         "invoice-extraction-prompt",
+        "invoice-locate-prompt",
+        "shipping-list-extract-prompt",
+        "shipping-list-locate-prompt",
     }
     assert all(a["authority_level"] is None for a in prompts)
     finance = client.get("/api/v1/assets", params={"prefix": "finance"}).json()
@@ -51,8 +69,10 @@ def test_list_and_prefix_filter(client):
         "expense-approval-policy",
         "travel-booking-guideline",
         "invoice-posting-policy",
+        "ap-intake-policy",
         "receipt-extraction-prompt",
         "invoice-extraction-prompt",
+        "invoice-locate-prompt",
     }
 
 
@@ -88,7 +108,7 @@ def test_crud_cycle(client):
 
 def test_search_ranks_relevant_doc(client):
     hits = client.get(
-        "/api/v1/search", params={"q": "expense approval thresholds"}
+        "/api/v1/search", params={"q": "expense auto-approval limit"}
     ).json()
     assert hits[0]["asset"]["id"] == "expense-approval-policy"
 
@@ -231,13 +251,17 @@ def test_index_updates_incrementally_on_write(client):
     assert client.get("/api/v1/search", params={"q": "wombat"}).json() == []
 
 
-def test_users_crud_and_role_rules(client):
+def test_creating_a_person_and_the_role_rules_around_it(client):
+    """`/users` mints the account; `/identities` does everything after that.
+
+    The second spelling of list-change-delete that used to live on `/users`
+    is gone — one directory behind two authorization policies is how the two
+    come to disagree — so this walks the create half here and the manage half
+    where it now lives.
+    """
     # Dev mode: caller acts as owner.
     me = client.get("/api/v1/users/me").json()
     assert me["role"] == "owner"
-
-    users = client.get("/api/v1/users").json()
-    assert users[0]["email"] == "owner@localhost"
 
     created = client.post(
         "/api/v1/users",
@@ -253,20 +277,24 @@ def test_users_crud_and_role_rules(client):
     )
     assert dup.status_code == 409
 
-    changed = client.put(f"/api/v1/users/{uid}/role", json={"role": "user"})
+    # The person is one identity among all of them, and is managed there.
+    listed = client.get("/api/v1/identities").json()
+    assert {"owner@localhost", "ana@example.com"} <= {i["email"] for i in listed}
+
+    changed = client.put(f"/api/v1/identities/{uid}/role", json={"role": "user"})
     assert changed.json()["role"] == "user"
 
-    assert client.delete(f"/api/v1/users/{uid}").status_code == 204
-    assert client.delete(f"/api/v1/users/{uid}").status_code == 404
+    assert client.delete(f"/api/v1/identities/{uid}").status_code == 204
+    assert client.delete(f"/api/v1/identities/{uid}").status_code == 404
 
     # Cannot change your own role or delete yourself. Asked rather than
     # hardcoded: the signed-in uid is the acting persona's, not a literal.
     me_uid = client.get("/api/v1/users/me").json()["uid"]
     assert (
-        client.put(f"/api/v1/users/{me_uid}/role",
+        client.put(f"/api/v1/identities/{me_uid}/role",
                    json={"role": "user"}).status_code == 400
     )
-    assert client.delete(f"/api/v1/users/{me_uid}").status_code == 400
+    assert client.delete(f"/api/v1/identities/{me_uid}").status_code == 400
 
 
 def test_a2a_agent_card_and_message(client):

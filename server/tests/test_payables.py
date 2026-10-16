@@ -17,14 +17,17 @@ The doctrinal assertions:
   round-trips through it verbatim.
 """
 
+import base64
+
 import pytest
 from pydantic import ValidationError
 
 from app.graph import object_id
 from app.matching import MatchLine, MatchTolerances, match_invoice
 from app.models import AssetUpdate
-from app.payables import InvoiceScenario, ScenarioLine
-from app.sync import SyncRequest
+from app.tasks.accounts_payable import domain as payables
+from app.tasks.accounts_payable.scenarios import InvoiceScenario, ScenarioLine
+from app.connectors.sync import SyncRequest
 from tests import demo_world
 from tests import world as test_world
 
@@ -76,7 +79,7 @@ def _orders(world):
 
 def _receipts(world, short: float = 0.0):
     world.sync.deliver(SyncRequest.model_validate({
-        "source": "wms-receiving",
+        "source": "erp-receiving",
         "receiving_reports": [{
             "external_id": "RR-5501", "receipt_number": "RR-5501",
             "po_number": "PO-7741", "received_date": "2026-08-11",
@@ -90,6 +93,34 @@ def _receipts(world, short: float = 0.0):
         }],
     }), actor="system:test")
 
+
+
+def _posted(world, hint: str, filename: str = "acme.pdf", **kwargs):
+    """Submit an invoice and take it through the review the policy now requires.
+
+    The governed auto-post limit is **$0.00** — every invoice raises a review
+    task, which is the whole of decision D6 — so a test that needs a *posted*
+    invoice has to answer that task, exactly as the desk does. Approving is
+    the honest gesture here: these cases are clean invoices whose only
+    objection is the limit itself, which is what the clerk is being asked
+    about.
+
+    It fails loudly rather than approving twice. A case that comes back to the
+    gate a second time is a case with a real objection in it, and quietly
+    clicking through that would turn every assertion below into a test of the
+    approve button.
+    """
+    record = world.payables.submit(
+        kwargs.pop("submitted_by", "connie.alberts@naviant.com"),
+        filename=filename, hint=hint, **kwargs,
+    )
+    if record.state != "pending" or not record.task_id:
+        return record
+    decided = world.tasks.decide(
+        record.task_id, "approved", "dana.prentiss@naviant.com",
+        note="Nothing to check but the governed limit.",
+    )
+    return world.payables.resume_for_task(decided) or record
 
 
 # ---- the case-authoring language ------------------------------------------
@@ -145,7 +176,7 @@ def test_the_grammar_distinguishes_what_an_empty_string_cannot():
     assert bare.to_hint() == "newvendor po=PO-9001"
 
 
-def test_lines_carry_the_quantity_the_composer_stepped_to():
+def test_lines_carry_the_quantity_a_case_asked_for():
     scenario = InvoiceScenario.parse("lines=STL-0250:2,FAS-M12:3")
     assert [(line.sku, line.quantity) for line in scenario.lines] == [
         ("STL-0250", 2.0), ("FAS-M12", 3.0)
@@ -183,12 +214,13 @@ TWIST_BRANCHES = {
 
 @pytest.mark.parametrize("twist", sorted(TWIST_BRANCHES))
 def test_each_twist_reaches_the_branch_it_advertises(world, twist):
-    """A checkbox that names a branch has to reach it.
+    """A twist that names a branch has to reach it.
 
-    The composer labels each twist with the branch it exercises and the
-    governed clause that decides it. If a twist stopped reaching its branch the
-    label would still read correctly and the screen would be teaching the
-    wrong thing, which is the failure this catches.
+    Each `ScenarioTwist` declares the branch it exercises and the governed
+    clause that decides it, and the seeded world and the eval cases are written
+    against those declarations. If a twist stopped reaching its branch the
+    declaration would still read correctly and every case built on it would be
+    grading the wrong path, which is the failure this catches.
     """
     _vendors(world)
     _orders(world)
@@ -235,25 +267,44 @@ def test_each_twist_reaches_the_branch_it_advertises(world, twist):
 
 def test_posting_values_come_from_the_document(world):
     policy = world.payables.read_policy()
-    assert policy.found_asset and policy.limit_usd == 2500.0
+    # $0.00 as shipped — decision D6, taken as a knowledge edit rather than a
+    # code change, which is the point of the value being governed at all.
+    assert policy.found_asset and policy.limit_usd == 0.0
+    assert policy.min_confidence == 0.75
     assert policy.source_ref.endswith("@rev1")
 
 
 def test_editing_the_posting_limit_changes_the_flow(world):
+    """The dial, in both directions — including the one D6 turned.
+
+    As shipped the limit is $0.00, so a clean invoice from a resolved vendor
+    that matches its order line for line still stops at a clerk. Raising the
+    limit is a knowledge edit and nothing else, and the very next run posts
+    with nobody involved: the auto-post path is dormant, not deleted, which is
+    the difference between a policy decision and a code change.
+    """
     _vendors(world)
     _orders(world)
     _receipts(world)
-    content = world.knowledge.repo.get("invoice-posting-policy").content
-    world.knowledge.update("invoice-posting-policy", AssetUpdate(
-        content=content.replace("Auto-post limit: $2,500.00", "Auto-post limit: $500.00")
-    ))
-    record = world.payables.submit(
+    held = world.payables.submit(
         "connie.alberts@naviant.com", filename="acme.pdf",
         hint="vendor=acme-industrial po=PO-7741 invoice=ACME-1 lines=STL-0250:2,FAS-M12:3",
     )
-    assert record.state == "pending"
-    assert "$500.00 auto-post limit" in record.verdict_reason
-    assert record.policy_ref.endswith("@rev2")
+    assert held.state == "pending"
+    assert "$0.00 auto-post limit" in held.verdict_reason
+    assert held.policy_ref.endswith("@rev1")
+
+    content = world.knowledge.repo.get("invoice-posting-policy").content
+    world.knowledge.update("invoice-posting-policy", AssetUpdate(
+        content=content.replace("Auto-post limit: $0.00", "Auto-post limit: $5,000.00")
+    ))
+    posted = world.payables.submit(
+        "connie.alberts@naviant.com", filename="acme.pdf",
+        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-1B lines=STL-0250:2,FAS-M12:3",
+    )
+    assert posted.state == "posted"
+    assert posted.decided_by == ""  # nobody was asked
+    assert posted.policy_ref.endswith("@rev2")
 
 
 # ---- identity --------------------------------------------------------------
@@ -341,14 +392,16 @@ def test_one_model_call_reads_the_document(world):
     _vendors(world)
     _orders(world)
     _receipts(world)
-    record = world.payables.submit(
-        "connie.alberts@naviant.com", filename="acme.pdf",
-        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-2 lines=STL-0250:2,FAS-M12:3",
+    record = _posted(
+        world,
+        "vendor=acme-industrial po=PO-7741 invoice=ACME-2 lines=STL-0250:2,FAS-M12:3",
     )
     assert record.state == "posted"
     run = world.engine.get(record.run_id)
     step_ids = {s.step_id for s in run.steps}
-    assert step_ids >= {"s1", "m1", "z1", "x3", "c1", "c2"}
+    assert step_ids >= {"s1", "x0", "m1", "z1", "x2", "c2"}
+    # One call, and the second one is *absent* rather than empty: a clean
+    # invoice puts nothing in doubt, so `m2` is never asked for boxes.
     assert [s.step_id for s in run.steps if s.kind == "modelcall"] == ["m1"]
 
 
@@ -418,7 +471,13 @@ def test_an_unknown_vendor_is_minted_onboarding_and_graduates_on_posting(world):
     vendor = world.graph.get(record.vendor_id)
     assert vendor.props["status"] == "onboarding"
     task = world.tasks.get(record.task_id)
-    assert task.kind == "decision" and task.queue == "ap-clerk"
+    # v9 routes the review to the person who submitted it, per the governed
+    # approval table — their own desk, not the shared AP queue.
+    assert task.kind == "decision"
+    assert task.subject_email == "connie.alberts@naviant.com"
+    assert task.queue == world.queues.ensure_personal(
+        "connie.alberts@naviant.com"
+    ).slug
 
     decided = world.tasks.decide(
         task.id, "approved", "dana.prentiss@naviant.com",
@@ -475,9 +534,9 @@ def test_a_clean_invoice_matches_its_po_and_receipt(world):
     _vendors(world)
     _orders(world)
     _receipts(world)
-    record = world.payables.submit(
-        "connie.alberts@naviant.com", filename="acme.pdf",
-        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-3 lines=STL-0250:2,FAS-M12:3",
+    record = _posted(
+        world,
+        "vendor=acme-industrial po=PO-7741 invoice=ACME-3 lines=STL-0250:2,FAS-M12:3",
     )
     assert record.match_verdict == "matched"
     assert record.state == "posted"
@@ -513,9 +572,23 @@ def test_a_price_variance_holds_the_invoice_and_a_correction_releases_it(world):
     resumed = world.payables.resume_for_task(decided)
     # The correction re-runs the match rather than overriding it.
     assert resumed.match_verdict == "matched"
-    assert resumed.state == "posted"
     run = world.engine.get(record.run_id)
-    assert "c1_1" in {s.step_id for s in run.steps}
+    assert "c2_1" in {s.step_id for s in run.steps}
+
+    # And it comes back to the desk once more, held now by the governed limit
+    # alone — the variance the clerk answered is gone from the reason. That
+    # second gate is D6's doing and is worth pinning: under a $0.00 limit a
+    # correction can never *release* an invoice, it can only settle the
+    # objection that is not the limit.
+    assert resumed.state == "pending"
+    assert "off the PO's" not in resumed.verdict_reason
+    assert "$0.00 auto-post limit" in resumed.verdict_reason
+
+    approved = world.payables.resume_for_task(world.tasks.decide(
+        resumed.task_id, "approved", "dana.prentiss@naviant.com",
+        note="Corrected price agrees with the order.",
+    ))
+    assert approved.state == "posted"
 
 
 def test_billing_more_than_was_received_is_a_quantity_variance(world):
@@ -581,9 +654,26 @@ def test_goods_not_booked_in_block_rather_than_vary():
 
 
 # ---- the anomaly screen ---------------------------------------------------
+#
+# A v8 capability, and these run against v8 for that reason. v9 cut the screen
+# from the default path deliberately — scoring every invoice against its
+# vendor's history before anybody sees it buys a finding on the handful of
+# invoices that were going to a person anyway — and the capability is not gone:
+# it is a version the console can make live, which is what a shipped candidate
+# is for. So the tests that exercise it say which version they exercise.
 
 
-def test_the_screen_says_so_when_there_is_no_history(world):
+@pytest.fixture()
+def screened(world):
+    """`world`, with the version that screens made live."""
+    world.engine.live_version = lambda flow_id: (
+        8 if flow_id == payables.FLOW_ID else 0
+    )
+    return world
+
+
+def test_the_screen_says_so_when_there_is_no_history(screened):
+    world = screened
     _vendors(world)
     record = world.payables.submit(
         "connie.alberts@naviant.com", filename="acme.pdf",
@@ -593,15 +683,19 @@ def test_the_screen_says_so_when_there_is_no_history(world):
     assert "no history" in record.anomaly_basis
 
 
-def test_an_outlier_is_measured_against_this_vendor(world):
+def test_an_outlier_is_measured_against_this_vendor(screened):
+    world = screened
     _vendors(world)
     _orders(world)
     _receipts(world)
+    # Posted, not merely submitted: a vendor's payment history is what was
+    # *paid*, and under the $0.00 limit that means three invoices a clerk
+    # approved. An invoice still sitting at a gate is not history.
     for number in ("ACME-A", "ACME-B", "ACME-C"):
-        world.payables.submit(
-            "connie.alberts@naviant.com", filename="acme.pdf",
-            hint=f"vendor=acme-industrial po=PO-7741 invoice={number} "
-                 "lines=STL-0250:2,FAS-M12:3",
+        _posted(
+            world,
+            f"vendor=acme-industrial po=PO-7741 invoice={number} "
+            "lines=STL-0250:2,FAS-M12:3",
         )
     world.anomaly.rebuild()
     profile = world.anomaly.profile_for(
@@ -619,14 +713,15 @@ def test_an_outlier_is_measured_against_this_vendor(world):
     assert str(profile.median_usd)[:4] in big.anomaly_basis.replace(",", "")
 
 
-def test_a_duplicate_total_inside_the_window_is_flagged(world):
+def test_a_duplicate_total_inside_the_window_is_flagged(screened):
+    world = screened
     _vendors(world)
     _orders(world)
     _receipts(world)
-    first = world.payables.submit(
-        "connie.alberts@naviant.com", filename="acme.pdf",
-        hint="vendor=acme-industrial po=PO-7741 invoice=ACME-D1 "
-             "lines=STL-0250:2,FAS-M12:3",
+    first = _posted(
+        world,
+        "vendor=acme-industrial po=PO-7741 invoice=ACME-D1 "
+        "lines=STL-0250:2,FAS-M12:3",
     )
     world.anomaly.rebuild()
     second = world.payables.submit(
@@ -673,12 +768,16 @@ def test_seed_builds_a_matchable_world(world):
     stats = world.payables.stats()
     assert stats.posted and stats.pending and stats.denied
     assert stats.matched  # the PO and receiving feeds landed, so matches happen
-    assert stats.anomalies  # and the screen found something
+    # Every seeded invoice went through a person, because the governed limit is
+    # $0.00 — the seeded world's shape is now the *decisions*, not a screen's
+    # findings: one corrected, one rejected as a duplicate by the reviewer who
+    # recognised it, two still open.
+    assert stats.match_variance
     # Vendors, orders and receipts all arrived through their sync Flows.
     assert len(world.graph.find("Vendor")) >= 4
     assert world.graph.find("PurchaseOrder") and world.graph.find("ReceivingReport")
     sources = {s.source for s in world.sync.sources()}
-    assert {"erp-vendors", "erp-purchase-orders", "wms-receiving"} <= sources
+    assert {"erp-vendors", "erp-purchase-orders", "erp-receiving"} <= sources
 
 
 def test_a_redelivery_changes_nothing(world):
@@ -691,19 +790,27 @@ def test_a_redelivery_changes_nothing(world):
     assert vendor_runs[0].outputs["unchanged"] == 2
 
 
-def test_api_exposes_the_table_the_match_and_the_vendors(client, world):
+def test_api_exposes_the_table_and_the_match(client, world):
     demo_world.seed_payables(world.payables, sync=world.sync)
     rows = client.get("/api/v1/payables").json()
     assert rows and any(r["match_pairings"] for r in rows)
     stats = client.get("/api/v1/payables/stats").json()
     assert stats["total"] == len(rows)
 
-    vendors = client.get("/api/v1/graph/vendors").json()
-    acme = next(v for v in vendors if "Acme" in v["label"])
-    assert len(acme["source_records"]) >= 2  # ERP and procurement
-    assert acme["invoices"] >= 1
+    # The canonical vendor carries both source systems' rows and the invoice
+    # it issued. Read off the graph rather than through `/graph/vendors`: that
+    # view route went with the composer screen that was its only caller, and
+    # the assembly it used to prove is the graph's, not the route's.
+    acme = next(v for v in world.graph.find("Vendor") if "Acme" in v.label)
+    identified = world.graph.neighbors(
+        acme.id, "identified_as", "out", include_reversed=True
+    )
+    assert len(identified) >= 2  # ERP and procurement
+    assert world.graph.neighbors(acme.id, "issued", "out")
 
-    sources = client.get("/api/v1/sources").json()
+    # The console door: the bare machine list was retired, and the assembly
+    # under both spellings was always `SyncService.sources()`.
+    sources = client.get("/api/ui/v1/sources").json()["sources"]
     assert {s["kind"] for s in sources} >= {
         "vendors", "purchase-orders", "receiving-reports"
     }
@@ -778,13 +885,13 @@ def test_a_total_is_a_read_of_every_row_it_counts(client, world):
     tomas = client.get(
         "/api/v1/payables/stats", headers={"X-Cumulus-Persona": "customer-user:ap"}
     ).json()
-    assert everyone["posted_usd"] > 0 and everyone["anomalies"] > 0
-    assert kim["posted_usd"] == 0.0 and kim["anomalies"] == 0
+    assert everyone["posted_usd"] > 0 and everyone["matched"] > 0
+    assert kim["posted_usd"] == 0.0 and kim["matched"] == 0
     # Tomas owns the queue this flow routes to, so the workspace is his and
     # his totals are the tenant's — that is what a Seeing Space is. The leak
     # this guards is Kim's, who owns no queue and entered no invoice.
     assert tomas["posted_usd"] == everyone["posted_usd"]
-    assert tomas["anomalies"] == everyone["anomalies"]
+    assert tomas["matched"] == everyone["matched"]
 
 
 def test_an_invoice_outside_your_slice_is_missing_not_forbidden(client, world):
@@ -805,108 +912,104 @@ def test_an_invoice_outside_your_slice_is_missing_not_forbidden(client, world):
 
 # ---- the console's own door -----------------------------------------------
 #
-# `/api/ui/v1/payables` replaces a free-text hint box with a composer built out
-# of the graph, and answers a submission with a screen rather than a sentence.
-# Three things are worth defending: the composer's controls are real rows, the
-# outcome names the clause the Rule cited without re-deriving the verdict, and
-# `may_decide` answers `require_queue` before the 403 rather than after it.
+# `/api/ui/v1/payables` used to serve a composer: the vendor master, its open
+# orders and their lines, four "twist" checkboxes, and a preview of the hint
+# string the choices serialized to. Every control was a real graph row and the
+# whole thing was still a way to manufacture an extraction from a form — an
+# invoice nobody wrote, indistinguishable afterwards from one a model read.
+#
+# What is defended now is the opposite property: the door takes bytes and
+# nothing else, the screen says which extractor will read them, and the outcome
+# names the clause the Rule cited without re-deriving the verdict.
 
 UI_PAYABLES = "/api/ui/v1/payables"
 UI_SUBMISSIONS = "/api/ui/v1/payables/submissions"
 
 
-def _composed(**overrides) -> dict:
-    scenario = {
-        "vendor_slug": "acme-industrial",
-        "po_number": "PO-7741",
-        "invoice_number": "ACME-INV-9001",
-        "lines": [{"sku": "STL-0250", "quantity": 2}, {"sku": "FAS-M12", "quantity": 3}],
-    }
-    scenario.update(overrides)
-    return {"scenario": scenario}
+def _pdf(marker: str) -> bytes:
+    """A tiny artifact with a real PDF signature.
+
+    Enough for `media.sniff` to call it `application/pdf` and for the store to
+    key it by its content — which is the point of the marker: two uploads in
+    one test must be two documents, and a content-hash id makes identical bytes
+    one.
+    """
+    return b"%PDF-1.4\n% " + marker.encode() + b"\n%%EOF\n"
 
 
-def test_every_composer_control_is_a_row_from_the_graph(client, world):
-    """The picker is the vendor master, its orders and their lines.
+def _uploaded(filename: str = "", **overrides) -> dict:
+    """An upload, as the console posts one.
 
-    Not a list of example strings: choosing Acme and then PO-7741 is what makes
-    `lines=STL-0250:2,FAS-M12:3` appear, and nobody composing an invoice has to
-    know that spelling exists.
+    The filename carries the case, and that is the stub extractor's documented
+    behaviour rather than a back door: `MODEL_BACKEND=none` means *the reader
+    reads the name, not the page*, the screen says so in `submission.extractor`,
+    and a deployment with a real extractor ignores it entirely. There is no
+    request field that carries a case — that is what this section is about.
+    """
+    # The `.pdf` goes after a token whose charset stops at a dot: the `lines=`
+    # and `total=` patterns would otherwise swallow the extension and fail to
+    # parse. A real filename has the same hazard, which is why the grammar's
+    # patterns are the constraint rather than a convention.
+    name = filename or (
+        "vendor=acme-industrial po=PO-7741 lines=STL-0250:2,FAS-M12:3 "
+        "invoice=ACME-INV-9001.pdf"
+    )
+    body = {"image_base64": base64.b64encode(_pdf(name)).decode(), "filename": name}
+    body.update(overrides)
+    return body
+
+
+def test_the_submission_panel_offers_no_way_to_compose_an_invoice(client, world):
+    """The screen's controls are gone, and their absence is the assertion.
+
+    A vendor picker, an order picker, line steppers and the twist checkboxes
+    were all served from here. Removing the *widgets* would have left the
+    payload; this checks the payload, because a console rebuilt against a
+    server that still offers `twists` is one commit from composing again.
     """
     demo_world.seed_payables(world.payables, sync=world.sync)
-    composer = client.get(UI_PAYABLES).json()["composer"]
+    screen = client.get(UI_PAYABLES).json()
 
-    acme = next(v for v in composer["vendors"] if "Acme" in v["label"])
-    assert acme["status"] == "active"
-    # The vendor master's whole point, at the moment you pick one.
-    assert {s["source"] for s in acme["sources"]} >= {"erp-vendors", "procurement-coupa"}
+    assert "composer" not in screen
+    panel = screen["submission"]
+    assert set(panel) == {"policy", "extractor"}
 
-    [order] = acme["orders"]
-    assert order["po_number"] == "PO-7741" and order["receipts"] == ["RR-5501"]
-    # In the order's own ordinal order: a twist that says "the first line"
-    # has to mean line 1 of the purchase order, not whichever SKU sorts first.
-    assert [(line["sku"], line["quantity_ordered"]) for line in order["lines"]] == [
-        ("STL-0250", 2.0), ("FAS-M12", 3.0)
-    ]
-    assert [line["quantity_received"] for line in order["lines"]] == [2.0, 3.0]
-    # The catalog is the line source for an invoice with no order behind it.
-    assert {line["sku"] for line in composer["catalog"]} >= {"PPE-GLV", "STL-0375"}
+    # What a person is owed before they read an answer: which reader produced
+    # it. `stub` reads the filename; `vertex` reads the page.
+    assert panel["extractor"] == "stub"
 
-    # Every twist names a clause the flow actually reads.
-    clause_ids = {clause["id"] for clause in composer["policy"]}
-    assert {t["clause_id"] for t in composer["twists"]} <= clause_ids
-    limit = next(c for c in composer["policy"] if c["id"] == "auto-post-limit")
-    assert limit["value"] == "$2,500.00"
+    # The governed clauses the flow reads, at the revision it reads them.
+    limit = next(c for c in panel["policy"] if c["id"] == "auto-post-limit")
+    assert limit["value"] == "$0.00"
     assert limit["ref"] == "knowledge:invoice-posting-policy@rev1"
 
+    # And no row of the table carries a composed string any more.
+    assert all("hint" not in outcome for outcome in screen["invoices"])
 
-def test_the_composer_offers_orders_that_are_actually_open(client, world):
-    """"N open PO(s)" counted the closed and the fully-billed ones too.
 
-    The count is `len(orders)` and the word is "open", so the two have to
-    agree at the source rather than in the caption. Named as the closed set
-    because the status vocabulary is the ERP's and grows: a word this
-    deployment has not seen yet is more safely read as still-open than
-    silently dropped out of the picker.
+def test_an_uploaded_document_runs_the_flow_over_bytes_it_kept(client, world):
+    """The one door, and it carries evidence.
+
+    The artifact is stored before anything reads it, keyed by its content, and
+    the invoice row points at it — which is what makes "a model read this
+    document" a claim somebody can check two years later.
     """
-    _vendors(world)
-    world.sync.deliver(SyncRequest.model_validate({
-        "source": "erp-purchase-orders",
-        "purchase_orders": [
-            {
-                "external_id": f"PO-99{n}", "po_number": f"PO-99{n}",
-                "vendor_external_id": "V-10041",
-                "vendor_name": "Acme Industrial Inc.",
-                "ordered_date": "2026-08-05", "status": status,
-                "lines": [{
-                    "sku": "STL-0250", "description": "Hot-rolled steel plate",
-                    "quantity_ordered": 1.0, "unit_price_usd": 486.00,
-                }],
-            }
-            for n, status in enumerate(
-                ["open", "pending-receipt", "partially-received",
-                 "fully-billed", "closed", "cancelled"]
-            )
-        ],
-    }), actor="system:test")
-
-    composer = client.get(UI_PAYABLES).json()["composer"]
-    acme = next(v for v in composer["vendors"] if "Acme" in v["label"])
-    offered = {o["status"] for o in acme["orders"]}
-    assert offered == {"open", "pending-receipt", "partially-received"}
-    assert len(acme["orders"]) == 3
-
-
-def test_a_composed_submission_sends_the_string_it_showed(client, world):
     demo_world.seed_payables(world.payables, sync=world.sync)
-    outcome = client.post(UI_SUBMISSIONS, json=_composed()).json()
-    assert outcome["hint"] == (
-        "vendor=acme-industrial po=PO-7741 invoice=ACME-INV-9001 "
-        "lines=STL-0250:2,FAS-M12:3"
-    )
-    assert outcome["invoice"]["state"] == "posted"
+    outcome = client.post(UI_SUBMISSIONS, json=_uploaded()).json()
+
+    # Held at the clerk's desk like every other invoice — the $0.00 limit
+    # applies to the side door too, and the gate the screen is handed is the
+    # evidence of it. What this test is about is the artifact underneath, and
+    # that is stored before anything reads it either way.
+    assert outcome["invoice"]["state"] == "pending"
     assert outcome["invoice"]["match_verdict"] == "matched"
-    assert outcome["gate"] is None
+    assert outcome["gate"] is not None
+
+    stored = world.documents.get(outcome["invoice"]["document_id"])
+    assert stored is not None
+    assert stored.media_type == "application/pdf"
+    assert stored.byte_size > 0
+    assert outcome["invoice"]["run_id"] in stored.run_ids
 
 
 def test_the_outcome_marks_the_clause_the_rule_cited(client, world):
@@ -918,10 +1021,9 @@ def test_the_outcome_marks_the_clause_the_rule_cited(client, world):
     rule, and the two would eventually disagree.
     """
     demo_world.seed_payables(world.payables, sync=world.sync)
-    outcome = client.post(UI_SUBMISSIONS, json=_composed(
-        invoice_number="ACME-INV-9002",
-        lines=[{"sku": "STL-0375", "quantity": 12}],
-        total_usd=9800.0,
+    outcome = client.post(UI_SUBMISSIONS, json=_uploaded(
+        "vendor=acme-industrial po=PO-7741 lines=STL-0375:12 total=9800.00 "
+        "invoice=ACME-INV-9002.pdf"
     )).json()
     assert outcome["invoice"]["state"] == "pending"
     deciding = {c["id"] for c in outcome["policy"] if c["deciding"]}
@@ -941,15 +1043,22 @@ def test_may_decide_answers_require_queue_before_the_403(client, world):
     them, which is what a queue binding is for.
     """
     demo_world.seed_payables(world.payables, sync=world.sync)
-    body = _composed(invoice_number="ACME-INV-9003", total_usd=9800.0)
+    body = _uploaded(
+        "vendor=acme-industrial po=PO-7741 total=9800.00 "
+        "invoice=ACME-INV-9003.pdf"
+    )
 
     tomas = client.post(
         UI_SUBMISSIONS, json=body, headers={"X-Cumulus-Persona": "customer-user:ap"}
     ).json()["gate"]
-    assert tomas["queue"] == "ap-clerk"
+    # v9 routes the review back to the person who uploaded it, which here is
+    # Tomas — so the desk is his own rather than the shared queue, and he may
+    # decide it on the very response that minted the desk.
+    desk = world.queues.ensure_personal("connie.alberts@naviant.com").slug
+    assert tomas["queue"] == desk
     assert tomas["may_decide"] and tomas["why_not"] == ""
     # Which step stopped it, not merely that something did.
-    assert tomas["step_id"].startswith("k2") and tomas["step_name"] == "review-invoice"
+    assert tomas["step_id"].startswith("k1") and tomas["step_name"] == "review-invoice"
 
     screen = client.get(
         UI_PAYABLES, headers={"X-Cumulus-Persona": "naviant-support"}
@@ -958,19 +1067,19 @@ def test_may_decide_answers_require_queue_before_the_403(client, world):
         o["gate"] for o in screen["invoices"]
         if o["invoice"]["invoice_number"] == "ACME-INV-9003"
     )
-    assert support["queue"] == "ap-clerk"
+    assert support["queue"] == desk
     assert not support["may_decide"]
-    assert support["why_not"] == "this is in ap-clerk; you are bound to no queue"
+    assert support["why_not"] == f"this is in {desk}; you are bound to no queue"
 
 
 def test_the_ap_workspace_is_the_clerk_desk_not_a_public_screen(client, world):
     """Kim owns no queue, and the workspace is more than the rows she has none of.
 
     The table was already scoped to her — an empty one — but the screen around
-    it is the vendor master, every open purchase order, the posting policy and
-    a control that runs the flow and can auto-post money. None of that is
-    anyone's own work, so the door says which desk it is rather than handing
-    over an empty table that reads as "the business is quiet".
+    it is the posting policy and a control that runs the flow and can auto-post
+    money. Neither is anyone's own work, so the door says which desk it is
+    rather than handing over an empty table that reads as "the business is
+    quiet".
     """
     demo_world.seed_payables(world.payables, sync=world.sync)
     kim = {"X-Cumulus-Persona": "customer-user:ae"}
@@ -980,31 +1089,41 @@ def test_the_ap_workspace_is_the_clerk_desk_not_a_public_screen(client, world):
     assert "ap-clerk" in refused.json()["detail"]
     assert "your own work" in refused.json()["detail"]
 
-    submitted = client.post(UI_SUBMISSIONS, json=_composed(), headers=kim)
+    submitted = client.post(UI_SUBMISSIONS, json=_uploaded(), headers=kim)
     assert submitted.status_code == 403
 
     # Platform reach opens the screen and still may not file an invoice:
     # reading a workstream and committing to its book are different acts.
     support = {"X-Cumulus-Persona": "naviant-support"}
     assert client.get(UI_PAYABLES, headers=support).status_code == 200
-    blocked = client.post(UI_SUBMISSIONS, json=_composed(), headers=support)
+    blocked = client.post(UI_SUBMISSIONS, json=_uploaded(), headers=support)
     assert blocked.status_code == 403
     assert "ap-clerk" in blocked.json()["detail"]
 
 
-def test_an_upload_carries_no_hints_and_a_key_gets_no_door(client, world):
-    """The two honest halves.
+def test_a_submission_with_no_document_is_refused_at_both_doors(client, world):
+    """The shape that used to work, and must not.
 
-    An upload is a document and says nothing about the case — with no model
-    configured the extractor reads the filename, which the screen admits rather
-    than dressing up. And the console door refuses a minted key outright: a
-    machine has no screens.
+    A filename and no bytes was a valid submission: the stub read the name and
+    the run posted an invoice whose `document_id` pointed at a zero-byte
+    artifact. Both doors now refuse it, and the console door refuses a minted
+    key outright besides — a machine has no screens.
     """
     demo_world.seed_payables(world.payables, sync=world.sync)
-    outcome = client.post(UI_SUBMISSIONS, json={"filename": "a-scan.pdf"}).json()
-    assert outcome["hint"] == "" and outcome["invoice"]["id"]
+    assert client.post(
+        UI_SUBMISSIONS, json={"filename": "a-scan.pdf"}
+    ).status_code == 400
     assert client.post(UI_SUBMISSIONS, json={}).status_code == 400
     assert client.get(UI_PAYABLES, headers={"X-API-Key": "k"}).status_code == 401
+
+    rest = client.post("/api/v1/payables", json={"filename": "a-scan.pdf"})
+    assert rest.status_code == 400
+    # And there is no field left to describe a case with.
+    described = client.post(
+        "/api/v1/payables",
+        json={"filename": "a.pdf", "note": "vendor=acme-industrial"},
+    )
+    assert described.status_code == 400
 
 
 def test_the_screen_and_its_strip_count_the_same_slice(client, world):
@@ -1015,7 +1134,7 @@ def test_the_screen_and_its_strip_count_the_same_slice(client, world):
     are refused the console screen outright (see
     `test_the_ap_workspace_is_the_clerk_desk_not_a_public_screen`). The REST
     table still answers them with an empty list, which is the honest shape for
-    a row list; a *workspace* with a composer in it is not a row list.
+    a row list; a *workspace* with a door that files invoices is not.
     """
     demo_world.seed_payables(world.payables, sync=world.sync)
     for persona, expected in sorted(AP_VISIBLE.items()):
@@ -1027,3 +1146,44 @@ def test_the_screen_and_its_strip_count_the_same_slice(client, world):
             continue
         screen = response.json()
         assert len(screen["invoices"]) == screen["stats"]["total"] == expected
+
+
+# ---- the quarantine ---------------------------------------------------------
+
+
+def test_no_invented_business_vocabulary_reaches_a_production_path():
+    """Four vendor names and six SKUs that no customer ever had.
+
+    They were module-level vocabulary shared with the console's composer, the
+    seeded orders and the stub extractor, so a deployed screen offered invented
+    parts beside the ERP's real catalogue. They survive only as the stub
+    reader's own fixtures, under a `_STUB_` prefix and below a banner that says
+    so — the prefix exists precisely so this check, and a reviewer's grep, can
+    be written at all.
+
+    Asserted as an exact set rather than a bound: a third module reaching for
+    the stub's vocabulary is the regression, and a bound would let it through.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "app"
+    holders: dict[str, list[int]] = {}
+    banners: dict[str, int] = {}
+    for path in sorted(root.rglob("*.py")):
+        lines = path.read_text().splitlines()
+        hits = [n for n, line in enumerate(lines, 1) if "_STUB_" in line]
+        if not hits:
+            continue
+        holders[str(path.relative_to(root))] = hits
+        banners[str(path.relative_to(root))] = next(
+            (n for n, line in enumerate(lines, 1) if "STUB FIXTURES" in line), 0
+        )
+
+    assert set(holders) == {
+        "tasks/accounts_payable/domain.py",
+        "tasks/expense_reimbursement/domain.py",
+    }
+    # Every reference sits under the banner that quarantines it.
+    for module, hits in holders.items():
+        assert banners[module], module
+        assert min(hits) > banners[module], module

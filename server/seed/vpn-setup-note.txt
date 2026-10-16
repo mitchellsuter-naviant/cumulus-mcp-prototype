@@ -3,7 +3,6 @@ id: vpn-setup-note
 path: engineering/notes/vpn-setup
 title: VPN Setup Notes
 authority_level: note
-scope: team
 owner: platform-eng
 tags: vpn, network, setup
 status: published

@@ -3,7 +3,6 @@ id: receipt-extraction-prompt
 path: finance/prompts/receipt-extraction
 title: Receipt Extraction Prompt
 kind: prompt
-scope: org
 owner: finance-ops
 tags: expenses, extraction, reimbursement, prompt
 status: published

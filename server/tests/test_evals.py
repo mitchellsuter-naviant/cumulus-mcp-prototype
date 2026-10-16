@@ -7,7 +7,7 @@ most of these break something on purpose and check the failure is legible.
 
 import pytest
 
-from app.eval_specs import AP_SPEC, EXPENSE_SPEC, DeclaredSpecStore
+from app.eval_specs import AP_SPEC, EXPENSE_SPEC, SPECS, DeclaredSpecStore
 from app.evals import (
     EvalCase,
     EvalService,
@@ -75,8 +75,15 @@ def register(service, fixture_id: str, email: str) -> str:
 # ---- the declared specs pass ----------------------------------------------
 
 
-@pytest.mark.parametrize("spec_id", [EXPENSE_SPEC.id, AP_SPEC.id])
+@pytest.mark.parametrize("spec_id", [spec.id for spec in SPECS])
 def test_every_declared_case_passes(service, spec_id):
+    """Every spec, not a chosen two.
+
+    The list used to name the two flows whose specs happened to be written
+    first, which meant a spec could be declared, registered, published to the
+    corpus as a contract — and never run. Deriving the parameters from `SPECS`
+    is what makes registering a spec the same act as being answerable for it.
+    """
     result = service.run(spec_id)
     assert result.cases, "the spec has no cases"
     failures = [
@@ -88,7 +95,7 @@ def test_every_declared_case_passes(service, spec_id):
 
 
 def test_a_case_carries_the_knowledge_revisions_it_read(service):
-    result = service.run(EXPENSE_SPEC.id, case_ids=["expense-in-policy-auto-approves"])
+    result = service.run(EXPENSE_SPEC.id, case_ids=["expense-in-policy-confirmed"])
     revisions = result.cases[0].knowledge_revisions
     # Comparing two pass rates only means something when they read the same
     # governed values, so the result records them.
@@ -146,10 +153,12 @@ def test_a_missing_value_fails_rather_than_passing_vacuously():
 
 def test_a_milestone_sees_only_what_had_been_written(service, world):
     """The point of recording the step on every claim."""
-    from app.reimbursements import SubmittedDocument
+    from app.tasks.expense_reimbursement.domain import SubmittedDocument
 
-    request = world.expenses.submit(
-        "felicia.marks@naviant.com",
+    from tests import demo_world
+
+    request = demo_world.run_expense(
+        world.expenses, "felicia.marks@naviant.com",
         documents=[SubmittedDocument(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
@@ -163,7 +172,7 @@ def test_a_milestone_sees_only_what_had_been_written(service, world):
 
 
 def test_steps_upto_reports_a_step_the_run_never_reached(service, world):
-    from app.reimbursements import SubmittedDocument
+    from app.tasks.expense_reimbursement.domain import SubmittedDocument
 
     request = world.expenses.submit(
         "nathan.pryce@naviant.com",
@@ -173,8 +182,8 @@ def test_steps_upto_reports_a_step_the_run_never_reached(service, world):
     run = world.engine.get(request.run_id)
     prefix, reached = steps_upto(run, "a1")
     assert not reached and prefix == []
-    prefix, reached = steps_upto(run, "r1")
-    assert reached and prefix[-1] == "r1"
+    prefix, reached = steps_upto(run, "r1_1")
+    assert reached and prefix[-1] == "r1_1"
 
 
 def test_a_case_declaring_an_unreachable_milestone_fails_legibly(service):
@@ -349,9 +358,9 @@ def test_the_declared_milestones_resolve_to_the_steps_they_replaced(service):
         ("ap-price-variance-corrected", "outcome"): "final",
         ("ap-second-invoice-links-not-mints", "outcome"): "final",
         # `first_of_kind: task` — the two runs `terminal` correctly refuses.
-        ("ap-quantity-variance-holds", "held"): "k2_1",
-        ("ap-unknown-vendor-onboards", "held"): "k2_1",
-        ("expense-in-policy-auto-approves", "recorded"): "final",
+        ("ap-quantity-variance-holds", "held"): "k1_1",
+        ("ap-unknown-vendor-onboards", "held"): "k1_1",
+        ("expense-in-policy-confirmed", "recorded"): "final",
         ("expense-submitter-claims-part-of-a-receipt", "recorded"): "final",
         ("expense-compound-receipt-corrected", "recorded"): "final",
         ("expense-restricted-category-denied", "recorded"): "final",
@@ -394,7 +403,7 @@ def test_renaming_a_step_id_fails_no_case(service, monkeypatch):
     assert before[("ap-known-vendor-clean", "vendor-settled")] == "z1"
     assert after[("ap-known-vendor-clean", "vendor-settled")] == "zv"
     assert after[("ap-known-vendor-clean", "invoice-retained")] == "commit"
-    assert after[("ap-quantity-variance-holds", "held")] == "k2_1"
+    assert after[("ap-quantity-variance-holds", "held")] == "k1_1"
 
 
 def test_splitting_one_modelcall_in_two_moves_no_milestone(service, monkeypatch):
@@ -552,6 +561,9 @@ def test_a_wrong_expected_value_fails_with_both_values(service):
             "commentary": "Team lunch after the Acme review.",
             "hint": "total=64.20 category=meals",
         },
+        decisions=[ScriptedDecision(
+            verdict="approved", decided_by="felicia.marks@naviant.com"
+        )],
         expectations=[MilestoneExpectation(
             milestone="final",
             objects=[ExpectedObject(
@@ -580,6 +592,9 @@ def test_an_ambiguous_empty_key_is_refused_rather_than_guessed(service):
             "commentary": "Two nights at the Acme onsite.",
             "hint": "compound total=140.00 category=lodging",
         },
+        decisions=[ScriptedDecision(
+            verdict="approved", decided_by="john.smith@naviant.com"
+        )],
         expectations=[MilestoneExpectation(
             milestone="final",
             objects=[ExpectedObject(type="ExpenseLine", key="")],
@@ -611,6 +626,9 @@ def test_unlisted_fields_can_be_required(service):
             "commentary": "Team lunch after the Acme review.",
             "hint": "total=64.20 category=meals",
         },
+        decisions=[ScriptedDecision(
+            verdict="approved", decided_by="felicia.marks@naviant.com"
+        )],
         expectations=[MilestoneExpectation(
             milestone="final",
             objects=[ExpectedObject(
@@ -849,6 +867,10 @@ def _probe_case(service, ident: str, email: str, total: float) -> EvalCase:
             "commentary": "Team lunch after the Acme review.",
             "hint": f"total={total} category=meals",
         },
+        # Every expense run stops for its submitter to confirm what was read
+        # off their receipt, so a case that expects a *recorded* expense has to
+        # answer that question.
+        decisions=[ScriptedDecision(verdict="approved", decided_by=email)],
         expectations=[MilestoneExpectation(
             milestone="final",
             objects=[ExpectedObject(
@@ -966,7 +988,7 @@ def test_the_gate_names_the_cases_that_regressed(probe, monkeypatch):
     employee's extraction now comes back a dollar light — because a regression
     is a property of the flow, not of the spec.
     """
-    from app.reimbursements import StubReceiptReader
+    from app.tasks.expense_reimbursement.domain import StubReceiptReader
 
     service, _ = probe
     baseline = service.run("probe")

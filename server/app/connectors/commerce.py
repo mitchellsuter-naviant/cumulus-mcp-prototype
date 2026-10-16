@@ -1,9 +1,9 @@
 """The commerce feeds: the counterparty book, and what the business sold.
 
-Two flow bodies — `crm-sync` and `sales-sync` — kept out of `sync.py` because
-that file is already the wire shapes, the service, the landing step and five
-flows, and a reader looking for the vendor sync should not have to scroll past
-the whole sell side to find it. Everything structural still lives there: these
+Two flow bodies — `crm-sync` and `sales-sync` — kept out of
+`connectors/sync.py` because that file is already the wire shapes, the service,
+the landing step and five flows, and a reader looking for the vendor sync
+should not have to scroll past the whole sell side to find it. Everything structural still lives there: these
 register through `SyncService.__init__`, write through `service._act` so the
 Gateway records every claim, and land rows through `service._land` so a
 redelivery is recognized here exactly as it is everywhere else.
@@ -39,16 +39,17 @@ from __future__ import annotations
 
 import logging
 
-from .graph import Claim, GraphService, GraphWriter, normalize_key, object_id
-from .mappings import steward_queue_for
-from .models import utcnow
-from .resolution import (
+from ..graph import Claim, GraphService, GraphWriter, normalize_key, object_id
+from ..mappings import steward_queue_for
+from ..models import utcnow
+from ..ontology import names as onto
+from ..resolution import (
     ResolutionOutcome,
     ResolutionThresholds,
     read_resolution_thresholds,
     resolve,
 )
-from .runs import RunContext
+from ..runs import RunContext
 from .sync import (
     CRM_EVENT,
     CRM_FLOW_ID,
@@ -64,21 +65,11 @@ from .sync import (
     _authority,
     _slug,
 )
-from .tasks import Task, TaskEvidence, TaskProposal, TaskService
+from ..task_queue import Task, TaskEvidence, TaskProposal, TaskService
 
 log = logging.getLogger("cumulus.sync.commerce")
 
 
-def register(service: SyncService) -> None:
-    """Bind both bodies to the engine `SyncService` was handed."""
-    if service.engine is None:
-        return
-    service.engine.register(
-        CRM_FLOW_ID, lambda ctx, inputs: crm_body(service, ctx, inputs)
-    )
-    service.engine.register(
-        SALES_FLOW_ID, lambda ctx, inputs: sales_body(service, ctx, inputs)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +147,7 @@ class _CompanyIndex:
         if found:
             return found
         landed = self._graph.get(
-            object_id("SourceRecord", f"{self._source}:{external_id}")
+            object_id(onto.SOURCE_RECORD, f"{self._source}:{external_id}")
         )
         if landed is None:
             return ""
@@ -249,7 +240,7 @@ def _apply_counterparty(
     sure of that.
     """
     source_record = service.graph.get(
-        object_id("SourceRecord", f"{source}:{external_id}")
+        object_id(onto.SOURCE_RECORD, f"{source}:{external_id}")
     )
     if source_record is None:
         # `_land` ran in the same run and could only have skipped this row for
@@ -269,14 +260,14 @@ def _apply_counterparty(
     if outcome.disposition == "linked":
         existing = service.graph.get(outcome.object_id)
         company = graph.upsert(
-            "Company", existing.natural_key if existing else name,
+            onto.COMPANY, existing.natural_key if existing else name,
             claims, label=existing.label if existing else name,
             provenance=f"claims from {source} via {run_id}",
         )
         counts["linked"] += 1
     else:
         company = graph.upsert(
-            "Company", name, claims, label=name,
+            onto.COMPANY, name, claims, label=name,
             provenance=f"minted from {source} record {external_id} by {run_id}",
         )
         counts["created"] += 1
@@ -355,7 +346,7 @@ def crm_body(service: SyncService, ctx: RunContext, inputs: dict) -> dict:
         fn=lambda: {
             "accounts": [
                 resolve(
-                    service.graph, "Company", [a.name], thresholds,
+                    service.graph, onto.COMPANY, [a.name], thresholds,
                     source=source, source_external_id=a.external_id,
                 ).model_dump()
                 for a in accounts
@@ -367,7 +358,7 @@ def crm_body(service: SyncService, ctx: RunContext, inputs: dict) -> dict:
                 # below the review floor, so the book does not quietly merge
                 # two people who happen to work at the same company.
                 resolve(
-                    service.graph, "Person", [_person_key(c, source)], thresholds,
+                    service.graph, onto.PERSON, [_person_key(c, source)], thresholds,
                     source=source, source_external_id=c.external_id,
                 ).model_dump()
                 for c in contacts
@@ -473,7 +464,7 @@ def _apply_crm_book(
     for record, outcome in zip(contacts, contact_outcomes):
         key = _person_key(record, source)
         source_record = service.graph.get(
-            object_id("SourceRecord", f"{source}:{record.external_id}")
+            object_id(onto.SOURCE_RECORD, f"{source}:{record.external_id}")
         )
         company_id = index.lookup(record.account_external_id)
         company = service.graph.get(company_id) if company_id else None
@@ -507,7 +498,7 @@ def _apply_crm_book(
         minted = outcome.disposition != "linked"
         if minted:
             person = graph.upsert(
-                "Person", key, claims, label=_display_name(record),
+                onto.PERSON, key, claims, label=_display_name(record),
                 provenance=(
                     f"minted from {source} record {record.external_id} by "
                     f"{run_id}"
@@ -516,7 +507,7 @@ def _apply_crm_book(
         else:
             existing = service.graph.get(outcome.object_id)
             person = graph.upsert(
-                "Person", existing.natural_key if existing else key, claims,
+                onto.PERSON, existing.natural_key if existing else key, claims,
                 label=existing.label if existing else _display_name(record),
                 provenance=f"claims from {source} via {run_id}",
             )
@@ -582,7 +573,7 @@ def _apply_opportunities(
         deal = graph.upsert(
             # Source-scoped, as the type declares: two CRMs can issue the same
             # opportunity id and mean different deals.
-            "Opportunity", f"{source}:{record.external_id}", claims,
+            onto.OPPORTUNITY, f"{source}:{record.external_id}", claims,
             label=record.name or record.external_id,
             provenance=f"synced by {run_id}",
         )
@@ -652,7 +643,7 @@ def sales_body(service: SyncService, ctx: RunContext, inputs: dict) -> dict:
         "z1", "resolve-records", "resolve",
         fn=lambda: [
             resolve(
-                service.graph, "Company", [c.name], thresholds,
+                service.graph, onto.COMPANY, [c.name], thresholds,
                 source=source, source_external_id=c.external_id,
             ).model_dump()
             for c in customers
@@ -775,7 +766,7 @@ def _apply_items(
             )
             continue
         graph.upsert(
-            "Item", record.sku,
+            onto.ITEM, record.sku,
             [
                 Claim(field="sku", value=record.sku, source=claim_source),
                 Claim(field="name", value=record.display_name,
@@ -821,17 +812,17 @@ def _apply_sales_orders(
             return None
         sku = by_external.get(external_id)
         if sku is None:
-            # Asked of the store by the property, the way `sync_dms` asks for a
-            # folder — a bare `find("Item")` filtered in Python here reads the
-            # whole catalogue to answer one order line.
+            # Asked of the store by the property, the way `connectors.dms`
+            # asks for a folder — a bare `find("Item")` filtered in Python
+            # here reads the whole catalogue to answer one order line.
             known = service.graph.find(
-                "Item", prop_equals={"external_id": external_id}, limit=1,
+                onto.ITEM, prop_equals={"external_id": external_id}, limit=1,
             )
             if not known:
                 return None
             sku = str(known[0].props.get("sku") or known[0].natural_key)
             by_external[external_id] = sku
-        return service.graph.get(object_id("Item", sku))
+        return service.graph.get(object_id(onto.ITEM, sku))
 
     for record in records:
         company_id = index.lookup(record.customer_external_id)
@@ -856,7 +847,7 @@ def _apply_sales_orders(
                 source=claim_source,
             ))
         order = graph.upsert(
-            "SalesOrder", record.order_number, claims,
+            onto.SALES_ORDER, record.order_number, claims,
             label=record.order_number,
             provenance=f"synced by {run_id}",
         )
@@ -875,7 +866,7 @@ def _apply_sales_orders(
             item = item_for(line.item_external_id)
             sku = str(item.props.get("sku") or item.natural_key) if item else ""
             line_obj = graph.upsert(
-                "SalesOrderLine", f"{order.id}#{ordinal}",
+                onto.SALES_ORDER_LINE, f"{order.id}#{ordinal}",
                 [
                     Claim(field="sku", value=sku, source=claim_source),
                     Claim(

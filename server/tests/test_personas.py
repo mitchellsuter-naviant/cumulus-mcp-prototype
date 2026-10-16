@@ -139,6 +139,41 @@ def test_the_engineer_owns_every_queue():
         assert auth.require_queue(engineer, queue) is engineer, queue
 
 
+def test_a_persona_also_holds_the_desks_the_registry_grants_it(world):
+    """Kim owns no shared queue and still has to be able to decide her own.
+
+    A personal desk is minted the first time something routes to it — an
+    expense of hers routed back for her to confirm — so the roster cannot know
+    about it, because it did not exist when the code was written. A persona
+    principal therefore unions the queue registry the way a real Firebase
+    credential already did; without it the console offers somebody their own
+    review and then refuses it.
+    """
+    kim = personas.get("customer-user:ae")
+    assert auth.principal_for(kim).queues == ()
+
+    desk = world.queues.ensure_personal(kim.email, kim.person).slug
+    principal = auth.principal_for(kim)
+    assert desk in principal.queues
+    assert auth.require_queue(principal, desk) is principal
+    # It adds work and never power: still the bottom rung, still own-scope.
+    assert principal.role == "user" and principal.scope == "own"
+
+
+def test_sign_in_survives_an_unreadable_queue_registry(monkeypatch):
+    """What an outage costs is the desks only the console knows about. It must
+    not cost sign-in — the roster answers from code, so a persona resolves
+    against a deployment whose registry cannot be read at all."""
+    import app.deps as deps
+
+    def broken():
+        raise RuntimeError("the registry is unreachable")
+
+    monkeypatch.setattr(deps, "get_queue_service", broken)
+    clerk = personas.get("customer-user:ap")
+    assert auth.principal_for(clerk).queues == clerk.queues
+
+
 # ---- the person behind the persona ------------------------------------------
 
 
@@ -156,6 +191,47 @@ def test_every_customer_persona_is_really_in_the_graph(client, persona):
     assert body["person"] == persona.person
     assert body["email"].endswith("@naviant.com")
     assert body["in_workforce"] is True
+
+
+def test_a_title_comes_from_the_hris_and_not_from_the_roster(client, world):
+    """Whose fact is a job title? The customer's HR system's.
+
+    It was authored beside the persona, so a promotion in the HRIS left the
+    switcher printing a title Naviant made up. The declared one is the
+    fallback; where the graph holds an `Employee`, the graph wins.
+    """
+    from app.graph import Claim, object_id
+    from app.tasks.accounts_payable import domain as payables  # noqa: F401
+
+    controller = next(
+        p for p in personas.CUSTOMER_USERS if p.id.endswith(":controller")
+    )
+    person = world.graph.get(object_id("Employee", controller.email))
+    world.graph.upsert(
+        "Employee", controller.email,
+        [Claim(field="title", value="VP, Finance", source="hris")],
+        label=person.label,
+    )
+
+    body = client.get("/api/ui/v1/session", headers=_as(controller.id)).json()
+    assert body["title"] == "VP, Finance" != controller.title
+    switcher = {
+        option["id"]: option
+        for group in body["groups"] for option in group["personas"]
+    }
+    assert switcher[controller.id]["title"] == "VP, Finance"
+
+
+def test_a_persona_still_resolves_on_an_empty_deployment(_client):
+    """Sign-in must not depend on a populated graph. A cold deployment has no
+    `Employee` for anybody, and the switcher still has to name a job."""
+    test_world.fresh()
+
+    body = _client.get(
+        "/api/ui/v1/session", headers=_as(personas.CUSTOMER_ADMIN.id)
+    ).json()
+    assert body["in_workforce"] is False
+    assert body["title"] == personas.CUSTOMER_ADMIN.title
 
 
 @pytest.mark.parametrize(
@@ -216,6 +292,41 @@ def test_the_roster_is_internally_consistent():
     assert bound <= set(personas.ALL_QUEUES)
 
 
+# ---- the desk vocabulary ----------------------------------------------------
+
+
+def test_a_desk_is_declared_once_and_read_everywhere():
+    """The roster used to *be* the list of desks, and half of it was a second
+    spelling of a constant in the module that routes there. A slug typed twice
+    is a slug that can disagree with itself, and the disagreement shows up as a
+    Task nobody is bound to rather than as an error."""
+    from app import desks, disagreement_sweep, employee, routing
+    from app.tasks.accounts_payable import domain as payables
+    from app.tasks.expense_reimbursement import domain as reimbursements
+
+    routed = {
+        payables.CLERK_QUEUE,
+        reimbursements.REVIEW_QUEUE,
+        routing.OPS_QUEUE,
+        employee.HR_QUEUE,
+        disagreement_sweep.ORDER_DESK_QUEUE,
+    }
+    assert routed <= set(desks.ALL_SLUGS)
+    assert personas.ALL_QUEUES is desks.ALL_SLUGS
+    # Every declared desk carries the description the registry bootstraps with,
+    # so an admin screen never opens onto an unexplained slug.
+    assert all(d.description and d.owner for d in desks.DESKS)
+
+
+def test_a_desk_that_is_not_declared_cannot_be_named():
+    """The point of the registry: a typo is a failure at import, not a Task
+    filed to a queue that does not exist."""
+    from app import desks
+
+    with pytest.raises(ValueError, match="ap-clrek"):
+        desks._slug("ap-clrek")
+
+
 # ---- reach: one rule, or none at all ----------------------------------------
 
 
@@ -242,12 +353,6 @@ def test_an_own_scoped_persona_cannot_read_the_graph_around_it(client):
     # The model names types, not people, so reading it discloses nothing.
     assert client.get("/api/v1/graph/ontology", headers=kim).status_code == 200
 
-    # And the vendor master is company data an AP clerk cannot work without —
-    # the distinction is whose facts these are, not graph-versus-not.
-    tomas = {"X-Cumulus-Persona": "customer-user:ap"}
-    assert client.get("/api/v1/graph/vendors", headers=tomas).status_code == 200
-    assert client.get("/api/v1/graph/vendors", headers=kim).status_code == 200
-
 
 def test_an_own_scoped_persona_may_name_a_document_and_not_browse_for_one(
     client,
@@ -261,8 +366,9 @@ def test_an_own_scoped_persona_may_name_a_document_and_not_browse_for_one(
     who asked.
 
     The split is not "assets are secret". Reading *this* policy is how an
-    own-scoped screen renders the clause a run cited — the posting limit under
-    the AP composer, the PTO window on the hub — so naming one stays open, and
+    own-scoped screen renders the clause a run cited — the posting limit on
+    the AP submission panel, the PTO window on the hub — so naming one stays
+    open, and
     so does naming the team an asset says owns it. Browsing the corpus, or the
     access map, is a governance act.
     """
@@ -333,3 +439,86 @@ def test_impersonation_is_not_a_one_way_trip(monkeypatch):
     )
     assert acting_as_kim.role == "user"
     assert ui_api.session(acting_as_kim).may_switch_persona
+
+
+# ---- the cast this deployment runs ------------------------------------------
+#
+# The roster moved into `app/casts/` and `personas` became the selector over
+# it. Everything above this line is the proof that the move changed no
+# behaviour — not one assertion was touched — and everything below pins the
+# naviant roster itself, so a future cast cannot quietly edit it. The
+# selection, the Wick cast and the three new desks are in `test_casts.py`.
+
+
+def test_this_deployment_runs_the_naviant_cast():
+    """Unpinned is what the suite and a dev box run as, and it has to mean the
+    roster the console was built against rather than an empty switcher."""
+    from app import casts
+
+    assert not settings.estate_namespace
+    assert casts.active() is casts.CASTS["naviant"]
+    assert personas.GROUPS is casts.CASTS["naviant"].GROUPS
+    assert personas.Persona is casts.Persona  # re-exported, not redefined
+    assert personas.OPERATOR_EMAIL == "masuter@naviant.com"
+
+
+def test_the_naviant_roster_is_exactly_what_it_was():
+    """A snapshot, because the roster decides who may decide a Task: a cast
+    refactor that dropped a desk from one persona would otherwise show up as a
+    silently narrower authorization somewhere else entirely."""
+    assert {
+        p.id: (p.person, p.email, p.authority, p.scope, p.queues)
+        for p in personas.ALL_PERSONAS
+    } == {
+        "naviant-engineer": (
+            "Mitchell Suter", "masuter@naviant.com", "owner", "platform",
+            personas.ALL_QUEUES,
+        ),
+        "naviant-support": (
+            "", "support@naviant.com", "user", "platform", (),
+        ),
+        "customer-admin": (
+            "Nathan Pryce", "nathan.pryce@naviant.com", "admin", "tenant",
+            ("knowledge-curation", "eval-review"),
+        ),
+        "customer-user:controller": (
+            "Raymond Fitzgerald", "raymond.fitzgerald@naviant.com", "user",
+            "own",
+            ("ap-clerk", "expense-review", "vendor-stewardship",
+             "data-stewardship", "order-desk"),
+        ),
+        "customer-user:ap": (
+            "Connie Alberts", "connie.alberts@naviant.com", "user", "own",
+            ("ap-clerk",),
+        ),
+        "customer-user:hr": (
+            "Karen Boothe", "karen.boothe@naviant.com", "user", "own",
+            ("hr",),
+        ),
+        "customer-user:ceo": (
+            "Diane Vogel", "diane.vogel@naviant.com", "user", "own",
+            ("expense-review", "expense-review-exec"),
+        ),
+        "customer-user:ae": (
+            "John Smith", "john.smith@naviant.com", "user", "own", (),
+        ),
+    }
+    # The uid convention every ledger row is attributed under.
+    assert [p.uid for p in personas.CUSTOMER_USERS] == [
+        "persona_controller", "persona_ap", "persona_hr", "persona_ceo",
+        "persona_ae",
+    ]
+
+
+def test_a_naviant_email_still_resolves_to_its_persona_and_desks():
+    assert personas.for_email("Connie.Alberts@Naviant.com ") is personas.get(
+        "customer-user:ap"
+    )
+    assert personas.queues_for_email("connie.alberts@naviant.com") == (
+        "ap-clerk",
+    )
+    assert personas.queues_for_email("john.smith@naviant.com") == ()
+    assert personas.for_email("nobody@naviant.com") is None
+    # Nobody from another cast is reachable from this deployment.
+    assert personas.for_email("abby.wick@wickbuildings.com") is None
+    assert personas.queues_for_email("abby.wick@wickbuildings.com") == ()

@@ -28,7 +28,11 @@ from .auth import (
     require_reader,
 )
 from .deps import (
+    get_credential_tracking_service,
+    get_department_scheduling_service,
     get_employee_service,
+    get_extraction_service,
+    get_field_documents_service,
     get_payable_service,
     get_queue_service,
     get_reimbursement_service,
@@ -36,7 +40,7 @@ from .deps import (
     get_task_service,
 )
 from .gateway import Refused
-from .tasks import (
+from .task_queue import (
     Task,
     TaskAlreadyDecidedError,
     TaskClaimConflict,
@@ -162,10 +166,29 @@ class TaskDecisionRequest(BaseModel):
 #: on a disagreement — belong to exactly one kind each and commit straight
 #: through the Gateway with no run to record them, which is why an exception
 #: escaping one of them has to reach the caller (see below).
+
+
+#: The **plant spine's** four, added beside the two above and for the same
+#: reason: a Task raised by one of them that reached no hook was a judgment the
+#: queue recorded and no flow ever heard. Two of them genuinely gate — the
+#: shipping-list review and the day approval each suspend a run on their Task,
+#: and answering one drives it forward — and two of them do not: `field-
+#: documents` and `credential-tracking` raise aggregate Tasks and walk on, so
+#: their hooks answer `None` today. They are listed anyway, because this table
+#: is the one place a reader learns which flow answers for which Task, and a
+#: flow absent from it is a silence nobody can see. Each service's own
+#: `resume_for_task` says so in as many words.
+_PLANT_GATES: tuple = (
+    lambda t, p: get_extraction_service().apply_task_decision(t, p),
+    lambda t, p: get_department_scheduling_service().apply_task_decision(t, p),
+    lambda t, p: get_field_documents_service().apply_task_decision(t, p),
+    lambda t, p: get_credential_tracking_service().apply_task_decision(t, p),
+)
+
 _RUN_GATES: tuple = (
     lambda t, p: get_reimbursement_service().apply_task_decision(t, p),
     lambda t, p: get_payable_service().apply_task_decision(t, p),
-)
+) + _PLANT_GATES
 
 RESUME_HOOKS: dict[str, tuple] = {
     "decision": _RUN_GATES + (

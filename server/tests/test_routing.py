@@ -1,9 +1,16 @@
-"""Where an elevated request goes, and why that desk.
+"""Where a review goes, and why that desk.
 
 The expense policy has carried an approval table since it was written — *under
 $500, direct manager; $500–5,000, department head; over $5,000, VP of Finance*
 — and the flow sent every elevated request to one hardcoded queue regardless.
 These are the assertions that the document and the machinery now agree.
+
+The table the seeded policy carries **today** says `submitter`, because v10's
+gate is a confirmation and confirming an extraction is the submitter's own
+work. `manager-of(submitter)` and the amount bands are still a supported
+grammar and are exercised against inline documents below — which is the right
+place for them: what a table *can* say is a property of the parser, and what
+the shipped policy *does* say is a decision somebody made in a document.
 """
 
 import pytest
@@ -29,8 +36,34 @@ def world():
 
 
 def test_the_table_in_the_document_is_the_table_that_runs(world):
+    """What the shipped policy says, read off the shipped policy.
+
+    Every band is the submitter, at every amount, because a reimbursement rests
+    on one claim — *this is what the receipt says* — and there is no amount at
+    which somebody else can make it.
+    """
     table = routing.parse_routing(world.expenses.read_policy_content())
     assert table.found_asset
+    assert table.target_for(40.00) == routing.SUBMITTER
+    assert table.target_for(6_500.00) == routing.SUBMITTER
+    assert table.target_for(40.00, restricted=True) == routing.SUBMITTER
+    assert table.fallback == "expense-review"
+
+
+def test_the_bands_and_the_manager_resolver_are_still_a_supported_grammar():
+    """A customer who wants an approval chain writes one, with no code change.
+
+    Kept as a parser assertion over an inline document rather than by shipping
+    a policy nobody uses: the grammar is what this module owes, and which
+    grammar the seeded corpus chooses is somebody's decision in a document.
+    """
+    table = routing.parse_routing(
+        "## Approval routing\n\n| Amount | Desk |\n| --- | --- |\n"
+        "| Over $0 | manager-of(submitter) |\n"
+        "| Over $5,000 | expense-review-exec |\n\n"
+        "- Restricted category desk: expense-review-exec\n"
+        "- Fallback desk: expense-review\n"
+    )
     assert table.target_for(210.00) == routing.MANAGER_OF
     assert table.target_for(6_500.00) == "expense-review-exec"
     assert table.target_for(40.00, restricted=True) == "expense-review-exec"
@@ -60,6 +93,21 @@ def test_the_document_can_spell_the_resolver_in_english():
         "| Over $0 | Direct manager |\n"
     )
     assert table.target_for(10.00) == routing.MANAGER_OF
+
+
+def test_the_table_can_send_a_review_back_to_the_submitter():
+    """The keyword a policy asset writes, exactly as it writes it.
+
+    And the trap it has to avoid: `submitter` is a legal queue slug, so read
+    as a literal it would name a shared desk nobody created and pile every
+    submitter's own review into it.
+    """
+    table = routing.parse_routing(
+        "## Approval routing\n\n| Amount | Desk |\n| --- | --- |\n"
+        "| Over $0 | submitter |\n"
+    )
+    assert table.target_for(10.00) == routing.SUBMITTER
+    assert routing.SUBMITTER != "expense-review"
 
 
 # ---- answering it against the org chart --------------------------------------
@@ -105,6 +153,83 @@ def test_somebody_outside_the_org_chart_falls_back(world):
     assert resolved.fell_back and resolved.queue == "expense-review"
 
 
+def _submitter(world, email: str, **kwargs):
+    return routing.resolve(
+        routing.SUBMITTER, submitter_email=email, graph=world.graph,
+        queues=world.queues, fallback="expense-review", **kwargs,
+    )
+
+
+def test_a_review_routes_back_to_the_person_who_submitted_it(world):
+    """Confirming an extraction is the submitter's own work: nobody else can
+    say whether the number on the receipt is the number on the receipt."""
+    resolved = _submitter(world, AE)
+    assert resolved.queue == personal_slug(AE)
+    assert not resolved.fell_back
+    assert "John Smith" in resolved.explanation
+    # A desk, not an address: the Task still routes to a Queue, so it survives
+    # its holder being away and `require_queue` still gates deciding it.
+    assert world.queues.get(resolved.queue).holds(AE)
+
+
+def test_a_case_with_no_submitter_falls_back_and_says_so(world):
+    """The sim-filed invoice: an intake path with no human behind it. It must
+    land on a desk somebody watches rather than nowhere."""
+    resolved = _submitter(world, "")
+    assert resolved.queue == "expense-review"
+    assert resolved.fell_back
+    assert "names no submitter" in resolved.explanation
+
+
+def test_a_submitter_the_org_chart_never_heard_of_still_gets_their_own_desk(
+    world
+):
+    """The difference between the two resolvers, stated. `manager-of` needs
+    the graph to answer and falls back when it cannot; this one needs only the
+    case, so a contractor confirms their own receipt with no `Employee` row."""
+    resolved = _submitter(world, "contractor@example.com")
+    assert not resolved.fell_back
+    assert resolved.queue == personal_slug("contractor@example.com")
+    # No name to print, so the address stands rather than the routing failing.
+    assert "contractor@example.com" in resolved.explanation
+
+
+def test_a_caller_that_knows_the_name_does_not_need_the_graph_to_supply_it(
+    world
+):
+    resolved = _submitter(world, "vera.holt@example.com", submitter_name="Vera Holt")
+    assert world.queues.get(resolved.queue).name == "Vera Holt"
+    assert "Vera Holt" in resolved.explanation
+
+
+def test_a_desk_that_cannot_be_opened_falls_back_rather_than_failing_the_run(
+    world
+):
+    """A registry outage is a routing answer the policy already has a name for
+    — the fallback desk — not an exception in the middle of a reimbursement."""
+
+    class Unreachable:
+        def ensure_personal(self, email, label=""):
+            raise RuntimeError("the registry is down")
+
+    for target in (routing.SUBMITTER, routing.MANAGER_OF):
+        resolved = routing.resolve(
+            target, submitter_email=AE, graph=world.graph,
+            queues=Unreachable(), fallback="expense-review",
+        )
+        assert resolved.queue == "expense-review", target
+        assert resolved.fell_back, target
+        assert "no desk could be opened" in resolved.explanation, target
+
+
+def test_resolving_the_submitter_twice_mints_one_desk(world):
+    """A replayed step must pick the same desk and not a second inbox."""
+    first = _submitter(world, AE)
+    again = _submitter(world, AE)
+    assert first.queue == again.queue
+    assert len([q for q in world.queues.list() if q.personal]) == 1
+
+
 def test_resolving_twice_mints_one_desk(world):
     """A replayed step must pick the same queue and not a second inbox."""
     first = routing.resolve(
@@ -123,7 +248,7 @@ def test_resolving_twice_mints_one_desk(world):
 
 
 def _submit(world, email: str, hint: str, commentary: str = "Client dinner."):
-    from app.reimbursements import SubmittedDocument
+    from app.tasks.expense_reimbursement.domain import SubmittedDocument
 
     return world.expenses.submit(
         email,
@@ -132,44 +257,46 @@ def _submit(world, email: str, hint: str, commentary: str = "Client dinner."):
     )
 
 
-def test_an_elevated_request_lands_on_the_submitters_manager(world):
+def test_a_review_lands_on_the_submitters_own_desk(world):
     request = _submit(world, VP_SALES, "total=850.00 category=meals")
     assert request.state == "pending"
     task = world.tasks.get(request.task_id)
-    assert task.queue == personal_slug(CEO)
+    assert task.queue == personal_slug(VP_SALES)
+    assert task.subject_email == VP_SALES
 
 
-def test_a_large_request_goes_to_the_executive_desk_instead(world):
-    request = _submit(world, VP_SALES, "total=7500.00 category=travel")
-    task = world.tasks.get(request.task_id)
-    assert task.queue == "expense-review-exec"
+def test_the_amount_does_not_move_the_desk(world):
+    """The findings are annotations, not a routing decision. There is no
+    amount at which somebody other than the submitter can say what a receipt
+    says, so a $7,500 hotel bill and a $40 lunch go to the same person."""
+    large = _submit(world, VP_SALES, "total=7500.00 category=travel")
+    small = _submit(world, VP_SALES, "total=40.00 category=meals",
+                    commentary="Coffee for the team standup.")
+    assert (
+        world.tasks.get(large.task_id).queue
+        == world.tasks.get(small.task_id).queue
+        == personal_slug(VP_SALES)
+    )
+    # And the amount is still on the record as a reason to look twice.
+    assert any(e.kind == "over-limit" for e in large.escalations)
+    assert small.escalations == []
 
 
-def test_a_restricted_category_goes_to_the_executive_desk_at_any_amount(world):
+def test_a_restricted_category_is_flagged_rather_than_re_routed(world):
     request = _submit(world, VP_SALES, "total=90.00 category=alcohol")
-    task = world.tasks.get(request.task_id)
-    assert task.queue == "expense-review-exec"
+    assert any(e.kind == "restricted-category" for e in request.escalations)
+    assert world.tasks.get(request.task_id).queue == personal_slug(VP_SALES)
 
 
 def test_the_journal_records_which_desk_and_why(world):
     """A queue slug says where work went. A reader needs to know whether that
-    was the governed table or a fallback covering a gap in the org chart."""
+    was the governed table or a fallback covering a gap somewhere."""
     request = _submit(world, VP_SALES, "total=850.00 category=meals")
-    step = world.engine.get(request.run_id).step("x2r")
+    step = world.engine.get(request.run_id).step("x2")
     assert step is not None and step.status == "done"
-    assert "Diane Vogel" in step.summary
+    assert "Marcus Reyes" in step.summary
     assert step.output["fell_back"] is False
-
-
-def test_routing_is_recorded_even_when_nobody_was_asked(world):
-    """"This would have gone to Diane" is worth knowing about a request that
-    auto-approved — it is what makes the table auditable rather than merely
-    effective."""
-    request = _submit(world, VP_SALES, "total=40.00 category=meals",
-                      commentary="Coffee for the team standup.")
-    assert request.state == "approved"
-    step = world.engine.get(request.run_id).step("x2r")
-    assert step is not None and step.output["queue"] == personal_slug(CEO)
+    assert step.output["target"] == routing.SUBMITTER
 
 
 def test_editing_the_routing_table_moves_the_next_request(world):
@@ -178,18 +305,19 @@ def test_editing_the_routing_table_moves_the_next_request(world):
     from app.models import AssetUpdate
 
     before = _submit(world, VP_SALES, "total=850.00 category=meals")
-    assert world.tasks.get(before.task_id).queue == personal_slug(CEO)
+    assert world.tasks.get(before.task_id).queue == personal_slug(VP_SALES)
 
     asset = world.knowledge.repo.get("expense-approval-policy")
     world.knowledge.update(
         "expense-approval-policy",
         AssetUpdate(content=asset.content.replace(
+            "| Over $0 | submitter |",
             "| Over $0 | manager-of(submitter) |",
-            "| Over $0 | expense-review |",
         )),
     )
     after = _submit(world, VP_SALES, "total=851.00 category=meals")
-    assert world.tasks.get(after.task_id).queue == "expense-review"
+    # A finance lead who wants an approval chain back gets one, in a document.
+    assert world.tasks.get(after.task_id).queue == personal_slug(CEO)
 
 
 def test_a_step_that_threw_goes_to_operations_not_to_the_approver(world):
@@ -227,7 +355,7 @@ def test_an_unreadable_file_is_only_attempted_once(world):
     request = _submit(world, VP_SALES, "total=90.00 category=meals")
     assert len(attempts) == 1
     run = world.engine.get(request.run_id)
-    assert "resubmit as PDF or JPEG" in run.step("m1").error
+    assert "resubmit as PDF or JPEG" in run.step("m1_1").error
 
 
 # ---- recovering a run --------------------------------------------------------
@@ -237,7 +365,7 @@ def test_a_suspended_run_retries_the_failed_step_and_replays_the_rest(world):
     """The whole point of a durable journal: fix the cause, resume, and only
     the step that broke runs again."""
     from app.media import UnsupportedMediaError
-    from app.reimbursements import ReceiptExtraction, ExtractedLine
+    from app.tasks.expense_reimbursement.domain import ReceiptExtraction, ExtractedLine
 
     calls = {"n": 0}
 
@@ -260,11 +388,11 @@ def test_a_suspended_run_retries_the_failed_step_and_replays_the_rest(world):
     world.expenses.reader = Flaky()
     request = _submit(world, VP_SALES, "total=90.00 category=meals")
     run = world.engine.get(request.run_id)
-    assert run.status == "suspended" and run.step("m1").status == "failed"
+    assert run.status == "suspended" and run.step("m1_1").status == "failed"
     replayed_before = [s.step_id for s in run.steps if s.status == "done"]
 
     resumed = world.engine.resume(request.run_id)
-    assert resumed.step("m1").status == "done"
+    assert resumed.step("m1_1").status == "done"
     assert calls["n"] == 2  # the failed step ran again; nothing else did
     for step_id in replayed_before:
         assert resumed.step(step_id).status == "done"
@@ -275,7 +403,7 @@ def test_resuming_settles_the_task_it_answered(world):
     left the task itself open — a row in somebody's queue for work already
     moving."""
     from app.media import UnsupportedMediaError
-    from app.reimbursements import ExtractedLine, ReceiptExtraction
+    from app.tasks.expense_reimbursement.domain import ExtractedLine, ReceiptExtraction
 
     calls = {"n": 0}
 

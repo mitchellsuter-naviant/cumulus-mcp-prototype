@@ -1124,6 +1124,58 @@ class FlowService:
     def version(self, flow_id: str, version: int) -> FlowVersion | None:
         return self.require(flow_id).find_version(version)
 
+    def activate_version(self, flow_id: str, version: int) -> FlowDefinition:
+        """Make one shipped version the live one.
+
+        The console drives which version is live, but it can only choose among
+        versions whose executable package is in the deployed code — a stored
+        pointer at code that is not there would be a map the engine cannot
+        honor. Raises ValueError for a version that is not shipped.
+        """
+        from . import tasks as process_packages
+
+        defn = self.require(flow_id)
+        shipped = process_packages.shipped_versions(flow_id)
+        if version not in shipped:
+            raise ValueError(
+                f"v{version} of {flow_id} is not shipped in this deployment; "
+                "only a version whose package is in the running code can be "
+                "made live"
+            )
+        history = defn.version_history()
+        target = next((v for v in history if v.version == version), None)
+        if target is None:
+            module = shipped[version]
+            target = FlowVersion(
+                version=version,
+                label=module.LABEL,
+                status="draft",
+                steps=[s.model_copy(deep=True) for s in module.STEPS],
+                model_budget_usd_per_run=defn.model_budget_usd_per_run,
+                notes=module.NOTES,
+                authored_by=defn.authored_by,
+                created_at=utcnow(),
+            )
+            history.append(target)
+        reshaped = []
+        for entry in history:
+            if entry.version == version:
+                reshaped.append(entry.model_copy(update={"status": "active"}))
+            elif entry.status == "active":
+                reshaped.append(entry.model_copy(update={"status": "archived"}))
+            else:
+                reshaped.append(entry)
+        return self.update(
+            defn.model_copy(
+                update={
+                    "version": version,
+                    "steps": [s.model_copy(deep=True) for s in target.steps],
+                    "model_budget_usd_per_run": target.model_budget_usd_per_run,
+                    "versions": sorted(reshaped, key=lambda v: v.version),
+                }
+            )
+        )
+
     def version_by_label(self, flow_id: str, label: str) -> FlowVersion | None:
         return next(
             (v for v in self.versions(flow_id) if v.display() == label), None
@@ -1265,6 +1317,17 @@ def _ago(days: int) -> datetime:
 
 
 def _seed_definitions() -> list[FlowDefinition]:
+    # The three FDE-authored processes declare their own shape: the steps the
+    # map shows are read off the default version package under `app/tasks/`,
+    # never kept as a second copy here. Deferred import — the version packages
+    # import this module for `FlowStep`.
+    from . import tasks as process_packages
+    from .tasks import accounts_payable, expense_reimbursement, order_release
+
+    def package_steps(flow_id: str, version: int) -> list[FlowStep]:
+        module = process_packages.shipped_versions(flow_id)[version]
+        return [step.model_copy(deep=True) for step in module.STEPS]
+
     return [
         FlowDefinition(
             id="expense-reimbursement",
@@ -1277,7 +1340,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             ),
             team="finance-ops",
             status="active",
-            version=9,
+            version=expense_reimbursement.DEFAULT_VERSION,
             tags=["expenses", "reimbursement", "vision"],
             queues=["expense-review"],
             workspace="ap-workspace",
@@ -1286,35 +1349,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(140),
             updated_at=_ago(9),
-            steps=[
-                # The event name is the one the `expense-submitted` Trigger
-                # binds, not a near-synonym: an export naming a fact nothing
-                # emits is the display string this module used to carry.
-                FlowStep(id="t1", type="trigger", name="ExpenseSubmitted",
-                         summary="one run per submitted receipt",
-                         config={"event": "ExpenseSubmitted"}, next=["m1"]),
-                FlowStep(id="m1", type="modelcall", name="extract-receipt",
-                         summary="reads the receipt image: vendor, date, total, category — with a confidence per field",
-                         config={"model": "gemini-3.5-flash-lite",
-                                 "prompt": "knowledge:receipt-extraction-prompt"},
-                         next=["x1"]),
-                FlowStep(id="x1", type="transform", name="read-policy",
-                         summary="gathers the governed policy values (auto-approval limit, category caps) from the knowledge layer for the rule — rules never fetch",
-                         config={"source": "knowledge:expense-approval-policy"}, next=["r1"]),
-                FlowStep(id="r1", type="rule", name="needs-elevation",
-                         summary="within the policy's auto-approval limit, an allowed category, and confidently extracted?",
-                         config={"rule_type": "threshold",
-                                 "source": "knowledge:expense-approval-policy"},
-                         next=["a1", "k1"], branch_labels=["approve", "elevate"]),
-                FlowStep(id="k1", type="task", name="elevate-review",
-                         summary="a reviewer decides the elevated request with the extraction and the policy findings attached",
-                         config={"queue": "expense-review"}, next=["a1"]),
-                FlowStep(id="a1", type="action", name="record-reimbursement",
-                         summary="guarded write of the request and its state into the reimbursements table",
-                         config={"target": "reimbursements", "gateway": "action-gateway"}, next=["e1"]),
-                FlowStep(id="e1", type="event", name="ReimbursementRecorded",
-                         summary="emitted on commit", config={"event": "ReimbursementRecorded"}),
-            ],
+            steps=package_steps("expense-reimbursement", expense_reimbursement.DEFAULT_VERSION),
         ),
         FlowDefinition(
             id="accounts-payable",
@@ -1330,7 +1365,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             ),
             team="finance-ops",
             status="active",
-            version=6,
+            version=accounts_payable.DEFAULT_VERSION,
             tags=["ap", "invoices", "vision", "three-way-match"],
             queues=["ap-clerk"],
             workspace="ap-workspace",
@@ -1339,61 +1374,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(90),
             updated_at=_ago(4),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="InvoiceReceived",
-                         summary="one run per inbound invoice",
-                         config={"event": "InvoiceReceived"}, next=["s1"]),
-                FlowStep(id="s1", type="action", name="store-document",
-                         summary="the invoice bytes land in the document store before anything reads them, so every later claim has an artifact to point at",
-                         config={"target": "documents", "gateway": "action-gateway"},
-                         next=["m1"]),
-                FlowStep(id="m1", type="modelcall", name="extract-invoice",
-                         summary="one pass over the document: the vendor as printed, the invoice number, dates, PO, totals and the billed lines — with a confidence",
-                         config={"model": "gemini-3.5-flash-lite",
-                                 "prompt": "knowledge:invoice-extraction-prompt"},
-                         next=["z1"]),
-                FlowStep(id="z1", type="resolve", name="resolve-vendor",
-                         summary="the printed name becomes a canonical Vendor id against the vendor master; an unknown one is minted `onboarding`, an ambiguous one stops the run",
-                         config={"entity": "Vendor", "source": "knowledge:entity-resolution-policy"},
-                         next=["x3", "k0"], branch_labels=["resolved", "ambiguous"]),
-                FlowStep(id="k0", type="task", name="confirm-vendor",
-                         summary="a clerk names the vendor from the scored candidates — nothing is asserted until they do, because posting against the wrong vendor is not recoverable",
-                         config={"queue": "ap-clerk"}, next=["a0"]),
-                FlowStep(id="a0", type="action", name="apply-vendor-decision",
-                         summary="guarded write of the vendor the clerk chose: an identity link, or a newly minted vendor",
-                         config={"target": "vendor-master", "gateway": "action-gateway"},
-                         next=["x3"]),
-                FlowStep(id="x3", type="transform", name="project-lines",
-                         summary="the extracted lines become facts against the ontology's paths — the same vocabulary the eval spec asserts on",
-                         config={"language": "python"}, next=["x4"]),
-                FlowStep(id="x4", type="transform", name="gather-po-and-receiving",
-                         summary="reads the purchase order and receiving lines out of the graph — the flow gathers; the matcher and the rule never fetch",
-                         config={"source": "graph:PurchaseOrder,ReceivingReport"},
-                         next=["c1"]),
-                FlowStep(id="c1", type="check", name="three-way-match",
-                         summary="pairs invoice ↔ PO ↔ receiving line by line within the governed tolerances, and writes the pairings as a MatchSet rather than discarding them",
-                         config={"source": "knowledge:invoice-posting-policy"},
-                         next=["c2"]),
-                FlowStep(id="c2", type="check", name="anomaly-screen",
-                         summary="scores the invoice against this vendor's own payment history — duplicates, amount outliers, round numbers — with thresholds read at run time",
-                         config={"source": "knowledge:invoice-posting-policy"},
-                         next=["x5"]),
-                FlowStep(id="x5", type="transform", name="read-posting-policy",
-                         summary="gathers the governed posting values (auto-post limit, confidence floor) for the rule",
-                         config={"source": "knowledge:invoice-posting-policy"}, next=["r2"]),
-                FlowStep(id="r2", type="rule", name="post-or-review",
-                         summary="under the governed auto-post limit, confidently extracted, matched, and nothing unusual?",
-                         config={"rule_type": "threshold", "source": "knowledge:invoice-posting-policy"},
-                         next=["a1", "k2"], branch_labels=["post", "review"]),
-                FlowStep(id="k2", type="task", name="review-invoice",
-                         summary="a clerk decides the flagged invoice; a correction re-runs the match and the rule rather than overriding them",
-                         config={"queue": "ap-clerk"}, next=["a1"]),
-                FlowStep(id="a1", type="action", name="post-to-ap",
-                         summary="guarded write of the invoice, its lines and the match set into the graph and the AP ledger",
-                         config={"target": "ap-ledger", "gateway": "action-gateway"}, next=["e1"]),
-                FlowStep(id="e1", type="event", name="InvoicePosted",
-                         summary="emitted on commit", config={"event": "InvoicePosted"}),
-            ],
+            steps=package_steps("accounts-payable", accounts_payable.DEFAULT_VERSION),
         ),
         # -- the sync fleet -------------------------------------------------
         #
@@ -1440,31 +1421,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(120),
             updated_at=_ago(1),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="VendorRecordsDelivered",
-                         summary="one run per delivery, woken by a window rather than a case",
-                         config={"event": "VendorRecordsDelivered"}, next=["x1"]),
-                FlowStep(id="x1", type="transform", name="read-resolution-policy",
-                         summary="gathers the governed auto-link and steward-review thresholds — the resolver never fetches",
-                         config={"source": "knowledge:entity-resolution-policy"},
-                         next=["s1"]),
-                FlowStep(id="s1", type="sync", name="land-records",
-                         summary="every row kept as delivered, so a change to the matching rules can re-resolve without re-fetching; byte-identical redeliveries are suppressed by payload hash",
-                         config={"target": "source-landing", "gateway": "action-gateway"},
-                         next=["z1"]),
-                FlowStep(id="z1", type="resolve", name="resolve-records",
-                         summary="scores each landed row against the vendor master and asserts nothing — linked, new, or a steward's to decide",
-                         config={"entity": "Vendor",
-                                 "source": "knowledge:entity-resolution-policy"},
-                         next=["a1"]),
-                FlowStep(id="a1", type="action", name="apply-resolutions",
-                         summary="guarded write of the identity decisions: claims onto known vendors, newly minted ones, and a `match_review` Task per ambiguous row — the run does not wait for it",
-                         config={"target": "vendor-master", "gateway": "action-gateway",
-                                 "queue": "vendor-stewardship"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="VendorsSynced",
-                         summary="emitted on commit", config={"event": "VendorsSynced"}),
-            ],
+            steps=package_steps("vendor-sync", 1),
         ),
         FlowDefinition(
             id="purchase-order-sync",
@@ -1489,22 +1446,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(120),
             updated_at=_ago(1),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="PurchaseOrdersDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "PurchaseOrdersDelivered"}, next=["s1"]),
-                FlowStep(id="s1", type="sync", name="land-records",
-                         summary="the orders as delivered, kept before anything is derived from them",
-                         config={"target": "source-landing", "gateway": "action-gateway"},
-                         next=["a1"]),
-                FlowStep(id="a1", type="action", name="apply-purchase-orders",
-                         summary="guarded write of each order, its lines and the `ordered_from` edge — the three-way match reads these legs out of the graph rather than re-fetching them",
-                         config={"target": "source-landing", "gateway": "action-gateway"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="PurchaseOrdersSynced",
-                         summary="emitted on commit",
-                         config={"event": "PurchaseOrdersSynced"}),
-            ],
+            steps=package_steps("purchase-order-sync", 1),
         ),
         FlowDefinition(
             id="crm-sync",
@@ -1531,35 +1473,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(2),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="CrmBookDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "CrmBookDelivered"}, next=["x1"]),
-                FlowStep(id="x1", type="transform", name="read-resolution-policy",
-                         summary="gathers the governed auto-link and steward-review thresholds — the same policy the vendor master resolves under, so the two books cannot disagree about what counts as a match",
-                         config={"source": "knowledge:entity-resolution-policy"},
-                         next=["s1"]),
-                FlowStep(id="s1", type="sync", name="land-records",
-                         summary="accounts and contacts land as they arrived, tagged `company` and `person` — the field a steward's decision is later routed on",
-                         config={"target": "source-landing", "gateway": "action-gateway"},
-                         next=["z1"]),
-                FlowStep(id="z1", type="resolve", name="resolve-records",
-                         summary="scores accounts against the counterparty book by name and contacts by address; asserts nothing",
-                         config={"entity": "Company,Person",
-                                 "source": "knowledge:entity-resolution-policy"},
-                         next=["a1"]),
-                FlowStep(id="a1", type="action", name="apply-resolutions",
-                         summary="guarded write of the companies, the people in them, the reversible identity links back to each landed row, and a `match_review` Task per ambiguous company",
-                         config={"target": "company-master", "gateway": "action-gateway",
-                                 "queue": "data-stewardship"},
-                         next=["a2"]),
-                FlowStep(id="a2", type="action", name="apply-opportunities",
-                         summary="guarded write of the pipeline, each deal bound to the company it is being pursued with — a deal naming an account this delta did not carry is counted, never minted",
-                         config={"target": "sales-records", "gateway": "action-gateway"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="CrmBookSynced",
-                         summary="emitted on commit", config={"event": "CrmBookSynced"}),
-            ],
+            steps=package_steps("crm-sync", 1),
         ),
         FlowDefinition(
             id="sales-sync",
@@ -1586,40 +1500,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(2),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="SalesRecordsDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "SalesRecordsDelivered"}, next=["x1"]),
-                FlowStep(id="x1", type="transform", name="read-resolution-policy",
-                         summary="gathers the governed thresholds the counterparty match runs under",
-                         config={"source": "knowledge:entity-resolution-policy"},
-                         next=["s1"]),
-                FlowStep(id="s1", type="sync", name="land-records",
-                         summary="the ERP's customer rows as delivered, under their legal spellings",
-                         config={"target": "source-landing", "gateway": "action-gateway"},
-                         next=["z1"]),
-                FlowStep(id="z1", type="resolve", name="resolve-records",
-                         summary="scores each customer against the counterparty book — `Northwind Traders Inc.` against the `Northwind Traders` the CRM already minted",
-                         config={"entity": "Company",
-                                 "source": "knowledge:entity-resolution-policy"},
-                         next=["a1"]),
-                FlowStep(id="a1", type="action", name="apply-resolutions",
-                         summary="guarded write of the ERP's claims onto known companies and its identity links back to each landed row; an ambiguous one raises a Task and asserts nothing",
-                         config={"target": "company-master", "gateway": "action-gateway",
-                                 "queue": "data-stewardship"},
-                         next=["a2"]),
-                FlowStep(id="a2", type="action", name="apply-items",
-                         summary="guarded write of the catalogue, keyed by SKU and carrying the ERP's internal id — the bridge an order line is resolved through",
-                         config={"target": "sales-records", "gateway": "action-gateway"},
-                         next=["a3"]),
-                FlowStep(id="a3", type="action", name="apply-sales-orders",
-                         summary="guarded write of the orders, their lines, the customer edge and the catalogue edge; a line naming an item nobody has seen is counted rather than minting a SKU-less item the real one could never merge with",
-                         config={"target": "sales-records", "gateway": "action-gateway"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="SalesRecordsSynced",
-                         summary="emitted on commit",
-                         config={"event": "SalesRecordsSynced"}),
-            ],
+            steps=package_steps("sales-sync", 1),
         ),
         FlowDefinition(
             id="workforce-sync",
@@ -1646,31 +1527,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(120),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="WorkforceDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "WorkforceDelivered"}, next=["a1"]),
-                FlowStep(id="a1", type="action", name="apply-teams",
-                         summary="guarded write of each department as a Team, keyed by slug and carrying the HRIS's own id",
-                         config={"target": "workforce", "gateway": "action-gateway"},
-                         next=["a2"]),
-                FlowStep(id="a2", type="action", name="apply-employees",
-                         summary="guarded write of each worker, keyed by work email — with the HRIS's worker status and employment type claimed only where the source stated them",
-                         config={"target": "workforce", "gateway": "action-gateway"},
-                         next=["a3"]),
-                FlowStep(id="a3", type="action", name="wire-org-chart",
-                         summary="guarded write of the membership, reporting, nesting and lead edges; a reference resolves by key first and by the source's own id second, and what neither answers is counted rather than minted",
-                         config={"target": "workforce", "gateway": "action-gateway"},
-                         next=["e1", "e2"],
-                         branch_labels=["synced", "references unresolved"]),
-                FlowStep(id="e1", type="event", name="WorkforceSynced",
-                         summary="emitted on commit",
-                         config={"event": "WorkforceSynced"}),
-                FlowStep(id="e2", type="event",
-                         name="WorkforceReferencesUnresolved",
-                         summary="emitted alongside e1 when the delivery named people or teams the graph does not hold — one aggregate per delivery, never a gate per row",
-                         config={"event": "WorkforceReferencesUnresolved"}),
-            ],
+            steps=package_steps("workforce-sync", 1),
         ),
         FlowDefinition(
             id="receiving-sync",
@@ -1695,25 +1552,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(120),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger",
-                         name="ReceivingReportsDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "ReceivingReportsDelivered"},
-                         next=["s1"]),
-                FlowStep(id="s1", type="sync", name="land-records",
-                         summary="the reports as delivered, kept before anything is derived from them",
-                         config={"target": "source-landing", "gateway": "action-gateway"},
-                         next=["a1"]),
-                FlowStep(id="a1", type="action",
-                         name="apply-receiving-reports",
-                         summary="guarded write of each report, its lines and the edge to the PO it books in against",
-                         config={"target": "source-landing", "gateway": "action-gateway"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="ReceivingReportsSynced",
-                         summary="emitted on commit",
-                         config={"event": "ReceivingReportsSynced"}),
-            ],
+            steps=package_steps("receiving-sync", 1),
         ),
         FlowDefinition(
             id="employment-event-sync",
@@ -1739,20 +1578,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(1),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger",
-                         name="EmploymentEventsDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "EmploymentEventsDelivered"},
-                         next=["s1"]),
-                FlowStep(id="s1", type="sync", name="land-records",
-                         summary="every ledger row kept exactly as delivered, previous values included; a byte-identical redelivery is suppressed by payload hash",
-                         config={"target": "source-landing", "gateway": "action-gateway"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="EmploymentEventsLanded",
-                         summary="emitted on commit — `Landed` and not `Synced`, because nothing downstream was asserted",
-                         config={"event": "EmploymentEventsLanded"}),
-            ],
+            steps=package_steps("employment-event-sync", 1),
         ),
         FlowDefinition(
             id="dms-sync",
@@ -1779,23 +1605,64 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(1),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="DocumentsDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "DocumentsDelivered"}, next=["a1"]),
-                FlowStep(id="a1", type="action", name="apply-folders",
-                         summary="walks the parent pointers into full paths — through the batch first, then the tree already in the graph — and guards a write per folder plus the nesting edge; a folder neither answers for is counted, not filed at the root",
-                         config={"target": "document-library", "gateway": "action-gateway"},
-                         next=["a2"]),
-                FlowStep(id="a2", type="action", name="apply-documents",
-                         summary="guarded write of each file as a reference: filename, media type, size, the Collection that governs it and the version-pinned `storage_ref` — then the edge to the folder the customer filed it in",
-                         config={"target": "document-library", "gateway": "action-gateway",
-                                 "custody": "reference"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="DocumentsSynced",
-                         summary="emitted on commit",
-                         config={"event": "DocumentsSynced"}),
-            ],
+            steps=package_steps("dms-sync", 1),
+        ),
+        FlowDefinition(
+            id="ap-intake",
+            name="AP invoice intake",
+            description=(
+                "Turns the customer's own filing tree into accounts-payable "
+                "work. Woken by the same delivery that wakes `dms-sync`, it "
+                "reads the governed AP folders, finds the documents under "
+                "them whose pointer resolves to a revision nobody has read, "
+                "fetches the bytes through that pointer and stores them under "
+                "their content hash — then emits one InvoiceReceived per "
+                "invoice, which is the seam where a windowed batch becomes "
+                "per-case work. A file that will not fetch is a count on the "
+                "run, never a Task the other thirty-nine queue behind; the "
+                "only Task it raises is the aggregate, when nothing in a "
+                "window answered at all."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["intake", "ap", "documents", "dms", "invoices"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(0),
+            updated_at=_ago(0),
+            steps=package_steps("ap-intake", 1),
+        ),
+        FlowDefinition(
+            id="ap-corrections",
+            name="AP correction capture",
+            description=(
+                "The flywheel, as a flow you can watch. When a clerk corrects "
+                "an extracted invoice, the accounts-payable run emits the fact "
+                "and carries on posting; this answers it, appending one "
+                "raw→corrected pair per field the clerk moved to the "
+                "correction set — keyed by the same canonical field paths the "
+                "review screen highlights and the golden sets assert on. "
+                "Decoupled on purpose: a payment must not wait on a knowledge "
+                "write, and what the correction *teaches* is a governed "
+                "decision somebody makes later, against this set. Nothing "
+                "here promotes anything into the extraction prompt."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["flywheel", "ap", "corrections", "evals", "knowledge"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(0),
+            updated_at=_ago(0),
+            steps=package_steps("ap-corrections", 1),
         ),
         FlowDefinition(
             id="calendar-sync",
@@ -1821,26 +1688,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(60),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="CalendarsDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "CalendarsDelivered"}, next=["a1"]),
-                FlowStep(id="a1", type="action", name="apply-calendars",
-                         summary="guarded write of each calendar and the `has_calendar` edge to the employee whose it is — times stay wall-clock local in the calendar's own zone, because a recurring 9am has to survive a daylight-saving change",
-                         config={"target": "calendars", "gateway": "action-gateway"},
-                         next=["a2"]),
-                FlowStep(id="a2", type="action", name="apply-events",
-                         summary="guarded write of each block as a part of the calendar that holds it; an event whose calendar this graph does not hold is dropped and counted rather than being given an owner it does not have",
-                         config={"target": "calendars", "gateway": "action-gateway"},
-                         next=["a3"]),
-                FlowStep(id="a3", type="action", name="wire-attendance",
-                         summary="guarded write of the organizer and attendee edges, by work email — a client sponsor or an external recruiter resolves to nobody and is reported on the aggregate",
-                         config={"target": "calendars", "gateway": "action-gateway"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="CalendarsSynced",
-                         summary="emitted on commit",
-                         config={"event": "CalendarsSynced"}),
-            ],
+            steps=package_steps("calendar-sync", 1),
         ),
         FlowDefinition(
             id="mail-sync",
@@ -1868,26 +1716,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(2),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="MailDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "MailDelivered"}, next=["a1"]),
-                FlowStep(id="a1", type="action", name="apply-mailboxes",
-                         summary="guarded write of each mailbox, keyed by address — the directory's job title and department land as `office` claims, which the HRIS outranks wherever the two disagree",
-                         config={"target": "correspondence", "gateway": "action-gateway"},
-                         next=["a2"]),
-                FlowStep(id="a2", type="action", name="apply-messages",
-                         summary="guarded write of each message as a part of the mailbox that holds it, truncated to the governed preview length; a message whose mailbox this graph does not hold is dropped and counted",
-                         config={"target": "correspondence", "gateway": "action-gateway",
-                                 "custody": "headers, addressing and body_preview only"},
-                         next=["a3"]),
-                FlowStep(id="a3", type="action", name="wire-correspondents",
-                         summary="guarded write of the sender and recipient edges, by address — separately typed for employees and outside people, because whether a commitment came from inside or outside the company is the first question anybody asks of a thread",
-                         config={"target": "correspondence", "gateway": "action-gateway"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="MailSynced",
-                         summary="emitted on commit", config={"event": "MailSynced"}),
-            ],
+            steps=package_steps("mail-sync", 1),
         ),
         FlowDefinition(
             id="identity-sweep",
@@ -1920,31 +1749,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(1),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="IdentityWindowClosed",
-                         summary="one run per window over the whole book — the first windowed trigger that is not a delivery",
-                         config={"event": "IdentityWindowClosed"}, next=["x1"]),
-                FlowStep(id="x1", type="transform", name="read-sweep-policy",
-                         summary="gathers the governed thresholds — the floor to propose at, the confidence under which a steward is asked, the name floor a pair must clear without a hard identifier",
-                         config={"source": "knowledge:entity-resolution-policy"},
-                         next=["z1"]),
-                FlowStep(id="z1", type="resolve", name="score-candidates",
-                         summary="every pair in and across the two counterparty books and the person book, scored on shared domain, phone band, anchor word, shared employer and blended name similarity — read-only, deliberately outside the guarded write",
-                         config={"signals": "domain · phone · anchor · employer · name",
-                                 "source": "knowledge:entity-resolution-policy"},
-                         next=["a1"]),
-                FlowStep(id="a1", type="action", name="propose-merges",
-                         summary="guarded write of each surviving pair as a typed identity link at `status=in_review`, with confidence, method, decidedBy, reversibleWith and the signals that produced it — edges only, never a claim on either object",
-                         config={"target": "entity-layer", "gateway": "action-gateway",
-                                 "asserts": "nothing merges; status-gated until confirmed"},
-                         next=["k1"]),
-                FlowStep(id="k1", type="task", name="ask-a-steward",
-                         summary="a `merge_review` Task per proposal under the governed confidence bar, in the queue the Mapping names for that book; the run does not wait for it",
-                         config={"queue": "data-stewardship"}, next=["e1"]),
-                FlowStep(id="e1", type="event", name="IdentityMergesProposed",
-                         summary="emitted on commit",
-                         config={"event": "IdentityMergesProposed"}),
-            ],
+            steps=package_steps("identity-sweep", 1),
         ),
         FlowDefinition(
             id="disagreement-sweep",
@@ -1982,32 +1787,243 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(0),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="StateWindowClosed",
-                         summary="one run per window over every held order — the sibling of IdentityWindowClosed, and windowed for the same reason: the unit of work is a pass, not a row",
-                         config={"event": "StateWindowClosed"}, next=["x1"]),
-                FlowStep(id="x1", type="transform", name="read-state-policy",
-                         summary="gathers the governed class table and its thresholds — which pairs of states are a disagreement, how far either side of a close date an order may sit, the name floor and the amount band a corroborator must clear",
-                         config={"source": "knowledge:state-agreement-policy"},
-                         next=["z1"]),
-                FlowStep(id="z1", type="resolve", name="correlate-states",
-                         summary="every held order walked to its counterparty and out to that company's won deals, scored on the window, name proximity, amount containment, sole candidacy and a delivery engagement — read-only, deliberately outside the guarded write; a company reachable only through an unconfirmed merge is not read, and is counted",
-                         config={"signals": "window · name · amount · sole candidate · engagement",
-                                 "source": "knowledge:state-agreement-policy",
-                                 "gate": "company_same_as must read confirmed"},
-                         next=["a1"]),
-                FlowStep(id="a1", type="action", name="record-disagreements",
-                         summary="guarded write of each finding as a typed link at `status=standing`, carrying its class, correlation confidence, signals, policy ref and the states both rows held when it was found — edges only, never a claim on the deal or the order",
-                         config={"target": "entity-layer", "gateway": "action-gateway",
-                                 "asserts": "nothing is released; no external system is written to"},
-                         next=["k1"]),
-                FlowStep(id="k1", type="task", name="ask-the-order-desk",
-                         summary="a `state_disagreement` Task per standing finding, in the order desk's queue — releasing revenue is the controller's call and nobody else's; a finding already dismissed is never re-raised",
-                         config={"queue": "order-desk"}, next=["e1"]),
-                FlowStep(id="e1", type="event", name="DisagreementsFound",
-                         summary="emitted on commit",
-                         config={"event": "DisagreementsFound"}),
-            ],
+            steps=package_steps("disagreement-sweep", 1),
+        ),
+        FlowDefinition(
+            id="credential-tracking",
+            name="Credential tracking",
+            description=(
+                "The compliance clock: five spreadsheet sub-processes and "
+                "three Excel trackers answered by one windowed pass over the "
+                "credential and inspection rows the graph already holds. A "
+                "timer closes a window — nothing arrives — and "
+                "`certification-alert-policy` decides what an open window "
+                "means: the 60/30/15 notice stages, the 30-day service-level "
+                "floor a stage list is checked against, the five categories "
+                "tracked, the seven-year retention horizon and the desk. A "
+                "pure Rule decides which stage each row is owed and **a stage "
+                "already sent this cycle is not re-sent**, which is what makes "
+                "a daily cadence safe: a window with nothing due writes "
+                "nothing, sends nothing and raises nothing. One guarded Action "
+                "stamps the whole window — never one per row. An asset whose "
+                "register carries no next-due date is excluded and *counted*, "
+                "which is the skid-steer exclusion expressed as a fact about "
+                "the asset rather than a list of machine types. The four "
+                "exception classes — an unreadable date, an unresolvable "
+                "holder, a leaver still on the active roster, a record past "
+                "the horizon — go to `hr-safety` as at most four aggregate "
+                "Tasks, never one per row. **Nothing is deleted:** a record "
+                "past seven years is reported for manual review, which is the "
+                "customer's own rule. And no `Last Notified` column, no "
+                "`Last Run Status` cell and no workbook is read or written "
+                "anywhere — that state is the graph rows and this run's "
+                "journal."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["compliance", "credentials", "inspections", "windowed",
+                  "governed-knowledge", "dot"],
+            queues=["hr-safety"],
+            workspace="compliance",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(0),
+            updated_at=_ago(0),
+            steps=package_steps("credential-tracking", 1),
+        ),
+        # -- the plant spine ------------------------------------------------
+        #
+        # Two flows and one seam. The window is a pass over the job book that
+        # commits nothing; the extraction is a case that commits the demand
+        # rows a plant's day is built out of. They are separate flows because
+        # they are woken by different kinds of fact and answered at different
+        # grain — the shape-is-read-off-the-Trigger rule, made visible on the
+        # fleet page.
+        FlowDefinition(
+            id="plant-eligibility-sweep",
+            name="Plant eligibility sweep",
+            description=(
+                "The 11:00 window: which of the jobs the production system "
+                "holds are actually in play. Nothing arrives — a clock closes "
+                "a window over the job book — and every clause that judges it "
+                "is a line on a governed page: load date on or after today, a "
+                "week position in the governed set, released, not held, and a "
+                "load date the plant is actually open on, counted against a "
+                "business-day calendar and a holiday list somebody can edit. "
+                "A job that fails a clause is excluded for **that** named "
+                "reason and counted, so \"why was 260118 not scheduled\" "
+                "answers with a clause rather than an opinion. **An eligible "
+                "set of zero raises nothing** — the governed page says a slow "
+                "week is informational — and the only Task it can raise is the "
+                "aggregate for a job book that is *empty*, which is a feed "
+                "that stopped and goes to the operations desk. Each eligible "
+                "job then becomes one `JobEligible` fact answered by a full "
+                "extraction before the window is acknowledged, bounded by a "
+                "governed jobs-per-window figure with the remainder reported "
+                "as deferred; and after them, one `DepartmentDayOpened` per "
+                "department and business day the extractions produced demand "
+                "for. It writes nothing at all: the verdict is the journal."
+            ),
+            team="plant-operations",
+            status="active",
+            version=1,
+            tags=["plant", "scheduling", "eligibility", "windowed",
+                  "governed-knowledge"],
+            queues=["platform-operations"],
+            workspace="plant-schedule",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(0),
+            updated_at=_ago(0),
+            steps=package_steps("plant-eligibility-sweep", 1),
+        ),
+        FlowDefinition(
+            id="shipping-list-extraction",
+            name="Shipping list extraction",
+            description=(
+                "One eligible job's seven-page shipping list becomes ten "
+                "departments' worth of demand — and the only ModelCall pair in "
+                "the plant spine. It gathers every governed value in one step, "
+                "finds the job's ticket under the governed cut-sheet root "
+                "(which is what tells the floor's copy from the office's), "
+                "fetches the bytes under their content hash, and makes **one** "
+                "metered pass over the pages with a confidence per field. The "
+                "prompt forbids the model to compute an hour: the arithmetic "
+                "is a governed page a superintendent can edit, and a figure a "
+                "model invented would be a hidden second implementation of it. "
+                "The grids are then checked against their own printed totals "
+                "and the computed hours against each department's expected "
+                "band, and the union of what is left in doubt — a low "
+                "confidence, a grid that does not add up, a required field "
+                "that is absent, a figure outside its band — is what one "
+                "supervisor is asked about, with a box on each field from a "
+                "second cheap call that is **skipped entirely** when there is "
+                "nothing to locate. A correction re-runs both checks rather "
+                "than overriding them. Then one guarded write: a `JobTask` per "
+                "department whose page family is present, each naming the "
+                "formula and the asset revision that produced its hours. A job "
+                "with no shipping list is a count, not a Task; a department "
+                "with no page family is skipped, and the job is not."
+            ),
+            team="plant-operations",
+            status="active",
+            version=1,
+            tags=["plant", "vision", "extraction", "scheduling",
+                  "governed-knowledge"],
+            queues=["plant-supervisor"],
+            workspace="plant-schedule",
+            roi_minutes_per_run=0.0,
+            # Two calls at most, and usually one: a multi-page read plus a
+            # narrow locate that a clean ticket never makes.
+            model_budget_usd_per_run=0.40,
+            authored_by="fde:m.suter",
+            created_at=_ago(0),
+            updated_at=_ago(0),
+            steps=package_steps("shipping-list-extraction", 1),
+        ),
+        FlowDefinition(
+            id="department-scheduling",
+            name="Department scheduling",
+            description=(
+                "One plant department's day, filled out of the graph and "
+                "signed by a person — and the flow that makes Cumulus the "
+                "**system of record** for a schedule rather than a thing that "
+                "writes into somebody's workbook. Woken once per (department, "
+                "business day) by the fact the eligibility sweep raises after "
+                "its extractions have landed demand. Everything it reads "
+                "about the day it reads out of **our own graph**: the "
+                "`ScheduleDay` "
+                "a previous window opened, its rows — specifically the rows a "
+                "supervisor's correction stamped `placed_by: human`, which it "
+                "must never overwrite — and the headcount, which is the count "
+                "of active employees `member_of` the department's team rather "
+                "than a number somebody typed in every morning. There is no "
+                "spreadsheet here, because there is no spreadsheet anywhere. "
+                "Each share is judged against the governed clauses in the "
+                "page's own order — still eligible, upstream department done, "
+                "inside the lead-time and farthest-out windows, on a day the "
+                "plant is open — and what fails is **deferred with its "
+                "reason, never a failure**: nothing sits warm waiting for a "
+                "saw, because the next sweep re-raises the day. The fill then "
+                "adds shares in load-date order until the governed goal max, "
+                "or until the computed incentive crosses zero for the two "
+                "departments the page names, inside the fudge band and with "
+                "the absolute max as the hard stop — and going past the "
+                "absolute max by within the fudge is explicitly not an "
+                "exception. Below capacity is reported and never forced. One "
+                "guarded write puts the day at `pending_approval`; one Task "
+                "carries the rows, the total against the limits, the "
+                "incentive written out as its own arithmetic, everything "
+                "deferred and why, and a headcount staleness warning that "
+                "warns and proceeds; and the run suspends there, because that "
+                "approval is a **permanent control point**. Approving is the "
+                "instant the day becomes exportable, and the CSV export "
+                "refuses a day nobody has signed."
+            ),
+            team="plant-operations",
+            status="active",
+            version=1,
+            tags=["plant", "scheduling", "capacity", "windowed",
+                  "governed-knowledge", "system-of-record"],
+            queues=["plant-supervisor"],
+            workspace="plant-schedule",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(0),
+            updated_at=_ago(0),
+            steps=package_steps("department-scheduling", 1),
+        ),
+        FlowDefinition(
+            id="field-documents",
+            name="Field documents",
+            description=(
+                "The job packet, as one windowed pass: a dispatcher that "
+                "watched a portal for scheduled jobs, a performer that copied "
+                "four PDFs into a per-foreman folder tree, and a weekly "
+                "reconciliation that went looking for the jobs that had moved "
+                "between crews, collapsed into one standing question asked of "
+                "the graph — *which scheduled job inside the horizon does not "
+                "have its four documents linked at their latest revision?* "
+                "**No ModelCall at all**: the fact the retired crew-schedule "
+                "PDF carried is a column on the job. Two Triggers wake it, "
+                "because either half can be the new fact — a job becoming "
+                "`Scheduled`, or a revision arriving for a job already "
+                "scheduled. `field-documents-policy` decides what a packet "
+                "is: the four types and their filename patterns, the folder "
+                "root, the statuses and the horizon that put a job in scope, "
+                "the window bound, the naming convention with its stopwords "
+                "and collision rule, the recurrence threshold and the desk. "
+                "*The topmost one is the most recent* is not a rule this "
+                "system can keep, so the current revision is a comparison "
+                "rather than a position. One guarded Action lands the whole "
+                "window — never one per job — and at most two aggregate Tasks "
+                "reach `field-operations`: the jobs nothing has been filed "
+                "for past the recurrence threshold, and the jobs whose crew "
+                "id resolves to no team, which is the subcontractor case as "
+                "**one identity question** rather than one document question "
+                "per job. **No folder is created, copied, moved or deleted "
+                "anywhere:** a packet is a graph fact, a superseded revision "
+                "keeps its row and its withdrawn edge, and \"no longer this "
+                "crew\'s job\" is an ended validity rather than a directory "
+                "somebody has to remove."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["field", "crews", "documents", "jobs", "windowed",
+                  "governed-knowledge"],
+            queues=["field-operations"],
+            workspace="field-documents",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(0),
+            updated_at=_ago(0),
+            steps=package_steps("field-documents", 1),
         ),
         FlowDefinition(
             id="order-release",
@@ -2037,7 +2053,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             ),
             team="platform-eng",
             status="active",
-            version=1,
+            version=order_release.DEFAULT_VERSION,
             tags=["write-back", "sales-orders", "estate", "governed-write",
                   "per-case"],
             queues=["order-desk"],
@@ -2047,40 +2063,7 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(0),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="OrderReleaseApproved",
-                         summary="one run per approved finding — per case, unlike the windowed sweep that raised it, because a controller releases one order at a time and the run has to re-read the world rather than trust a state somebody looked at days ago",
-                         config={"event": "OrderReleaseApproved"}, next=["x1"]),
-                FlowStep(id="x1", type="transform", name="read-write-policy",
-                         summary="the one row of the write table this flow may go through — resource, field and the transitions permitted out of each value — and the order it is about, whose ERP record id is read off the object's `external_id` and never sliced out of its transaction number",
-                         config={"source": "estate_writes:WRITABLE",
-                                 "target": "sales-order-status"},
-                         next=["z1"]),
-                FlowStep(id="z1", type="resolve", name="check-preconditions",
-                         summary="re-reads the record in the ERP and answers one of five ways — proceed, already ours, resolved by somebody else, escalate, or refused by the table before any request exists. Read-only, and deliberately outside the guarded write: this reaches a customer's network, and a read that failed inside an Action would be ledgered as a failed write",
-                         config={"reads": "erp.salesOrders", "outcomes": "5",
-                                 "compares": "value, not updatedAt"},
-                         next=["a1", "k1"]),
-                FlowStep(id="a1", type="action", name="release-sales-order",
-                         summary="the intent is journalled before the request leaves, one PATCH is sent, the record is read back, and the finding moves to `resolved` in the same commit — write-ahead because a request that raises may still have landed, and verified by re-read because a cheerful 200 that changed nothing settles `unverified` and raises a Task instead of reporting success",
-                         config={"target": "sales-records",
-                                 "gateway": "action-gateway",
-                                 "journal": "estate_write_journal",
-                                 "asserts": "no human claim on the order; at most one PATCH per run"},
-                         next=["s1"]),
-                FlowStep(id="s1", type="action", name="apply-source-records",
-                         summary="what the ERP said when it was read back, landed as an observation under `erp:erp-sales` — the same claim the feed itself writes, so the delta that carries this change home is a byte-identical no-op rather than a conflict",
-                         config={"target": "entity-layer",
-                                 "gateway": "action-gateway",
-                                 "regime": "observation"},
-                         next=["k1"]),
-                FlowStep(id="k1", type="task", name="tell-the-order-desk",
-                         summary="a Task when the ERP is not where the approval left it, or when it accepted the write and did not change — and deliberately nothing at all when somebody else had already released the order, which is a number and not an interruption",
-                         config={"queue": "order-desk"}, next=["e1"]),
-                FlowStep(id="e1", type="event", name="SalesOrderReleased",
-                         summary="emitted on commit — or `OrderReleaseWithheld`, just as loudly, because a run that decided not to write is not a run that did nothing",
-                         config={"event": "SalesOrderReleased"}),
-            ],
+            steps=package_steps("order-release", order_release.DEFAULT_VERSION),
         ),
         FlowDefinition(
             id="psa-sync",
@@ -2112,36 +2095,106 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(1),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="PsaBookDelivered",
-                         summary="one run per delivery, woken by a window",
-                         config={"event": "PsaBookDelivered"}, next=["x1"]),
-                FlowStep(id="x1", type="transform", name="read-resolution-policy",
-                         summary="gathers the governed thresholds the counterparty match runs under — the same policy the CRM and the ERP resolve against, so three systems cannot disagree about what counts as one company",
-                         config={"source": "knowledge:entity-resolution-policy"},
-                         next=["s1"]),
-                FlowStep(id="s1", type="sync", name="land-records",
-                         summary="the client list as delivered, under the nicknames Delivery uses; only the clients land, because a project code is exact and has nothing to adjudicate",
-                         config={"target": "source-landing", "gateway": "action-gateway"},
-                         next=["z1"]),
-                FlowStep(id="z1", type="resolve", name="resolve-records",
-                         summary="scores each client against the counterparty book — `Apex Mfg` against the `Apex Manufacturing` the CRM minted; a nickname usually falls below the floor and mints, which is what leaves the join for the identity sweep to propose with evidence",
-                         config={"entity": "Company",
-                                 "source": "knowledge:entity-resolution-policy"},
-                         next=["a1"]),
-                FlowStep(id="a1", type="action", name="apply-resolutions",
-                         summary="guarded write of the PSA's name claim onto known counterparties and its identity links back to each landed row, plus the contact's mail domain — the one hard identifier an informal client list carries; an ambiguous client raises a Task and asserts nothing",
-                         config={"target": "company-master", "gateway": "action-gateway",
-                                 "queue": "data-stewardship"},
-                         next=["a2"]),
-                FlowStep(id="a2", type="action", name="apply-delivery-book",
-                         summary="guarded write of the projects, their phases, the counterparty edge and the hours — summed onto each phase through the task an entry names, with time booked past every phase counted rather than spread",
-                         config={"target": "delivery-records", "gateway": "action-gateway"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="PsaBookSynced",
-                         summary="emitted on commit",
-                         config={"event": "PsaBookSynced"}),
-            ],
+            steps=package_steps("psa-sync", 1),
+        ),
+        FlowDefinition(
+            id="job-sync",
+            name="Production job sync",
+            description=(
+                "What the plant is building, mirrored from the production "
+                "system: the job, its dimensions, the date it has to leave the "
+                "yard, the crew it is assigned to, and ten departments' worth "
+                "of completion flags. Two decisions carry this flow. The "
+                "customer each job names is **resolved** through the same "
+                "policy the CRM, the sell side and the PSA go through — a name "
+                "is fuzzy, `Hoffman` and `Hoffmann` are one farm, and an "
+                "ambiguous one raises a steward Task while the job lands "
+                "anyway. The crew is **bound**, not matched: the ERP's crew id "
+                "is the accounting code on the HRIS crew department, and an id "
+                "that matches nothing is a count rather than a failure, "
+                "because the subcontractor crew has no department and never "
+                "will. A job that changes crews **withdraws** the old edge "
+                "rather than deleting it, so which crew has it now and who "
+                "held it before are one traversal — which is what retires the "
+                "weekly folder reconciliation the RPA design needed. The "
+                "production system's own words — its `Yes`/`No` flags and its "
+                "week labels — are translated here against the governed "
+                "vocabulary table, and the landed row keeps the strings "
+                "alongside, so an edit to that table re-applies without "
+                "re-fetching a thing."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "erp", "production", "jobs", "crews"],
+            queues=["data-stewardship"],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(1),
+            updated_at=_ago(0),
+            steps=package_steps("job-sync", 1),
+        ),
+        FlowDefinition(
+            id="credential-sync",
+            name="Credential sync",
+            description=(
+                "Everything a person holds that expires, from the two files "
+                "that track it: completed training and certifications on one "
+                "side, CDLs, medical cards and clearances on the other. One "
+                "type for both, because a thing that expires and gets renewed "
+                "behaves identically whichever department owns the "
+                "spreadsheet — and one driver row becomes one credential per "
+                "date it carries, because four permissions cannot share a "
+                "key. A **bind** feed: the holder is joined by work email, "
+                "which is exact, so nothing is reified and nobody "
+                "adjudicates. It derives no status: `valid | expiring | "
+                "expired` is the compliance sweep's verdict against the "
+                "governed notice stages, and a feed that wrote its own input "
+                "into that field would make the sweep read its own output."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "hris", "compliance", "credentials", "safety"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(1),
+            updated_at=_ago(0),
+            steps=package_steps("credential-sync", 1),
+        ),
+        FlowDefinition(
+            id="equipment-sync",
+            name="Equipment sync",
+            description=(
+                "The fleet the business is answerable for, and the two dates "
+                "that say whether a unit is legal to run. Its one interesting "
+                "decision is an absence: **a null next-due date is the source "
+                "saying this unit carries no tracked inspection**, derived "
+                "once on the way in, which is what stops a skid steer that "
+                "never needed a sticker from being reported as overdue "
+                "forever. The examination is written as a part of the unit "
+                "from the dates the asset row holds — no result, no inspector, "
+                "no notes, because the source says nothing about what was "
+                "found and a `pass` inferred from a due date would invent the "
+                "finding a certificate carries."
+            ),
+            team="platform-eng",
+            status="active",
+            version=1,
+            tags=["sync", "erp", "equipment", "compliance", "fleet"],
+            queues=[],
+            workspace="ap-workspace",
+            roi_minutes_per_run=0.0,
+            model_budget_usd_per_run=0.0,
+            authored_by="fde:m.suter",
+            created_at=_ago(1),
+            updated_at=_ago(0),
+            steps=package_steps("equipment-sync", 1),
         ),
         FlowDefinition(
             id="answer-question",
@@ -2177,122 +2230,58 @@ def _seed_definitions() -> list[FlowDefinition]:
             authored_by="fde:m.suter",
             created_at=_ago(1),
             updated_at=_ago(0),
-            steps=[
-                FlowStep(id="t1", type="trigger", name="QuestionAsked",
-                         summary="one run per question, from any surface — the HR agent's `HrQuestionAsked` binds the same flow and differs only in the context it carries",
-                         config={"event": "QuestionAsked"}, next=["m1"]),
-                FlowStep(id="m1", type="modelcall", name="answer-question",
-                         summary="the planner loop over the two retrieval planes: document text and corpus metadata, every claim cited to an asset id it actually read — one step, however many turns it took",
-                         config={"model": "gemini-3.5-flash-lite",
-                                 "prompt": "answering.SYSTEM_INSTRUCTION",
-                                 "budget": "answer_max_steps turns"},
-                         next=["e1"]),
-                FlowStep(id="e1", type="event", name="QuestionAnswered",
-                         summary="emitted with the backend that answered — `retrieval` when nothing generated, which the console renders differently on purpose",
-                         config={"event": "QuestionAnswered"}),
-            ],
+            steps=package_steps("answer-question", 1),
         ),
     ]
 
 
-# Definitions that seed an open draft, and how that draft differs from the
-# active version — an added node plus a modified one, so the canvas diff
-# overlay has real indicators to paint.
-_SEED_DRAFTS: dict[str, str] = {
-    "expense-reimbursement": "add-duplicate-check",
-}
-
-
-def _earlier_revision(ref: str, back: int) -> str:
-    """The same knowledge ref, `back` revisions earlier.
-
-    A bare ref is treated as naming the current revision, because that is what
-    it resolves to — so the archived version pins one explicitly and the diff
-    shows the edit as what it was: a prompt revision, not a rename.
-    """
-    base, _, revision = ref.partition("@rev")
-    current = int(revision) if revision.isdigit() else 1
-    return f"{base}@rev{max(1, current - back)}"
-
-
 def _seed_version_history(defn: FlowDefinition) -> list[FlowVersion]:
-    """Two archived revisions, the active one, and sometimes an open draft."""
-    active_steps = [s.model_copy(deep=True) for s in defn.steps]
-    versions: list[FlowVersion] = []
+    """The live version, plus every other version shipped as a package.
 
-    # Archived revisions differ only in their governed knowledge — an earlier
-    # revision of the prompt the ModelCall reads. That is the most common real
-    # edit, it keeps the diff legible, and it is now literally how a prompt
-    # versions: the config holds a `knowledge:` ref, and an older version of
-    # the flow pinned an older revision of the same asset.
-    for back in (2, 1):
-        older = []
-        for step in active_steps:
-            copy = step.model_copy(deep=True)
-            if copy.type == "modelcall" and "prompt" in copy.config:
-                config = dict(copy.config)
-                config["prompt"] = _earlier_revision(config["prompt"], back)
-                copy = copy.model_copy(update={"config": config})
-            older.append(copy)
-        versions.append(
-            FlowVersion(
-                version=defn.version - back,
-                label=f"v{defn.version - back}",
-                status="archived",
-                steps=older,
-                model_budget_usd_per_run=defn.model_budget_usd_per_run,
-                notes="Superseded.",
-                authored_by=defn.authored_by,
-                created_at=defn.updated_at - timedelta(days=30 * back),
-            )
-        )
+    That is the whole of a new flow's history, because it is the whole of what
+    exists. This used to mint two back-dated `archived` revisions per flow —
+    the active steps with an earlier `@revN` pinned on the prompt — plus, for
+    expense reimbursement, a fabricated `add-duplicate-check` draft carrying a
+    step nobody wrote. The version picker then offered five revisions of a flow
+    that had shipped one, and the canvas diffed a draft against a change no
+    engineer had proposed.
 
-    versions.append(
+    A version is real when a `v<N>/` package for it is present in the deployed
+    code: above the live pointer it is a candidate the console can activate,
+    below it an older package still deployed. So a flow that has shipped once
+    has one version, and accounts payable has the v6/v7/v8 set it actually
+    ships.
+    """
+    from . import tasks as process_packages
+
+    versions = [
         FlowVersion(
             version=defn.version,
             label=f"v{defn.version}",
             status="active",
-            steps=active_steps,
+            steps=[step.model_copy(deep=True) for step in defn.steps],
             model_budget_usd_per_run=defn.model_budget_usd_per_run,
             notes="Live.",
             authored_by=defn.authored_by,
             created_at=defn.updated_at,
         )
-    )
-
-    recipe = _SEED_DRAFTS.get(defn.id)
-    if recipe is None:
-        return versions
-
-    draft_steps = [s.model_copy(deep=True) for s in active_steps]
-    # add-duplicate-check: a new deterministic guard in front of the model
-    # call, so the trigger is modified (its `next` moves) and the guard
-    # itself is added.
-    draft_steps = [
-        s.model_copy(update={"next": ["x0"]}) if s.id == "t1" else s
-        for s in draft_steps
     ]
-    guard = FlowStep(
-        id="x0", type="transform", name="duplicate-check",
-        summary="rejects a receipt already reimbursed, before any model runs",
-        config={"language": "python"}, next=["m1"],
-    )
-    draft_steps.insert(1, guard)
-    notes = "Adds a deterministic duplicate guard ahead of extraction."
-
-    versions.append(
-        FlowVersion(
-            version=defn.version + 1,
-            label=f"v{defn.version + 1}-draft",
-            status="draft",
-            steps=draft_steps,
-            model_budget_usd_per_run=defn.model_budget_usd_per_run,
-            notes=notes,
-            authored_by=defn.authored_by,
-            created_at=utcnow() - timedelta(days=2),
+    for number, module in sorted(process_packages.shipped_versions(defn.id).items()):
+        if number == defn.version:
+            continue
+        versions.append(
+            FlowVersion(
+                version=number,
+                label=module.LABEL,
+                status="draft" if number > defn.version else "archived",
+                steps=[step.model_copy(deep=True) for step in module.STEPS],
+                model_budget_usd_per_run=defn.model_budget_usd_per_run,
+                notes=module.NOTES,
+                authored_by=defn.authored_by,
+                created_at=utcnow(),
+            )
         )
-    )
-    return versions
+    return sorted(versions, key=lambda v: v.version)
 
 
 def _upgraded(stored: FlowDefinition, latest: FlowDefinition) -> FlowDefinition:
@@ -2332,6 +2321,44 @@ def _upgraded(stored: FlowDefinition, latest: FlowDefinition) -> FlowDefinition:
     })
 
 
+def _with_shipped_versions(stored: FlowDefinition) -> FlowDefinition | None:
+    """The stored definition, plus any shipped version its history lacks.
+
+    Returns None when there is nothing to add. New rows land as drafts when
+    they sit above the live version (candidates the console can activate) and
+    as archived when below it (an old package still deployed).
+    """
+    from . import tasks as process_packages
+
+    shipped = process_packages.shipped_versions(stored.id)
+    if not shipped:
+        return None
+    history = stored.version_history()
+    known = {v.version for v in history}
+    added = False
+    for number, module in sorted(shipped.items()):
+        if number in known:
+            continue
+        history.append(
+            FlowVersion(
+                version=number,
+                label=module.LABEL,
+                status="draft" if number > stored.version else "archived",
+                steps=[step.model_copy(deep=True) for step in module.STEPS],
+                model_budget_usd_per_run=stored.model_budget_usd_per_run,
+                notes=module.NOTES,
+                authored_by=stored.authored_by,
+                created_at=utcnow(),
+            )
+        )
+        added = True
+    if not added:
+        return None
+    return stored.model_copy(
+        update={"versions": sorted(history, key=lambda v: v.version)}
+    )
+
+
 def seed_flows_if_empty(service: FlowService) -> int:
     """Bring the registry in line with the definitions declared in code.
 
@@ -2361,19 +2388,30 @@ def seed_flows_if_empty(service: FlowService) -> int:
             created += 1
             continue
 
-        if defn.version <= stored.version:
-            continue
+        if defn.version > stored.version:
+            stored = service.update(_upgraded(stored, defn))
+            log.info(
+                "Flow definition upgraded from the repository",
+                extra={
+                    "flowId": defn.id,
+                    "from": stored.version,
+                    "to": defn.version,
+                },
+            )
+            updated += 1
 
-        service.update(_upgraded(stored, defn))
-        log.info(
-            "Flow definition upgraded from the repository",
-            extra={
-                "flowId": defn.id,
-                "from": stored.version,
-                "to": defn.version,
-            },
-        )
-        updated += 1
+        # Independent of the version bump: a redeploy that *ships* a new
+        # version package (without changing what is live) must still put that
+        # version in the stored history, or the console could never see it to
+        # make it live.
+        patched = _with_shipped_versions(stored)
+        if patched is not None:
+            service.update(patched)
+            log.info(
+                "Shipped flow versions recorded",
+                extra={"flowId": defn.id},
+            )
+            updated += 1
 
     if created or updated:
         log.info(

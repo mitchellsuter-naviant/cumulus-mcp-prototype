@@ -45,7 +45,8 @@ from tests import world as test_world
 ONTOLOGY_ROUTE = "/api/ui/v1/ontology"
 SOURCES_ROUTE = "/api/ui/v1/sources"
 LIBRARY_ROUTE = "/api/ui/v1/library"
-ROUTES = (ONTOLOGY_ROUTE, SOURCES_ROUTE, LIBRARY_ROUTE)
+DATA_ROUTE = "/api/ui/v1/data"
+ROUTES = (ONTOLOGY_ROUTE, SOURCES_ROUTE, LIBRARY_ROUTE, DATA_ROUTE)
 
 #: The flows that reach the graph. Written out rather than derived from the
 #: engine, so the test states the expected answer: eleven of them are inbound
@@ -58,8 +59,16 @@ ROUTES = (ONTOLOGY_ROUTE, SOURCES_ROUTE, LIBRARY_ROUTE)
 #: disagree.
 GRAPH_FLOWS = {
     "accounts-payable",
+    # It writes exactly one thing, and it is the one that matters here: the
+    # `sha256` and `read_version` on a referenced Document, which is how a
+    # `Document` row stops saying nobody has read it.
+    "ap-intake",
     "identity-sweep",
     "disagreement-sweep",
+    # The compliance clock: a timer closes a window over the credential and
+    # inspection rows the feeds landed, and what it writes back is the notice
+    # stage a governed rule says each row is owed.
+    "credential-tracking",
     # The answer to what that one finds, and it belongs in the picker for the
     # reason the picker is built from the engine at all: it writes the graph
     # (the finding's status, and the ERP's own account of the order it read
@@ -73,6 +82,22 @@ GRAPH_FLOWS = {
     "expense-reimbursement",
     "mail-sync",
     "psa-sync",
+    # The plant floor: jobs and their crews, dated permissions, the fleet.
+    "job-sync",
+    "credential-sync",
+    "equipment-sync",
+    # The job packet: it reads the filing tree and the job book and writes
+    # back what a governed rule made of them — the four documents a job is
+    # linked to at their latest revision, the label a crew calls it by, and
+    # whether the set is complete.
+    "field-documents",
+    # The plant floor's three: the sweep that decides which jobs a day may
+    # build, the extraction that turns a shipping list into department work,
+    # and the flow that fills a department's day out of those rows and holds
+    # it at `pending_approval` until a supervisor signs it.
+    "plant-eligibility-sweep",
+    "shipping-list-extraction",
+    "department-scheduling",
     "purchase-order-sync",
     "receiving-sync",
     "sales-sync",
@@ -309,7 +334,14 @@ def test_the_selector_offers_every_flow_that_writes_the_graph(client):
     # than a missing option: "this flow touches no type" is a fact about it,
     # and a picker that silently omitted it would be back to being a curated
     # list of the flows somebody remembered.
-    assert {f["id"] for f in body["flows"]} == GRAPH_FLOWS | {"answer-question"}
+    # `ap-corrections` joins `answer-question` in the second category: a Flow
+    # the engine knows and the graph never hears from. Its one write is a
+    # Dataset append — the correction set is knowledge, not entities — so it is
+    # offered, draws an empty overlay, and that is the true answer rather than
+    # a missing option.
+    assert {f["id"] for f in body["flows"]} == GRAPH_FLOWS | {
+        "answer-question", "ap-corrections",
+    }
     # Named from the engine, not the registry.
     assert all(f["label"] and f["label"] != f["id"] for f in body["flows"])
 
@@ -325,10 +357,12 @@ def test_the_overlay_ships_both_halves_of_the_diff(client):
     assert overlay["writes"] == [
         "Document", "Invoice", "InvoiceLine", "MatchSet", "Vendor",
     ]
-    # Three governed reads now: the extraction prompt, the posting policy, and
-    # the price sheet the run metered its ModelCall against.
+    # Four governed reads now: the extraction prompt, the posting policy, the
+    # resolution thresholds that decided the vendor, and the price sheet the
+    # run metered its ModelCall against.
     assert overlay["knowledge"] == [
-        "invoice-extraction-prompt", "invoice-posting-policy", "model-pricing",
+        "entity-resolution-policy", "invoice-extraction-prompt",
+        "invoice-posting-policy", "model-pricing",
     ]
     assert overlay["scanned_runs"] == overlay["total_runs"] > 0
 
@@ -385,7 +419,16 @@ def test_a_flow_the_selector_never_offered_is_refused(client):
 def test_the_sources_route_puts_health_and_contract_on_one_row(client):
     body = client.get(SOURCES_ROUTE).json()
     rows = {r["source"]: r for r in body["sources"]}
-    assert len(rows) == 7
+    # Named rather than counted, because the number moved when the AP fixture
+    # started landing its item catalogue under `erp-sales` — the seeded orders
+    # bill the `Item` objects a feed delivered, so a world with no catalogue
+    # delivery is a world whose invoices pair with nothing, and a bare count
+    # would have read as a regression instead of the new delivery it is.
+    assert set(rows) == {
+        "erp-vendors", "erp-purchase-orders", "erp-sales", "erp-receiving",
+        "procurement-coupa", "legacy-ap-extract", "hris-workforce",
+        "office-calendar",
+    }
 
     erp = rows["erp-vendors"]
     assert erp["flow_id"] == "vendor-sync"
@@ -399,21 +442,22 @@ def test_the_sources_route_puts_health_and_contract_on_one_row(client):
     # the run and not the flow.
     assert sum(1 for r in rows.values() if r["flow_id"] == "vendor-sync") == 3
 
-    # Three feeds arrive under no declared contract, and the screen says so
-    # for each. They are the AP *test fixture*'s deliveries: the map lost
-    # `procurement-coupa`, `legacy-ap-extract` and `wms-receiving` when the
-    # mock world died, because the estate runs none of those systems. This
-    # is the reading the row is for — a feed nobody wrote a contract for is
-    # reported, never dropped — and here it is a true statement about a
-    # fixture rather than a finding about the deployment.
+    # Two feeds arrive under no declared contract, and the screen says so for
+    # each. They are the AP *test fixture*'s deliveries: the map lost
+    # `procurement-coupa` and `legacy-ap-extract` when the mock world died,
+    # because the estate runs none of those systems. This is the reading the
+    # row is for — a feed nobody wrote a contract for is reported, never
+    # dropped — and here it is a true statement about a fixture rather than a
+    # finding about the deployment.
     undeclared = {s for s, r in rows.items() if r["contract"] is None}
-    assert undeclared == {
-        "procurement-coupa", "legacy-ap-extract", "wms-receiving",
-    }
+    assert undeclared == {"procurement-coupa", "legacy-ap-extract"}
     assert all(rows[s]["records_landed"] > 0 for s in undeclared)
-    # The receiving flow keeps its Tier-2 definition even with no Mapping:
-    # the machinery is real, the system behind it is the honest gap.
-    assert rows["wms-receiving"]["flow_id"] == "receiving-sync"
+    # The receiving leg lands under the contract the estate grew for it. The
+    # fixture used to deliver it as `wms-receiving` — a system nobody runs —
+    # so the third leg of every graded three-way match arrived under no
+    # declared Mapping.
+    assert rows["erp-receiving"]["flow_id"] == "receiving-sync"
+    assert rows["erp-receiving"]["contract"]["id"] == "erp-receiving"
     assert rows["hris-workforce"]["records_landed"] > 0
     assert body["problems"] == []
 
@@ -428,7 +472,7 @@ def test_a_delivery_under_an_undeclared_source_is_reported_as_one(_client):
     into the module's shared one would be a row every other test here had to
     know about.
     """
-    from app.sync import SyncRequest
+    from app.connectors.sync import SyncRequest
 
     world = test_world.fresh()
     world.sync.deliver(
@@ -520,6 +564,65 @@ def test_untouched_assets_are_zero_filled_rather_than_omitted(client):
     unused = [a for a in body["assets"] if a["reads"] == a["citations"] == 0]
     assert unused
     assert all(a["last_used_at_iso"] == "" for a in unused)
+
+
+# ---------------------------------------------------------------------------
+# The Data screen
+# ---------------------------------------------------------------------------
+
+
+def test_the_data_route_reports_every_collection_with_an_honest_count(client):
+    """`rows` is an int where a store can be counted and null where it cannot
+    — two different facts, and a zero standing in for "unknown" would be the
+    dishonest one."""
+    body = client.get(DATA_ROUTE).json()
+    declared = {c.id for c in data_collections.COLLECTIONS}
+    reported = {c["id"] for c in body["collections"]}
+    assert reported == declared
+    # Every graph-backed Collection counts its objects — possibly zero, which
+    # is a real answer. A Collection whose store this route cannot reach
+    # answers null, and the payload must keep the two distinguishable.
+    for row in body["collections"]:
+        if row["object_types"]:
+            assert row["rows"] is not None, row["id"]
+        if row["rows"] is None:
+            assert row["rows_caption"] == "", row["id"]
+
+
+def test_the_data_route_says_the_purge_pass_is_not_built(client):
+    """Retention is declared and computed, never yet enforced. An empty
+    expiring list must not read as enforcement, so the flag travels."""
+    body = client.get(DATA_ROUTE).json()
+    assert body["purge_built"] is False
+    assert body["expiring_total"] == len(body["expiring"]) or (
+        body["expiring_total"] > len(body["expiring"])
+    )
+    assert body["documents"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# The write plane on the Systems screen
+# ---------------------------------------------------------------------------
+
+
+def test_the_sources_route_carries_the_write_plane(client):
+    """The outbound half rides the same payload: the WRITABLE table verbatim,
+    the journal against it, and `enabled` saying whether the live door exists
+    at all — false in every test, by construction."""
+    body = client.get(SOURCES_ROUTE).json()
+    writes = body["writes"]
+    assert writes["enabled"] is False
+    targets = {t["id"] for t in writes["targets"]}
+    assert "sales-order-status" in targets
+    release = next(t for t in writes["targets"] if t["id"] == "sales-order-status")
+    assert release["action"] == "release-sales-order"
+    assert release["transitions"] == [
+        {"from_value": "Pending Approval", "to_values": ["Pending Fulfillment"]}
+    ]
+    assert writes["journal_total"] >= len(writes["journal"])
+    assert writes["open_writes"] == sum(
+        1 for e in writes["journal"] if e["state"] in ("applied", "unverified")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -871,19 +974,28 @@ def test_an_unreachable_estate_is_reported_as_itself(estate_client):
     assert pull["sync_now_refusal"].startswith("The estate could not be reached")
 
 
-def test_the_console_sync_now_gates_where_the_machine_route_gates():
-    """One spelling of the rule. A console door that let a weaker principal
-    through would be a second, quieter authorization policy."""
+def test_the_console_sync_now_is_the_only_door_and_it_gates():
+    """One spelling of the rule, because there is now one door.
+
+    A pull writes through the delivery door, so it needs `admin`. There used to
+    be a second route for the same act on `/api/v1/estate` — nothing called it,
+    and two doors onto one act is two authorization policies waiting to drift
+    apart. What is asserted here is that the surviving one still comes through
+    the console door and still gates, and that the machine router carries no
+    per-feed pull at all.
+    """
     from app import estate_api
 
     console = inspect.signature(ui_api.sync_source_now)
     assert console.parameters["principal"].default.dependency is (
         ui_api.get_sources_principal
     )
-    machine = inspect.getsource(estate_api.sync_now)
-    assert 'require_role(principal, "admin")' in machine
     assert 'require_role(principal, "admin")' in inspect.getsource(
         ui_api.sync_source_now
+    )
+    assert not any(
+        "sync-now" in getattr(route, "path", "")
+        for route in estate_api.router.routes
     )
 
 

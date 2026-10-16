@@ -40,7 +40,7 @@ from app.identity_sweep import (
 from app.mappings import steward_queue_for_type
 from app.ontology import ONTOLOGY
 from app.resolution import parse_sweep_policy, read_sweep_thresholds
-from app.sync import SyncRequest
+from app.connectors.sync import SyncRequest
 from tests import world as test_world
 
 NORTHWIND = "Northwind Traders"
@@ -587,9 +587,10 @@ def test_the_pinned_desk_would_have_refused_this_steward(freight):
     assert _refusal(derived, VENDOR_STEWARD) == ""
 
     # The derivation is a declared property of the Action and not a parameter
-    # any caller may set: an Action that names its own desk refuses one.
+    # any caller may set: an Action that names its own desk and derives no
+    # other refuses one.
     with pytest.raises(Refused):
-        _for_case(ACTIONS["post-invoice"], "vendor-stewardship")
+        _for_case(ACTIONS["link-source-record"], "vendor-stewardship")
     # And one that derives its desk refuses to commit with none derived, rather
     # than falling through to an empty queue that passes every check.
     with pytest.raises(Refused):

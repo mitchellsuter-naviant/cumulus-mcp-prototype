@@ -8,7 +8,7 @@ can ask a human twice.
 import pytest
 
 from app.runs import InMemoryRunStore, ModelUsage, RunEngine, StepFailed
-from app.tasks import InMemoryTaskDirectory, Task, TaskService
+from app.task_queue import InMemoryTaskDirectory, Task, TaskService
 
 
 @pytest.fixture()

@@ -32,6 +32,12 @@ class RunSummary(BaseModel):
 
     id: str
     flow_id: str
+    # The definition this run executed, pinned at start and honoured on
+    # resume. A list row carries it because the console traces a run's path
+    # over a canvas, and the canvas has to be the graph that ran — not
+    # whichever version happens to be active by the time anyone looks.
+    # 0 means the record predates the field: no claim, not "version zero".
+    flow_version: int = 0
     status: RunStatus
     case_ref: str
     actor: str
@@ -65,7 +71,8 @@ class FlowRunStats(BaseModel):
 
 def _summary(record: RunRecord) -> RunSummary:
     return RunSummary(
-        id=record.id, flow_id=record.flow_id, status=record.status,
+        id=record.id, flow_id=record.flow_id,
+        flow_version=record.flow_version, status=record.status,
         case_ref=record.case_ref, actor=record.actor, steps=len(record.steps),
         model_calls=record.model_calls, cost_usd=record.cost_usd,
         duration_ms=record.duration_ms(), open_task_id=record.open_task_id,

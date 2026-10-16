@@ -3,11 +3,11 @@
 The doctrine names Mapping as a primitive — "how an external source's fields
 and identifiers bind to the ontology, plus identity keys and freshness policy.
 Config, not logic." Until now ours was real but smeared: payload schemas in
-`sync.py`, match policy in `resolution.py`, natural keys in `ontology.py`, the
-precedence table in `graph.py`. Each piece was right; nowhere could you read
-*one feed's whole contract*. This module is that contract, declared in Python
-and exported to the corpus like the ontology and the Collection registry —
-one artifact the person reads and the system runs.
+`connectors/sync.py`, match policy in `resolution.py`, natural keys in
+`ontology.py`, the precedence table in `graph.py`. Each piece was right;
+nowhere could you read *one feed's whole contract*. This module is that
+contract, declared in Python and exported to the corpus like the ontology and
+the Collection registry — one artifact the person reads and the system runs.
 
 The one decision a Mapping adds beyond binding is **materialization**:
 
@@ -31,13 +31,31 @@ mapping that names a ``lands_as`` type, so the distinction cannot blur.
 **Every Mapping here describes a system the customer actually runs.** Three
 once did not — `procurement-coupa`, `legacy-ap-extract` and `wms-receiving`
 were contracts for systems invented to give a seeded demo world something to
-arrive from — and they retired with that world. `receiving-sync` keeps its
+arrive from — and they retired with that world. `receiving-sync` was for a
+long time the standing example of the other half of that rule: it kept its
 Flow, its wire shape and its Tier-2 definition, because the goods-received leg
-of a three-way match is real machinery that evals exercise; what it does not
-keep is a Mapping, because this estate has no receiving system to declare a
-contract with. The Sources screen renders that gap as a feed under no declared
-contract, which is the finding it exists to make — and the same reading it
-gives any feed that turns up unannounced.
+of a three-way match is real machinery that evals exercise, and it kept no
+Mapping, because the estate had no receiving system to declare a contract
+with. The Sources screen rendered that gap as a feed under no declared
+contract, which is the finding it exists to make.
+
+The estate grew one. `erp-receiving` below is that contract, and the gap it
+used to demonstrate is closed — the three-way match now reads a real third leg
+rather than an absent one. The reading the screen gives an unannounced feed is
+unchanged; there is simply no longer a feed relying on it to tell the truth.
+
+**A third case, now that more than one kind of business is modelled: a
+contract whose feed lands nothing.** A namespace activates a feed by running
+the app it names, not by having rows in it — so a manufacturer's ERP serves
+the job and asset routes this registry's plant-floor contracts read, and can
+answer `erp-vendors`, `erp-purchase-orders` and `erp-receiving` with empty
+lists because its purchasing lives elsewhere. That is a **healthy feed with
+zero rows**: the route answered, the cursor did not move, no run started, and
+the Sources screen says `unchanged`. It is a real reading and not a fault, and
+it is a different fact in kind from a route that 404s or a feed under no
+declared contract. The three plant-floor contracts run the same way in
+reverse: on the office estate they are declared, their apps are present, and
+their resources are absent.
 """
 
 from __future__ import annotations
@@ -45,6 +63,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from . import desks
 from .data_collections import COLLECTIONS
 from .ontology import ONTOLOGY
 
@@ -70,7 +89,7 @@ class Mapping:
     system: str  # the external system behind it
     summary: str
     transport: Transport
-    payload: str  # the payload schema, by name (a model in sync.py)
+    payload: str  # the payload schema, by name (a model in connectors/sync.py)
     strategy: Strategy
     # reify only: the graph type a landed row becomes.
     lands_as: str = ""
@@ -97,7 +116,7 @@ class Mapping:
     # are one company is not the person who decides whether an invoice gets
     # paid; the default keeps every feed that predates the counterparty book
     # exactly where it was, and C4 rebinds it without touching a flow.
-    steward_queue: str = "vendor-stewardship"
+    steward_queue: str = desks.VENDOR_STEWARDSHIP
     notes: str = ""
 
 
@@ -172,6 +191,52 @@ MAPPINGS: tuple[Mapping, ...] = (
             "vendor row is read for `companyName` and the item row for its "
             "SKU and display name. Both are memoized for the whole pull, so a "
             "delta of forty orders against four vendors costs four GETs."
+        ),
+    ),
+    Mapping(
+        id="erp-receiving",
+        source="erp-receiving",
+        system="ERP receiving (the estate's finance system)",
+        summary=(
+            "What the dock signed for, pulled on a delta. Each report books "
+            "against the purchase order it names, which is the third leg the "
+            "three-way match reads out of the graph — and the one that was "
+            "structurally absent until this feed existed."
+        ),
+        transport="pull",
+        payload="ReceivingRecord",
+        strategy="reify",
+        lands_as="ReceivingReport",
+        resolves_to=("PurchaseOrder",),
+        identity=(
+            IdentityBinding(column="po_number", object_type="PurchaseOrder",
+                            key="po number"),
+            IdentityBinding(column="receipt_number",
+                            object_type="ReceivingReport",
+                            key="receipt number"),
+        ),
+        precedence_source="erp",
+        freshness="pull, delta by updatedAt watermark",
+        custody="copy",
+        collection="source-landing",
+        escalation="windowed aggregate",
+        notes=(
+            "A batch feed with no fuzzy leg: a report binds to its order on an "
+            "exact key, and an order that has not landed yet is counted as "
+            "`po_missing` on the run while the report lands anyway — no Task is "
+            "raised and the edge is made when the order arrives. Declared-key "
+            "dereferences, named because the connector is otherwise mechanical: "
+            "a receipt row names its order by internal id while a "
+            "PurchaseOrder's natural key is the ERP's `tranId`, and its lines "
+            "name an item by internal id while this contract keys a line by "
+            "SKU — so the order row is read for `tranId` and the item row for "
+            "its SKU and display name. Both memoized for the whole pull, so a "
+            "split delivery of two receipts against one order costs one GET. "
+            "Two fields this source cannot fill: a receipt carries no status "
+            "(completeness is the order's property, which the ERP restates "
+            "from the sum of its receipts) and a line carries no condition, so "
+            "both land empty rather than defaulted. There is no money on a "
+            "receipt at all."
         ),
     ),
     Mapping(
@@ -316,7 +381,7 @@ MAPPINGS: tuple[Mapping, ...] = (
         custody="copy",
         collection="source-landing",
         escalation="per-row task",
-        steward_queue="data-stewardship",
+        steward_queue=desks.DATA_STEWARDSHIP,
         notes=(
             "No dereference: every reference in this family is an id the "
             "flow resolves against a row the same feed landed, so the "
@@ -365,7 +430,7 @@ MAPPINGS: tuple[Mapping, ...] = (
         # *item* side of this contract escalates on the aggregate, and it
         # reaches no desk — see the note below.
         escalation="per-row task",
-        steward_queue="data-stewardship",
+        steward_queue=desks.DATA_STEWARDSHIP,
         notes=(
             "No dereference: an order line names an item by the ERP's "
             "internal id, and the item row this feed carries is the only "
@@ -422,11 +487,12 @@ MAPPINGS: tuple[Mapping, ...] = (
         escalation="windowed aggregate",
         notes=(
             "**Custody stops at `body_preview`, capped at 240 characters "
-            "(`sync_office.PREVIEW_CHARS`).** The source serves the whole body "
-            "on every row; the connector never puts it on the wire — the shape "
-            "has no `body` field — and the flow truncates the preview again on "
-            "the way in, so a provider that called a whole body a preview "
-            "cannot smuggle one through. An address that belongs to nobody in "
+            "(`connectors.office.PREVIEW_CHARS`).** The source serves the "
+            "whole body on every row; the connector never puts it on the wire "
+            "— the shape has no `body` field — and the flow truncates the "
+            "preview again on the way in, so a provider that called a whole "
+            "body a preview cannot smuggle one through. An address that "
+            "belongs to nobody in "
             "the graph is counted and left on the row as `from_email`, never "
             "minted: a counterparty book that grew a Person per unrecognized "
             "sender would fill with no-reply robots. That is also where the "
@@ -523,6 +589,230 @@ MAPPINGS: tuple[Mapping, ...] = (
         ),
     ),
     Mapping(
+        id="erp-jobs",
+        source="erp-jobs",
+        system="ERP production (the estate's manufacturing system)",
+        summary=(
+            "What the plant is building: the job, its dimensions, the date it "
+            "has to leave the yard, the crew it is assigned to, and ten "
+            "departments' worth of completion flags. Jobs **reify**, and the "
+            "reason is the customer: a job names the party it is being built "
+            "for by an internal id, this feed's own pull turns that into a "
+            "name, and a name is exactly the evidence that fails — `Hoffman "
+            "Ridge Farms` and `Hoffmann Ridge Farms` are one farm and two "
+            "rows, and nothing in the source says so. So the reference lands "
+            "as a row a steward can rule on, in the same book the CRM, the "
+            "sell side and the PSA write into. The crew is the opposite case "
+            "and is bound below."
+        ),
+        transport="pull",
+        payload="JobRecord",
+        strategy="reify",
+        lands_as="Job",
+        resolves_to=("Company", "Team"),
+        identity=(
+            IdentityBinding(column="customer_name", object_type="Company",
+                            key="normalized legal name"),
+            IdentityBinding(column="job_number", object_type="Job",
+                            key="job number"),
+            IdentityBinding(column="crew_id", object_type="Team",
+                            key="cost_center — the HRIS crew department's "
+                                "accounting code"),
+        ),
+        precedence_source="erp",
+        match_policy="knowledge:entity-resolution-policy",
+        freshness="pull, delta by updatedAt watermark per resource",
+        custody="copy",
+        collection="production-records",
+        # Per row, like the three feeds it shares the counterparty book with:
+        # an ambiguous customer raises a `match_review` Task and asserts
+        # nothing about it, while the job lands anyway — a batch feed never
+        # suspends for one row. Only the *crew* side of this contract
+        # escalates on the aggregate, and it reaches no desk: see the note.
+        escalation="per-row task",
+        steward_queue=desks.DATA_STEWARDSHIP,
+        notes=(
+            "**`crew_id → Team` is declared here rather than decided in a "
+            "flow, and that is the whole point of the binding.** The HRIS "
+            "lands a crew as a department whose head is the foreman and whose "
+            "**cost centre** is the bare crew id (`12`, `14`, `18`); the "
+            "ERP's job names the crew by that same string. The key is "
+            "`Team.cost_center` and not `Team.external_id`: a department's id "
+            "is the HRIS's own addressing and a cost centre is the code the "
+            "rest of the business writes, so binding on the code keeps the "
+            "join off a seeding accident. Declaring it makes \"this "
+            "crew id is that team\" a portable statement the customer owns — "
+            "and makes a crew id that resolves to **nothing** a countable "
+            "aggregate rather than a per-row failure. That case is designed, "
+            "not exceptional: jobs erected by the subcontractor carry "
+            "`crewId: SUB-KVB` and there is no HRIS department for it, so the "
+            "`Job` keeps `crew_id` and `foreman_name` as landed strings and a "
+            "later flow raises the identity question with a human at the end "
+            "of it. A Task per row would page somebody weekly about a "
+            "subcontractor everybody knows about. "
+            "**A job that changes crews withdraws the old edge rather than "
+            "deleting it** — the link's validity is ended and both stay on the "
+            "record — which is what lets a workspace show *former crew* beside "
+            "*current crew*, and what retires the weekly folder "
+            "reconciliation the RPA design needed: the difference is a "
+            "property of the record, so nothing has to go looking for it. "
+            "One declared-key dereference, named because the connector is "
+            "otherwise mechanical: a job row carries `customerId` while this "
+            "contract keys a counterparty by name, so the customer row is "
+            "read for `companyName` — the pulled page first, one memoized GET "
+            "for what it does not hold, so forty jobs against six customers "
+            "cost six. Those customer rows are joined and **never delivered**: "
+            "the sell side's list is `erp-sales`' contract, and filling it "
+            "from here would start two flows on one delivery. "
+            "**Three columns arrive as the estate's own words and are "
+            "translated by the flow, not here**: `out_to_yard` and "
+            "`do_not_fab` are the ERP's literal `Yes`/`No` picklist values "
+            "(it has no boolean type) and `week_position` is its own phrase "
+            "for a production window — all three are mapped onto "
+            "`release_state`, `hold_reason` and the numeric week against the "
+            "`## Source vocabulary` table in `plant-scheduling-parameters`, "
+            "so a customer can re-map them without a deploy. The landed row "
+            "keeps the strings verbatim, which is what lets the derivation be "
+            "re-run when the table changes. `upstream_done` is the one "
+            "vocabulary the connector does spell: the ten `<dept>Done` "
+            "columns become the department slugs of the governed `## "
+            "Departments` table, so neither system learns the other's "
+            "spelling. No `site_address` in v1: the field exists and nothing "
+            "reads it, and a column delivered for nobody gets relied on "
+            "before anyone decides what it means."
+        ),
+    ),
+    Mapping(
+        id="hris-credentials",
+        source="hris-credentials",
+        system="HRIS training and driver files (the estate's people system)",
+        summary=(
+            "Everything somebody holds that expires: completed training, "
+            "certifications, a CDL, a medical card, a PSP query, a "
+            "clearinghouse check. A **bind** contract on the HRIS feed's own "
+            "argument — a work email is exact and nobody adjudicates it — so "
+            "nothing is reified and no steward is asked. One shape for two "
+            "resources, because a thing that expires and gets renewed "
+            "behaves identically whichever department tracks it: both land as "
+            "`Credential` rows distinguished only by `category`, and a second "
+            "record model for driver files would have produced two compliance "
+            "sweeps that had to agree with each other."
+        ),
+        transport="pull",
+        payload="CredentialRecord",
+        strategy="bind",
+        resolves_to=("Employee", "Credential"),
+        identity=(
+            IdentityBinding(column="holder_email", object_type="Employee",
+                            key="work email"),
+            IdentityBinding(column="holder_external_id", object_type="Employee",
+                            key="the HRIS's own worker id"),
+            IdentityBinding(column="external_id", object_type="Credential",
+                            key="source + the issuing system's row id"),
+        ),
+        precedence_source="hris",
+        freshness="pull, delta by updatedAt watermark per resource",
+        custody="copy",
+        collection="compliance-records",
+        escalation="windowed aggregate",
+        notes=(
+            "One declared-key dereference, and it is why the feed pulls a "
+            "third resource: both credential resources name a person by "
+            "`employeeId` and nothing else, while this contract binds a "
+            "holder by work email — so `employees` is pulled first and the "
+            "row is read for `workEmail`, the pulled page first and one "
+            "memoized GET for what it does not hold. `holder_external_id` "
+            "travels beside the address for `manager_external_id`'s reason: a "
+            "delta of one renewal should not have to buy a translation the "
+            "graph already holds, and it is the fallback when the join "
+            "missed. A holder the workforce does not contain is counted, "
+            "never minted — a training record is not evidence of employment. "
+            "**One driver-qualification row becomes up to four credentials**, "
+            "one per date it carries, each under its own `external_id` suffix "
+            "because the natural key is the source's row id and four "
+            "permissions cannot share one; a null date yields no row at all, "
+            "because an absent CDL date is the HRIS saying this driver has no "
+            "CDL on file rather than an expiry of nothing. **Two fields the "
+            "source could fill and this contract refuses.** `status` is the "
+            "issuing system's word for how an *assignment* stands, and "
+            "`Credential.status` is `valid | expiring | expired | withdrawn` "
+            "derived from the dates against the governed notice stages — "
+            "writing one into the other would make the compliance sweep read "
+            "its own input as its own output. And `retain_until` is a "
+            "regulator's horizon, which is why the holder edge is an "
+            "association: a credential outlives the employment it was earned "
+            "under."
+        ),
+    ),
+    Mapping(
+        id="erp-equipment",
+        source="erp-equipment",
+        system="ERP fixed assets (the estate's finance system)",
+        summary=(
+            "The fleet the business operates and is answerable for — trucks, "
+            "trailers, lifts, machines — and the two dates that say whether "
+            "each unit is legal to run. It **reifies** on the purchase-order "
+            "feed's terms: an asset tag is exact and nothing needs a steward, "
+            "but the row is the only place the pair of dates exists, so "
+            "keeping it as delivered is what lets a change to the notice "
+            "stages re-read the fleet without re-pulling it."
+        ),
+        transport="pull",
+        payload="EquipmentRecord",
+        strategy="reify",
+        lands_as="Equipment",
+        resolves_to=("Team",),
+        identity=(
+            IdentityBinding(column="equipment_id", object_type="Equipment",
+                            key="source + equipment id (the asset tag)"),
+            IdentityBinding(column="home_site", object_type="Team",
+                            key="team slug"),
+        ),
+        precedence_source="erp",
+        freshness="pull, delta by updatedAt watermark",
+        custody="copy",
+        # The unit's own home. Its `Inspection` parts are governed by
+        # `compliance-records` instead — declared on the type, because what
+        # governs a dated examination of a truck is the same thing that
+        # governs a dated certification of a driver, and neither is a fixed
+        # asset. One contract names the collection the rows it lands belong
+        # to; the part's is the ontology's to declare.
+        collection="equipment-register",
+        escalation="windowed aggregate",
+        notes=(
+            "**A null `nextInspectionDueDate` is the source saying this unit "
+            "carries no tracked inspection**, and `inspection_tracked` is "
+            "derived from it once, on the way in. The skid steers really are "
+            "like this. Saying so on the row is what stops a compliance sweep "
+            "reporting the same machine as overdue forever, and it is a fact "
+            "about the asset rather than a gap in the feed — a screen that had "
+            "to explain the null would teach people to ignore it. There is no "
+            "inspection resource to pull and no `InspectionRecord` on the "
+            "wire: the two dates on the asset are the whole of what the source "
+            "holds, so the examination is written as a **part of the unit** "
+            "from them — one per landed inspection date, with no `result`, no "
+            "`inspector` and no `notes`, because a `pass` inferred from the "
+            "existence of a next due date would be inventing the finding a "
+            "certificate carries. `make`, `model` and `year` are declared on "
+            "the wire and left empty, because this estate's asset rows do not "
+            "carry them; parsing them out of the description would put a guess "
+            "in three fields that read as facts. No dereference: the site is a "
+            "string and the vendor id is a reference this contract does not "
+            "bind. The site is where the two systems' vocabularies really do "
+            "differ — an asset says `Mazo` where the HRIS department is `Plant "
+            "— Mazomanie` — and the flow closes that with a **named rename "
+            "table** (`connectors.compliance.SITE_DEPARTMENTS`), on the same "
+            "footing as every other place one estate's word becomes ours. A "
+            "rename is a rename and not a judgment; the pairing is also "
+            "declared for a person in the `## Departments` / site material of "
+            "`plant-scheduling-parameters`, so two copies exist and the "
+            "governed one is the authority. A site the table does not hold is "
+            "still **counted on the run** — a third plant should arrive as a "
+            "number rather than as a silent absence — and never as a question "
+            "to ask per truck."
+        ),
+    ),
+    Mapping(
         id="psa-book",
         source="psa-book",
         system="PSA (the estate's project delivery system)",
@@ -570,7 +860,7 @@ MAPPINGS: tuple[Mapping, ...] = (
         # Per row, like the two feeds it shares the counterparty book with: an
         # ambiguous client raises a `match_review` Task and asserts nothing.
         escalation="per-row task",
-        steward_queue="data-stewardship",
+        steward_queue=desks.DATA_STEWARDSHIP,
         notes=(
             "**Two whole column sets are refused at the wire.** A task's name, "
             "assignee, status, due date and estimate never leave the estate: "
@@ -684,17 +974,23 @@ def validate_mappings(
                 f"{where}: precedence source `{m.precedence_source}` is not "
                 "in the ontology precedence order"
             )
+        if m.steward_queue and desks.get(m.steward_queue) is None:
+            problems.append(
+                f"{where}: steward queue `{m.steward_queue}` is not a "
+                "declared desk — an escalated row would land where nobody "
+                "is looking"
+            )
     # One book, one desk. `steward_queue_for_type` answers "who judges identity
     # for a Company" by finding the first feed that writes one, which is only
     # honest while every feed that writes one agrees — so a disagreement is a
     # declaration-time failure rather than a coin toss resolved by tuple order.
-    desks: dict[str, dict[str, list[str]]] = {}
+    by_type: dict[str, dict[str, list[str]]] = {}
     for m in mappings:
         if m.escalation != "per-row task":
             continue
         for t in m.resolves_to:
-            desks.setdefault(t, {}).setdefault(m.steward_queue, []).append(m.id)
-    for object_type, by_queue in desks.items():
+            by_type.setdefault(t, {}).setdefault(m.steward_queue, []).append(m.id)
+    for object_type, by_queue in by_type.items():
         if len(by_queue) > 1:
             named = "; ".join(
                 f"`{queue}` ({', '.join(ids)})" for queue, ids in sorted(by_queue.items())
@@ -778,7 +1074,6 @@ def mappings_asset_fields() -> dict:
         "path": "platform/ontology/source-mappings",
         "title": "Source mappings",
         "kind": "schema-export",
-        "scope": "org",
         "owner": "platform-eng",
         "tags": ["mappings", "sync", "governed-knowledge", "mdm"],
         "status": "published",

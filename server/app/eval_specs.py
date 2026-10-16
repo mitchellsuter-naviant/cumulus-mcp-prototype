@@ -22,6 +22,7 @@ are seeded into a store rather than read out of this module at grading time.
 
 from __future__ import annotations
 
+from .ontology import ONTOLOGY
 from .evals import (
     EvalCase,
     EvalSpec,
@@ -37,8 +38,15 @@ from .evals import (
     ScriptedDecision,
     TrajectoryRule,
 )
+from .queues import personal_slug
 
 DECLARED_IN = "server/app/eval_specs.py"
+
+#: Who submits the invoices these cases are about. Named once because the
+#: governed approval table routes the review back to them: the desk a held
+#: invoice waits on is *this person's own*, so the expectation is derived from
+#: the address rather than written out as a slug nobody would recognise.
+AP_SUBMITTER = "connie.alberts@naviant.com"
 
 # ---------------------------------------------------------------------------
 # Shared fixture pieces
@@ -91,7 +99,7 @@ def _ap_deliveries(short: float = 0.0) -> list[dict]:
         {"source": "erp-vendors", "watermark": "2026-08-01T00:00:00Z",
          "vendors": [_ACME, _NORTHWIND]},
         {"source": "erp-purchase-orders", "purchase_orders": [_PO_7741]},
-        {"source": "wms-receiving", "receiving_reports": [_receipt(short)]},
+        {"source": "erp-receiving", "receiving_reports": [_receipt(short)]},
     ]
 
 
@@ -116,16 +124,46 @@ AP_CATALOG_LINES: dict[str, list[tuple[str, float]]] = {
     "PO-7815": [("CNS-HYD", 3.0), ("FAS-M12", 2.0)],
 }
 
-#: sku -> (description, unit price). Held here rather than read out of
-#: `payables.CATALOG` so the fixture cannot drift when the stub reader's
-#: catalogue is edited: a graded world is a frozen thing.
+#: sku -> (description, unit price). Held here rather than read out of the stub
+#: extractor's own catalogue so the fixture cannot drift when that is edited: a
+#: graded world is a frozen thing.
 AP_CATALOG: dict[str, tuple[str, float]] = {
     "STL-0250": ("Hot-rolled steel plate, 1/4 in", 486.00),
+    "STL-0375": ("Hot-rolled steel plate, 3/8 in", 712.50),
     "FAS-M12": ("Grade 8 hex bolt, M12 x 60mm, box of 100", 128.75),
     "WLD-6013": ("Welding rod E6013, 5kg", 92.40),
     "PPE-GLV": ("Cut-resistant gloves, size L, 12 pair", 64.20),
     "CNS-HYD": ("Hydraulic fluid ISO 46, 20L drum", 214.90),
 }
+
+
+def ap_catalog_delivery() -> dict:
+    """The AP fixture catalogue as `Item` rows the ERP would have sent.
+
+    A fixture world that wants a catalogue has to *land* one, the way the
+    estate does. It is what the seeded purchase orders bill against, so a
+    fixture invoice can pair with a real PO line rather than with a list of
+    SKUs living in a Python constant — which is the invented vocabulary that
+    stopped being offered anywhere. Kept out of `ap_demo_deliveries` on
+    purpose: the graded worlds are frozen, and a catalogue is only needed
+    where something picks from one.
+    """
+    return {
+        "source": "erp-sales",
+        "watermark": "2026-08-01T00:00:00Z",
+        "items": [
+            {
+                "external_id": f"AP-{index:04d}",
+                "sku": sku,
+                "display_name": description,
+                "item_type": "Inventory Item",
+                "base_price": price,
+            }
+            for index, (sku, (description, price)) in enumerate(
+                sorted(AP_CATALOG.items()), start=1
+            )
+        ],
+    }
 
 
 def _catalog_lines(po_number: str) -> list[dict]:
@@ -247,9 +285,9 @@ def ap_demo_deliveries() -> list[dict]:
             ],
         },
         {
-            "source": "wms-receiving",
+            "source": "erp-receiving",
             "watermark": "2026-08-12T00:00:00Z",
-            "idempotency_key": "wms-001",
+            "idempotency_key": "erp-receiving-001",
             "receiving_reports": [
                 {
                     "external_id": "RR-5501", "receipt_number": "RR-5501",
@@ -385,6 +423,7 @@ def declared_fixtures() -> list[Fixture]:
         ),
         _identity_world(),
         _state_world(),
+        *_wick_fixtures(),
         _demo_world(),
     ]
 
@@ -630,11 +669,14 @@ AP_CASES = [
     EvalCase(
         id="ap-known-vendor-clean",
         spec_id=AP_SPEC.id,
-        name="Known vendor, bills its PO exactly, posts without a human",
+        name="Known vendor, bills its PO exactly, approved at a glance",
         summary=(
             "The happy path, and the one that regresses silently: the vendor "
-            "is in the master, the lines match the order and the receipt, and "
-            "the total is under the governed limit."
+            "is in the master and the lines match the order and the receipt, "
+            "so the clerk's only question is the governed auto-post limit — "
+            "which is $0.00, so they are asked. What this grades is that "
+            "nothing else was wrong: one gate, answered with a bare approval, "
+            "and the invoice posts exactly as read."
         ),
         fixture_id="ap/acme-po-7741-clean",
         trigger={
@@ -643,6 +685,15 @@ AP_CASES = [
             "hint": "vendor=acme-industrial po=PO-7741 invoice=ACME-INV-1 "
                     "lines=STL-0250:2,FAS-M12:3",
         },
+        # One decision, and it is deliberately a bare approval with nothing to
+        # correct: the case is about a clean invoice, and the gate is the
+        # governed limit rather than anything the flow found. A second
+        # decision here would mean the run came back, which is what the
+        # `gate_count` below refuses.
+        decisions=[ScriptedDecision(
+            verdict="approved",
+            note="Matches the order line for line; nothing to check.",
+        )],
         expectations=[
             MilestoneExpectation(
                 milestone="vendor-settled",
@@ -682,7 +733,7 @@ AP_CASES = [
             ),
             MilestoneExpectation(
                 milestone="outcome",
-                trajectory={"terminal_status": "succeeded", "gate_count": "0"},
+                trajectory={"terminal_status": "succeeded", "gate_count": "1"},
             ),
         ],
     ),
@@ -693,8 +744,11 @@ AP_CASES = [
         summary=(
             "The property worth protecting: a clerk's correction is applied "
             "and the checks run *again*, rather than the reviewer overriding a "
-            "rule. If this ever passes with one gate and no second match, the "
-            "correction path has quietly become an override."
+            "rule. If this ever passes without a second match, the correction "
+            "path has quietly become an override. Two gates rather than one, "
+            "and the second is the governed limit's: a correction settles the "
+            "variance, and at a $0.00 auto-post limit somebody still has to "
+            "say yes — so the case ends with the approval that follows."
         ),
         fixture_id="ap/acme-po-7741-clean",
         trigger={
@@ -703,11 +757,17 @@ AP_CASES = [
             "hint": "vendor=acme-industrial po=PO-7741 invoice=ACME-INV-2 "
                     "lines=STL-0250:2,FAS-M12:3 pricebump",
         },
-        decisions=[ScriptedDecision(
-            verdict="corrected",
-            note="Vendor billed the old list price; corrected to the PO price.",
-            payload={"lines": [{"ordinal": 1, "unit_price_usd": 486.00}]},
-        )],
+        decisions=[
+            ScriptedDecision(
+                verdict="corrected",
+                note="Vendor billed the old list price; corrected to the PO price.",
+                payload={"lines": [{"ordinal": 1, "unit_price_usd": 486.00}]},
+            ),
+            ScriptedDecision(
+                verdict="approved",
+                note="The corrected price agrees with the order.",
+            ),
+        ],
         expectations=[
             MilestoneExpectation(
                 milestone="invoice-retained",
@@ -724,7 +784,7 @@ AP_CASES = [
             ),
             MilestoneExpectation(
                 milestone="outcome",
-                trajectory={"terminal_status": "succeeded", "gate_count": "1"},
+                trajectory={"terminal_status": "succeeded", "gate_count": "2"},
             ),
         ],
     ),
@@ -761,7 +821,8 @@ AP_CASES = [
             trajectory={
                 "terminal_status": "suspended",
                 "gate_count": "1",
-                "queue": "ap-clerk",
+                # The submitter's own desk, per the governed approval table.
+                "queue": personal_slug(AP_SUBMITTER),
             },
         )],
     ),
@@ -797,7 +858,8 @@ AP_CASES = [
                 trajectory={
                     "terminal_status": "suspended",
                     "gate_count": "1",
-                    "queue": "ap-clerk",
+                    # The submitter's own desk, per the governed approval table.
+                    "queue": personal_slug(AP_SUBMITTER),
                 },
             ),
         ],
@@ -892,8 +954,13 @@ EXPENSE_SPEC = EvalSpec(
                         LinkRule(type="submitted", direction="in",
                                  to_type="Employee", expect="exists"),
                         LinkRule(type="has_expense_line", expect="count"),
-                        # Counted, not asserted to exist: an auto-approved
-                        # request has no decider, and that is correct.
+                        # Counted rather than asserted to exist. Every v10 run
+                        # is confirmed by its submitter, so the edge is there
+                        # on the recorded cases — but a case that ends
+                        # suspended, or one graded under v9's auto-approval
+                        # path, correctly has none, and `exists` would make
+                        # this rule a claim about the version rather than about
+                        # the request.
                         LinkRule(type="decided_by", expect="count"),
                     ],
                 ),
@@ -932,15 +999,26 @@ EXPENSE_SPEC = EvalSpec(
 
 EXPENSE_CASES = [
     EvalCase(
-        id="expense-in-policy-auto-approves",
+        id="expense-in-policy-confirmed",
         spec_id=EXPENSE_SPEC.id,
-        name="An in-policy receipt with a stated purpose needs nobody",
+        name="A clean in-policy receipt, confirmed by the person who filed it",
+        summary=(
+            "Nothing is flagged and it is still somebody's to say. The reading "
+            "the policy checks cleared is a model's reading of a photograph, "
+            "and the only person who can vouch for the total is the one who "
+            "was holding the paper — so one gate, on their own desk, and the "
+            "lines stay `origin: model` because the confirmation agreed with "
+            "them rather than replacing them."
+        ),
         fixture_id="expense/felicia-on-the-roster",
         trigger={
             "employee": "felicia.marks@naviant.com",
             "commentary": "Team lunch after the Acme Phase 1 review.",
             "hint": "total=64.20 category=meals vendor=corner-bistro",
         },
+        decisions=[ScriptedDecision(
+            verdict="approved", decided_by="felicia.marks@naviant.com",
+        )],
         expectations=[MilestoneExpectation(
             milestone="recorded",
             objects=[
@@ -952,7 +1030,7 @@ EXPENSE_CASES = [
                         "state": "approved",
                         "employee_email": "felicia.marks@naviant.com",
                     },
-                    link_counts={"has_expense_line": 1, "decided_by": 0},
+                    link_counts={"has_expense_line": 1, "decided_by": 1},
                 ),
                 ExpectedObject(
                     type="ExpenseLine", key="",
@@ -964,7 +1042,11 @@ EXPENSE_CASES = [
                     },
                 ),
             ],
-            trajectory={"terminal_status": "succeeded", "gate_count": "0"},
+            trajectory={
+                "terminal_status": "succeeded",
+                "gate_count": "1",
+                "queue": "person-felicia-marks-9d11",
+            },
         )],
     ),
     EvalCase(
@@ -972,9 +1054,10 @@ EXPENSE_CASES = [
         spec_id=EXPENSE_SPEC.id,
         name="The submitter claims $75 of a $110 receipt, and that stands",
         summary=(
-            "The commentary is an input, not a note filed beside one. Claiming "
-            "less than the paper is legitimate and must not need a human; the "
-            "two amounts are kept apart so the difference stays legible."
+            "The memo is an input, not a note filed beside one — it lowers "
+            "what the line asks for, and it is never given to the extractor. "
+            "Claiming less than the paper raises no finding; the two amounts "
+            "are kept apart so the difference stays legible."
         ),
         fixture_id="expense/felicia-on-the-roster",
         trigger={
@@ -983,13 +1066,16 @@ EXPENSE_CASES = [
             "documents": [{
                 "filename": "dinner.jpg",
                 "hint": "total=110.00 category=meals vendor=corner-bistro",
-                "note": (
+                "memo": (
                     "Dinner with the Acme team after the Phase 2 review. I am "
                     "only requesting $75 of the $110 — I ordered wine on my "
                     "own tab."
                 ),
             }],
         },
+        decisions=[ScriptedDecision(
+            verdict="approved", decided_by="felicia.marks@naviant.com",
+        )],
         expectations=[MilestoneExpectation(
             milestone="recorded",
             objects=[
@@ -1006,17 +1092,19 @@ EXPENSE_CASES = [
                     },
                 ),
             ],
-            trajectory={"terminal_status": "succeeded", "gate_count": "0"},
+            trajectory={"terminal_status": "succeeded", "gate_count": "1"},
         )],
     ),
     EvalCase(
         id="expense-compound-receipt-corrected",
         spec_id=EXPENSE_SPEC.id,
-        name="A compound receipt becomes two lines a reviewer can trim",
+        name="A compound receipt becomes two lines the submitter can trim",
         summary=(
             "Two facts out of one document, then a correction that re-runs the "
-            "Rule. `origin: human` on both lines is what proves the reviewer's "
-            "values were applied rather than logged."
+            "checks and asks again — because a corrected set of facts is a new "
+            "set of facts and nobody has vouched for it yet. `origin: human` "
+            "on both lines is what proves the submitter's values were applied "
+            "rather than logged."
         ),
         fixture_id="expense/john-on-the-roster",
         trigger={
@@ -1024,15 +1112,20 @@ EXPENSE_CASES = [
             "commentary": "Two nights at the Acme onsite.",
             "hint": "compound total=210.00 category=lodging vendor=harbor-hotel",
         },
-        decisions=[ScriptedDecision(
-            verdict="corrected",
-            note="Trimmed the parking line to the reimbursable rate.",
-            payload={"lines": [
-                {"ordinal": 1, "purpose": "Two nights at the Acme onsite."},
-                {"ordinal": 2, "requested_usd": 60.0, "category": "travel",
-                 "purpose": "Parking at the onsite, capped rate."},
-            ]},
-        )],
+        decisions=[
+            ScriptedDecision(
+                verdict="corrected", decided_by="john.smith@naviant.com",
+                note="Trimmed the parking line to the reimbursable rate.",
+                payload={"lines": [
+                    {"ordinal": 1, "purpose": "Two nights at the Acme onsite."},
+                    {"ordinal": 2, "requested_usd": 60.0, "category": "travel",
+                     "purpose": "Parking at the onsite, capped rate."},
+                ]},
+            ),
+            ScriptedDecision(
+                verdict="approved", decided_by="john.smith@naviant.com",
+            ),
+        ],
         expectations=[MilestoneExpectation(
             milestone="recorded",
             objects=[
@@ -1050,13 +1143,19 @@ EXPENSE_CASES = [
                     },
                 ),
             ],
-            trajectory={"terminal_status": "succeeded", "gate_count": "1"},
+            trajectory={"terminal_status": "succeeded", "gate_count": "2"},
         )],
     ),
     EvalCase(
         id="expense-restricted-category-denied",
         spec_id=EXPENSE_SPEC.id,
-        name="A restricted category is always reviewed, and can be denied",
+        name="A restricted category is always flagged, and can be withdrawn",
+        summary=(
+            "The finding annotates the confirmation rather than re-routing it: "
+            "there is no amount and no category at which somebody other than "
+            "the submitter can say what a receipt says. Nathan reads the flag "
+            "and withdraws the request himself."
+        ),
         fixture_id="expense/nathan-on-the-roster",
         trigger={
             "employee": "nathan.pryce@naviant.com",
@@ -1064,8 +1163,8 @@ EXPENSE_CASES = [
             "hint": "total=96.40 category=alcohol vendor=vintners-cellar",
         },
         decisions=[ScriptedDecision(
-            verdict="rejected",
-            note="Out of policy §4.2 — use the gifting desk.",
+            verdict="rejected", decided_by="nathan.pryce@naviant.com",
+            note="Out of policy §4.2 — refiling with the gifting desk.",
         )],
         expectations=[MilestoneExpectation(
             milestone="recorded",
@@ -1076,7 +1175,10 @@ EXPENSE_CASES = [
             trajectory={
                 "terminal_status": "succeeded",
                 "gate_count": "1",
-                "queue": "expense-review",
+                # His own desk, per the governed routing table's `submitter`.
+                # The slug is a pure function of the address, which is what
+                # makes it something a fixture can name.
+                "queue": "person-nathan-pryce-82d6",
             },
         )],
     ),
@@ -2536,17 +2638,2010 @@ RELEASE_CASES = [
 
 
 # ---------------------------------------------------------------------------
+# Wick: the plant floor, the field packet and the compliance clock
+# ---------------------------------------------------------------------------
+#
+# Five flows, six specs, and one property they all share that the naviant specs
+# do not: **not one of them is submitted.** Each is woken by a fact — a feed
+# delivering, a clock closing a window, an upstream flow finishing — so a case's
+# `trigger` here is the fact, and `eval_world`'s entrypoints emit it.
+#
+# Every fixture is deliveries, including the crews and the plant departments:
+# `TeamRecord` carries the `cost_center` the jobs feed binds `crew_id` against
+# and `EmployeeRecord` carries the `team_slug` the headcount counts, so the
+# workforce feed establishes both ends of the two joins the plant depends on.
+# The unit tests write those two rows directly and say why — a department feed
+# would put its whole surface between the test and what it is testing — but a
+# fixture is not a unit test: what it has to be is the world production would
+# have built, and `seed_fixture` runs objects *after* deliveries, so a Team
+# written as an object would land after the job that needed it.
+#
+# The dates are literals rather than offsets from today. A fourteen-day
+# document horizon, a sixty-day notice stage and a governed business-day
+# calendar are all functions of *which* day it is, and a suite whose answers
+# moved with the clock would be measuring the calendar.
+
+WICK_SUPERVISOR = "chris.robson@wickbuildings.com"
+WICK_SAFETY = "katy.tiller@wickbuildings.com"
+
+#: The day every Wick window is answered as of. A Tuesday, and deliberately not
+#: 2026-09-07 — that Monday is on the governed plant holiday list, and a plant
+#: day dated on a holiday is a different test.
+WICK_AS_OF = "2026-09-08"
+
+
+# ---- the field packet ------------------------------------------------------
+#
+# The job numbers, the customers and the two label traps are the estate's
+# authored roster (`docs/namespaces/wick/roster.md`): `The Willows Equine LLC`
+# on 250661 and the two Evermores on 250553 / 250774.
+
+def _wick_document(external_id: str, name: str, folder: str, version: int) -> dict:
+    return {
+        "external_id": external_id, "name": name,
+        "folder_external_id": folder, "content_type": "application/pdf",
+        "size": 24_000, "latest_version": version,
+        "storage_ref": f"dms://{external_id}",
+    }
+
+
+def _wick_job(
+    external_id: str,
+    number: str,
+    customer: str,
+    crew: str,
+    foreman: str,
+    load: str,
+    status: str = "Scheduled",
+) -> dict:
+    return {
+        "external_id": external_id, "job_number": number,
+        "name": f"{number} building", "customer_name": customer,
+        "status": status, "load_date": load, "crew_id": crew,
+        "foreman": foreman, "plant_site": "Mazomanie",
+    }
+
+
+#: The two crews the ERP's `crewId` binds to, through the cost centre the HRIS
+#: writes beside the department. `SUB-KVB` matches none of them and never will:
+#: the subcontractor is not on the payroll, which is the whole of the second
+#: aggregate.
+WICK_CREWS = {
+    "source": "hris-workforce",
+    "watermark": "2026-09-07T04:00:00Z",
+    "teams": [
+        {"external_id": "DEPT-2031", "slug": "crew-12", "name": "Crew 12",
+         "cost_center": "12"},
+        {"external_id": "DEPT-2032", "slug": "crew-14", "name": "Crew 14",
+         "cost_center": "14"},
+    ],
+}
+
+#: The filing tree, as the DMS holds it. 250661's packet is complete and one of
+#: its four types is on a second revision; 250553 has one of the four; 250900's
+#: folder holds nothing that matches a governed pattern; and **250774 has no
+#: folder at all**, which is what the recurrence threshold is counted over.
+WICK_FILING_TREE = {
+    "source": "dms-library",
+    "watermark": "2026-09-07T05:00:00Z",
+    "folders": [
+        {"external_id": "F-root", "name": "Job Documents"},
+        {"external_id": "F-661", "name": "250661", "parent_external_id": "F-root"},
+        {"external_id": "F-553", "name": "250553", "parent_external_id": "F-root"},
+        {"external_id": "F-900", "name": "250900", "parent_external_id": "F-root"},
+    ],
+    "documents": [
+        _wick_document("D-661-SL", "250661 Shipping List.pdf", "F-661", 1),
+        _wick_document("D-661-EP1", "250661 Engineering Plans REV A.pdf",
+                       "F-661", 1),
+        _wick_document("D-661-EP2", "250661 Engineering Plans REV B.pdf",
+                       "F-661", 2),
+        _wick_document("D-661-MAP", "250661 Job Site Map.pdf", "F-661", 1),
+        _wick_document("D-661-CH", "250661 Crew Hours.pdf", "F-661", 1),
+        # Named to no governed pattern: counted, never guessed at.
+        _wick_document("D-661-X", "site photos.pdf", "F-661", 1),
+        _wick_document("D-553-SL", "250553 Shipping List.pdf", "F-553", 1),
+        _wick_document("D-900-X", "notes.pdf", "F-900", 1),
+    ],
+}
+
+WICK_SCHEDULED_JOBS = {
+    "source": "erp-jobs",
+    "watermark": "2026-09-07T05:00:00Z",
+    "jobs": [
+        # The stopword trap: `The Willows Equine LLC` → `250661 Willows`.
+        _wick_job("J-661", "250661", "The Willows Equine LLC", "12",
+                  "D. Prellwitz", "2026-09-12"),
+        # The collision trap, both halves — the labels move together.
+        _wick_job("J-553", "250553", "Evermore Ridge Estates", "14",
+                  "M. Tessmann", "2026-09-14"),
+        _wick_job("J-774", "250774", "Evermore Farms LLC", "12",
+                  "D. Prellwitz", "2026-09-15"),
+        # The subcontractor: a crew id no HRIS department carries.
+        _wick_job("J-900", "250900", "Kickapoo Valley Builders", "SUB-KVB",
+                  "KICKAPOO VALLEY BUILDERS", "2026-09-16"),
+        # Off the governed status, and therefore never selected — which is how
+        # "once the job moves to IN PROGRESS, stop checking" is kept.
+        _wick_job("J-111", "250111", "Sauk Prairie Dairy LLC", "12",
+                  "D. Prellwitz", "2026-09-10", status="In Progress"),
+    ],
+}
+
+#: The same job, one crew later, as a one-row delta — which is how the estate
+#: really reports a reassignment: the row's watermark moves and everything else
+#: about it stays.
+WICK_JOB_REASSIGNED = {
+    "source": "erp-jobs",
+    "watermark": "2026-09-08T05:00:00Z",
+    "jobs": [
+        _wick_job("J-661", "250661", "The Willows Equine LLC", "14",
+                  "M. Tessmann", "2026-09-12"),
+    ],
+}
+
+
+# ---- the compliance clock --------------------------------------------------
+#
+# The ladder is the point: one credential at each governed notice stage, one
+# whose date will not read, one whose holder is on nobody's roster, one whose
+# holder has left, one past the seven-year retention horizon — and two machines,
+# one on an inspection cycle and one the source says carries none.
+
+def _wick_credential(external_id: str, holder: str, name: str, category: str,
+                     expires: str = "", **over) -> dict:
+    row = {
+        "external_id": external_id, "holder_email": holder,
+        "credential_type": name, "category": category,
+        "expiration_date": expires,
+    }
+    row.update(over)
+    return row
+
+
+WICK_ROSTER = {
+    "source": "hris-workforce",
+    "watermark": "2026-09-07T04:00:00Z",
+    "teams": [
+        {"external_id": "DEPT-2003", "slug": "plant-mazomanie",
+         "name": "Plant — Mazomanie", "cost_center": "3000",
+         "lead_email": "chris.robson@wickbuildings.com"},
+    ],
+    "employees": [
+        {"external_id": "EMP-2003", "email": WICK_SUPERVISOR,
+         "name": "Chris Robson", "title": "Plant Manager",
+         "team_slug": "plant-mazomanie", "status": "Active"},
+        {"external_id": "EMP-2005", "email": WICK_SAFETY,
+         "name": "Katy Tiller", "title": "HR & Safety",
+         "team_slug": "plant-mazomanie", "status": "Active"},
+        {"external_id": "EMP-2020", "email": "terry.nachreiner@wickbuildings.com",
+         "name": "Terry Nachreiner", "title": "Driver",
+         "team_slug": "plant-mazomanie", "status": "Active",
+         "manager_email": WICK_SUPERVISOR},
+        # On the roster and gone: the holder of a live certification who has
+        # left is one of the four exception classes.
+        {"external_id": "EMP-2021", "email": "vern.oimoen@wickbuildings.com",
+         "name": "Vern Oimoen", "title": "Driver",
+         "team_slug": "plant-mazomanie", "status": "Terminated",
+         "manager_email": WICK_SUPERVISOR},
+    ],
+}
+
+#: The training file. `TR-3001` is 60 days out on the day the first window
+#: closes, so the whole 60 → 30 → 15 cycle can be walked over one row.
+WICK_TRAINING = {
+    "source": "hris-training",
+    "watermark": "2026-09-07T05:00:00Z",
+    "credentials": [
+        _wick_credential("TR-3001", "terry.nachreiner@wickbuildings.com",
+                         "Fall Protection Refresher", "training",
+                         "2026-11-07", completion_date="2025-11-07",
+                         result="Pass", provider="Wisconsin Safety Council"),
+        # No expiry anyone can read: the first exception class.
+        _wick_credential("TR-3002", "terry.nachreiner@wickbuildings.com",
+                         "Lift Operator", "training",
+                         completion_date="2026-01-14", result="Pass"),
+        # A holder no employee resolves to: the second.
+        _wick_credential("TR-3003", "cody.statz@wickbuildings.com",
+                         "Confined Space", "clearance", "2026-10-01"),
+        # A holder who has left, and a live certification: the third.
+        _wick_credential("TR-3004", "vern.oimoen@wickbuildings.com",
+                         "Forklift Certification", "certification",
+                         "2026-10-15"),
+        # Older than the governed seven-year horizon: the fourth. Nothing is
+        # deleted; it is reported for a person to rule on.
+        _wick_credential("TR-3005", "terry.nachreiner@wickbuildings.com",
+                         "Rigging Certification", "certification",
+                         "2017-06-30"),
+    ],
+}
+
+#: The driver file. One row, one category — and the claim it exists to grade is
+#: that this becomes the same `Credential` type as a training row, differing
+#: only in `category`.
+WICK_DRIVER_FILES = {
+    "source": "hris-driver-files",
+    "watermark": "2026-09-07T05:00:00Z",
+    "credentials": [
+        _wick_credential("DQ-4001", "terry.nachreiner@wickbuildings.com",
+                         "Commercial Driver Licence — Class A", "licence",
+                         "2026-09-20"),
+    ],
+}
+
+#: The fleet. A truck on a cycle, and a skid steer the source says carries no
+#: tracked inspection — a fact about the machine, not a gap in the feed.
+WICK_FLEET = {
+    "source": "erp-assets",
+    "watermark": "2026-09-07T05:00:00Z",
+    "equipment": [
+        {"external_id": "AST-7001", "equipment_id": "TRK-101",
+         "name": "Truck 101", "category": "truck", "home_site": "Mazo",
+         "last_inspection_date": "2025-10-08",
+         "next_inspection_due_date": "2026-10-08"},
+        {"external_id": "AST-7004", "equipment_id": "SKD-410",
+         "name": "Skid Steer 410", "category": "skid-steer",
+         "home_site": "Mazo", "last_inspection_date": "2025-04-02"},
+    ],
+}
+
+
+# ---- the plant floor -------------------------------------------------------
+
+#: The ten plant departments, spelled the HRIS's way — which is the string the
+#: governed department table joins on — and the people whose `member_of` edges
+#: are the headcount. Two rows per department is not decoration: the capacity
+#: ladder turns a headcount into a capacity row, so a day filled against an
+#: empty department would be filled against the wrong row.
+WICK_PLANT_ROSTER = {
+    "source": "hris-workforce",
+    "watermark": "2026-09-07T04:00:00Z",
+    "teams": [
+        {"external_id": "DEPT-2004", "slug": "truss-cut",
+         "name": "Truss Cutting", "cost_center": "3010"},
+        {"external_id": "DEPT-2005", "slug": "truss-fab",
+         "name": "Truss Fabrication", "cost_center": "3020"},
+        {"external_id": "DEPT-2006", "slug": "steel-fab",
+         "name": "Steel Fabrication", "cost_center": "3030"},
+        {"external_id": "DEPT-2007", "slug": "trim-fab",
+         "name": "Trim Fabrication", "cost_center": "3040"},
+        {"external_id": "DEPT-2008", "slug": "hardware-trim-pack",
+         "name": "Hardware & Trim Packaging", "cost_center": "3050"},
+        {"external_id": "DEPT-2031", "slug": "crew-12", "name": "Crew 12",
+         "cost_center": "12"},
+    ],
+    "employees": [
+        {"external_id": f"EMP-31{index:02d}",
+         "email": f"{slug}-{index}@wickbuildings.com",
+         "name": f"{slug} {index}", "team_slug": slug, "status": "Active"}
+        for index, slug in enumerate([
+            "steel-fab", "steel-fab", "steel-fab",
+            "truss-cut", "truss-fab", "truss-fab",
+            "trim-fab", "hardware-trim-pack",
+        ])
+    ],
+}
+
+#: The four jobs a plant day is filled out of. `trim-fab` is done on all of
+#: them and `truss-cut` on none, which is what makes one department's day a
+#: fill and another's a deferral in the same window — the sequencing table is
+#: read live off the job's own flags.
+WICK_PLANT_LOADS = ("2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22")
+
+
+def _wick_plant_job(external_id: str, number: str, load: str, **over) -> dict:
+    row = {
+        "external_id": external_id, "job_number": number,
+        "name": f"{number} shed", "customer_name": "Evermore Ridge Estates",
+        "builder_name": "Wick Buildings", "plant_site": "Mazo",
+        "status": "Scheduled", "load_date": load, "shipment_date": load,
+        "week_position": "Week 1", "out_to_yard": "Yes", "do_not_fab": "No",
+        "foreman": "D. Prellwitz", "crew_id": "12",
+        "width": 60.0, "length": 120.0, "height": 16.0,
+        "secondary_dimensions": "12 x 24",
+        "upstream_done": ["trim-fab"],
+    }
+    row.update(over)
+    return row
+
+
+#: Four buildable jobs and five that are not, each excluded by a different
+#: governed clause and each for its own named reason.
+WICK_PLANT_JOBS = {
+    "source": "erp-jobs",
+    "watermark": "2026-09-07T05:00:00Z",
+    "jobs": [
+        *(
+            _wick_plant_job(f"JOB-70{index:02d}", number, load)
+            for index, (number, load) in enumerate(zip(
+                ("250553", "250774", "250661", "250900"), WICK_PLANT_LOADS,
+            ))
+        ),
+        # A Saturday load: the governed calendar says the plant is shut.
+        _wick_plant_job("JOB-7101", "260101", "2026-10-24"),
+        # Held. `doNotFab: "Yes"` is `DNF` in the governed vocabulary.
+        _wick_plant_job("JOB-7102", "260102", "2026-10-20", do_not_fab="Yes"),
+        # A load date already behind the window.
+        _wick_plant_job("JOB-7103", "260103", "2026-09-01"),
+        # A production week outside the governed set — the screen's own way of
+        # saying "beyond the last week", which is not an error.
+        _wick_plant_job("JOB-7104", "260104", "2026-10-21",
+                        week_position="Week 5"),
+        # Not released to the yard.
+        _wick_plant_job("JOB-7105", "260105", "2026-10-22", out_to_yard="No"),
+    ],
+}
+
+#: Nothing eligible, and a job book that is not empty — which is the difference
+#: the governed page calls informational: an empty *eligible* set is a slow
+#: week, and an empty *book* is a broken feed.
+WICK_PLANT_JOBS_ALL_HELD = {
+    "source": "erp-jobs",
+    "watermark": "2026-09-07T05:00:00Z",
+    "jobs": [
+        _wick_plant_job("JOB-7102", "260102", "2026-10-20", do_not_fab="Yes"),
+        _wick_plant_job("JOB-7101", "260101", "2026-10-24"),
+    ],
+}
+
+
+def _wick_cut_sheets(numbers: tuple[str, ...]) -> dict:
+    """The plant floor's own copy of the paper, filed where the page says.
+
+    `PlantCutSheets/<plant site>/<job number>` — not the office's
+    `Job Documents/<job>`, which holds a shipping list matching the same
+    governed pattern and is deliberately not the one read.
+    """
+    folders = [
+        {"external_id": "F-cut", "name": "PlantCutSheets"},
+        {"external_id": "F-mazo", "name": "Mazo", "parent_external_id": "F-cut"},
+    ]
+    documents = []
+    for number in numbers:
+        folders.append({
+            "external_id": f"F-{number}", "name": number,
+            "parent_external_id": "F-mazo",
+        })
+        documents.append({
+            "external_id": f"WD-{number}",
+            "name": f"{number} Shipping List A1-LL.pdf",
+            "folder_external_id": f"F-{number}",
+            "content_type": "application/pdf", "size": 4_096,
+            "latest_version": 1,
+            "storage_ref": f"https://dms.example/{number}/content",
+        })
+    return {
+        "source": "dms-library", "watermark": "2026-09-07T05:00:00Z",
+        "folders": folders, "documents": documents,
+    }
+
+
+#: What the plant's copy of each ticket says, in the stub reader's own case
+#: grammar. A hardware grid big enough that four jobs carry a department past
+#: the point its governed incentive crosses zero — which is the only way the
+#: incentive clause is reachable at all.
+WICK_PLANT_LIBRARY = {
+    number: "bags=400 caps=40" for number in ("250553", "250774", "250661", "250900")
+}
+
+
+def _wick_fixtures() -> list[Fixture]:
+    """The five worlds the Wick specs run in, all of them deliveries.
+
+    `objects` is empty here and that is the interesting part: every row these
+    flows stand on — the crews, the plant departments, the people whose
+    membership *is* the headcount, the job book, the filing tree — arrives on a
+    feed Wick really has, so each fixture is established the way production
+    established it and the three sync flows are exercised on the way in.
+    """
+    common = {
+        "origin": "declared", "authored_by": "platform-eng",
+        "derived_from": DECLARED_IN,
+    }
+    plant_reads = [
+        "knowledge:plant-scheduling-parameters@rev1",
+        "knowledge:labor-hour-formulas@rev1",
+        "knowledge:truss-standards@rev1",
+    ]
+    return [
+        Fixture(
+            id="wick/scheduled-jobs-week",
+            flow_id="field-documents",
+            name="A week of scheduled jobs, and the filing tree behind them",
+            summary=(
+                "Five jobs and four folders. Both packet-label traps are in "
+                "it — an article-leading customer name and two customers "
+                "sharing a first keyword — beside a complete packet on a "
+                "second revision, a partial one, a job with no folder at all, "
+                "a crew id no department carries, and a job that has moved off "
+                "the governed status and must not be selected."
+            ),
+            deliveries=[WICK_CREWS, WICK_FILING_TREE, WICK_SCHEDULED_JOBS],
+            read_set=["knowledge:field-documents-policy@rev1"],
+            **common,
+        ),
+        Fixture(
+            id="wick/job-moves-crew",
+            flow_id="field-documents",
+            name="The same week, and one job reassigned",
+            summary=(
+                "The world above with a second, one-row jobs delta moving "
+                "250661 from Crew 12 to Crew 14 — which is how the estate "
+                "really reports a reassignment. The precondition for the claim "
+                "that retired the reconciliation Flow: the old edge is "
+                "withdrawn rather than deleted, and no folder is touched."
+            ),
+            deliveries=[
+                WICK_CREWS, WICK_FILING_TREE, WICK_SCHEDULED_JOBS,
+                WICK_JOB_REASSIGNED,
+            ],
+            read_set=["knowledge:field-documents-policy@rev1"],
+            **common,
+        ),
+        Fixture(
+            id="wick/compliance-clock",
+            flow_id="credential-tracking",
+            name="The compliance clock, with one row at every stage",
+            summary=(
+                "A roster, a training file, a driver file and two machines. "
+                "One credential is exactly sixty days out on the first window, "
+                "so a single row can be walked through all three governed "
+                "notice stages; the other four are one of each exception class; "
+                "and one machine carries no tracked inspection at all."
+            ),
+            deliveries=[
+                WICK_ROSTER, WICK_TRAINING, WICK_DRIVER_FILES, WICK_FLEET,
+            ],
+            read_set=["knowledge:certification-alert-policy@rev1"],
+            **common,
+        ),
+        Fixture(
+            id="wick/plant-day",
+            flow_id="plant-eligibility-sweep",
+            name="A plant week: four jobs to build and five that cannot be",
+            summary=(
+                "The whole plant spine's precondition. Four buildable jobs "
+                "with their shipping lists filed under the plant's own cut "
+                "sheet root, and five more excluded one apiece by a weekend "
+                "load, a hold, a load date already past, a production week "
+                "outside the governed set, and a job not released to the yard. "
+                "`trim-fab` is done on every job and `truss-cut` on none, so "
+                "one department's day is a fill and another's is a deferral in "
+                "the same window."
+            ),
+            deliveries=[
+                WICK_PLANT_ROSTER,
+                _wick_cut_sheets(("250553", "250774", "250661", "250900")),
+                WICK_PLANT_JOBS,
+            ],
+            read_set=plant_reads,
+            **common,
+        ),
+        Fixture(
+            id="wick/plant-day-nothing-eligible",
+            flow_id="plant-eligibility-sweep",
+            name="A plant week with nothing eligible and a book that is not empty",
+            summary=(
+                "Two jobs, both excluded. The distinction the governed page "
+                "draws: an empty *eligible* set is a slow week and raises "
+                "nothing, while an empty job *book* is a broken feed and is "
+                "somebody's morning."
+            ),
+            deliveries=[WICK_PLANT_ROSTER, WICK_PLANT_JOBS_ALL_HELD],
+            read_set=["knowledge:plant-scheduling-parameters@rev1"],
+            **common,
+        ),
+        Fixture(
+            id="wick/shipping-list-pages",
+            flow_id="shipping-list-extraction",
+            name="One job's shipping list, filed on the plant floor",
+            summary=(
+                "A single eligible job and the plant's own copy of its seven "
+                "page families, under `PlantCutSheets/Mazo/250553`. What each "
+                "page says is the case's to declare, so one world serves the "
+                "clean read, the absent grid, the figure outside its band and "
+                "the correction that re-runs both checks."
+            ),
+            deliveries=[
+                WICK_PLANT_ROSTER,
+                _wick_cut_sheets(("250553",)),
+                {
+                    "source": "erp-jobs", "watermark": "2026-09-07T05:00:00Z",
+                    "jobs": [_wick_plant_job("JOB-7000", "250553",
+                                             WICK_PLANT_LOADS[0])],
+                },
+            ],
+            read_set=[
+                *plant_reads,
+                "knowledge:shipping-list-extract-prompt@rev1",
+                "knowledge:shipping-list-locate-prompt@rev1",
+            ],
+            **common,
+        ),
+    ]
+
+
+
+
+# ---- field documents -------------------------------------------------------
+
+FIELD_DOCUMENTS_SPEC = EvalSpec(
+    id="field-documents-core",
+    flow_id="field-documents",
+    version=1,
+    summary=(
+        "What the job packet promises. The label a crew calls a job by is a "
+        "governed derivation and not a literal, and both traps the estate "
+        "seeds deliberately have to hold: an article-leading customer name "
+        "resolves through the stopword list, and two customers sharing a first "
+        "keyword resolve through the collision rule — both of them, because a "
+        "collision is a fact about the pair. Beside that: only the current "
+        "revision is linked, a job off the governed status is never selected, "
+        "a job with no filed documents is a count until the governed "
+        "recurrence threshold and only then somebody's morning, and a crew id "
+        "nobody can resolve is one identity question rather than N document "
+        "questions."
+    ),
+    milestones=[
+        Milestone(
+            id="considered",
+            label="once the window has decided what it is answering",
+            anchor="first_of_kind",
+            selector="action",
+            note=(
+                "The only step that writes, which makes it the point where a "
+                "job that was **not** selected can be judged: nothing later "
+                "can give it a label, so an absence here is an absence for "
+                "good."
+            ),
+            objects=[
+                ObjectRule(
+                    type="Job",
+                    fields=[FieldRule(
+                        field="packet_label", match="absent",
+                        note="a job off the governed status is not selected, "
+                             "so no rule ever derives a label for it — which "
+                             "is how *stop checking once it is In Progress* is "
+                             "kept: there is nothing to switch off",
+                    )],
+                ),
+            ],
+            trajectory=[TrajectoryRule(
+                kind="model_calls_at_most",
+                note="none. Every decision here is a governed rule over rows "
+                     "the feeds landed, and a model in this loop would be a "
+                     "model nobody could argue with",
+            )],
+        ),
+        Milestone(
+            id="packets",
+            label="once the packets have been written to the job book",
+            anchor="wrote",
+            selector="graph:Job/",
+            note=(
+                "Named by what it wrote rather than by a step id: the label, "
+                "the completeness flag and the edges to the current revisions "
+                "all land in one guarded write, and that write is the point."
+            ),
+            objects=[
+                ObjectRule(
+                    type="Job",
+                    fields=[
+                        FieldRule(field="packet_label", match="exact"),
+                        FieldRule(field="documents_complete", match="exact"),
+                    ],
+                    links=[
+                        LinkRule(
+                            type="documented_by", to_type="Document",
+                            expect="count",
+                            note="the four governed types at their current "
+                                 "revision — a superseded one is withdrawn "
+                                 "and therefore not counted, which is what "
+                                 "makes this number the whole claim",
+                        ),
+                        LinkRule(
+                            type="job_folder", to_type="Folder",
+                            expect="count",
+                            note="the packet is a query over one edge rather "
+                                 "than a directory somebody has to create",
+                        ),
+                        LinkRule(
+                            type="assigned_to", to_type="Team", expect="count",
+                            props=[FieldRule(field="crew_id", match="exact")],
+                            note="the live crew. `job-sync` draws it; this "
+                                 "flow reads it, and a job whose crew resolves "
+                                 "to nobody has no edge at all",
+                        ),
+                    ],
+                ),
+            ],
+        ),
+        Milestone(
+            id="settled",
+            label="once the window has closed",
+            anchor="terminal",
+            objects=[],
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(
+                    kind="reported",
+                    note="the window's own account: which governed rules fired, "
+                         "what it could not find, and whether a gap has become "
+                         "a question yet",
+                ),
+                TrajectoryRule(
+                    kind="task_raised",
+                    note="the desk the governed approval table routes an "
+                         "aggregate to",
+                ),
+                TrajectoryRule(
+                    kind="claimed_by",
+                    note="the label is this flow's claim and nobody else's. A "
+                         "second source on it would mean two derivations of "
+                         "one name, which is exactly the confusion the "
+                         "governed convention exists to end",
+                ),
+            ],
+        ),
+    ],
+)
+
+FIELD_DOCUMENTS_CASES = [
+    EvalCase(
+        id="wick/both-label-traps-hold",
+        spec_id=FIELD_DOCUMENTS_SPEC.id,
+        name="Both packet-label traps hold, and the out-of-scope job is untouched",
+        summary=(
+            "One window over the week. `The Willows Equine LLC` becomes "
+            "`250661 Willows` through the governed stopword list; the two "
+            "Evermores become `250553 Evermore Ridge` and `250774 Evermore "
+            "Farms` through the collision rule, and **both** move. The "
+            "complete packet carries four edges and not five — the superseded "
+            "revision is withdrawn — the job with no folder carries none, the "
+            "job off the governed status has no label at all, and the "
+            "subcontractor's jobs are one identity question."
+        ),
+        fixture_id="wick/scheduled-jobs-week",
+        trigger={"as_of": WICK_AS_OF, "windows": 1},
+        expectations=[
+            MilestoneExpectation(
+                milestone="considered",
+                objects=[
+                    ExpectedObject(
+                        type="Job", key="erp-jobs:250111",
+                        fields={"packet_label": ""},
+                    ),
+                    # The subcontractor's job: no packet was even attempted,
+                    # so no document question is asked about a job nobody can
+                    # deliver to — one identity question instead of N.
+                    ExpectedObject(
+                        type="Job", key="erp-jobs:250900",
+                        fields={"packet_label": ""},
+                    ),
+                ],
+                trajectory={"model_calls_at_most": "0"},
+            ),
+            MilestoneExpectation(
+                milestone="packets",
+                objects=[
+                    ExpectedObject(
+                        type="Job", key="erp-jobs:250661",
+                        fields={
+                            "packet_label": "250661 Willows",
+                            "documents_complete": "yes",
+                        },
+                        link_counts={
+                            "documented_by": 4, "job_folder": 1,
+                            "assigned_to": 1,
+                        },
+                        link_props={"assigned_to.crew_id": "12"},
+                    ),
+                    ExpectedObject(
+                        type="Job", key="erp-jobs:250553",
+                        fields={
+                            "packet_label": "250553 Evermore Ridge",
+                            "documents_complete": "no",
+                        },
+                        link_counts={
+                            "documented_by": 1, "job_folder": 1,
+                            "assigned_to": 1,
+                        },
+                        link_props={"assigned_to.crew_id": "14"},
+                    ),
+                    ExpectedObject(
+                        type="Job", key="erp-jobs:250774",
+                        fields={
+                            "packet_label": "250774 Evermore Farms",
+                            "documents_complete": "no",
+                        },
+                        link_counts={
+                            "documented_by": 0, "job_folder": 0,
+                            "assigned_to": 1,
+                        },
+                    ),
+                    # The subcontractor's job, by its edges: no crew resolved,
+                    # so no packet was resolved, so **no document question was
+                    # asked** — which is the structural half of "in the second
+                    # aggregate and only the second". Its fields are graded at
+                    # `considered`, where the rule is an absence.
+                    ExpectedObject(
+                        type="Job", key="erp-jobs:250900",
+                        link_counts={
+                            "documented_by": 0, "assigned_to": 0,
+                            "job_folder": 1,
+                        },
+                    ),
+                ],
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": (
+                        "stopwords_applied=1, collisions=2, folders_missing=1, "
+                        "unclassified=1, crew_unstated=0, linked=5, "
+                        "gap_tasks=0, "
+                        "exclusions~'status-not-in-scope': 1, "
+                        "screened~'crewless': 1, "
+                        "screened~'past_threshold': 0"
+                    ),
+                    "task_raised": "field-operations/exception",
+                    "claimed_by": "Job.packet_label=flow:field-documents",
+                },
+            ),
+        ],
+    ),
+    EvalCase(
+        id="wick/no-documents-becomes-a-question-at-the-threshold",
+        spec_id=FIELD_DOCUMENTS_SPEC.id,
+        name="No documents at all is a count until the threshold, then one Task",
+        summary=(
+            "The design's own answer, kept: *log as information and continue; "
+            "notify if recurring*. 250774 has no folder and nothing filed. The "
+            "window above counted it and asked nobody; the window here is the "
+            "one that crosses the governed recurrence threshold, and the "
+            "aggregate it raises carries the empty job and not the partial one "
+            "— a filing failure is worth somebody's morning and a missing crew "
+            "hours sheet is not."
+        ),
+        fixture_id="wick/scheduled-jobs-week",
+        trigger={"as_of": WICK_AS_OF, "windows": 2},
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "gap_tasks=1, threshold=3, "
+                    "screened~'past_threshold': 1, "
+                    "screened~'partial': 1, "
+                    "empty_jobs~erp-jobs:250774"
+                ),
+                "task_raised": "field-operations/exception",
+            },
+        )],
+    ),
+]
+
+
+FIELD_MOVE_SPEC = EvalSpec(
+    id="field-documents-crew-move",
+    flow_id="field-documents",
+    version=1,
+    summary=(
+        "The claim that retired a Flow. A weekly bot used to go looking for "
+        "the difference between last week's crew schedule and this one, and "
+        "to delete a folder out of one foreman's tree and create it in "
+        "another's. The difference is a property of the record now: the old "
+        "`assigned_to` edge is **withdrawn** — validity ended, never deleted — "
+        "the new one is live, and both stay on the job, so *which crew has it "
+        "now, and who held it before* is one traversal. There is no "
+        "destructive act left to gate, and no folder is created, moved, copied "
+        "or removed by any of it."
+    ),
+    milestones=[
+        Milestone(
+            id="packets",
+            label="once the packets have been written to the job book",
+            anchor="wrote",
+            selector="graph:Job/",
+            objects=[
+                ObjectRule(
+                    type="Job",
+                    fields=[FieldRule(field="packet_label", match="exact")],
+                    links=[
+                        LinkRule(
+                            type="assigned_to", to_type="Team", expect="count",
+                            props=[FieldRule(field="crew_id", match="exact")],
+                            note="**one** live edge, to the new crew. A "
+                                 "withdrawn edge is still on the record and is "
+                                 "deliberately not counted here — a count of "
+                                 "two would mean the reassignment never took, "
+                                 "and a count of one after a delete would look "
+                                 "identical, which is why the run's own "
+                                 "`reassigned` figure is graded beside it",
+                        ),
+                        LinkRule(
+                            type="documented_by", to_type="Document",
+                            expect="count",
+                            note="unchanged by the move: a job's paperwork is "
+                                 "not a fact about which crew is holding it",
+                        ),
+                        LinkRule(
+                            type="job_folder", to_type="Folder",
+                            expect="count",
+                            note="the same folder, still. Nothing was created "
+                                 "and nothing was removed",
+                        ),
+                    ],
+                ),
+            ],
+        ),
+        Milestone(
+            id="settled",
+            label="once the window has closed",
+            anchor="terminal",
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(
+                    kind="reported",
+                    note="`reassigned` is the window seeing a withdrawn edge "
+                         "on a job it is answering — the fact that a delete "
+                         "would have destroyed",
+                ),
+            ],
+        ),
+    ],
+)
+
+FIELD_MOVE_CASES = [
+    EvalCase(
+        id="wick/a-job-moves-crews-and-nothing-is-deleted",
+        spec_id=FIELD_MOVE_SPEC.id,
+        name="A job moves crews: the old edge is withdrawn, not deleted",
+        summary=(
+            "The reassignment arrives the way the estate really reports one — "
+            "a one-row delta whose watermark moved and whose crew changed. "
+            "After it, 250661 has exactly one live `assigned_to` edge and it "
+            "names Crew 14; the edge to Crew 12 is withdrawn and still on the "
+            "record; the packet is untouched; and the window reads the new "
+            "crew while reporting that a move happened."
+        ),
+        fixture_id="wick/job-moves-crew",
+        trigger={"as_of": WICK_AS_OF, "windows": 1},
+        expectations=[
+            MilestoneExpectation(
+                milestone="packets",
+                objects=[ExpectedObject(
+                    type="Job", key="erp-jobs:250661",
+                    fields={"packet_label": "250661 Willows"},
+                    link_counts={
+                        "assigned_to": 1, "documented_by": 4, "job_folder": 1,
+                    },
+                    link_props={"assigned_to.crew_id": "14"},
+                )],
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": (
+                        "reassigned=1, packets~'crew': 'Crew 14'"
+                    ),
+                },
+            ),
+        ],
+    ),
+]
+
+
+# ---- the compliance clock --------------------------------------------------
+
+CREDENTIAL_SPEC = EvalSpec(
+    id="credential-tracking",
+    flow_id="credential-tracking",
+    version=1,
+    summary=(
+        "The Excel training matrix and the DOT tracker, as a governed rule "
+        "over the graph. Three notice stages fire once each per cycle and "
+        "never twice, because the stage that was sent is written on the row "
+        "rather than kept in a spreadsheet cell somebody could edit. A course "
+        "certificate and a commercial driving licence are the **same** kind of "
+        "thing — a dated permission that expires and gets renewed — so they "
+        "are one type differing only in category, and a second sweep that had "
+        "to agree with the first was never built. What the rule cannot decide "
+        "is sorted into four named classes and reaches a desk as four Tasks "
+        "however many rows are behind them; and a machine the source says "
+        "carries no tracked inspection is excluded and counted rather than "
+        "reported overdue forever."
+    ),
+    milestones=[
+        Milestone(
+            id="staged",
+            label="once every row has been measured against the notice stages",
+            anchor="last_of_kind",
+            selector="rule",
+            trajectory=[
+                TrajectoryRule(
+                    kind="reported",
+                    note="what the rule decided, by stage — and what it "
+                         "deliberately did not re-send",
+                ),
+                TrajectoryRule(kind="model_calls_at_most"),
+            ],
+        ),
+        Milestone(
+            id="recorded",
+            label="once the notices have been written onto the rows",
+            anchor="wrote",
+            selector="graph:Credential/",
+            objects=[
+                ObjectRule(
+                    type="Credential",
+                    fields=[
+                        FieldRule(field="category", match="exact"),
+                        FieldRule(field="credential_type", match="exact"),
+                        FieldRule(field="last_notice_stage", match="exact"),
+                        FieldRule(field="last_notified_on", match="exact"),
+                        FieldRule(field="status", match="exact"),
+                        FieldRule(
+                            field="holder_email", match="exact",
+                            note="filled by a join on the way in: both "
+                                 "credential resources name a person by the "
+                                 "HRIS's own id and nothing else",
+                        ),
+                    ],
+                ),
+                ObjectRule(
+                    type="Equipment",
+                    fields=[FieldRule(
+                        field="inspection_tracked", match="exact",
+                        note="derived once, on the way in, from the absence of "
+                             "a next-due date. A fact about the machine, not a "
+                             "gap in the feed — and the reason it never alerts",
+                    )],
+                ),
+            ],
+        ),
+        Milestone(
+            id="settled",
+            label="once the window has closed",
+            anchor="terminal",
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(kind="reported"),
+                TrajectoryRule(
+                    kind="task_raised",
+                    note="the desk the governed routing table names",
+                ),
+            ],
+        ),
+    ],
+)
+
+_WICK_TERRY = "terry.nachreiner@wickbuildings.com"
+
+CREDENTIAL_CASES = [
+    EvalCase(
+        id="wick/one-window-fires-every-stage-once",
+        spec_id=CREDENTIAL_SPEC.id,
+        name="Each governed stage fires once, and two files are one type",
+        summary=(
+            "One window over the whole book. Six rows are due and they land "
+            "two apiece on the 60, 30 and 15-day stages. A training record and "
+            "a driver-qualification row both come out as `Credential`s "
+            "distinguished only by `category` — and both are stamped by the "
+            "same pass, each at the stage its own date earned. The skid steer "
+            "the source gives no next-due date for is excluded and counted, "
+            "and the four things the rule could not decide reach one desk as "
+            "four Tasks and not five."
+        ),
+        fixture_id="wick/compliance-clock",
+        trigger={"days": [WICK_AS_OF]},
+        expectations=[
+            MilestoneExpectation(
+                milestone="staged",
+                trajectory={
+                    "reported": (
+                        "due=6, already_sent=0, "
+                        "by_stage~'60': 2, by_stage~'30': 2, by_stage~'15': 2"
+                    ),
+                    "model_calls_at_most": "0",
+                },
+            ),
+            MilestoneExpectation(
+                milestone="recorded",
+                objects=[
+                    ExpectedObject(
+                        type="Credential", key="hris-training:TR-3001",
+                        fields={
+                            "category": "training",
+                            "credential_type": "Fall Protection Refresher",
+                            "last_notice_stage": "60",
+                            "last_notified_on": WICK_AS_OF,
+                            "status": "expiring",
+                            "holder_email": _WICK_TERRY,
+                        },
+                    ),
+                    ExpectedObject(
+                        type="Credential", key="hris-driver-files:DQ-4001",
+                        fields={
+                            "category": "licence",
+                            "credential_type":
+                                "Commercial Driver Licence — Class A",
+                            "last_notice_stage": "15",
+                            "last_notified_on": WICK_AS_OF,
+                            "status": "expiring",
+                            "holder_email": _WICK_TERRY,
+                        },
+                    ),
+                    ExpectedObject(
+                        type="Equipment", key="erp-assets:SKD-410",
+                        fields={"inspection_tracked": "no"},
+                    ),
+                ],
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": (
+                        "alerted=6, considered=7, equipment=2, "
+                        "untracked_assets=1, inspections=1, "
+                        "holder_unresolved=1, exception_tasks=4"
+                    ),
+                    "task_raised": "hr-safety/exception",
+                },
+            ),
+        ],
+    ),
+    EvalCase(
+        id="wick/a-second-window-the-same-day-re-sends-nothing",
+        spec_id=CREDENTIAL_SPEC.id,
+        name="The stage on the row is what stops a second notice",
+        summary=(
+            "Two windows on the same day. The second finds every row already "
+            "at the stage it is owed and sends nothing — the guard is the "
+            "`last_notice_stage` claim on the row itself, which is the "
+            "spreadsheet's *Last Notified* cell turned into something with a "
+            "provenance. This is also what makes a daily cadence safe."
+        ),
+        fixture_id="wick/compliance-clock",
+        trigger={"days": [WICK_AS_OF, WICK_AS_OF]},
+        expectations=[
+            MilestoneExpectation(
+                milestone="staged",
+                trajectory={"reported": "due=0, already_sent=6"},
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": "alerted=0, exception_tasks=0",
+                },
+            ),
+        ],
+    ),
+    EvalCase(
+        id="wick/the-cycle-walks-sixty-thirty-fifteen",
+        spec_id=CREDENTIAL_SPEC.id,
+        name="One row, three windows, three stages — and then nothing left",
+        summary=(
+            "The claim a table of thresholds cannot make on its own: the same "
+            "certificate is notified at sixty days, again at thirty and again "
+            "at fifteen, once each, as the date comes at it. The window graded "
+            "here is the third, where the row is thirteen days out and the "
+            "last stage fires."
+        ),
+        fixture_id="wick/compliance-clock",
+        trigger={"days": [WICK_AS_OF, "2026-10-10", "2026-10-25"]},
+        expectations=[
+            MilestoneExpectation(
+                milestone="staged",
+                trajectory={"reported": "due=1, by_stage~'15': 1"},
+            ),
+            MilestoneExpectation(
+                milestone="recorded",
+                objects=[ExpectedObject(
+                    type="Credential", key="hris-training:TR-3001",
+                    fields={
+                        "category": "training",
+                        "credential_type": "Fall Protection Refresher",
+                        "last_notice_stage": "15",
+                        "last_notified_on": "2026-10-25",
+                        "status": "expiring",
+                        "holder_email": _WICK_TERRY,
+                    },
+                )],
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": "alerted=1, already_sent=5",
+                },
+            ),
+        ],
+    ),
+]
+
+
+# ---- the plant window ------------------------------------------------------
+
+PLANT_SPEC = EvalSpec(
+    id="plant-eligibility",
+    flow_id="plant-eligibility-sweep",
+    version=1,
+    summary=(
+        "The screen a scheduler used to read down by eye, as clauses with "
+        "names. Every clause is a line on one governed page, they are read in "
+        "the page's order, and a job that fails one is excluded **for that "
+        "clause** and no other — so *why is this not on Thursday* has an "
+        "answer that cites the sentence it came from. The sweep itself writes "
+        "nothing at all: it decides what is in play and emits the facts the "
+        "extraction and the day-fill answer, which is why an empty eligible "
+        "set is a slow week rather than an alarm."
+    ),
+    milestones=[
+        Milestone(
+            id="screened",
+            label="once every candidate has been put to the governed clauses",
+            anchor="last_of_kind",
+            selector="rule",
+            note=(
+                "There is one rule step and this is it. The clauses are "
+                "evaluated in the page's order and stop at the first failure, "
+                "so a job that breaks two rules is excluded for the first — "
+                "which is what makes the counts below a partition rather than "
+                "a tally."
+            ),
+            trajectory=[
+                TrajectoryRule(
+                    kind="reported",
+                    note="the count per named clause. The English reason is on "
+                         "the step's own verdicts, one sentence per job",
+                ),
+                TrajectoryRule(
+                    kind="read",
+                    note="one page decides all of it",
+                ),
+            ],
+        ),
+        Milestone(
+            id="settled",
+            label="once the window has closed and the spine has run",
+            anchor="terminal",
+            note=(
+                "There is deliberately no `wrote` milestone on this spec. The "
+                "sweep commits no claim and draws no link — it decides what is "
+                "in play and emits the facts other flows answer — so a "
+                "milestone anchored on a write would be a milestone this flow "
+                "can never reach, and the `JobTask` rows in the world "
+                "afterwards belong to the extractions it started."
+            ),
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(
+                    kind="reported",
+                    note="what the window put in play: the extractions it "
+                         "raised and the department-days it opened. Both are "
+                         "started from inside this run, which is what makes "
+                         "this a spine rather than three flows",
+                ),
+            ],
+        ),
+    ],
+)
+
+PLANT_CASES = [
+    EvalCase(
+        id="wick/each-exclusion-names-its-own-clause",
+        spec_id=PLANT_SPEC.id,
+        name="Five jobs excluded, five different governed clauses",
+        summary=(
+            "A weekend load, a job on Do-Not-Fab, a load date already past, a "
+            "production week outside the governed set and a job not released "
+            "to the yard. Nine jobs considered, four eligible, and the five "
+            "exclusions are one apiece — not a tally of rules broken, but a "
+            "partition, because the clauses are read in the page's order and "
+            "stop at the first failure."
+        ),
+        fixture_id="wick/plant-day",
+        trigger={"as_of": WICK_AS_OF, "library": WICK_PLANT_LIBRARY},
+        expectations=[
+            MilestoneExpectation(
+                milestone="screened",
+                trajectory={
+                    "reported": (
+                        "considered=9, eligible=4, excluded=5, "
+                        "exclusions~'not-a-business-day': 1, "
+                        "exclusions~'held': 1, "
+                        "exclusions~'load-date-past': 1, "
+                        "exclusions~'week-position-out-of-set': 1, "
+                        "exclusions~'not-released': 1"
+                    ),
+                    "read": "knowledge:plant-scheduling-parameters",
+                },
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": (
+                        "bound=15, taken=4, deferred=0, raised=4, "
+                        "extractions_succeeded=4, extractions_failed=0, "
+                        "department_days=40"
+                    ),
+                },
+            ),
+        ],
+    ),
+    EvalCase(
+        id="wick/an-empty-eligible-set-raises-nothing",
+        spec_id=PLANT_SPEC.id,
+        name="Nothing eligible is informational, and raises nothing",
+        summary=(
+            "A book with two jobs in it and neither of them buildable. The "
+            "governed page calls an empty eligible set informational, so the "
+            "window says so and stops: no job is put in play, no department "
+            "day is opened, and nobody is interrupted. The distinction that "
+            "makes this safe is that an empty *book* — a feed that broke — is "
+            "a different fact and does reach a desk."
+        ),
+        fixture_id="wick/plant-day-nothing-eligible",
+        trigger={"as_of": WICK_AS_OF},
+        expectations=[
+            MilestoneExpectation(
+                milestone="screened",
+                trajectory={
+                    "reported": (
+                        "considered=2, eligible=0, excluded=2, "
+                        "exclusions~'held': 1, "
+                        "exclusions~'not-a-business-day': 1"
+                    ),
+                },
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": (
+                        "raised=0, taken=0, department_days=0, "
+                        "extractions_succeeded=0, extractions_failed=0"
+                    ),
+                },
+            ),
+        ],
+    ),
+]
+
+
+# ---- the shipping list -----------------------------------------------------
+
+EXTRACTION_SPEC = EvalSpec(
+    id="shipping-list-extraction",
+    flow_id="shipping-list-extraction",
+    version=1,
+    summary=(
+        "Seven pages of a shipping list become ten departments' hours, and "
+        "the model is only ever asked what is printed. The arithmetic that "
+        "turns a grid into hours is a governed formula, so a figure outside "
+        "its department's expected band is a **verdict on a field** — carried "
+        "to the one review the run already stops at — rather than a second "
+        "gate; a department whose page family is absent is skipped and "
+        "counted while the job goes on; the locating call is not made at all "
+        "when nothing is in doubt, because a second model call over a page "
+        "nobody is arguing about is spend with no question behind it; and a "
+        "correction re-runs **both** checks over the corrected reading rather "
+        "than being written straight through."
+    ),
+    milestones=[
+        Milestone(
+            id="read",
+            label="once the page has been read",
+            anchor="last_of_kind",
+            selector="modelcall",
+            note=(
+                "The last model call, which on a clean ticket is the only one: "
+                "the locate call is conditional, and *that it did not happen* "
+                "is the claim."
+            ),
+            trajectory=[
+                TrajectoryRule(
+                    kind="model_calls_at_most",
+                    note="one for the reading. A second is made only when a "
+                         "field a person will be asked about can be boxed on "
+                         "the page — never for a computed figure, which has no "
+                         "box because nobody printed it",
+                ),
+                TrajectoryRule(kind="step_absent"),
+            ],
+        ),
+        Milestone(
+            id="review",
+            label="the first time it stopped for a supervisor",
+            anchor="first_of_kind",
+            selector="task",
+            note=(
+                "Declared, and therefore only nameable by a case that expects "
+                "the run to stop. A clean ticket never reaches it, which is "
+                "the point of the clean case."
+            ),
+            trajectory=[
+                TrajectoryRule(
+                    kind="gate_count",
+                    note="one. An out-of-band figure and a low-confidence "
+                         "field are two findings on one review, not two "
+                         "interruptions",
+                ),
+                TrajectoryRule(kind="queue"),
+            ],
+        ),
+        Milestone(
+            id="demand",
+            label="once the departments' hours are on the job",
+            anchor="wrote",
+            selector="graph:JobTask/",
+            trajectory=[TrajectoryRule(
+                kind="step_ran",
+                note="the grid check, on its second pass. Anchored here rather "
+                     "than at the end because a milestone carries one claim per "
+                     "kind, and the hours check is the other half of the same "
+                     "promise",
+            )],
+            objects=[
+                ObjectRule(
+                    type="JobTask",
+                    fields=[
+                        FieldRule(field="department", match="exact"),
+                        FieldRule(field="labor_hours", match="approx",
+                                  tolerance=0.01),
+                        FieldRule(
+                            field="out_of_band", match="exact",
+                            note="the verdict, on the row. A supervisor "
+                                 "approving an unusual figure does not make it "
+                                 "an ordinary one",
+                        ),
+                        FieldRule(field="source_page", match="exact"),
+                    ],
+                ),
+            ],
+        ),
+        Milestone(
+            id="settled",
+            label="once the ticket has been answered",
+            anchor="terminal",
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(kind="reported"),
+                TrajectoryRule(
+                    kind="step_ran",
+                    note="a correction re-runs the grid check and the hours "
+                         "check over the corrected reading — the whole point "
+                         "of correcting rather than overriding",
+                ),
+            ],
+        ),
+    ],
+)
+
+_WICK_JOB_TICKET = {
+    "job_key": "erp-jobs:250553", "job_number": "250553",
+    "plant_site": "Mazo", "source": "erp-jobs",
+}
+
+EXTRACTION_CASES = [
+    EvalCase(
+        id="wick/a-clean-ticket-asks-nobody",
+        spec_id=EXTRACTION_SPEC.id,
+        name="A clean ticket is one model call, ten departments and no question",
+        summary=(
+            "Seven page families, every computed figure inside its governed "
+            "band and every field read confidently. One model call is made, "
+            "the locating call is not, nobody is interrupted, and ten "
+            "departments' hours land on the job."
+        ),
+        fixture_id="wick/shipping-list-pages",
+        trigger={**_WICK_JOB_TICKET, "library": {"250553": ""}},
+        expectations=[
+            MilestoneExpectation(
+                milestone="read",
+                trajectory={"model_calls_at_most": "1", "step_absent": "m2"},
+            ),
+            MilestoneExpectation(
+                milestone="demand",
+                objects=[
+                    ExpectedObject(
+                        type="JobTask", key="erp-jobs:250553:steel-fab",
+                        fields={
+                            "department": "steel-fab", "labor_hours": 10.76,
+                            "out_of_band": "no", "source_page": "C",
+                        },
+                    ),
+                    ExpectedObject(
+                        type="JobTask", key="erp-jobs:250553:truss-cut",
+                        fields={
+                            "department": "truss-cut", "labor_hours": 5.7,
+                            "out_of_band": "no", "source_page": "A1",
+                        },
+                    ),
+                ],
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": (
+                        "state=extracted, wrote=True, skipped=False, "
+                        "review_rounds=0, out_of_band=[], "
+                        "departments_skipped=[]"
+                    ),
+                },
+            ),
+        ],
+    ),
+    EvalCase(
+        id="wick/a-department-with-no-grid-is-skipped-and-the-job-is-not",
+        spec_id=EXTRACTION_SPEC.id,
+        name="An absent page family skips its department, not the job",
+        summary=(
+            "The trim page is not in this ticket. `trim-fab` gets no hours and "
+            "is named as skipped; `hardware-trim-pack`, which is fed by three "
+            "pages and has two of them, still does; and the other nine "
+            "departments are unaffected. A missing page is a fact about the "
+            "paper, not a reason to drop a building."
+        ),
+        fixture_id="wick/shipping-list-pages",
+        trigger={
+            **_WICK_JOB_TICKET,
+            "library": {"250553": "pages=A1,B,C,D,F,LL"},
+        },
+        expectations=[
+            MilestoneExpectation(
+                milestone="demand",
+                objects=[
+                    ExpectedObject(
+                        type="JobTask", key="erp-jobs:250553:trim-fab",
+                        absent=True,
+                    ),
+                    ExpectedObject(
+                        type="JobTask",
+                        key="erp-jobs:250553:hardware-trim-pack",
+                        fields={
+                            "department": "hardware-trim-pack",
+                            "out_of_band": "no",
+                        },
+                    ),
+                ],
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": (
+                        "state=extracted, wrote=True, "
+                        "departments_skipped=['trim-fab'], "
+                        "departments_written~hardware-trim-pack"
+                    ),
+                },
+            ),
+        ],
+    ),
+    EvalCase(
+        id="wick/out-of-band-hours-are-a-verdict-not-a-second-gate",
+        spec_id=EXTRACTION_SPEC.id,
+        name="A figure outside its band is one review, and stays out of band",
+        summary=(
+            "Sixty thousand linear feet of steel is five times an ordinary "
+            "job, and the governed formula turns it into forty-five hours "
+            "against a band that tops out at twenty-five. That is one finding "
+            "on the one review the run stops at — not a second interruption — "
+            "and the locating call is skipped, because a computed figure has "
+            "no box on the page to draw around. The supervisor signs it off "
+            "and the row is written **still marked out of band**: approving an "
+            "unusual figure does not make it an ordinary one."
+        ),
+        fixture_id="wick/shipping-list-pages",
+        trigger={**_WICK_JOB_TICKET, "library": {"250553": "steel_lf=60000"}},
+        decisions=[ScriptedDecision(
+            verdict="approved",
+            decided_by=WICK_SUPERVISOR,
+            note="Big roof, and the footage is right. Book it.",
+        )],
+        expectations=[
+            MilestoneExpectation(
+                milestone="read",
+                trajectory={"model_calls_at_most": "1", "step_absent": "m2"},
+            ),
+            MilestoneExpectation(
+                milestone="review",
+                trajectory={
+                    "gate_count": "1",
+                    "queue": "plant-supervisor",
+                },
+            ),
+            MilestoneExpectation(
+                milestone="demand",
+                objects=[ExpectedObject(
+                    type="JobTask", key="erp-jobs:250553:steel-fab",
+                    fields={
+                        "department": "steel-fab", "labor_hours": 45.8,
+                        "out_of_band": "yes", "source_page": "C",
+                    },
+                )],
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "reported": (
+                        "state=extracted, wrote=True, review_rounds=1, "
+                        "out_of_band=['steel-fab'], "
+                        f"decided_by={WICK_SUPERVISOR}"
+                    ),
+                },
+            ),
+        ],
+    ),
+    EvalCase(
+        id="wick/a-correction-re-runs-both-checks",
+        spec_id=EXTRACTION_SPEC.id,
+        name="A correction re-runs both checks over the corrected reading",
+        summary=(
+            "The supervisor reads the footage off the page again and puts the "
+            "real figure in. The grid check and the hours check both run again "
+            "over the corrected reading — which is what makes a correction a "
+            "correction rather than an override — and the department that was "
+            "out of band comes back inside it. The row that lands is the one "
+            "the arithmetic produced from the corrected page, not the number "
+            "the supervisor typed."
+        ),
+        fixture_id="wick/shipping-list-pages",
+        trigger={**_WICK_JOB_TICKET, "library": {"250553": "steel_lf=60000"}},
+        decisions=[ScriptedDecision(
+            verdict="corrected",
+            decided_by=WICK_SUPERVISOR,
+            note="Read the footage off the page again — it is twelve thousand.",
+            payload={"fields": {
+                "c_steel_fab.total_linear_feet": "12000",
+                "c_steel_fab.colours[0].linear_feet": "6000",
+                "c_steel_fab.colours[1].linear_feet": "6000",
+            }},
+        )],
+        expectations=[
+            MilestoneExpectation(
+                milestone="demand",
+                objects=[ExpectedObject(
+                    type="JobTask", key="erp-jobs:250553:steel-fab",
+                    fields={
+                        "department": "steel-fab", "labor_hours": 10.76,
+                        "out_of_band": "no", "source_page": "C",
+                    },
+                )],
+                trajectory={"step_ran": "c1_1"},
+            ),
+            MilestoneExpectation(
+                milestone="settled",
+                trajectory={
+                    "terminal_status": "succeeded",
+                    "step_ran": "c2_1",
+                    "reported": (
+                        "state=extracted, wrote=True, review_rounds=1, "
+                        "out_of_band=[], "
+                        f"decided_by={WICK_SUPERVISOR}"
+                    ),
+                },
+            ),
+        ],
+    ),
+]
+
+
+# ---- the day a department works --------------------------------------------
+
+SCHEDULING_SPEC = EvalSpec(
+    id="department-scheduling",
+    flow_id="department-scheduling",
+    version=1,
+    summary=(
+        "The one flow where Cumulus is the system of record, and therefore "
+        "the one with a central claim rather than a list of properties: "
+        "**nothing leaves the graph before a person signs it, and a day is "
+        "exportable only once approved.** The fill writes the day at "
+        "`pending_approval` and stops there; the export refuses a day in that "
+        "state and names the Task standing in its way; only a decision moves "
+        "it to `approved`, with the signer and the moment on the record and "
+        "the claim carrying their address rather than the flow's. Around that: "
+        "the fill stops where a governed number says to — a goal max, or for "
+        "the two departments the page names, the point their incentive crosses "
+        "zero — the latitude either side of it never reaches past the absolute "
+        "max, an unmet upstream dependency ends the day deferred rather than "
+        "failed, and the headcount is the count of who is `member_of` the "
+        "department rather than a number somebody typed."
+    ),
+    milestones=[
+        Milestone(
+            id="written",
+            label="once the day has been written",
+            anchor="wrote",
+            selector="graph:ScheduleDay/",
+            note=(
+                "The first write, which is the fill. Everything the fill "
+                "decided is on the day at this point — and so is the status "
+                "that makes it unexportable."
+            ),
+            objects=[
+                ObjectRule(
+                    type="ScheduleDay",
+                    fields=[
+                        FieldRule(field="department", match="exact"),
+                        FieldRule(field="schedule_date", match="exact"),
+                        FieldRule(field="status", match="exact"),
+                        FieldRule(field="total_hours", match="approx",
+                                  tolerance=0.01),
+                        FieldRule(field="goal_max_hours", match="exact"),
+                        FieldRule(field="abs_max_hours", match="exact"),
+                        FieldRule(field="fudge_hours", match="exact"),
+                        FieldRule(
+                            field="headcount", match="exact",
+                            note="the count of active people `member_of` the "
+                                 "department's Team. The design had a "
+                                 "supervisor typing it into a spreadsheet and "
+                                 "a bot counting the names",
+                        ),
+                        FieldRule(
+                            field="approved_by", match="absent",
+                            note="nobody has signed it yet, and that is the "
+                                 "whole claim",
+                        ),
+                    ],
+                    links=[LinkRule(
+                        type="has_schedule_entry", to_type="ScheduleEntry",
+                        expect="count",
+                        note="the rows the fill placed, in load-date order",
+                    )],
+                ),
+            ],
+        ),
+        Milestone(
+            id="proposed",
+            label="the moment it stopped for a signature",
+            anchor="first_of_kind",
+            selector="task",
+            note=(
+                "The permanent control point. A day sits here, unexportable, "
+                "for as long as it takes — and a case that grades this "
+                "milestone and no other is a case about a run that has not "
+                "finished, which is exactly the state being asserted."
+            ),
+            objects=[
+                ObjectRule(
+                    type="ScheduleDay",
+                    fields=[
+                        FieldRule(
+                            field="status", match="exact",
+                            note="`pending_approval`. The export answers 409 "
+                                 "for a day in this state and names the Task",
+                        ),
+                        FieldRule(field="approved_by", match="absent"),
+                        FieldRule(field="approved_at", match="absent"),
+                    ],
+                ),
+            ],
+            trajectory=[
+                TrajectoryRule(kind="gate_count"),
+                TrajectoryRule(kind="queue"),
+                TrajectoryRule(kind="task_raised"),
+            ],
+        ),
+        Milestone(
+            id="settled",
+            label="once the day has been answered",
+            anchor="terminal",
+            objects=[
+                ObjectRule(
+                    type="ScheduleDay",
+                    fields=[
+                        FieldRule(field="status", match="exact"),
+                        FieldRule(field="approved_by", match="exact"),
+                        FieldRule(field="approved_at", match="present"),
+                        FieldRule(field="headcount", match="exact"),
+                        FieldRule(field="total_hours", match="approx",
+                                  tolerance=0.01),
+                    ],
+                ),
+            ],
+            trajectory=[
+                TrajectoryRule(kind="terminal_status"),
+                TrajectoryRule(
+                    kind="reported",
+                    note="where the fill stopped, and which governed number "
+                         "stopped it — stated as its own arithmetic, so a "
+                         "supervisor can argue with it",
+                ),
+                TrajectoryRule(
+                    kind="claimed_by",
+                    note="the signature is the *person's* claim, not the "
+                         "flow's. A day approved under `flow:` would be a day "
+                         "nobody signed",
+                ),
+            ],
+        ),
+    ],
+)
+
+#: The days the governed lead-time table dates for this fixture's loads. Not
+#: arbitrary: `steel-fab` is fourteen business days back from the last load,
+#: `truss-fab` twenty-one, and the sweep opens one day per load date. They are
+#: written out because a case has to name the day it is about, and a natural
+#: key is `<department slug>:<date>`.
+_WICK_STEEL_DAY = "2026-10-02"
+_WICK_PACK_DAY = "2026-10-02"
+_WICK_TRUSS_FAB_DAY = "2026-09-23"
+
+_WICK_SIGN = ScriptedDecision(
+    verdict="approved",
+    decided_by=WICK_SUPERVISOR,
+    note="Signed — that is the day.",
+)
+
+SCHEDULING_CASES = [
+    EvalCase(
+        id="wick/nothing-leaves-the-graph-before-a-signature",
+        spec_id=SCHEDULING_SPEC.id,
+        name="The day is written, held at pending_approval, and waits",
+        summary=(
+            "The central claim, in the state it is actually made: the fill has "
+            "run, the day and its rows are in the graph, and the run has "
+            "stopped. `status` is `pending_approval`, nobody has signed it, "
+            "and the schedule export refuses a day in this state and names the "
+            "Task standing in its way. There is no decision in this case on "
+            "purpose — a day nobody has answered is the thing being graded."
+        ),
+        fixture_id="wick/plant-day",
+        trigger={
+            "as_of": WICK_AS_OF, "department": "steel-fab",
+            "schedule_date": _WICK_STEEL_DAY, "library": WICK_PLANT_LIBRARY,
+        },
+        expectations=[
+            MilestoneExpectation(
+                milestone="written",
+                objects=[ExpectedObject(
+                    type="ScheduleDay",
+                    key=f"steel-fab:{_WICK_STEEL_DAY}",
+                    fields={
+                        "department": "steel-fab",
+                        "schedule_date": _WICK_STEEL_DAY,
+                        "status": "pending_approval",
+                        "total_hours": 10.76,
+                        "goal_max_hours": 20.0,
+                        "abs_max_hours": 22.0,
+                        "fudge_hours": 1.0,
+                        "headcount": 3.0,
+                        "approved_by": "",
+                    },
+                    link_counts={"has_schedule_entry": 1},
+                )],
+            ),
+            MilestoneExpectation(
+                milestone="proposed",
+                objects=[ExpectedObject(
+                    type="ScheduleDay",
+                    key=f"steel-fab:{_WICK_STEEL_DAY}",
+                    fields={
+                        "status": "pending_approval",
+                        "approved_by": "",
+                        "approved_at": "",
+                    },
+                )],
+                trajectory={
+                    "gate_count": "1",
+                    "queue": "plant-supervisor",
+                    "task_raised": "plant-supervisor/decision",
+                },
+            ),
+        ],
+    ),
+    EvalCase(
+        id="wick/a-signed-day-carries-the-signature",
+        spec_id=SCHEDULING_SPEC.id,
+        name="A signed day is approved, and the goal max is what stopped it",
+        summary=(
+            "The same day, answered. `status` becomes `approved` with the "
+            "signer's address and the moment on the record — and the claim "
+            "carries *their* address, not the flow's, which is what makes it a "
+            "signature. The fill stopped where the governed page said to: "
+            "adding the next job would have taken the day past the ceiling the "
+            "goal max and its latitude allow, and that ceiling is below the "
+            "absolute max rather than beyond it."
+        ),
+        fixture_id="wick/plant-day",
+        trigger={
+            "as_of": WICK_AS_OF, "department": "steel-fab",
+            "schedule_date": _WICK_STEEL_DAY, "library": WICK_PLANT_LIBRARY,
+        },
+        decisions=[_WICK_SIGN],
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="ScheduleDay",
+                key=f"steel-fab:{_WICK_STEEL_DAY}",
+                fields={
+                    "status": "approved",
+                    "approved_by": WICK_SUPERVISOR,
+                    "approved_at": "",
+                    "headcount": 3.0,
+                    "total_hours": 10.76,
+                },
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "state=approved, status=approved, rows=1, "
+                    f"approved_by={WICK_SUPERVISOR}, "
+                    "capacity_row=no-condenstop, "
+                    "goal_max_hours=20.0, abs_max_hours=22.0, "
+                    "fudge_hours=1.0, "
+                    "stopped_at~past the governed ceiling of 21.0 h"
+                ),
+                "claimed_by":
+                    f"ScheduleDay.approved_by=human:{WICK_SUPERVISOR}",
+            },
+        )],
+    ),
+    EvalCase(
+        id="wick/the-incentive-crossing-zero-stops-the-fill",
+        spec_id=SCHEDULING_SPEC.id,
+        name="Hardware & Trim Packaging fills until it is out of the hole",
+        summary=(
+            "One of the two departments the governed page says the incentive "
+            "decides the fill for. Its capacity row has no goal max and no "
+            "ceiling at all — as far out as needed — so what stops the day is "
+            "the plant's own phrase for filling one: the bonus figure starts "
+            "negative and rises with hours, and the fill runs until it crosses "
+            "zero. The sentence on the run is the arithmetic itself, which is "
+            "the whole reason this is two governed numbers rather than a "
+            "formula in a spreadsheet cell."
+        ),
+        fixture_id="wick/plant-day",
+        trigger={
+            "as_of": WICK_AS_OF, "department": "hardware-trim-pack",
+            "schedule_date": _WICK_PACK_DAY, "library": WICK_PLANT_LIBRARY,
+        },
+        decisions=[_WICK_SIGN],
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="ScheduleDay",
+                key=f"hardware-trim-pack:{_WICK_PACK_DAY}",
+                fields={
+                    "status": "approved",
+                    "approved_by": WICK_SUPERVISOR,
+                    "approved_at": "",
+                    "headcount": 1.0,
+                    "total_hours": 29.34,
+                },
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "state=approved, rows=3, capacity_row=any, "
+                    "out_of_the_hole=True, below_capacity=False, "
+                    "stopped_at~crosses zero at 25.00 h, "
+                    "incentive_sentence~$-150.00 + $6.00/h"
+                ),
+            },
+        )],
+    ),
+    EvalCase(
+        id="wick/an-unmet-dependency-ends-the-day-deferred",
+        spec_id=SCHEDULING_SPEC.id,
+        name="Truss Fabrication waits for the saw, and the day is deferred",
+        summary=(
+            "The governed sequencing table puts `truss-cut` before "
+            "`truss-fab`, and it is read live off each job's own Done flags "
+            "rather than off a snapshot. No job on this day has been cut yet, "
+            "so nothing is placeable: no day is written, nobody is asked to "
+            "approve one, and the run ends `deferred` rather than failed — an "
+            "unmet dependency is a fact about Tuesday, not an error."
+        ),
+        fixture_id="wick/plant-day",
+        trigger={
+            "as_of": WICK_AS_OF, "department": "truss-fab",
+            "schedule_date": _WICK_TRUSS_FAB_DAY,
+            "library": WICK_PLANT_LIBRARY,
+        },
+        expectations=[MilestoneExpectation(
+            milestone="settled",
+            objects=[ExpectedObject(
+                type="ScheduleDay",
+                key=f"truss-fab:{_WICK_TRUSS_FAB_DAY}",
+                absent=True,
+            )],
+            trajectory={
+                "terminal_status": "succeeded",
+                "reported": (
+                    "state=deferred, wrote=False, rows=0, deferred=4, "
+                    "capacity_row=table-3-man, "
+                    "deferrals~'upstream-not-done': 4, "
+                    "reason~no share of this department's work could be placed"
+                ),
+            },
+        )],
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # The store
 # ---------------------------------------------------------------------------
 
-SPECS = [AP_SPEC, EXPENSE_SPEC, IDENTITY_SPEC, DISAGREEMENT_SPEC, RELEASE_SPEC]
+SPECS = [
+    AP_SPEC, EXPENSE_SPEC, IDENTITY_SPEC, DISAGREEMENT_SPEC, RELEASE_SPEC,
+    # Wick. Six specs over five flows: `field-documents` has two because its
+    # two claims are about two different worlds, and a fixture is a world.
+    FIELD_DOCUMENTS_SPEC, FIELD_MOVE_SPEC, CREDENTIAL_SPEC, PLANT_SPEC,
+    EXTRACTION_SPEC, SCHEDULING_SPEC,
+]
 CASES = {
     AP_SPEC.id: AP_CASES,
     EXPENSE_SPEC.id: EXPENSE_CASES,
     IDENTITY_SPEC.id: IDENTITY_CASES,
     DISAGREEMENT_SPEC.id: DISAGREEMENT_CASES,
     RELEASE_SPEC.id: RELEASE_CASES,
+    FIELD_DOCUMENTS_SPEC.id: FIELD_DOCUMENTS_CASES,
+    FIELD_MOVE_SPEC.id: FIELD_MOVE_CASES,
+    CREDENTIAL_SPEC.id: CREDENTIAL_CASES,
+    PLANT_SPEC.id: PLANT_CASES,
+    EXTRACTION_SPEC.id: EXTRACTION_CASES,
+    SCHEDULING_SPEC.id: SCHEDULING_CASES,
 }
+
+
+def validate_specs(
+    specs: list[EvalSpec] | None = None,
+    cases: dict[str, list[EvalCase]] | None = None,
+    fixtures: list[Fixture] | None = None,
+) -> list[str]:
+    """Every type and link a spec, case or fixture names must exist in the TBox.
+
+    The same conformance `validate_mappings` and `validate_collections` do, for
+    the third registry that writes ontology names down as data. A misspelled
+    type here does not raise — it grades. An `ObjectRule` for `Invoic` is a rule
+    nothing can ever satisfy, so the case fails for a reason that reads as a
+    flow regression; a `FixtureObject` of an undeclared type is a world that
+    silently sets up nothing. Both are caught at declaration time instead.
+    """
+    problems: list[str] = []
+    declared = {o.name for o in ONTOLOGY.objects}
+    links = {link.name for link in ONTOLOGY.links}
+
+    def check_type(where: str, name: str) -> None:
+        if name and name not in declared:
+            problems.append(f"{where}: unknown object type `{name}`")
+
+    for spec in specs if specs is not None else SPECS:
+        for milestone in spec.milestones:
+            for rule in milestone.objects:
+                where = f"spec `{spec.id}` milestone `{milestone.id}`"
+                check_type(where, rule.type)
+                for link in rule.links:
+                    if link.type not in links:
+                        problems.append(
+                            f"{where}: unknown link type `{link.type}`"
+                        )
+                    check_type(where, link.to_type)
+    for spec_id, spec_cases in (cases if cases is not None else CASES).items():
+        for case in spec_cases:
+            for expectation in case.expectations:
+                for expected in expectation.objects:
+                    check_type(
+                        f"case `{spec_id}/{case.id}` at "
+                        f"`{expectation.milestone}`",
+                        expected.type,
+                    )
+    for fixture in fixtures if fixtures is not None else declared_fixtures():
+        for obj in fixture.objects:
+            check_type(f"fixture `{fixture.id}`", obj.type)
+    return problems
 
 
 class DeclaredSpecStore:
@@ -2689,7 +4784,6 @@ def specs_asset_fields() -> dict:
         "path": "platform/evals/flow-specs",
         "title": "Flow eval specs",
         "kind": "schema-export",
-        "scope": "org",
         "owner": "platform-eng",
         "tags": ["evals", "governed-knowledge", "testing"],
         "status": "published",

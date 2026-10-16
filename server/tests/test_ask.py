@@ -100,16 +100,35 @@ def test_filters_apply_before_scoring_not_after(wired):
     """A narrow filter with a small limit must still return that filter's best.
 
     Filtering the top N afterwards is the bug this guards. Both teams own a
-    document mentioning "access", and unfiltered the People Ops one wins the
+    document mentioning "access", and unfiltered the Security one wins the
     single slot — so a post-hoc owner filter would return nothing at all.
     """
     unfiltered = wired.get("/api/v1/search", params={"q": "access", "limit": 1}).json()
-    assert unfiltered[0]["asset"]["owner"] == "people-ops"
+    assert unfiltered[0]["asset"]["owner"] == "security"
 
     filtered = wired.get(
-        "/api/v1/search", params={"q": "access", "limit": 1, "owner": "security"}
+        "/api/v1/search", params={"q": "access", "limit": 1, "owner": "people-ops"}
     ).json()
-    assert [h["asset"]["id"] for h in filtered] == ["vpn-standard"]
+    assert [h["asset"]["id"] for h in filtered] == ["onboarding-checklist"]
+
+
+def test_authority_settles_which_of_two_answers_governs(wired):
+    """Both documents contain "access"; BM25 puts the checklist first.
+
+    A `standard` outranks a `how-to`, so the governed precedence buys the VPN
+    standard the two places it needs to take the slot. This is the whole of
+    what authority weighting does — it reorders documents relevance already
+    found, and the checklist is still on the page directly underneath.
+    """
+    hits = wired.get("/api/v1/search", params={"q": "access"}).json()
+    assert [h["asset"]["id"] for h in hits[:2]] == [
+        "vpn-standard",
+        "onboarding-checklist",
+    ]
+    # And the lift is reported rather than applied invisibly: a reader who
+    # wonders why the standard is on top can see that it was bought.
+    assert hits[0]["authority_lift"] == 2
+    assert hits[1]["authority_lift"] == 0
 
 
 def test_search_filters_narrow_by_authority_and_tag(wired):
@@ -526,7 +545,7 @@ def test_an_unknown_sort_is_rejected(wired):
 
 def test_graph_tools_answer_a_question_no_document_contains():
     from app.answering import Toolbox
-    from app.reimbursements import SubmittedDocument
+    from app.tasks.expense_reimbursement.domain import SubmittedDocument
     from tests import world as test_world
 
     world = test_world.fresh()
@@ -535,11 +554,17 @@ def test_graph_tools_answer_a_question_no_document_contains():
         "total=32.50 category=travel",
         "total=41.00 category=meals",
     ):
-        world.expenses.submit(
+        # Submitted *and confirmed*: the expense flow writes the graph on the
+        # submitter's confirmation, so a run left waiting has nothing for a
+        # traversal to find.
+        request = world.expenses.submit(
             "erin.tavares@naviant.com",
             documents=[SubmittedDocument(hint=hint)],
             commentary="Client visit to Acme.",
         )
+        world.expenses.resume_for_task(world.tasks.decide(
+            request.task_id, "approved", "erin.tavares@naviant.com",
+        ))
 
     tools = Toolbox(world.knowledge, None, graph=world.graph)
     resolved = tools.resolve_entity("Employee", "erin.tavares@naviant.com")
@@ -588,7 +613,7 @@ def test_graph_tools_degrade_politely_without_an_entity_layer():
 
 def test_describe_entity_surfaces_retained_conflicts():
     from app.answering import Toolbox
-    from app.sync import SyncRequest
+    from app.connectors.sync import SyncRequest
     from tests import world as test_world
 
     world = test_world.fresh()

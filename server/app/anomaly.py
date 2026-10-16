@@ -38,6 +38,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, Field
 
 from .graph import GraphService
+from .ontology import names as onto
 from .models import utcnow
 
 log = logging.getLogger("cumulus.anomaly")
@@ -200,7 +201,7 @@ class AnomalyService:
         """
         cutoff = utcnow() - timedelta(days=window_days)
         profiles: list[VendorProfile] = []
-        for vendor in self.graph.find("Vendor"):
+        for vendor in self.graph.find(onto.VENDOR):
             invoices = [
                 other for _, other in self.graph.neighbors(vendor.id, "issued", "out")
             ]

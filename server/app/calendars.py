@@ -32,6 +32,7 @@ from datetime import date, datetime, timedelta
 from pydantic import BaseModel, Field
 
 from .graph import GraphService, ObjectRecord, object_id
+from .ontology import names as onto
 
 log = logging.getLogger("cumulus.calendars")
 
@@ -143,7 +144,7 @@ class CalendarService:
     def employee(self, email: str) -> ObjectRecord | None:
         if not email:
             return None
-        return self.graph.get(object_id("Employee", email))
+        return self.graph.get(object_id(onto.EMPLOYEE, email))
 
     def resolve_person(self, email: str) -> tuple[ObjectRecord | None, str]:
         """The employee whose week this is, or a sentence saying there is none.
@@ -298,7 +299,7 @@ class CalendarService:
     def calendars(self) -> list[CalendarSummary]:
         """Every calendar in the system — the proof that everyone has one."""
         return sorted(
-            (self._summarize(calendar) for calendar in self.graph.find("Calendar")),
+            (self._summarize(calendar) for calendar in self.graph.find(onto.CALENDAR)),
             key=lambda c: c.owner_name or c.address,
         )
 

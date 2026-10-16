@@ -46,31 +46,51 @@ from datetime import date, timedelta
 from collections.abc import Callable
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
-from . import media, routing
-from .anomaly import AnomalyService, parse_anomaly_thresholds
-from .auth import Principal, flow_principal
-from .dispatch import Dispatcher, InMemoryEventLog
-from .documents import DOCUMENT_COLLECTION, DocumentService, Region
-from .gateway import ActionGateway, InMemoryLedgerStore
-from .graph import Claim, GraphService, GraphWriter, InMemoryGraphStore, object_id
-from .flows import read_model_rates
-from .matching import MatchLine, MatchResult, match_invoice, parse_match_tolerances
-from .models import utcnow
-from .prompts import GovernedPrompt, read_prompt
-from .reimbursements import JournalEvent, _event  # shared journal shape
-from .resolution import ResolutionOutcome, ResolutionThresholds
-from .resolution import read_resolution_thresholds, resolve
-from .runs import ModelUsage, RunContext, RunEngine, RunRecord
-from .tasks import Task, TaskEvidence, TaskProposal, TaskService
+from ... import desks, media, modelcall, routing
+from ...anomaly import AnomalyService, parse_anomaly_thresholds
+from ...auth import Principal, flow_principal
+from ...dispatch import Dispatcher, InMemoryEventLog
+from ...documents import DOCUMENT_COLLECTION, DocumentService, Region
+from ...gateway import ActionGateway, InMemoryLedgerStore
+from ...graph import Claim, GraphService, GraphWriter, InMemoryGraphStore, object_id
+from ...flows import read_model_rates
+from ...matching import MatchLine, MatchResult, match_invoice, parse_match_tolerances
+from ...modelcall import GovernedModelClient
+from ...models import utcnow
+from ...ontology import names as onto
+from ...prompts import GovernedPrompt, read_prompt
+from . import paths
+from ..expense_reimbursement.domain import JournalEvent, _event  # shared journal shape
+from ...resolution import ResolutionOutcome, ResolutionThresholds
+from ...resolution import read_resolution_thresholds, resolve
+from ...runs import ModelUsage, RunContext, RunEngine, RunRecord
+from ...task_queue import Task, TaskEvidence, TaskProposal, TaskService
+# The hint grammar, imported for one caller: `StubInvoiceReader`, below the
+# banner. It lives in its own module so the boundary is greppable — see the
+# note there, and the test that holds it.
+from .scenarios import InvoiceScenario, fixture_document, written_scenario
 
 log = logging.getLogger("cumulus.payables")
 
 FLOW_ID = "accounts-payable"
+# The version fresh environments start live on. An environment that has
+# chosen (through the console) keeps its choice across redeploys.
+#
+# v9 rather than v6, and that is the whole of decision C1: v6 asks a clerk
+# twice, checks no arithmetic, computes no field verdicts, and — because
+# `is_empty(0.0)` is a question it never asks — could post a $0.00 invoice as
+# "matched". v9 is v8's real machinery with one human gate, routed to the
+# person who submitted the invoice. v6, v7 and v8 stay shipped and selectable.
+DEFAULT_VERSION = 9
 POLICY_ASSET_ID = "invoice-posting-policy"
 PROMPT_ASSET_ID = "invoice-extraction-prompt"
-CLERK_QUEUE = "ap-clerk"
+#: What this flow's one ModelCall is *for*, on its ledger row. The column that
+#: makes a bill legible without joining anything: two flows sharing one model
+#: differ here and nowhere else.
+EXTRACT_PURPOSE = "extract-invoice"
+CLERK_QUEUE = desks.AP_CLERK
 
 #: Who posts an invoice that no person reviewed. An invoice under the governed
 #: auto-post limit is committed on the Flow's own authority, bound to the same
@@ -78,26 +98,45 @@ CLERK_QUEUE = "ap-clerk"
 #: either way, and un-binding this stops auto-posting rather than exempting it.
 AP_FLOW = flow_principal(FLOW_ID, CLERK_QUEUE)
 
+
+def ap_flow_principal(*queues: str) -> Principal:
+    """`AP_FLOW`, additionally bound to the desks this case was routed to.
+
+    The same shape `expense_flow_principal` takes, for the same reason. v9
+    routes every review to the desk the governed approval table names, which
+    for a submitted invoice is that person's own — a different queue for every
+    case, so a module-level constant cannot name it, and `post-invoice` would
+    refuse the Flow's own commit on a run resumed with no live principal (a
+    seed, an eval case, an operator's `POST /runs/{id}/resume`).
+
+    Still declared and still bounded: the standing AP desk, plus the one desk
+    this run's Task was actually raised to, and nothing else. Un-bind it and
+    those resumes stop rather than being waved through.
+    """
+    return flow_principal(FLOW_ID, CLERK_QUEUE, *[q for q in queues if q])
+
+
 PayableState = Literal["posted", "pending", "denied"]
 
 
-# ---------------------------------------------------------------------------
-# The catalog
-# ---------------------------------------------------------------------------
-# Shared by the stub extractor, the seeded purchase orders and the console's
-# composer, so a local three-way match is a real match rather than a
-# coincidence: the same SKUs, the same descriptions, the same unit prices on
-# both sides. A deployment with a real extractor never reads this.
+def submitter_email(submitted_by: str) -> str:
+    """The person who handed this invoice over, or "" when nobody did.
 
-CATALOG: tuple[tuple[str, str, float], ...] = (
-    ("STL-0250", "Hot-rolled steel plate, 1/4 in", 486.00),
-    ("STL-0375", "Hot-rolled steel plate, 3/8 in", 712.50),
-    ("FAS-M12", "Grade 8 hex bolt, M12 x 60mm, box of 100", 128.75),
-    ("WLD-6013", "Welding rod E6013, 5kg", 92.40),
-    ("PPE-GLV", "Cut-resistant gloves, size L, 12 pair", 64.20),
-    ("CNS-HYD", "Hydraulic fluid ISO 46, 20L drum", 214.90),
-)
-_FREIGHT = ("FRT-STD", "Freight and handling", 0.0)
+    `submitted_by` is one field with two kinds of value in it, and the routing
+    table needs them told apart. Both human doors — the console upload and the
+    REST side door — put the authenticated principal's own address here, which
+    is the address a review routes back to. `ap-intake` puts `flow:ap-intake`,
+    because a file fetched out of a folder was handed over by nobody, and the
+    governed table's fallback desk is the honest answer for it.
+
+    A prefix check rather than a lookup: `flow:`/`system:` actors are how this
+    system spells "not a person" everywhere, and asking the org chart would
+    make a missing `Employee` row look like a machine-filed invoice.
+    """
+    text = (submitted_by or "").strip()
+    if not text or ":" in text.split("@")[0]:
+        return ""
+    return text if "@" in text else ""
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +170,14 @@ class InvoiceExtraction(BaseModel):
     currency: str = "USD"
     line_summary: str = ""
     confidence: float = 0.0
+    #: How sure the extractor was **per field**, keyed by canonical fact path
+    #: (`paths.py`). The whole-document `confidence` above answers "how did
+    #: this page read", which is the question the posting rule asks; it cannot
+    #: answer "which three numbers should a person check", which is the
+    #: question a review screen asks. A path absent here means the extractor
+    #: said nothing about that field, and 0.0 means the same — silence, never
+    #: a claim that it was unsure.
+    field_confidence: dict[str, float] = Field(default_factory=dict)
     model: str = ""
     # What the call consumed, reported by the reader that made it and priced
     # by the flow that declared the step. Zero means *unmeasured*, never free —
@@ -226,7 +273,16 @@ printed, invoice_number, invoice_date (ISO 8601), due_date (ISO 8601),
 po_number, subtotal_usd, freight_usd, tax_usd, total_usd, currency, a short
 line_summary, your confidence 0-1, and lines: an array of the billed lines, each
 with sku, description, quantity, unit_price_usd, amount_usd and kind (goods,
-freight, tax or discount). Respond with only a JSON object with those keys."""
+freight, tax or discount).
+
+Also return field_confidence: an object whose keys are the field names above
+and whose values are your confidence 0-1 in that one field, and on each line a
+field_confidence object over that line's own keys. Judge each field on its own
+— how clearly that value is printed and how sure you are you read it correctly
+— rather than repeating one number for the whole page. Omit a field you did not
+find rather than reporting low confidence in a guess.
+
+Respond with only a JSON object with those keys."""
 
 
 class InvoiceReader(Protocol):
@@ -250,14 +306,6 @@ class InvoiceReader(Protocol):
         ...
 
 
-_AP_VENDORS = (
-    "Acme Industrial Inc.",
-    "Northwind Traders LLC",
-    "Bay State Fasteners Co.",
-    "Cascade Welding Supply",
-)
-
-
 def _slug_to_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.split("-"))
 
@@ -269,186 +317,40 @@ def _name_to_slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", cleaned).strip("-")
 
 
-def _upper(value: str) -> str:
-    return value.strip().upper() if isinstance(value, str) else value
+# ---------------------------------------------------------------------------
+# STUB FIXTURES — invented, and read by `StubInvoiceReader` and nothing else
+# ---------------------------------------------------------------------------
+#
+# Four vendor names and six SKUs that no customer ever had. They used to be
+# module-level vocabulary shared with the console's composer, which meant a
+# deployed screen offered invented parts beside the ERP's real catalogue and a
+# person picking one could not tell which was which. The vendor master and the
+# item catalogue are in the graph, landed by `vendor-sync` and `sales-sync`;
+# anything on a production path reads them from there.
+#
+# What is left is the stub extractor's own vocabulary, quarantined under a
+# `_STUB_` prefix so a reviewer can grep for it. It exists so an offline run
+# with `MODEL_BACKEND=stub` produces an invoice whose lines a seeded purchase
+# order can actually match — the same SKUs, descriptions and unit prices on
+# both sides, so a local three-way match is a real match and not a
+# coincidence. A deployment with a real extractor never reaches this block.
 
-
-def _lower(value: str) -> str:
-    return value.strip().lower() if isinstance(value, str) else value
-
-
-class ScenarioLine(BaseModel):
-    sku: str = Field(default="", pattern=r"^[A-Z0-9.\-]*$")
-    #: Bounded so `to_hint` never reaches `%g`'s exponent form, which the
-    #: parser's charset cannot read back.
-    quantity: float = Field(default=1.0, ge=0, le=99999)
-
-    _norm = field_validator("sku", mode="before")(_upper)
-
-
-class ScenarioTwist(BaseModel):
-    """One deviation the grammar can ask for, and what it costs.
-
-    A twist is a property of the Flow rather than of a screen, so all four
-    facts are declared together: the token has to parse, the branch has to
-    exist, and `clause_id` has to name a value this Flow actually reads. A
-    checkbox offering a branch nothing reaches, or naming a clause nothing
-    consults, would teach the wrong thing while looking right.
-    """
-
-    id: str
-    token: str
-    label: str
-    branch: str
-    clause_id: str
-
-
-#: In the order `to_hint` writes them. Declared once because three things
-#: consume them — the parser, the serializer and the console's composer — and
-#: a twist present in one and not the others would be a branch you could
-#: reach and never author, or author and never reach.
-SCENARIO_TWISTS: tuple[ScenarioTwist, ...] = (
-    ScenarioTwist(
-        id="price_variance", token="pricebump",
-        label="Bill the old price (+8% on the first line)",
-        branch="price variance", clause_id="price-variance",
-    ),
-    ScenarioTwist(
-        id="over_receipt", token="overbill",
-        label="Bill 2 more of the first line than was received",
-        branch="quantity variance", clause_id="quantity-variance",
-    ),
-    ScenarioTwist(
-        id="low_confidence", token="blurry",
-        label="A page the extractor can barely read (confidence 0.55)",
-        branch="low extraction confidence", clause_id="min-confidence",
-    ),
-    ScenarioTwist(
-        id="tax_id", token="taxid",
-        label="Print a tax id on the page",
-        branch="tax-id resolution", clause_id="resolution-auto-link",
-    ),
+_STUB_VENDORS: tuple[str, ...] = (
+    "Acme Industrial Inc.",
+    "Northwind Traders LLC",
+    "Bay State Fasteners Co.",
+    "Cascade Welding Supply",
 )
 
-
-class InvoiceScenario(BaseModel):
-    """The case-authoring language of this Flow, as a model rather than prose.
-
-    A local run is steered by a *hint string* — `vendor=acme-industrial
-    po=PO-7741 lines=STL-0250:2,FAS-M12:3 pricebump` — and that string is not
-    debug scaffolding. It is how the seeded world is written, how the nine eval
-    cases state their triggers, and how a person submits an invoice by hand.
-    Three consumers, one vocabulary, and until now it existed only as a
-    docstring above a pile of regexes.
-
-    So the grammar lives here and everything goes through it: `parse` is the
-    only reader of the string, `to_hint` the only writer, and the console
-    composes an instance from real graph rows and shows the string assembling.
-
-    `to_hint(parse(s)) == s` for every hint the repository ships, which is the
-    property that matters: a seed hint that serialized one character
-    differently would build a different world, and the eval suite would fail
-    looking like a Flow regression.
-
-    Three fields say something an empty string cannot, so each is its own flag:
-    `no_po` (billed against no order at all) differs from an absent
-    `po_number` (the extractor invents one), and `unnamed_new_vendor` (a
-    vendor we do not know, name unspecified) differs from a named one.
-    """
-
-    #: A vendor in the master, by slug. The resolver links it.
-    vendor_slug: str = Field(default="", pattern=r"^[a-z0-9\-]*$")
-    #: A vendor the master does not hold, named. The resolver mints it
-    #: `onboarding` rather than matching it to anything.
-    new_vendor: str = Field(default="", pattern=r"^[a-z0-9\-]*$")
-    #: `newvendor` with no name: still unknown, but the extractor picks one.
-    unnamed_new_vendor: bool = False
-    #: The order this invoice bills, so the three-way match is a real match.
-    po_number: str = Field(default="", pattern=r"^(PO-\d+)?$")
-    #: Billed against no purchase order at all — the `unmatched` branch.
-    no_po: bool = False
-    invoice_number: str = Field(default="", pattern=r"^[A-Z0-9\-]*$")
-    #: SKUs from the shared catalog, so a synced PO can actually pair with it.
-    lines: list[ScenarioLine] = Field(default_factory=list)
-    #: An explicit invoice total; 0 leaves the arithmetic to the lines.
-    total_usd: float = Field(default=0.0, ge=0, le=99_999_999)
-
-    # Every field is constrained to the charset its token is spelled in, so a
-    # composed scenario round-trips by construction rather than by luck. The
-    # patterns are exactly what `parse` can read back: a value this refuses is
-    # one `to_hint` could write and `parse` could not recover, which would
-    # quietly submit a different invoice than the one on screen.
-    _upper_fields = field_validator("invoice_number", "po_number", mode="before")(_upper)
-    _lower_fields = field_validator("vendor_slug", "new_vendor", mode="before")(_lower)
-
-    @field_validator("total_usd")
-    @classmethod
-    def _to_cents(cls, value: float) -> float:
-        """`to_hint` writes two decimal places, so the model holds two."""
-        return round(value, 2)
-
-    # -- twists: each reaches one branch of the flow ------------------------
-    price_variance: bool = False
-    over_receipt: bool = False
-    low_confidence: bool = False
-    tax_id: bool = False
-
-    @classmethod
-    def parse(cls, text: str) -> "InvoiceScenario":
-        """Read a hint string. `text` is filename *and* hint, because an upload
-        with no hint still steers a stub extractor by its filename."""
-        lowered = text.lower()
-        named_new = re.search(r"newvendor[=\-_]([a-z0-9\-]+)", lowered)
-        # `vendor[=-_]` also matches inside `newvendor=…`, so a named new
-        # vendor wins outright rather than being read as both.
-        vendor = re.search(r"vendor[=\-_]([a-z0-9\-]+)", lowered)
-        po = re.search(r"po[=\-_](po-\d+)", lowered)
-        invoice = re.search(r"invoice[=\-_]([a-z0-9\-]+)", lowered)
-        pinned = re.search(r"lines[=\-_]([a-z0-9:.,\-]+)", lowered)
-        total = re.search(r"total[=\-_]\$?(\d+(?:\.\d{1,2})?)", lowered)
-
-        lines: list[ScenarioLine] = []
-        if pinned:
-            for token in pinned.group(1).split(","):
-                sku, _, quantity = token.partition(":")
-                if sku.strip():
-                    lines.append(ScenarioLine(
-                        sku=sku.strip().upper(), quantity=float(quantity or 1)
-                    ))
-        return cls(
-            vendor_slug="" if named_new else (vendor.group(1) if vendor else ""),
-            new_vendor=named_new.group(1) if named_new else "",
-            unnamed_new_vendor=named_new is None and "newvendor" in lowered,
-            po_number=po.group(1).upper() if po else "",
-            no_po="nopo" in lowered,
-            invoice_number=invoice.group(1).upper() if invoice else "",
-            lines=lines,
-            total_usd=float(total.group(1)) if total else 0.0,
-            **{t.id: t.token in lowered for t in SCENARIO_TWISTS},
-        )
-
-    def to_hint(self) -> str:
-        parts: list[str] = []
-        if self.new_vendor:
-            parts.append(f"newvendor={self.new_vendor}")
-        elif self.unnamed_new_vendor:
-            parts.append("newvendor")
-        elif self.vendor_slug:
-            parts.append(f"vendor={self.vendor_slug}")
-        if self.no_po:
-            parts.append("nopo")
-        elif self.po_number:
-            parts.append(f"po={self.po_number}")
-        if self.invoice_number:
-            parts.append(f"invoice={self.invoice_number}")
-        if self.lines:
-            parts.append("lines=" + ",".join(
-                f"{line.sku}:{line.quantity:g}" for line in self.lines
-            ))
-        if self.total_usd:
-            parts.append(f"total={self.total_usd:.2f}")
-        parts.extend(t.token for t in SCENARIO_TWISTS if getattr(self, t.id))
-        return " ".join(parts)
+_STUB_CATALOG: tuple[tuple[str, str, float], ...] = (
+    ("STL-0250", "Hot-rolled steel plate, 1/4 in", 486.00),
+    ("STL-0375", "Hot-rolled steel plate, 3/8 in", 712.50),
+    ("FAS-M12", "Grade 8 hex bolt, M12 x 60mm, box of 100", 128.75),
+    ("WLD-6013", "Welding rod E6013, 5kg", 92.40),
+    ("PPE-GLV", "Cut-resistant gloves, size L, 12 pair", 64.20),
+    ("CNS-HYD", "Hydraulic fluid ISO 46, 20L drum", 214.90),
+)
+_STUB_FREIGHT = ("FRT-STD", "Freight and handling", 0.0)
 
 
 class StubInvoiceReader:
@@ -458,6 +360,15 @@ class StubInvoiceReader:
     and where the grammar and the branch each token reaches are written down.
     What the scenario leaves unsaid this fills in from a hash of the input, so
     the same submission always reads the same way.
+
+    Three places a case can be written, and only one of them is reachable from
+    a request. The **filename**, which is what a stub extractor has always read
+    when nobody passed a hint; the **hint**, which v6 hands over and no route
+    carries; and the **page itself**, which is where a composed fixture writes
+    its case (`scenarios.fixture_document`). The third is what keeps the seeded
+    world and the eval cases running under v9, whose body passes no hint at
+    all: the artifact exists, its bytes are stored, and the stub reads the case
+    off the page the way a real extractor reads an invoice off one.
     """
 
     name = "stub"
@@ -472,9 +383,16 @@ class StubInvoiceReader:
         prompt: str = "",
         media_type: str = "",
     ) -> InvoiceExtraction:
-        scenario = InvoiceScenario.parse(f"{filename} {hint}")
+        written = written_scenario(image)
+        steer = hint or written
+        scenario = InvoiceScenario.parse(f"{filename} {steer}")
+        # A fixture page is *the hint*, so it is hashed as one rather than as
+        # bytes: the same composed case has to read the same way whichever
+        # version ran it, and hashing the wrapper too would give v9 a different
+        # freight figure and a different invoice date than v6 for one case.
         base = hashlib.sha256(
-            (image or b"") + filename.encode() + hint.encode()
+            (b"" if written else (image or b""))
+            + filename.encode() + steer.encode()
         ).digest()
 
         if scenario.new_vendor:
@@ -484,7 +402,7 @@ class StubInvoiceReader:
         elif scenario.unnamed_new_vendor:
             slug = f"meridian-supply-{base[:2].hex()}"
         else:
-            slug = _name_to_slug(_AP_VENDORS[base[3] % len(_AP_VENDORS)])
+            slug = _name_to_slug(_STUB_VENDORS[base[3] % len(_STUB_VENDORS)])
         vendor_name = _slug_to_name(slug)
 
         po_number = "" if scenario.no_po else (
@@ -496,10 +414,13 @@ class StubInvoiceReader:
         )
         issued = date.today() - timedelta(days=base[10] % 21)
 
-        # Lines from the shared catalog, so a synced PO can actually match.
-        # A pinned SKU the catalog does not hold is dropped rather than
+        # Lines from the stub catalogue, so a seeded PO can actually match.
+        # A pinned SKU the catalogue does not hold is dropped rather than
         # invented: there would be no PO line for it to pair against.
-        by_sku = {sku: (sku, description, price) for sku, description, price in CATALOG}
+        by_sku = {
+            sku: (sku, description, price)
+            for sku, description, price in _STUB_CATALOG
+        }
         picks: list[tuple[tuple[str, str, float], float]] = [
             (by_sku[line.sku], line.quantity)
             for line in scenario.lines if line.sku in by_sku
@@ -507,7 +428,7 @@ class StubInvoiceReader:
         if not picks:
             picks = [
                 (
-                    CATALOG[(base[12 + i] + i) % len(CATALOG)],
+                    _STUB_CATALOG[(base[12 + i] + i) % len(_STUB_CATALOG)],
                     float(1 + (base[15 + i] % 4)),
                 )
                 for i in range(2 + base[11] % 2)
@@ -529,11 +450,20 @@ class StubInvoiceReader:
                 amount_usd=round(quantity * price, 2), kind="goods",
             ))
 
+        if scenario.bad_line_math and lines:
+            # The amount stops agreeing with quantity × unit price, and nothing
+            # else moves: the subtotal below is summed from the amounts, so the
+            # document still adds up and the *only* thing wrong with this
+            # invoice is one line. That is the case worth authoring — an
+            # invoice that is wrong everywhere teaches nothing about a check
+            # whose whole claim is that it names the field.
+            lines[0].amount_usd = round(lines[0].amount_usd + 18.00, 2)
+
         subtotal = round(sum(line.amount_usd for line in lines), 2)
         freight = round(48 + base[20] % 90, 2)
         if freight > 0:
             lines.append(InvoiceLineExtract(
-                sku=_FREIGHT[0], description=_FREIGHT[1], quantity=1.0,
+                sku=_STUB_FREIGHT[0], description=_STUB_FREIGHT[1], quantity=1.0,
                 unit_price_usd=freight, amount_usd=freight, kind="freight",
             ))
         total = round(subtotal + freight, 2)
@@ -564,10 +494,39 @@ class StubInvoiceReader:
                 f"{line.quantity:g}× {line.sku}" for line in lines if line.kind == "goods"
             ),
             confidence=confidence,
+            field_confidence=_stub_field_confidence(
+                lines, confidence, smudged_total=scenario.smudged_total
+            ),
             model="stub-extractor",
             lines=lines,
             regions=_invoice_regions(lines, total, invoice_number),
         )
+
+
+def _stub_field_confidence(
+    lines: list[InvoiceLineExtract],
+    document_confidence: float,
+    *,
+    smudged_total: bool,
+) -> dict[str, float]:
+    """Per-field scores for the stub, so the verdict path runs offline.
+
+    Every field carries the document's own score, because that is what a
+    uniformly legible page looks like and the stub reads no page at all. The
+    interesting shapes are authored: `blurry` drags the whole document down and
+    `smudged` leaves it high while one number — the total, the one a clerk
+    would most want to check — reads badly on its own.
+    """
+    scores = {
+        paths.invoice_path(field): document_confidence
+        for field in paths.INVOICE_FIELDS
+    }
+    for index in range(len(lines)):
+        for field in paths.LINE_FIELDS:
+            scores[paths.line_path(index, field)] = document_confidence
+    if smudged_total:
+        scores[paths.invoice_path("total_usd")] = 0.40
+    return scores
 
 
 def _invoice_regions(
@@ -590,21 +549,24 @@ def _invoice_regions(
 
 
 class VertexInvoiceReader:
-    """Multimodal extraction on Vertex AI via google-genai.
+    """Multimodal extraction on Vertex AI, through the governed model client.
 
-    Same client and credentials as the embedder and the answer backend. One
-    prompt, one call: the vendor as printed plus the commercial content. That
-    prompt arrives from the flow, which read it out of the corpus — so the
+    One prompt, one call: the vendor as printed plus the commercial content.
+    That prompt arrives from the flow, which read it out of the corpus — so the
     instruction that forbids guessing an identifier is a governed value a
     customer can see and revise, not a literal buried here.
+
+    It no longer holds a `genai.Client` of its own. Four readers each building
+    one was four chances for a ModelCall to go unmetered, and the embedder had
+    already taken it; the shared client is what makes "every model invocation
+    is on the ledger" a property of the system rather than of four call sites
+    remembering.
     """
 
     name = "vertex"
 
-    def __init__(self, project: str | None, location: str, model: str) -> None:
-        from google import genai
-
-        self._client = genai.Client(vertexai=True, project=project, location=location)
+    def __init__(self, model: str, client: GovernedModelClient) -> None:
+        self._client = client
         self._model = model
 
     def _parts(
@@ -630,21 +592,22 @@ class VertexInvoiceReader:
 
         The token counts arrive on the same response as the answer and used to
         be dropped on the floor here, which is why every AP run's ModelCall
-        step reported a cost of zero.
+        step reported a cost of zero. They come back priced now, because the
+        client that made the call has just read the governed rate sheet to
+        price its own ledger row and two answers to one question is one too
+        many — the journal and the ledger agree by construction.
         """
         from google.genai import types
 
-        response = self._client.models.generate_content(
+        response, usage = self._client.generate(
             model=self._model,
             contents=[types.Content(role="user", parts=parts)],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json", temperature=temperature
             ),
+            purpose=EXTRACT_PURPOSE,
         )
-        return (
-            json.loads(response.text or "{}"),
-            ModelUsage.from_vertex(self._model, response),
-        )
+        return json.loads(response.text or "{}"), usage
 
     def read(
         self,
@@ -688,6 +651,7 @@ class VertexInvoiceReader:
             currency=str(data.get("currency", "USD") or "USD"),
             line_summary=str(data.get("line_summary", "") or ""),
             confidence=float(data.get("confidence", 0) or 0),
+            field_confidence=_field_confidence(data),
             model=self._model,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
@@ -695,11 +659,78 @@ class VertexInvoiceReader:
         )
 
 
+def _field_confidence(data: dict) -> dict[str, float]:
+    """A model's per-field scores, re-keyed to canonical fact paths.
+
+    The model answers in its own vocabulary — the same key names it just used
+    for the values, and a `field_confidence` object per line — because asking
+    it to emit `line_items[2].amount_usd` would be asking it to do bracket
+    arithmetic in the middle of reading a page, which is a reliable way to get
+    the index wrong. The translation into paths happens here instead, where the
+    line's position is known for certain.
+
+    Out-of-range and unparseable scores are dropped rather than clamped. A
+    confidence of 4 is not "very confident"; it is a field this model did not
+    answer the question about, and 0.0-means-silence is the honest reading.
+    """
+    out: dict[str, float] = {}
+
+    def record(path: str, raw: object) -> None:
+        try:
+            value = float(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return
+        if 0.0 <= value <= 1.0:
+            out[path] = value
+
+    for field, raw in (data.get("field_confidence") or {}).items():
+        if field in paths.INVOICE_FIELDS:
+            record(paths.invoice_path(str(field)), raw)
+    for index, item in enumerate(data.get("lines") or []):
+        if not isinstance(item, dict):
+            continue
+        scores = item.get("field_confidence")
+        if isinstance(scores, dict):
+            for field, raw in scores.items():
+                if field in paths.LINE_FIELDS:
+                    record(paths.line_path(index, str(field)), raw)
+            continue
+        # A single score for the whole line is the shape a model falls back to
+        # when the per-field object is more structure than it wants to emit.
+        # Spread across the line's fields rather than dropped: "this line was
+        # hard to read" is a claim about every number on it.
+        if "confidence" in item:
+            for field in paths.LINE_FIELDS:
+                record(paths.line_path(index, field), item.get("confidence"))
+    return out
+
+
 def build_invoice_reader(
-    backend: str, project: str | None, location: str, model: str
+    backend: str,
+    project: str | None,
+    location: str,
+    model: str,
+    *,
+    client: GovernedModelClient | None = None,
 ) -> InvoiceReader:
+    """`client` is the deployment's governed client; None builds a private one.
+
+    A reader constructed without one is a test or a script, and it still meters
+    and still ledgers — into a store nobody serves. The alternative, a reader
+    that calls a model with no record anywhere, is the thing the ledger exists
+    to make impossible.
+
+    The last line used to be a bare `return StubInvoiceReader()`, which meant
+    every backend name that was not exactly `vertex` — a typo, an unset
+    variable, a value from a config nobody reviewed — produced a reader that
+    fabricates an extraction from a hash of the filename. `require_stub_opt_in`
+    is the difference between choosing that and falling into it.
+    """
     if backend == "vertex":
-        return VertexInvoiceReader(project, location, model)
+        return VertexInvoiceReader(
+            model, client or modelcall.vertex_client(project, location)
+        )
+    modelcall.require_stub_opt_in(backend, "invoice reader")
     return StubInvoiceReader()
 
 
@@ -748,17 +779,37 @@ class PolicyClause(BaseModel):
     deciding: bool = False
 
 
-def read_policy_clauses(knowledge) -> list[PolicyClause]:
+def _declared_step_names(version: int) -> set[str]:
+    """The step names one shipped version declares, or empty for an unshipped one."""
+    from .. import shipped_versions
+
+    module = shipped_versions(FLOW_ID).get(version)
+    return {step.name for step in getattr(module, "STEPS", [])} if module else set()
+
+
+def read_policy_clauses(knowledge, version: int | None = None) -> list[PolicyClause]:
     """Every governed value the accounts-payable flow reads, at its revision.
 
     Two documents, because the flow reads two: the posting policy governs the
     limit, the match and the screen; the entity-resolution policy governs
     whether a printed name becomes a link or a new vendor.
 
-    Only what a run actually consults is listed. A screen that showed the
-    whole document would be a document viewer — the Library is that — and one
-    that showed a curated subset would drift from what the flow reads.
+    Only what a run actually consults is listed — and "the flow" means the
+    version that runs, so the list is read off that version's declared steps:
+    a version without the anomaly screen does not list outlier thresholds it
+    never consults, and one that resolves review routing lists whose desk a
+    review lands on. A screen that showed the whole document would be a
+    document viewer — the Library is that — and one that showed a curated
+    subset would drift from what the flow reads.
     """
+    from .. import default_version
+
+    names = _declared_step_names(
+        version if version is not None else default_version(FLOW_ID)
+    )
+    # An unshipped or unknown version answers with everything: overstating what
+    # an odd world consults beats hiding a clause a run is about to cite.
+    show_all = not names
     asset = knowledge.repo.get(POLICY_ASSET_ID) if knowledge else None
     content = asset.content if asset is not None else ""
     ref = _knowledge_ref(asset) if asset is not None else f"knowledge:{POLICY_ASSET_ID}"
@@ -766,7 +817,14 @@ def read_policy_clauses(knowledge) -> list[PolicyClause]:
     match = parse_match_tolerances(content, ref)
     screen = parse_anomaly_thresholds(content, ref)
     resolution = read_resolution_thresholds(knowledge)
-    return [
+    # The field-verdict values live in the version package that reads them, and
+    # are imported here rather than re-parsed: this list exists to show a person
+    # what a run consults, and a second parser would eventually show them a
+    # number no run had ever used.
+    from .v8.arithmetic import parse_arithmetic_tolerances
+
+    field = parse_arithmetic_tolerances(content, ref)
+    clauses = [
         PolicyClause(
             id="auto-post-limit", label="Auto-post limit",
             value=f"${posting.limit_usd:,.2f}", ref=ref,
@@ -802,20 +860,51 @@ def read_policy_clauses(knowledge) -> list[PolicyClause]:
             cites="not booked in yet",
         ),
         PolicyClause(
-            id="amount-outlier", label="Amount outlier multiple",
-            value=f"{screen.outlier_multiple:.1f}× the vendor's median", ref=ref,
-            cites="anomaly (amount-outlier)",
+            id="min-field-confidence", label="Minimum field confidence",
+            value=f"{field.min_field_confidence:.2f}", ref=ref,
+            cites="below the governed floor",
         ),
         PolicyClause(
-            id="duplicate-window", label="Duplicate window",
-            value=f"{screen.duplicate_window_days} days", ref=ref,
-            cites="anomaly (duplicate-suspect)",
+            id="line-arithmetic", label="Line arithmetic tolerance",
+            value=f"${field.line_amount_usd:,.2f}", ref=ref,
+            cites="but this line reads",
+        ),
+        PolicyClause(
+            id="document-arithmetic", label="Document arithmetic tolerance",
+            value=f"${field.document_usd:,.2f}", ref=ref,
+            cites="but the invoice total reads",
         ),
         PolicyClause(
             id="resolution-auto-link", label="Vendor auto-link at or above",
             value=f"{resolution.auto_link_at:.2f}", ref=resolution.source_ref,
         ),
     ]
+    if show_all or "anomaly-screen" in names:
+        clauses.extend([
+            PolicyClause(
+                id="amount-outlier", label="Amount outlier multiple",
+                value=f"{screen.outlier_multiple:.1f}× the vendor's median",
+                ref=ref, cites="anomaly (amount-outlier)",
+            ),
+            PolicyClause(
+                id="duplicate-window", label="Duplicate window",
+                value=f"{screen.duplicate_window_days} days", ref=ref,
+                cites="anomaly (duplicate-suspect)",
+            ),
+        ])
+    if show_all or "read-knowledge" in names:
+        table = routing.parse_routing(content, default_fallback=CLERK_QUEUE)
+        landing = table.rules[0].target if table.rules else table.fallback
+        suffix = (
+            f" (fallback {table.fallback})" if table.rules and table.fallback else ""
+        )
+        clauses.append(
+            PolicyClause(
+                id="review-routing", label="Reviews land on",
+                value=f"{landing}{suffix}", ref=ref,
+            )
+        )
+    return clauses
 
 
 def clauses_cited_by(clauses: list[PolicyClause], reason: str) -> list[PolicyClause]:
@@ -917,9 +1006,25 @@ class PayableService:
         anomaly: AnomalyService | None = None,
         gateway: ActionGateway | None = None,
         dispatcher: Dispatcher | None = None,
+        locator=None,  # v8.locate.FieldLocator — duck-typed, see below
+        queues=None,  # QueueService — duck-typed, for the same reason
     ) -> None:
         self.directory = directory
         self.reader = reader
+        # The desk registry, so a review can be routed to the person who
+        # submitted the invoice. `None` is a service wired without one (a unit
+        # test), and then a `submitter` target falls back to the governed
+        # fallback desk with `fell_back` set rather than raising: a routing
+        # question the policy already answers must not fail a payment.
+        self.queues = queues
+        # The second reader, and it is deliberately typed as nothing. A
+        # `FieldLocator` lives in the v8 package because locating disputed
+        # fields is that version's idea; this service is shared by three
+        # shipped versions and importing one version's module here would make
+        # the package import itself. A version that has no use for it never
+        # asks, and `None` is a deployment that shows no boxes rather than one
+        # that shows invented ones.
+        self.locator = locator
         self.knowledge = knowledge
         self.tasks = tasks
         self.engine = engine
@@ -941,7 +1046,20 @@ class PayableService:
             Dispatcher(engine, InMemoryEventLog()) if engine is not None else None
         )
         if engine is not None:
-            engine.register(FLOW_ID, self._body)
+            # One registration per shipped version directory: the engine can
+            # then run whichever one the stored definition says is live, and
+            # resume old runs under the version that wrote their journals.
+            from .. import shipped_versions
+
+            for number, module in sorted(shipped_versions(FLOW_ID).items()):
+                # `metered` is what puts this run's coordinates in scope for the
+                # ModelCall the body makes: the extractor is called from a
+                # closure that knows nothing about runs, and a ledger row with
+                # no run and no step is a cost nobody can attribute to a case.
+                engine.register(
+                    FLOW_ID, modelcall.metered(module.build_body(self)),
+                    version=number, default=(number == DEFAULT_VERSION),
+                )
 
     # -- reads --------------------------------------------------------------
 
@@ -1019,6 +1137,28 @@ class PayableService:
             return "", f"knowledge:{POLICY_ASSET_ID}"
         return asset.content, _knowledge_ref(asset)
 
+    def _resolve_submitter_desk(
+        self, submitted_by: str, fallback: str
+    ) -> routing.ResolvedQueue:
+        """The submitter's own desk, answered against the org chart and the
+        registry — or the fallback, saying why it fell back.
+
+        The one fetching half of routing, and it runs inside a transform step
+        for the reason `routing`'s own docstring gives: a Rule never fetches.
+        What comes back out is a concrete queue and a sentence, and the band
+        the amount falls in is decided afterwards from values already in hand.
+
+        Deterministic, so a resumed run picks the same desk and mints no second
+        inbox: `ensure_personal` keys the slug off the address.
+        """
+        return routing.resolve(
+            routing.SUBMITTER,
+            submitter_email=submitter_email(submitted_by),
+            graph=self.graph,
+            queues=self.queues,
+            fallback=fallback,
+        )
+
     # -- entry point --------------------------------------------------------
 
     def submit(
@@ -1028,16 +1168,41 @@ class PayableService:
         filename: str = "",
         hint: str = "",
         *,
+        document_id: str = "",
         run_id: str | None = None,
         submitted_at_iso: str = "",
     ) -> InvoiceRecord:
+        """Submit one invoice. `hint` is authoring apparatus, not a request field.
+
+        No route passes it: both doors (`payables_api` and the console) carry
+        bytes and a filename and nothing else, because a hint is a way to get
+        an extraction without a document. What still passes one is the seeded
+        world and the eval cases — see `scenarios.py` — where composing a case
+        is the whole point and the extractor is explicitly the stub.
+
+        `document_id` names an artifact the store already holds, which is how
+        v8 is driven. `ap-intake` does not come through here — it emits the
+        fact itself, per invoice, because a windowed flow raising forty cases
+        has no single row to return — but the two put the same key on the same
+        event, so a run is the same run whichever door opened it.
+
+        A hint with no artifact behind it is turned into one. From v9 the flow
+        refuses a run with no document, and that rule holds for fixtures too —
+        so the composed case becomes a page with the case written on it
+        (`scenarios.fixture_document`) and the run reads stored bytes like
+        every other. Which is the honest arrangement: the exemption a fixture
+        needs is "you may compose the document", not "you may skip it".
+        """
         if self.dispatcher is None:
             raise RuntimeError("Payable service has no run engine wired")
+        if hint and not image_b64 and not document_id:
+            image_b64 = base64.b64encode(fixture_document(hint)).decode()
         inputs = {
             "submitted_by": submitted_by,
             "image_b64": image_b64,
             "filename": filename,
             "hint": hint,
+            "document_id": document_id,
             "submitted_at_iso": submitted_at_iso or utcnow().isoformat(),
         }
         # The fact, not the run: an invoice arriving is what happened, and
@@ -1060,290 +1225,72 @@ class PayableService:
         """
         if task.flow_id != FLOW_ID or self.engine is None:
             return None
+        self._emit_correction(task)
         record = self.engine.resume_for_task(task.id, principal=principal)
         return self._project(record) if record else None
+
+    # -- the flywheel -------------------------------------------------------
+
+    def _emit_correction(self, task: Task) -> None:
+        """Announce what a clerk changed, and then get on with the invoice.
+
+        Doctrine's flywheel clause is specific about the route: a human
+        correction flows back **decoupled, via an Event, not inline**. So this
+        emits `ExtractionCorrected` and returns — the Trigger table answers it
+        with an `ap-corrections` run that appends the raw→corrected pairs, and
+        the invoice below carries on posting whether or not that lands. The
+        alternative, appending here, would put a knowledge write in the middle
+        of a payment's critical path and give a correction-set outage the power
+        to stop a payment.
+
+        Emitted before the resume, deliberately: the resume applies the patch,
+        and after it the extraction the clerk was looking at is gone. What is
+        wanted is the pair — what the model read *and* what the human said —
+        and only one of those two is still on the record afterwards.
+        """
+        decision = task.decision
+        if (
+            decision is None
+            or decision.verdict != "corrected"
+            or self.dispatcher is None
+            or self.engine is None
+        ):
+            return
+        record = self.engine.get(task.run_id)
+        if record is None or record.status != "suspended":
+            # The decision has already been carried into the run. A second call
+            # here — the API hook and a seeding script both reaching for the
+            # same task — must not append the same pair twice, and "is this run
+            # still waiting" is the fact that distinguishes them.
+            return
+        extraction = _extraction_of(record)
+        pairs = _correction_pairs(extraction, decision.payload, task)
+        if not pairs:
+            return
+        self.dispatcher.emit(
+            "ExtractionCorrected",
+            {
+                "pairs": pairs,
+                "document_id": str(
+                    _step_output(record, "s1").get("document_id", "")
+                ),
+                "invoice_number": extraction.invoice_number,
+                "vendor_id": str(_step_output(record, "z1").get("vendor_id", "")),
+                "flow_id": record.flow_id,
+                "flow_version": record.flow_version,
+                "run_id": record.id,
+                "case_ref": record.case_ref or record.id,
+                "task_id": task.id,
+                "decided_by": decision.decided_by,
+            },
+            actor=decision.decided_by,
+            case_ref=record.case_ref or record.id,
+        )
 
     def apply_task_decision(
         self, task: Task, principal: Principal | None = None
     ) -> InvoiceRecord | None:
         return self.resume_for_task(task, principal)
-
-    # -- the flow body ------------------------------------------------------
-
-    def _body(self, ctx: RunContext, inputs: dict) -> dict:
-        submitted_by = inputs["submitted_by"]
-        filename = inputs.get("filename", "")
-        hint = inputs.get("hint", "")
-        image_b64 = inputs.get("image_b64", "")
-        submitted_at = inputs.get("submitted_at_iso") or utcnow().isoformat()
-        image = base64.b64decode(image_b64) if image_b64 else None
-
-        ctx.event(
-            "t1", "InvoiceReceived",
-            f"invoice received from {submitted_by}"
-            + (f" ({filename})" if filename else ""),
-            kind="trigger",
-        )
-
-        slot = ctx.step(
-            "s1", "store-document", "action",
-            fn=lambda: self._store(image_b64, filename, submitted_by, ctx.record.id),
-            writes=lambda out: [f"document:{out['document_id']}"],
-            summary=lambda out: (
-                f"artifact {out['document_id']} stored in `{DOCUMENT_COLLECTION}`"
-            ),
-        )
-        document_id = slot["document_id"]
-
-        # -- x0: the governed read the ModelCall runs on -------------------
-        # A prompt is knowledge, so it is read here at a revision rather than
-        # compiled in, and the revision travels onto the extraction step.
-        prompt = GovernedPrompt.model_validate(ctx.step(
-            "x0", "read-prompt", "transform",
-            fn=lambda: self.read_prompt().model_dump(),
-            summary=lambda out: (
-                f"{out['source_ref']}: {len(out['text'])} characters"
-                + ("" if out["found_asset"]
-                   else " — not in the corpus, running on the built-in default")
-            ),
-        ))
-        ctx.note_refs(prompt.source_ref)
-
-        # The price sheet this run's one ModelCall is metered against. See the
-        # same read in `reimbursements`: a ref on the metered step rather than
-        # a governed read a Rule consumes, because the rates change what the
-        # journal records the call cost and nothing about what the flow does.
-        rates = read_model_rates(self.knowledge)
-
-        # -- m1: one call reads the whole document ------------------------
-        extraction = InvoiceExtraction.model_validate(ctx.step(
-            "m1", "extract-invoice", "modelcall",
-            fn=lambda: self._extract(
-                image, filename, hint, document_id, prompt.text
-            ).model_dump(),
-            summary=lambda out: (
-                f"{out['model']}: {out['vendor_name'] or 'unnamed vendor'} · "
-                f"{out['invoice_number']} · ${out['total_usd']:,.2f} · "
-                f"{len(out['lines'])} line(s) · "
-                f"confidence {out['confidence']:.2f}"
-            ),
-            # Off the extraction, not off the reader's name. `getattr(reader,
-            # "name")` was the backend — "vertex" — filed in the column an
-            # auditor reads as the model that made the claim.
-            meter=lambda out: rates.priced(ModelUsage(
-                model=str(out.get("model") or ""),
-                input_tokens=int(out.get("input_tokens") or 0),
-                output_tokens=int(out.get("output_tokens") or 0),
-            )),
-            refs=[
-                f"document:{document_id}", prompt.source_ref, rates.source_ref,
-            ],
-            # The operations desk, not the AP clerk's: an extraction that
-            # threw is an engineering fault, and Connie has no verdict to give
-            # on one. See the note at the same step in `reimbursements`.
-            retries=1, escalate_queue=routing.OPS_QUEUE,
-        ))
-
-        # -- z1: the printed name becomes one canonical vendor ------------
-        # A resolution, not a decision: the resolver picked a winner among
-        # candidates by the governed thresholds and nobody was asked. Automatic
-        # like an observation, ledgered like a decision — which is exactly what
-        # the doctrine asks of the third regime.
-        resolve_act = self.gateway.action(
-            "resolve-identities", flow_principal(FLOW_ID),
-            run=ctx.record, step_id="z1",
-        )
-        resolution_raw = ctx.step(
-            "z1", "resolve-vendor", "resolve",
-            fn=lambda: resolve_act.commit(
-                lambda w: self._resolve_vendor(extraction, ctx.record.id, w)
-            ),
-            writes=lambda _out: resolve_act.writes,
-            summary=lambda out: (
-                f"{out['disposition']}: {out['label'] or '—'} "
-                f"({out['method']} {out['score']:.2f}) — {out['reason']}"
-            ),
-        )
-        vendor_id = resolution_raw.get("vendor_id", "")
-        vendor_label = resolution_raw.get("label", "")
-
-        if resolution_raw["disposition"] == "review":
-            # A per-case flow *does* stop here: posting against the wrong
-            # vendor is not a recoverable mistake, and the candidates are
-            # already scored, so the question is cheap for a human to answer.
-            decision = ctx.gate(
-                "k0", "confirm-vendor",
-                build_task=lambda: self._build_vendor_task(
-                    ctx.record, extraction, resolution_raw, submitted_by
-                ),
-            )
-            # The clerk named a vendor: a decision, and a consequential one —
-            # posting against the wrong company is not a recoverable mistake.
-            confirm = self.gateway.action(
-                "confirm-vendor", ctx.principal or AP_FLOW,
-                run=ctx.record, step_id="a0",
-                task_id=f"task_{ctx.record.id}_k0",
-                decided_by=decision.decided_by,
-            )
-            chosen = ctx.step(
-                "a0", "apply-vendor-decision", "action",
-                fn=lambda: confirm.commit(lambda w: self._apply_vendor_decision(
-                    extraction, resolution_raw, decision, ctx.record.id, w,
-                )),
-                writes=lambda _out: confirm.writes,
-                summary=lambda out: (
-                    f"{out['action']} {out['label']} by {out['decided_by']}"
-                ),
-            )
-            vendor_id = chosen["vendor_id"]
-            vendor_label = chosen["label"]
-
-        # -- x3: the lines become facts -----------------------------------
-        lines = ctx.step(
-            "x3", "project-lines", "transform",
-            fn=lambda: [line.model_dump() for line in extraction.lines],
-            summary=lambda out: (
-                f"{len(out)} line(s) · "
-                f"{sum(1 for line in out if line['kind'] == 'goods')} goods, "
-                f"{sum(1 for line in out if line['kind'] != 'goods')} "
-                "freight/tax"
-            ),
-        )
-
-        # -- x4/c1: the three-way match, against the synced graph ----------
-        context = ctx.step(
-            "x4", "gather-po-and-receiving", "transform",
-            fn=lambda: self._gather_match_context(vendor_id, extraction.po_number),
-            summary=lambda out: (
-                f"{len(out['po_numbers'])} PO(s) and "
-                f"{len(out['receipt_numbers'])} receiving report(s) in the "
-                "graph for this invoice"
-                if out["po_numbers"] or out["receipt_numbers"] else
-                "no purchase order or receiving report in the graph for this "
-                "invoice"
-            ),
-        )
-        policy_content, policy_ref = self._policy_asset_content()
-        match_raw = ctx.step(
-            "c1", "three-way-match", "check",
-            fn=lambda: match_invoice(
-                [
-                    MatchLine.model_validate(line)
-                    for line in _invoice_match_lines(extraction)
-                ],
-                [MatchLine.model_validate(line) for line in context["po_lines"]],
-                [MatchLine.model_validate(line) for line in context["receipt_lines"]],
-                parse_match_tolerances(policy_content, policy_ref),
-                invoice_total_usd=extraction.total_usd,
-            ).model_dump(),
-            summary=lambda out: MatchResult.model_validate(out).summary(),
-            refs=[policy_ref] + [
-                f"graph:PurchaseOrder/{n}" for n in context["po_numbers"]
-            ],
-        )
-        match = MatchResult.model_validate(match_raw)
-
-        # -- c2: anomaly, against this vendor's own history ----------------
-        screen = ctx.step(
-            "c2", "anomaly-screen", "check",
-            fn=lambda: self._screen(
-                vendor_id, extraction, policy_content, policy_ref
-            ),
-            summary=lambda out: (
-                f"{len(out['findings'])} finding(s): "
-                + "; ".join(f["kind"] for f in out["findings"])
-                + f" · basis: {out['basis']}"
-                if out["findings"] else f"nothing unusual · basis: {out['basis']}"
-            ),
-            refs=[policy_ref],
-        )
-
-        # -- r2/k2: post or review ----------------------------------------
-        policy_raw = ctx.step(
-            "x5", "read-posting-policy", "transform",
-            fn=lambda: self.read_policy().model_dump(),
-            summary=lambda out: (
-                f"{out['source_ref']}: auto-post ≤ ${out['limit_usd']:,.2f} · "
-                f"min confidence {out['min_confidence']:.2f}"
-            ),
-        )
-        policy = PostingPolicy.model_validate(policy_raw)
-        ctx.note_refs(policy.source_ref)
-
-        state: PayableState = "posted"
-        reason = "auto-posted within governed policy"
-        decided_by = ""
-        decision_note = ""
-
-        for round_number in range(1, MAX_REVIEW_ROUNDS + 1):
-            checked = ctx.step(
-                f"r2_{round_number}", "post-or-review", "rule",
-                fn=lambda: _posting_check(extraction, match, screen, policy),
-                summary=lambda out: (
-                    "review: " + "; ".join(out["reasons"]) if out["reasons"]
-                    else "post: within limit, matched, nothing unusual"
-                ),
-                refs=[policy.source_ref],
-            )
-            reasons = checked["reasons"]
-            if not reasons:
-                if round_number > 1:
-                    reason = f"posted after review by {decided_by}"
-                break
-            decision = ctx.gate(
-                f"k2_{round_number}", "review-invoice",
-                build_task=lambda rs=reasons, rn=round_number: self._build_review_task(
-                    ctx.record, extraction, match, screen, policy, rs, rn,
-                    vendor_label, submitted_by,
-                ),
-            )
-            decided_by = decision.decided_by
-            decision_note = decision.note or decision.correction
-            if decision.verdict == "rejected":
-                state = "denied"
-                reason = decision.note or "rejected on review"
-                break
-            if decision.verdict == "approved":
-                state = "posted"
-                reason = "posted on review despite: " + "; ".join(reasons)
-                break
-            # `corrected`: the clerk fixed the extraction, so re-run the checks
-            # against the corrected values rather than trusting the override.
-            patched = ctx.step(
-                f"x6_{round_number}", "apply-correction", "transform",
-                fn=lambda d=decision: _apply_invoice_patch(extraction, d.payload),
-                summary=lambda out: (
-                    f"clerk corrected {', '.join(out['changed']) or 'nothing'}"
-                ),
-            )
-            extraction = InvoiceExtraction.model_validate(patched["extraction"])
-            match_raw = ctx.step(
-                f"c1_{round_number}", "three-way-match", "check",
-                fn=lambda: match_invoice(
-                    [
-                        MatchLine.model_validate(line)
-                        for line in _invoice_match_lines(extraction)
-                    ],
-                    [MatchLine.model_validate(line) for line in context["po_lines"]],
-                    [MatchLine.model_validate(line) for line in context["receipt_lines"]],
-                    parse_match_tolerances(policy_content, policy_ref),
-                    invoice_total_usd=extraction.total_usd,
-                ).model_dump(),
-                summary=lambda out: MatchResult.model_validate(out).summary(),
-            )
-            match = MatchResult.model_validate(match_raw)
-        else:
-            state = "pending"
-            reason = (
-                f"still flagged after {MAX_REVIEW_ROUNDS} review round(s) — "
-                "left for the AP lead"
-            )
-
-        return self._finish(
-            ctx, submitted_by, submitted_at, filename, document_id, vendor_id,
-            vendor_label, resolution_raw, extraction, match, screen, policy,
-            state, reason, decided_by, decision_note,
-        )
 
     # -- step internals -----------------------------------------------------
 
@@ -1358,6 +1305,76 @@ class PayableService:
         )
         return {"document_id": record.id, "byte_size": record.byte_size}
 
+    def _resolve_document(
+        self,
+        document_id: str,
+        image_b64: str,
+        filename: str,
+        submitted_by: str,
+        run_id: str,
+    ) -> dict:
+        """The artifact this run reads, however it got here. v8's s1.
+
+        Two arrivals and one outcome. `ap-intake` has already fetched the
+        vendor's file out of the customer's document system and stored it, so
+        it hands over an **id**; a person with an invoice in their hand hands
+        over **bytes**, and the store gives them the same kind of id. Either
+        way what the extraction reads afterwards is the stored artifact, which
+        is what makes "the model read this document" a checkable claim rather
+        than a description of an input nobody kept.
+
+        A run with neither is refused. It used to be possible — a filename and
+        a hint and no file — and it is precisely the shape of submission that
+        produced an extraction with nothing behind it.
+        """
+        if self.documents is None:
+            raise RuntimeError("no document store wired")
+        if document_id:
+            record = self.documents.get(document_id)
+            if record is None:
+                raise KeyError(
+                    f"{document_id} is not in the document store; this run was "
+                    "started against an artifact nobody kept"
+                )
+            if run_id and run_id not in record.run_ids:
+                # The store's own idempotency does this when bytes are put; an
+                # id handed in skips that path, and a document that cannot name
+                # the runs that read it is evidence with no chain.
+                record.run_ids.append(run_id)
+                self.documents.store.put(record)
+            return {
+                "document_id": record.id, "byte_size": record.byte_size,
+                "arrived": "intake", "filename": record.filename or filename,
+            }
+        if not image_b64:
+            raise ValueError(
+                "an accounts-payable run needs a document: no stored id and "
+                "no bytes"
+            )
+        record = self.documents.put_bytes(
+            image_b64, filename=filename, kind="invoice",
+            uploaded_by=submitted_by, run_id=run_id,
+        )
+        return {
+            "document_id": record.id, "byte_size": record.byte_size,
+            "arrived": "upload", "filename": record.filename or filename,
+        }
+
+    def _document_bytes(self, document_id: str) -> bytes | None:
+        """The stored artifact, read back for the ModelCall to look at.
+
+        Read from the store rather than carried down from the inputs: the
+        stored copy is the one the region boxes, the review screen and an
+        auditor two years from now will resolve, and an extraction made from
+        some other copy of the bytes would be attributed to it anyway.
+        """
+        if self.documents is None:
+            return None
+        record = self.documents.get(document_id)
+        if record is None or not record.content_b64:
+            return None
+        return base64.b64decode(record.content_b64)
+
     def _extract(
         self,
         image: bytes | None,
@@ -1365,12 +1382,26 @@ class PayableService:
         hint: str,
         document_id: str,
         prompt: str,
+        *,
+        store_regions: bool = True,
     ) -> InvoiceExtraction:
-        extraction = self.reader.read(
-            image, filename, hint, prompt=prompt,
-            media_type=media.sniff(image, filename),
-        )
-        if self.documents is not None and extraction.regions:
+        # The prompt revision the ledger files this call against, taken off the
+        # read-set the metered step declared rather than by reading the asset
+        # again — the flow read it at x0, and a second read here could name a
+        # different revision exactly in the run where that matters.
+        with modelcall.reading(modelcall.governed_ref(PROMPT_ASSET_ID)):
+            extraction = self.reader.read(
+                image, filename, hint, prompt=prompt,
+                media_type=media.sniff(image, filename),
+            )
+        # `store_regions=False` is v8's, and it is the one behaviour v8
+        # deliberately drops rather than inherits. The only regions any reader
+        # here produces are the stub's synthetic geometry — the Vertex readers
+        # emit none — so persisting them would put invented boxes on a real
+        # document and draw them on a reviewer's screen as if a model had
+        # located something. v8's boxes come from WP-J's locate step, or the
+        # document carries none and the screen says so.
+        if store_regions and self.documents is not None and extraction.regions:
             self.documents.set_regions(document_id, extraction.regions)
         return extraction
 
@@ -1395,7 +1426,7 @@ class PayableService:
                 "candidates": [], "thresholds_ref": thresholds.source_ref,
             }
         outcome = resolve(
-            self.graph, "Vendor", [name] if name else [], thresholds,
+            self.graph, onto.VENDOR, [name] if name else [], thresholds,
             tax_id=extraction.vendor_tax_id,
         )
         payload = outcome.model_dump()
@@ -1407,7 +1438,7 @@ class PayableService:
             # doctrine describes.
             source = f"model:{extraction.model}"
             vendor = (writer or self.graph).upsert(
-                "Vendor", name,
+                onto.VENDOR, name,
                 [
                     Claim(field="name", value=name, source=source,
                           confidence=extraction.confidence),
@@ -1447,7 +1478,7 @@ class PayableService:
             vendor = self.graph.get(target)
             if vendor is not None:
                 graph.upsert(
-                    "Vendor", vendor.natural_key,
+                    onto.VENDOR, vendor.natural_key,
                     [Claim(
                         field="aliases", value=[extraction.vendor_name],
                         source=f"human:{decision.decided_by}",
@@ -1465,7 +1496,7 @@ class PayableService:
                 "decided_by": decision.decided_by,
             }
         vendor = graph.upsert(
-            "Vendor", name,
+            onto.VENDOR, name,
             [
                 Claim(field="name", value=name,
                       source=f"human:{decision.decided_by}"),
@@ -1499,7 +1530,7 @@ class PayableService:
 
         orders = []
         if po_number:
-            order = self.graph.get(object_id("PurchaseOrder", po_number))
+            order = self.graph.get(object_id(onto.PURCHASE_ORDER, po_number))
             if order is not None:
                 orders.append(order)
         if not orders and vendor_id:
@@ -1626,10 +1657,39 @@ class PayableService:
         round_number: int,
         vendor_label: str,
         submitted_by: str,
+        fields: list[dict] | None = None,
+        *,
+        gate_id: str = "k2",
+        queue: str = CLERK_QUEUE,
+        routing_note: str = "",
+        vendor: dict | None = None,
     ) -> Task:
+        """`fields` is the version's field verdicts, carried and not read.
+
+        Serialized `FieldVerdict`s, which this module deliberately does not
+        import: the verdicts are v8's and this service is shared by four
+        shipped versions. `None` travels through as `None` rather than being
+        flattened to an empty list — a version that computes no verdicts and a
+        version that computed them and found nothing wrong are opposite facts,
+        and the review screen renders them differently on purpose.
+
+        The four keyword arguments are v9's, and every one of them defaults to
+        what v6, v7 and v8 already did:
+
+        - `gate_id` names the step, because v9's single gate is `k1` where the
+          older versions' posting gate is `k2` — a Task has to be findable
+          from the step that raised it;
+        - `queue` is the desk the governed approval table resolved for *this
+          case*, which for a submitted invoice is the submitter's own;
+        - `routing_note` is that resolution's sentence, so the desk on the row
+          is a claim somebody can check;
+        - `vendor` is the entity question folded into this review rather than
+          asked at a gate of its own.
+        """
         findings = screen.get("findings") or []
+        subject = submitter_email(submitted_by)
         return Task(
-            id=f"task_{record.id}_k2_{round_number}",
+            id=f"task_{record.id}_{gate_id}_{round_number}",
             kind="decision",
             title=(
                 f"Review invoice {extraction.invoice_number} · "
@@ -1640,8 +1700,14 @@ class PayableService:
                 + "; ".join(reasons)
                 + ". The reviewer may correct extracted values and line "
                 "amounts, in which case the match and the screen re-run."
+                + (
+                    " The vendor is unsettled too: name it here and nothing "
+                    "is asserted about the entity until you do."
+                    if vendor else ""
+                )
             ),
-            queue=CLERK_QUEUE,
+            queue=queue,
+            subject_email=subject or None,
             priority="high" if findings or match.verdict != "matched" else "normal",
             flow_id=FLOW_ID,
             run_id=record.id,
@@ -1657,13 +1723,37 @@ class PayableService:
                 TaskEvidence(label="Anomaly basis", value=str(screen.get("basis", ""))),
                 TaskEvidence(label="Submitted by", value=submitted_by),
                 TaskEvidence(label="Review round", value=str(round_number)),
-            ] + [
+            ] + (
+                [TaskEvidence(label="Routed to this desk because",
+                              value=routing_note)]
+                if routing_note else []
+            ) + (
+                [TaskEvidence(
+                    label="Vendor as printed",
+                    value=(
+                        f"{vendor.get('printed', '')} — "
+                        f"{len(vendor.get('candidates') or [])} candidate(s) "
+                        "in the master, none confident enough to assert"
+                    ),
+                )] if vendor else []
+            ) + [
                 TaskEvidence(label=f"Anomaly: {f['kind']}", value=f["detail"])
                 for f in findings[:4]
             ] + [
                 TaskEvidence(label=f"Line {p.invoice_ordinal} ({p.verdict})",
                              value=p.reason)
                 for p in match.pairings if not p.clean
+            ][:4] + [
+                # The same doubts the review screen focuses, spelled out for
+                # the generic task pane — which is what a clerk sees on a
+                # deployment whose console has not shipped the v8 screen yet.
+                TaskEvidence(
+                    label=f"{field.get('label', field.get('path', ''))} "
+                          f"({field.get('status', '')})",
+                    value=str(field.get("reason", "")),
+                )
+                for field in (fields or [])
+                if field.get("status") not in ("ok", None)
             ][:4],
             proposal=TaskProposal(
                 action="post-invoice", target="ap-records",
@@ -1671,8 +1761,13 @@ class PayableService:
                     f"Post {extraction.invoice_number} for "
                     f"${extraction.total_usd:,.2f} to the AP ledger"
                 ),
+                fields=None if fields is None else list(fields),
+                vendor=vendor,
             ),
-            resumes=f"this run resumes at k2_{round_number} and re-runs the rule",
+            resumes=(
+                f"this run resumes at {gate_id}_{round_number} and re-runs "
+                "the rule"
+            ),
             created_at_iso=utcnow().isoformat(),
         )
 
@@ -1696,6 +1791,7 @@ class PayableService:
         reason: str,
         decided_by: str,
         decision_note: str,
+        queue: str = "",
     ) -> dict:
         record = InvoiceRecord(
             id=ctx.record.case_ref or ctx.record.id,
@@ -1746,10 +1842,18 @@ class PayableService:
         # auto-post limit with no gate at all, nobody decided, so the Flow
         # commits on its own authority and the ledger says so rather than
         # crediting the submitter with a judgment they never made.
+        #
+        # `queue` is the desk of the Task that authorized this commit, and it
+        # is passed only when there was one. Omitted, `post-invoice`'s standing
+        # `ap-clerk` pin stands — which is the right desk for a write nobody
+        # decided. Passed, the queue that raised the work and the queue that
+        # commits it are the same queue, so a submitter answering a review on
+        # their own desk is not refused their own answer.
         post = self.gateway.action(
-            "post-invoice", ctx.principal or AP_FLOW,
+            "post-invoice", ctx.principal or ap_flow_principal(queue),
             run=ctx.record, step_id="a1",
             task_id=record.task_id, decided_by=decided_by,
+            queue=queue,
         )
         written = ctx.step(
             "a1", "post-invoice", "action",
@@ -1811,7 +1915,7 @@ class PayableService:
         slug = record.vendor_slug or _name_to_slug(record.vendor_name)
         natural = f"{slug}:{record.invoice_number}"
         invoice = graph.upsert(
-            "Invoice", natural,
+            onto.INVOICE, natural,
             [
                 Claim(field="invoice_number", value=record.invoice_number, source=model_source),
                 Claim(field="invoice_date", value=record.invoice_date, source=model_source),
@@ -1845,7 +1949,7 @@ class PayableService:
                 and vendor.props.get("status") == "onboarding"
             ):
                 graph.upsert(
-                    "Vendor", vendor.natural_key,
+                    onto.VENDOR, vendor.natural_key,
                     [Claim(field="status", value="active",
                            source=f"human:{record.decided_by}")],
                     label=vendor.label,
@@ -1853,7 +1957,7 @@ class PayableService:
                 )
         if record.document_id:
             document = graph.upsert(
-                "Document", record.document_id,
+                onto.DOCUMENT, record.document_id,
                 [
                     Claim(field="kind", value="invoice", source=source),
                     Claim(field="filename", value=record.filename, source=source),
@@ -1869,7 +1973,7 @@ class PayableService:
         line_ids: list[str] = []
         for ordinal, line in enumerate(record.lines, start=1):
             line_obj = graph.upsert(
-                "InvoiceLine", f"{natural}#{ordinal}",
+                onto.INVOICE_LINE, f"{natural}#{ordinal}",
                 [
                     Claim(field="description", value=line.description, source=model_source),
                     Claim(field="sku", value=line.sku, source=model_source),
@@ -1891,7 +1995,7 @@ class PayableService:
         match_ref = ""
         if match is not None:
             match_obj = graph.upsert(
-                "MatchSet", natural,
+                onto.MATCH_SET, natural,
                 [
                     Claim(field="verdict", value=match.verdict, source=source),
                     Claim(field="matched_lines", value=match.matched_lines, source=source),
@@ -1929,7 +2033,7 @@ class PayableService:
                     )
                     links += 1
             for number in match.po_numbers:
-                order = self.graph.get(object_id("PurchaseOrder", number))
+                order = self.graph.get(object_id(onto.PURCHASE_ORDER, number))
                 if order is not None:
                     graph.link(
                         "billed_against", invoice.id, order.id, provenance=run_id
@@ -1951,6 +2055,13 @@ class PayableService:
         lines failed the match, what the anomaly screen said, which rule held
         it. Reading those off the completed steps means the pending row is as
         informative as the posted one, without a second copy of the truth.
+
+        Which step holds which fact is a **property of the version that ran**,
+        so it is read off `flow_version` rather than guessed at. v9 renumbered
+        the map — its `c2` is the three-way match where v6's `c2` is the
+        anomaly screen — and a projection that tried both orders would read one
+        version's screen as the other's match set and report a verdict no run
+        ever produced.
         """
         existing = self.directory.get(record.case_ref or record.id)
         # Only a *finished* run has an authoritative row: the commit step wrote
@@ -1975,24 +2086,11 @@ class PayableService:
         resolution = output("z1", {})
         stored = output("s1", {})
 
-        extraction = InvoiceExtraction()
-        # The last correction wins, then the extraction itself — newest
-        # reading of the document first.
-        sources = [f"x6_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)] + ["m1"]
-        for step_id in sources:
-            payload = output(step_id)
-            if not payload:
-                continue
-            if isinstance(payload, dict) and "extraction" in payload:
-                payload = payload["extraction"]
-            try:
-                extraction = InvoiceExtraction.model_validate(payload)
-                break
-            except Exception:  # noqa: BLE001 — a partial run is not an error
-                continue
+        extraction = _extraction_of(record)
+        journal = _journal_map(record.flow_version)
 
         match: MatchResult | None = None
-        for step_id in [f"c1_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)] + ["c1"]:
+        for step_id in journal["match"]:
             payload = output(step_id)
             if payload:
                 try:
@@ -2000,12 +2098,17 @@ class PayableService:
                     break
                 except Exception:  # noqa: BLE001
                     continue
-        screen = output("c2", {}) or {}
-        policy = PostingPolicy.model_validate(output("x5", {}) or {})
+        # v9 runs no anomaly screen: the capability stays selectable on v8, and
+        # `{}` here is what "not evaluated" looks like downstream rather than a
+        # screen that found nothing.
+        screen = (output(journal["screen"], {}) or {}) if journal["screen"] else {}
+        policy = PostingPolicy.model_validate(
+            _nested(output(journal["policy"], {}) or {}, journal["policy_key"])
+        )
 
         reasons: list[str] = []
-        for n in range(MAX_REVIEW_ROUNDS, 0, -1):
-            checked = output(f"r2_{n}", {})
+        for step_id in journal["rule"]:
+            checked = output(step_id, {})
             if checked and checked.get("reasons"):
                 reasons = list(checked["reasons"])
                 break
@@ -2082,6 +2185,182 @@ class PayableService:
 # ---------------------------------------------------------------------------
 
 
+def _step_output(record: RunRecord, step_id: str) -> dict:
+    step = record.step(step_id)
+    output = step.output if step is not None else None
+    return output if isinstance(output, dict) else {}
+
+
+def _nested(payload: dict, key: str) -> dict:
+    """One key of a step output, or the output itself when no key is named.
+
+    v9's `x0` is a single governed read whose output holds four things; the
+    older versions read the posting policy into a step of its own. One
+    accessor, so the projection reads "the policy this run ran on" rather than
+    "the shape the version happened to store it in".
+    """
+    if not key:
+        return payload
+    value = payload.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _journal_map(flow_version: int) -> dict:
+    """Where each fact sits in the journal, for the version that wrote it.
+
+    Read by the projection and by `_extraction_of`, which are the two things
+    that reconstruct a case from steps rather than from a return value. Written
+    as data rather than as branches at four call sites: the alternative was a
+    projection that knew v9's numbering in one place and v6's in another.
+    """
+    if flow_version >= 9:
+        return {
+            "match": [f"c2_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)] + ["c2"],
+            "screen": "",
+            "policy": "x0",
+            "policy_key": "posting",
+            "rule": [f"r1_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)],
+            "correction": [f"x3_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)],
+        }
+    return {
+        "match": [f"c1_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)] + ["c1"],
+        "screen": "c2",
+        "policy": "x5",
+        "policy_key": "",
+        "rule": [f"r2_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)],
+        "correction": [f"x6_{n}" for n in range(MAX_REVIEW_ROUNDS, 0, -1)],
+    }
+
+
+def _extraction_of(record: RunRecord) -> InvoiceExtraction:
+    """The reading of the document this run is currently working from.
+
+    The last correction wins, then the extraction itself — newest reading of
+    the page first. Read off the journal rather than carried, because the two
+    callers are in different processes' worth of time apart: the projection
+    runs while the run is suspended, and the flywheel runs at the moment
+    somebody answers.
+    """
+    sources = _journal_map(record.flow_version)["correction"] + ["m1"]
+    for step_id in sources:
+        payload: object = _step_output(record, step_id)
+        if not payload:
+            continue
+        if isinstance(payload, dict) and "extraction" in payload:
+            payload = payload["extraction"]
+        try:
+            return InvoiceExtraction.model_validate(payload)
+        except Exception:  # noqa: BLE001 — a partial run is not an error
+            continue
+    return InvoiceExtraction()
+
+
+def _corrected_by_path(payload: dict) -> dict[str, str]:
+    """A clerk's correction, whatever shape it arrived in, keyed by fact path.
+
+    Two shapes reach this. The review screen sends `fields`, a map from the
+    canonical path to the value the clerk left — which is the contract, and the
+    only shape that can name a field the v6-era form has no input for. The
+    older shape is the patch itself (`total_usd`, `lines[{ordinal, …}]`), which
+    the eval cases and the seeded world are written in and which stays valid.
+
+    Read for the *pair*, not for the patch: what comes back is what the human
+    said about a field, not what the applier will make of it. A subtotal the
+    applier is going to re-derive from the lines still belongs in the
+    correction set, because "the model misread the subtotal" is true whether or
+    not that particular number survives the round trip.
+    """
+    out: dict[str, str] = {}
+
+    def put(path: str, value: object) -> None:
+        # An emptied field is not read as a correction, here or in the applier
+        # below — the same rule both shapes have always had. "Delete what the
+        # model read" is a real thing a clerk might mean and a blank input is
+        # not evidence they meant it.
+        if value is None:
+            return
+        text = paths.render(path, value) if isinstance(value, (int, float)) else str(value)
+        if text.strip():
+            out[path] = text.strip()
+
+    for raw_path, value in (payload.get("fields") or {}).items():
+        # Three spellings reach the wire — `Region.field` carries the
+        # `invoice.` prefix on line paths and §4's examples do not — so they
+        # are normalized once, here, rather than compared three ways later.
+        path = str(raw_path)
+        if path.startswith("invoice.line_items["):
+            path = path[len("invoice."):]
+        elif path.startswith("lines["):
+            path = "line_items" + path[len("lines"):]
+        index, field = paths.parse_path(path)
+        if not field:
+            continue
+        put(path, value)
+
+    for field in paths.INVOICE_FIELDS:
+        if payload.get(field) is not None:
+            put(paths.invoice_path(field), payload[field])
+    for patch in payload.get("lines") or []:
+        ordinal = int(patch.get("ordinal", 0) or 0)
+        if ordinal < 1:
+            continue
+        for field in paths.LINE_FIELDS:
+            if patch.get(field) is not None:
+                put(paths.line_path(ordinal - 1, field), patch[field])
+    return out
+
+
+def _same_value(raw: str, corrected: str) -> bool:
+    """Whether these two are the same answer, punctuation aside.
+
+    Numerically when both sides are numbers, because `1200` and `1200.00` are
+    one value and a correction set full of reformattings is a correction set
+    nobody can learn from.
+    """
+    if raw.strip() == corrected.strip():
+        return True
+    try:
+        return abs(
+            float(raw.replace(",", "").replace("$", ""))
+            - float(corrected.replace(",", "").replace("$", ""))
+        ) < 0.005
+    except ValueError:
+        return False
+
+
+def _correction_pairs(
+    extraction: InvoiceExtraction, payload: dict, task: Task
+) -> list[dict]:
+    """The raw→corrected pairs one decision produced, in path order.
+
+    The raw side comes off the extraction the clerk was shown rather than off
+    the Task, so a pair is a claim about what the model read even when the
+    field was never flagged — a clerk who fixes a number nobody doubted is the
+    most interesting row in the set, because it is a miss the confidence score
+    did not catch.
+    """
+    verdicts = {
+        str(field.get("path", "")): field
+        for field in ((task.proposal.fields if task.proposal else None) or [])
+        if isinstance(field, dict)
+    }
+    pairs: list[dict] = []
+    for path, corrected in _corrected_by_path(payload).items():
+        raw = paths.render(path, paths.value_at(extraction, path))
+        if _same_value(raw, corrected):
+            continue
+        verdict = verdicts.get(path, {})
+        pairs.append({
+            "path": path,
+            "label": paths.label_for(path),
+            "raw": raw,
+            "corrected": corrected,
+            "status": str(verdict.get("status", "") or ""),
+            "confidence": float(verdict.get("confidence", 0) or 0),
+        })
+    return pairs
+
+
 def _invoice_match_lines(extraction: InvoiceExtraction) -> list[dict]:
     return [
         MatchLine(
@@ -2099,10 +2378,33 @@ def _posting_check(
     match: MatchResult,
     screen: dict,
     policy: PostingPolicy,
+    *,
+    check_line_sum: bool = True,
 ) -> dict:
-    """The Rule: a pure check over what the flow gathered. It never fetches."""
+    """The Rule: a pure check over what the flow gathered. It never fetches.
+
+    `check_line_sum=False` is v8's, and it removes a duplicate rather than a
+    check. The coarse "lines do not add up to the total" clause at the bottom
+    of this function is the only arithmetic v6 has; v8 runs `check-arithmetic`
+    before the vendor is even resolved, which asks the same question line by
+    line and *names the field path* that fails. Leaving both on would put two
+    sentences about one disagreement in front of the same clerk, and the vaguer
+    one second.
+    """
     reasons: list[str] = []
-    if extraction.total_usd > policy.limit_usd:
+    # First, and unconditional: an invoice with no total cannot be auto-posted
+    # by any limit, because arithmetic says nothing is *above* zero either. A
+    # live estate posted a $0.00 invoice as "matched" — the limit comparison
+    # passed, the match had nothing to disagree with, and a payment record was
+    # written for a page nobody had read a number off. A zero total is what an
+    # unread page looks like, so it is a reason to ask rather than a reason to
+    # be quick, and the governed policy says so in as many words.
+    if extraction.total_usd <= 0:
+        reasons.append(
+            "the invoice total reads $0.00 — an unread or unreadable total is "
+            "never posted without a person, whatever the auto-post limit says"
+        )
+    elif extraction.total_usd > policy.limit_usd:
         reasons.append(
             f"${extraction.total_usd:,.2f} exceeds the ${policy.limit_usd:,.2f} "
             "auto-post limit"
@@ -2129,12 +2431,65 @@ def _posting_check(
     # A quiet arithmetic check the extractors cannot do for themselves: the
     # lines have to add up to the total, or one of the two is wrong.
     line_total = round(sum(line.amount_usd for line in extraction.lines), 2)
-    if extraction.lines and abs(line_total - extraction.total_usd) > 0.05:
+    if check_line_sum and extraction.lines and abs(line_total - extraction.total_usd) > 0.05:
         reasons.append(
             f"lines sum to ${line_total:,.2f} but the invoice total reads "
             f"${extraction.total_usd:,.2f}"
         )
     return {"reasons": reasons}
+
+
+_NUMERIC_FIELDS = frozenset({
+    "quantity", "unit_price_usd", "amount_usd", "subtotal_usd", "freight_usd",
+    "tax_usd", "total_usd",
+})
+
+
+def _fold_field_corrections(payload: dict) -> dict:
+    """Path-keyed corrections, rewritten into the patch shape above.
+
+    Numbers are coerced here and a value that will not parse as one is
+    *dropped*, not zeroed: `"twelve hundred"` in a total field is a typo, and
+    the invoice keeping the number the model read is a better outcome than the
+    invoice reading zero because somebody fat-fingered a form.
+
+    A path the applier below has no case for — `vendor_name` is the one that
+    matters — is **recorded as a correction and not applied**, and that is the
+    right split rather than an omission: which entity issued an invoice is
+    settled by the resolver at `z1` and, when it cannot settle it, by the
+    `confirm-vendor` gate. Letting a posting review rename the vendor after the
+    match has run against that vendor's orders would leave the invoice pointing
+    at one company and its match set at another.
+    """
+    corrections = payload.get("fields")
+    if not isinstance(corrections, dict) or not corrections:
+        return payload
+
+    folded = {key: value for key, value in payload.items() if key != "fields"}
+    by_ordinal: dict[int, dict] = {
+        int(patch.get("ordinal", 0) or 0): dict(patch)
+        for patch in folded.get("lines") or []
+    }
+    for path, value in _corrected_by_path({"fields": corrections}).items():
+        index, field = paths.parse_path(path)
+        typed: object = value
+        if field in _NUMERIC_FIELDS:
+            try:
+                typed = float(str(value).replace(",", "").replace("$", ""))
+            except ValueError:
+                log.warning(
+                    "Dropping an uncorrectable value",
+                    extra={"path": path, "value": value},
+                )
+                continue
+        if index < 0:
+            folded[field] = typed
+        else:
+            patch = by_ordinal.setdefault(index + 1, {"ordinal": index + 1})
+            patch[field] = typed
+    if by_ordinal:
+        folded["lines"] = [by_ordinal[key] for key in sorted(by_ordinal)]
+    return folded
 
 
 def _apply_invoice_patch(extraction: InvoiceExtraction, payload: dict) -> dict:
@@ -2146,13 +2501,25 @@ def _apply_invoice_patch(extraction: InvoiceExtraction, payload: dict) -> dict:
          "total_usd": 1234.56,
          "lines": [{"ordinal": 1, "quantity": 3, "unit_price_usd": 486.00,
                     "amount_usd": 1458.00, "sku": "...", "description": "..."}],
-         "remove_ordinals": [4]}
+         "remove_ordinals": [4],
+         "fields": {"invoice.total_usd": "1234.56",
+                    "line_items[0].unit_price_usd": "486.00"}}
+
+    `fields` is the review screen's shape — corrections keyed by canonical fact
+    path, which is the same key the verdict that raised the question carried.
+    It is folded into the shape above before anything else happens, so there is
+    one applier rather than two: a field arriving both ways (the screen sends
+    the overlap deliberately, so a console built against v6's form keeps
+    working) is one value either way, and the path wins if they ever disagree
+    because the path is what the run named.
 
     Line amounts are recomputed from quantity × unit price when the clerk gives
     both and no explicit amount, because that is the arithmetic they would
     otherwise have to do by hand — and getting it wrong here would fail the
     lines-sum check on the next round for no reason.
     """
+    answered = list(_corrected_by_path(payload))
+    payload = _fold_field_corrections(payload)
     changed: list[str] = []
     patched = extraction.model_copy(deep=True)
     for field in ("invoice_number", "invoice_date", "due_date", "po_number", "currency"):
@@ -2190,14 +2557,27 @@ def _apply_invoice_patch(extraction: InvoiceExtraction, payload: dict) -> dict:
         patched.total_usd = round(
             sum(line.amount_usd for line in patched.lines), 2
         )
-    patched.subtotal_usd = round(
-        sum(line.amount_usd for line in patched.lines if line.kind == "goods"), 2
-    )
-    patched.freight_usd = round(
-        sum(line.amount_usd for line in patched.lines if line.kind == "freight"), 2
-    )
-    # A clerk who has read the document has resolved the model's uncertainty.
+    # Derived from the lines *unless the clerk said otherwise*, which is how
+    # the total one line up has always behaved. Deriving over an explicit
+    # correction would throw away an answer while reporting it as applied —
+    # and the field-verdict screen can now put a subtotal in front of somebody
+    # to correct, which v6's form could not.
+    if payload.get("subtotal_usd") is None:
+        patched.subtotal_usd = round(
+            sum(line.amount_usd for line in patched.lines if line.kind == "goods"), 2
+        )
+    if payload.get("freight_usd") is None:
+        patched.freight_usd = round(
+            sum(line.amount_usd for line in patched.lines if line.kind == "freight"), 2
+        )
+    # A clerk who has read the document has resolved the model's uncertainty —
+    # about the page as a whole, and about each field they actually answered.
+    # Without the second half a field the extractor was unsure of stays in
+    # doubt after the human has settled it, and the next round asks them the
+    # same question about the number they just typed.
     patched.confidence = 1.0
+    for path in answered:
+        patched.field_confidence[path] = 1.0
     return {"extraction": patched.model_dump(), "changed": changed}
 
 
@@ -2214,6 +2594,8 @@ def build_payable_service(
     anomaly: AnomalyService | None = None,
     gateway: ActionGateway | None = None,
     dispatcher: Dispatcher | None = None,
+    locator=None,
+    queues=None,
 ) -> PayableService:
     directory: PayableDirectory
     if backend == "firestore":
@@ -2222,5 +2604,5 @@ def build_payable_service(
         directory = InMemoryPayableDirectory()
     return PayableService(
         directory, reader, knowledge, tasks, engine, graph, documents, anomaly,
-        gateway, dispatcher,
+        gateway, dispatcher, locator, queues,
     )

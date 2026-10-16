@@ -11,8 +11,17 @@ beside it. Two kinds of target, because two different questions get asked:
 
 - a **queue slug** — "send it to the exec desk" — which is a standing
   arrangement somebody administers;
-- a **resolver** — `manager-of(submitter)` — which is a question about *this*
-  case, answered against the org chart in the graph.
+- a **resolver** — `manager-of(submitter)`, or `submitter` — which is a
+  question about *this* case, answered from the case itself and from the org
+  chart in the graph.
+
+`submitter` is the one that sends a review back to the person who raised it,
+which is what confirming an extraction is: nobody else can say whether the
+number on the receipt is the number on the receipt. It resolves to that
+person's own desk, so the work is still routed to a Queue and still gated by
+`require_queue` — a Task addressed to a human rather than to a desk would be
+work that disappears when they are away, which is the reason the doctrine has
+no such thing.
 
 The resolver has to run somewhere, and DOCTRINE point 199 says where it may
 not: a Rule is a pure check that never fetches. So resolution is a *transform*
@@ -29,19 +38,31 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from . import desks
+from .ontology import names as onto
+
 log = logging.getLogger("cumulus.routing")
 
 #: Where a *step* that threw goes, as opposed to a business escalation. A
 #: Vertex 400 about a file format landed on the finance approver's desk for as
 #: long as flows named their own review queue for both; the Controller cannot
 #: fix a mime type, and the person who can was not looking at that queue.
-OPS_QUEUE = "platform-operations"
+OPS_QUEUE = desks.PLATFORM_OPERATIONS
 
-#: The one resolver implemented. Written as a call rather than a keyword so the
-#: policy reads as an instruction with an argument, and so a second resolver
+#: The first resolver. Written as a call rather than a keyword so the policy
+#: reads as an instruction with an argument, and so a second resolver
 #: (`department-head-of`, `team-lead-of`) is a new name in this table rather
 #: than a new grammar.
 MANAGER_OF = "manager-of(submitter)"
+
+#: The second: the person the case is about, reviewing their own submission.
+#: A bare word and not a call, because there is no argument to take — the case
+#: already names its submitter, where `manager-of(submitter)` names whose
+#: manager to look up. It is still a resolver rather than a queue slug: the
+#: desk it answers with is different for every case, which is the distinction
+#: the module docstring draws and the reason a literal `submitter` queue must
+#: never be minted.
+SUBMITTER = "submitter"
 
 
 class RoutingRule(BaseModel):
@@ -140,20 +161,56 @@ def resolve(
     graph: Any,
     queues: Any,
     fallback: str,
+    submitter_name: str = "",
 ) -> ResolvedQueue:
     """Turn a routing target into a desk that actually exists.
 
     A literal target is returned as it stands — it is somebody's standing
     arrangement and this is not the place to second-guess whether they created
-    the queue. A resolver is answered against the graph, and *every* way of
+    the queue. A resolver is answered against the case, and *every* way of
     failing to answer lands on the fallback with `fell_back` set and a sentence
     saying why. Silence here would route a VP's expense to the wrong desk and
     look exactly like success.
 
+    `submitter_name` is what to call the person on their own desk when the
+    caller already knows — a flow holds the submitter's display name at gate
+    time. Omitted, the org chart is asked, and the email stands if it cannot
+    answer: a desk named after an address is legible, and a routing step that
+    failed because nobody had a display name would not be.
+
     Deterministic, which a replayed step requires: the personal desk's slug is
-    a pure function of the manager's email, so resuming this run mints no
-    second inbox and picks no different queue.
+    a pure function of the person's email, so resuming this run mints no second
+    inbox and picks no different queue.
     """
+    if target == SUBMITTER:
+        if not submitter_email:
+            return ResolvedQueue(
+                queue=fallback, target=target, fell_back=True,
+                explanation=(
+                    "this case names no submitter, so it routed to the "
+                    f"'{fallback}' desk instead of back to the person who "
+                    "raised it"
+                ),
+            )
+        name = submitter_name or name_of(graph, submitter_email)
+        desk = _personal_desk(queues, submitter_email, name)
+        if desk is None:
+            return ResolvedQueue(
+                queue=fallback, target=target, fell_back=True,
+                explanation=(
+                    f"no desk could be opened for {name or submitter_email}, "
+                    f"so this routed to the '{fallback}' desk instead of back "
+                    "to the person who raised it"
+                ),
+            )
+        return ResolvedQueue(
+            queue=desk, target=target,
+            explanation=(
+                f"routed to {name or submitter_email}'s own desk: the person "
+                "who submitted this case reviews it"
+            ),
+        )
+
     if target != MANAGER_OF:
         return ResolvedQueue(
             queue=target or fallback,
@@ -173,15 +230,41 @@ def resolve(
             ),
         )
     email, name = manager
-    desk = queues.ensure_personal(email, name)
+    desk = _personal_desk(queues, email, name)
+    if desk is None:
+        return ResolvedQueue(
+            queue=fallback, target=target, fell_back=True,
+            explanation=(
+                f"no desk could be opened for {name or email}, so this routed "
+                f"to the '{fallback}' desk instead of to a named approver"
+            ),
+        )
     return ResolvedQueue(
-        queue=desk.slug,
+        queue=desk,
         target=target,
         explanation=(
             f"routed to {name or email}'s own desk: the submitter's manager "
             "per the org chart"
         ),
     )
+
+
+def _personal_desk(queues: Any, email: str, name: str) -> str | None:
+    """One person's own desk, minted on first use — or None if it could not be.
+
+    The registry is a store like any other and can be unreachable, and a
+    resolver that let that out as an exception would fail the run over a
+    routing question the policy already answered: the fallback desk is exactly
+    what the document names for the case where a resolver cannot answer. So the
+    failure is caught here, logged with the address it was for, and handed back
+    as "no desk" — which the caller turns into a `fell_back` answer nobody has
+    to read a stack trace to understand.
+    """
+    try:
+        return queues.ensure_personal(email, name).slug
+    except Exception:  # noqa: BLE001 — a registry outage is a fallback, not a crash
+        log.exception("Could not open a personal desk", extra={"email": email})
+        return None
 
 
 def manager_of(graph: Any, email: str) -> tuple[str, str] | None:
@@ -195,7 +278,7 @@ def manager_of(graph: Any, email: str) -> tuple[str, str] | None:
         return None
     from .graph import object_id  # deferred: graph imports are heavy
 
-    person = graph.get(object_id("Employee", email))
+    person = graph.get(object_id(onto.EMPLOYEE, email))
     if person is None:
         return None
     for _, other in graph.neighbors(person.id, "reports_to", "out"):
@@ -205,13 +288,48 @@ def manager_of(graph: Any, email: str) -> tuple[str, str] | None:
     return None
 
 
-def _section(content: str, heading: str) -> str:
-    """The body under one `##` heading, up to the next one."""
+def name_of(graph: Any, email: str) -> str:
+    """What to call this person, as the org chart holds it, or "".
+
+    Only ever used for a label — the desk's slug comes from the email, so a
+    cold deployment with no `Employee` for anybody still routes to the right
+    inbox and merely prints an address on it.
+    """
+    if not email or graph is None:
+        return ""
+    from .graph import object_id  # deferred: graph imports are heavy
+
+    person = graph.get(object_id(onto.EMPLOYEE, email))
+    if person is None:
+        return ""
+    return str(person.props.get("name") or person.label or "")
+
+
+def section(content: str, heading: str) -> str:
+    """The body under one heading, up to the next heading of any level.
+
+    Public because it is the house answer to a question four modules now ask:
+    *which part of this governed page am I allowed to read?* Scoping is not
+    tidiness — `plant-scheduling-parameters` carries ten tables and a quoted
+    `- goal max: —` under its `## Open` heading, so a parser matching
+    document-wide reads a quotation as a capacity row. Every parser over a
+    multi-section asset starts here.
+
+    Case-insensitive on the heading, because a page is written for a person: a
+    reader asking for `source vocabulary` should find `## Source vocabulary`.
+    """
     match = re.search(
-        rf"^#{{1,4}}\s*{re.escape(heading)}\s*$(.*?)(?=^#{{1,4}}\s|\Z)",
+        rf"^#{{1,4}}\s*{re.escape(heading)}\s*$(?P<body>.*?)(?=^#{{1,4}}\s|\Z)",
         content or "", re.IGNORECASE | re.MULTILINE | re.DOTALL,
     )
-    return match.group(1) if match else ""
+    return match.group("body") if match else ""
+
+
+#: The name this had while it was private and `connectors.production` was its
+#: only outside caller. Kept as an alias rather than renamed at the call site,
+#: because a helper going public should not make anybody's import a
+#: coordination problem.
+_section = section
 
 
 def _clean_target(raw: str) -> str:
@@ -219,6 +337,12 @@ def _clean_target(raw: str) -> str:
     text = (raw or "").strip().strip("`*_ ").lower()
     if text.startswith("manager-of") or text in ("direct manager", "manager"):
         return MANAGER_OF
+    # Before the slug check below, and that ordering is the whole point:
+    # `submitter` matches the slug pattern, so read as a literal it would name
+    # a shared desk called "submitter" that nobody created and that every
+    # submitter's review would pile into.
+    if text in ("submitter", "the submitter", "submitter (self)"):
+        return SUBMITTER
     # A slug, or prose we cannot honour. Prose is dropped rather than slugified:
     # inventing `vp-of-finance` from "VP of Finance" would name a desk nobody
     # created and route real work into it.

@@ -63,12 +63,14 @@ from datetime import date, timedelta
 
 from pydantic import BaseModel, Field
 
+from . import desks
+from .ontology import names as onto
 from .graph import GraphService, GraphWriter, LinkRecord, ObjectRecord, link_id
 from .identity_sweep import Signal
 from .models import utcnow
 from .resolution import StatePolicy, name_similarity, read_state_policy
 from .runs import RunContext
-from .tasks import Task, TaskEvidence, TaskProposal, TaskService
+from .task_queue import Task, TaskEvidence, TaskProposal, TaskService
 
 log = logging.getLogger("cumulus.disagreement_sweep")
 
@@ -85,7 +87,7 @@ STATE_WINDOW_EVENT = "StateWindowClosed"
 #: `steward_queue_for_type("SalesOrder")` would return `data-stewardship`,
 #: which is the desk that decides who the customer *is*, not the desk that
 #: decides whether to bill them.
-ORDER_DESK_QUEUE = "order-desk"
+ORDER_DESK_QUEUE = desks.ORDER_DESK
 
 #: The identity link the counterparty join walks, and the status it must hold.
 #: A proposal a steward has not confirmed does not carry a join — see the
@@ -132,7 +134,7 @@ class DisagreementScan:
 #: One row today, and the shape is what makes the second row cheap.
 SCAN = DisagreementScan(
     link_type="deal_disagrees_with_order",
-    from_type="Opportunity", to_type="SalesOrder",
+    from_type=onto.OPPORTUNITY, to_type=onto.SALES_ORDER,
     from_edge="pursued_with", to_edge="sold_to",
     from_date_field="close_date", to_date_field="ordered_date",
     from_amount_field="amount_usd", to_amount_field="total_usd",
@@ -768,14 +770,6 @@ def raise_desk_tasks(
 # ---------------------------------------------------------------------------
 
 
-def register(service) -> None:
-    """Bind the body to the engine `SyncService` was handed."""
-    if service.engine is None:
-        return
-    service.engine.register(
-        DISAGREEMENT_SWEEP_FLOW_ID,
-        lambda ctx, inputs: sweep_body(service, ctx, inputs),
-    )
 
 
 def sweep_body(service, ctx: RunContext, inputs: dict) -> dict:

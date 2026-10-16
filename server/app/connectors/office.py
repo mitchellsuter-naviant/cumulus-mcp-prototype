@@ -1,8 +1,8 @@
 """The office feed that is not the calendar: mail, mirrored as evidence.
 
-One flow body — `mail-sync` — kept out of `sync.py` for the reason
-`sync_commerce.py` is: that file is already the wire shapes, the service, the
-landing step and five flows. It registers through `SyncService.__init__`,
+One flow body — `mail-sync` — kept out of `connectors/sync.py` for the reason
+`connectors/commerce.py` is: that file is already the wire shapes, the service,
+the landing step and five flows. It registers through `SyncService.__init__`,
 writes through `service._act` so the Gateway records every claim, and reads
 identity out of the graph rather than deciding any.
 
@@ -42,9 +42,10 @@ from __future__ import annotations
 
 import logging
 
-from .graph import Claim, GraphWriter, object_id
-from .models import utcnow
-from .runs import RunContext
+from ..graph import Claim, GraphWriter, object_id
+from ..models import utcnow
+from ..ontology import names as onto
+from ..runs import RunContext
 from .sync import (
     MAIL_EVENT,
     MAIL_FLOW_ID,
@@ -75,13 +76,6 @@ PREVIEW_CHARS = 240
 KEY_SEPARATOR = "#"
 
 
-def register(service: SyncService) -> None:
-    """Bind the body to the engine `SyncService` was handed."""
-    if service.engine is None:
-        return
-    service.engine.register(
-        MAIL_FLOW_ID, lambda ctx, inputs: mail_body(service, ctx, inputs)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +230,7 @@ def _apply_mailboxes(
             )
             continue
         graph.upsert(
-            "Mailbox", address,
+            onto.MAILBOX, address,
             [
                 Claim(field="address", value=address, source=claim_source),
                 Claim(field="display_name", value=record.display_name,
@@ -274,7 +268,7 @@ def _apply_messages(
     orphaned = 0
     for record in records:
         mailbox = service.graph.get(
-            object_id("Mailbox", _address(record.mailbox_address))
+            object_id(onto.MAILBOX, _address(record.mailbox_address))
         )
         if mailbox is None:
             # No mailbox, no message: a part cannot exist without its owner,
@@ -285,7 +279,7 @@ def _apply_messages(
             orphaned += 1
             continue
         message = graph.upsert(
-            "MailMessage", _message_key(record),
+            onto.MAIL_MESSAGE, _message_key(record),
             [
                 Claim(field="external_id", value=record.external_id,
                       source=claim_source),
@@ -355,17 +349,17 @@ def _wire_correspondents(
 
     def known(email: str) -> tuple[str, object] | None:
         """The person behind an address, and which book they are in."""
-        employee = service.graph.get(object_id("Employee", email))
+        employee = service.graph.get(object_id(onto.EMPLOYEE, email))
         if employee is not None:
             return "employee", employee
-        person = service.graph.get(object_id("Person", email))
+        person = service.graph.get(object_id(onto.PERSON, email))
         if person is not None:
             return "person", person
         return None
 
     for record in records:
         message = service.graph.get(
-            object_id("MailMessage", _message_key(record))
+            object_id(onto.MAIL_MESSAGE, _message_key(record))
         )
         if message is None:
             # Orphaned in `a2`, and already counted there.

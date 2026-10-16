@@ -568,6 +568,31 @@ PURCHASE_ORDERS: list[dict] = [
      "updatedAt": "2026-08-30T13:12:04.620976+00:00"},
 ]
 
+#: One clean shipment, against `PO6013` above. The shared estate serves this
+#: resource because a fake that 404s a feed the registry declares reports that
+#: feed as *broken* on every pull, which is a red row about the fixture rather
+#: than about the code under test.
+#:
+#: Deliberately one receipt and not four: the split delivery, the partial and
+#: the orders they need are scenario fixtures and live beside the test that
+#: asserts on them (`test_estate_receiving.py`). Adding their orders here would
+#: mean re-teaching every test that pins the purchase-order set — a shared
+#: fixture earns its place by being what *everything* needs, not by being the
+#: superset of what anything needs.
+#:
+#: No status on the receipt and no money on it anywhere: the ERP holds neither,
+#: and a fixture that supplied them would let a builder pass a test by reading
+#: a field the estate will never send.
+RECEIVING_REPORTS: list[dict] = [
+    {"id": "7000", "tranId": "RR7000", "purchaseOrderId": "6013",
+     "vendorId": "2000", "tranDate": "2026-08-31", "receivedBy": "Curtis Boyd",
+     "memo": "Crating stock — complete",
+     "lines": [{"line": 1, "itemId": "3002", "quantityOrdered": 35,
+                "quantityReceived": 35}],
+     "createdAt": "2026-08-31T15:20:41.339020+00:00",
+     "updatedAt": "2026-08-31T15:20:41.339020+00:00"},
+]
+
 #: Five of the twelve live mailboxes. Four here and one deliberately off-page
 #: below, because both office feeds reference a mailbox by internal id while
 #: both wire shapes key on the address — so a message or an event whose mailbox
@@ -2287,6 +2312,7 @@ RESOURCES: dict[tuple[str, str], list[dict]] = {
     ("erp", "salesOrders"): SALES_ORDERS,
     ("erp", "vendors"): VENDORS,
     ("erp", "purchaseOrders"): PURCHASE_ORDERS,
+    ("erp", "receivingReports"): RECEIVING_REPORTS,
     ("office", "mailboxes"): MAILBOXES,
     ("office", "messages"): MAIL_MESSAGES,
     ("office", "events"): OFFICE_EVENTS,
@@ -2563,3 +2589,1407 @@ class FakeEstate:
         off.update(updates)
         self.off_page[(app, resource)] = off
         return dict(off)
+
+
+# ---------------------------------------------------------------------------
+# The `wick` namespace — a post-frame construction plant
+# ---------------------------------------------------------------------------
+#
+# **Recorded, like everything above it.** Re-recorded on **2026-09-08** out of
+# the estate's own sample data in `/workspaces/cumulus-demo-ecosystem`, read
+# field by field rather than written from a plan:
+#
+#   * `erp._SEED["wick"]` — twelve customers, six vendors, twenty-two jobs and
+#     fourteen assets — through `erp.ENTITIES` / `erp._record_json`, which is
+#     what decides the served column order, the picklists and the defaults.
+#   * `hris._SEED["wick"]` — twenty-four departments, twenty-six job
+#     definitions, seventy-one workers, fifty-eight training records and six
+#     driver files — through `hris.ENTITIES` / `hris._record_json`.
+#   * `dms._wick_folders()` and `dms._wick_documents()`, which build Wick's
+#     filing tree and its paper at seed time.
+#
+# The ids are the ones each app really mints: the ERP hands out **sequential
+# integers** from its own `seq_start` (`customers` 1000, `vendors` 2000,
+# `assets` 4000, `jobs` 8000) in the order the dataset lists them, the HRIS
+# hands out `DEPT-1001`, `EMP-1001`, `JOB-1001`, `TRN-1001`, `DQ-1001` from
+# 1001 up, and the DMS mints `uuid4().hex[:12]`.
+#
+# **This is a subset, and every row in it is a row the seed really holds.**
+# Twelve of the twenty-two jobs, ten of the twelve customers on the page and
+# two off it, the whole org chart and the whole fleet, and enough of the
+# workforce to hold every head, holder and foreman the rest of the block
+# names. The subset was chosen so that each row carries a designed case — the
+# subcontractor crew, the two Evermores, the article-leading Willows, the
+# ERP's own `Hoffman`/`Hoffmann` duplicate, the DNF job, the two folder trees,
+# a document at revision three, and the jobs nobody has crewed or filed
+# anything for — and the docstring over each list says which.
+#
+# Two things a recording cannot pin, and they are named here rather than
+# quietly invented: the DMS's ids (a fresh `uuid4` per seed, so the *format*
+# is recorded and the values are stand-ins) and its document `size`s (bytes a
+# PDF writer produces at seed time). Everything else below is the estate's.
+#
+# Dates come in two kinds and the difference is deliberate. `updatedAt` is a
+# fixed authored instant, because the watermark logic orders strictly and a
+# moving cursor would make a delta test meaningless — the estate itself stamps
+# every seeded row with the second the seed ran, which is why the stale
+# duplicate customer below is stale in its *content* and not in its dates. The
+# *business* dates — expiries, load dates, inspection due dates — are offsets
+# from today, because that is how the estate itself writes them
+# (`erp._seed_date`, `hris._seed`'s `ago`/`ahead`): what a compliance sweep
+# finds is a function of how far away a date is, and the ladders below reach
+# 61, 45, 30, 21, 15, 7 and −10 days, which is every governed notice stage and
+# one thing already overdue.
+
+_WICK_TODAY = datetime.now(timezone.utc).date()
+
+
+def wick_date(offset_days: int) -> str:
+    """A business date this many days from today, as the estate spells one."""
+    return (_WICK_TODAY + timedelta(days=offset_days)).isoformat()
+
+
+def wick_saturday(offset_days: int) -> str:
+    """`erp._seed_date`'s `("SAT", n)`: the first Saturday on or after `n`.
+
+    Two of the twenty-two jobs load on a weekend, whatever weekday the seed
+    happens to run on, so the rule that ignores weekend loads has something to
+    ignore. `weekday()` counts Monday as 0, so Saturday is 5.
+    """
+    day = _WICK_TODAY + timedelta(days=offset_days)
+    return (day + timedelta(days=(5 - day.weekday()) % 7)).isoformat()
+
+
+def _wick_stamp(ordinal: int) -> str:
+    """An authored `updatedAt`, ascending with the ordinal.
+
+    Fixed rather than relative: `FakeEstate.fetch` filters strictly greater
+    than the cursor and orders ascending, so what these have to do is order —
+    and a timestamp that moved with the clock would make "the second delivery
+    carried one row" depend on when the suite ran.
+    """
+    return f"2026-09-01T{9 + ordinal // 60:02d}:{ordinal % 60:02d}:00+00:00"
+
+
+#: The instant the estate stamped every row it seeded. One value, because
+#: `_insert` writes `createdAt = updatedAt = now` for each record and a seed
+#: is one pass: nothing in a freshly seeded namespace is older than anything
+#: else, which is a fact worth recording rather than prettifying.
+_WICK_SEEDED = "2026-09-01T08:00:00+00:00"
+
+
+WICK_NAMESPACES: dict = {
+    "namespaces": [
+        *NAMESPACES["namespaces"],
+        {
+            "id": "wick",
+            "name": "Wick Buildings",
+            "description": (
+                "Wick Buildings, a Wisconsin post-frame building manufacturer "
+                "and builder."
+            ),
+            "industry": "post-frame-construction",
+            # Four apps and deliberately no `crm`, no `psa`, no `pas`. The
+            # builder portal the RPA designs read is not an app: it is a view
+            # over ERP jobs and DMS documents, which is why nothing here
+            # names it.
+            "apps": ["erp", "dms", "office", "hris"],
+            "processes": ["employee_lifecycle", "plant_week",
+                          "crew_assignment_week", "certification_cycle"],
+            # `namespaces.json` carries no pulse block for this namespace, so
+            # what the discovery route serves is `default_pulse` — off, every
+            # app it runs eligible, quiet cadence.
+            "pulse": {
+                "enabled": False,
+                "apps": {"erp": True, "dms": True, "office": True,
+                         "hris": True},
+                "intensity": "low",
+                "simDayMinutes": 15,
+            },
+        },
+    ],
+    "default": "naviant",
+}
+
+
+# ------------------------------------------------------------------ the HRIS
+
+
+def _wick_dept(**over) -> dict:
+    row = {
+        "id": "", "name": "", "costCenter": None,
+        "parentDepartmentId": None, "headEmployeeId": None,
+        "location": "Mazomanie, WI",
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+    }
+    row.update(over)
+    return row
+
+
+#: The whole org chart, all twenty-four rows, because every one of them is
+#: load-bearing: the ten plant departments each pair with one of the ERP's
+#: `<dept>Done` columns, and the three crews are the seam the jobs feed joins
+#: on.
+#:
+#: A crew is a department whose head is the foreman and whose **`costCenter`**
+#: is the crew id the ERP writes in `jobs.crewId` — `"12"`, `"14"`, `"18"`,
+#: bare, where every other department carries an accounting code spelled
+#: `CC-####`. That is the seam S1 declares and the reason `crew_id → Team` is
+#: a lookup rather than a match: the id and the code are two different facts
+#: about one department, which is why `Team` declares both.
+#:
+#: Nine departments carry **no head at all** — the plant floor's own
+#: departments report to a superintendent and have no named lead in the HRIS —
+#: and that is the ordinary case rather than a gap.
+WICK_DEPARTMENTS: list[dict] = [
+    _wick_dept(id="DEPT-1001", name="Executive", costCenter="CC-1000",
+               headEmployeeId="EMP-1001"),
+    _wick_dept(id="DEPT-1002", name="Builder Services", costCenter="CC-2000",
+               parentDepartmentId="DEPT-1001", headEmployeeId="EMP-1003"),
+    _wick_dept(id="DEPT-1003", name="Engineering & Design",
+               costCenter="CC-2500", parentDepartmentId="DEPT-1001",
+               headEmployeeId="EMP-1004"),
+    _wick_dept(id="DEPT-1004", name="Finance", costCenter="CC-5000",
+               parentDepartmentId="DEPT-1001", headEmployeeId="EMP-1007"),
+    _wick_dept(id="DEPT-1005", name="Information Systems",
+               costCenter="CC-5800", parentDepartmentId="DEPT-1004",
+               headEmployeeId="EMP-1008"),
+    _wick_dept(id="DEPT-1006", name="HR & Safety", costCenter="CC-5500",
+               parentDepartmentId="DEPT-1001", headEmployeeId="EMP-1005"),
+    _wick_dept(id="DEPT-1007", name="Operations", costCenter="CC-3000",
+               parentDepartmentId="DEPT-1001", headEmployeeId="EMP-1001"),
+    _wick_dept(id="DEPT-1008", name="Plant — Mazomanie", costCenter="CC-4000",
+               parentDepartmentId="DEPT-1007", headEmployeeId="EMP-1012"),
+    _wick_dept(id="DEPT-1009", name="Truss Cutting", costCenter="CC-4010",
+               parentDepartmentId="DEPT-1008"),
+    _wick_dept(id="DEPT-1010", name="Truss Fabrication", costCenter="CC-4020",
+               parentDepartmentId="DEPT-1008"),
+    _wick_dept(id="DEPT-1011", name="Steel Fabrication", costCenter="CC-4030",
+               parentDepartmentId="DEPT-1008"),
+    _wick_dept(id="DEPT-1012", name="Trim Fabrication", costCenter="CC-4040",
+               parentDepartmentId="DEPT-1008"),
+    _wick_dept(id="DEPT-1013", name="Hardware & Trim Packaging",
+               costCenter="CC-4050", parentDepartmentId="DEPT-1008"),
+    _wick_dept(id="DEPT-1014", name="Verticals", costCenter="CC-4060",
+               parentDepartmentId="DEPT-1008"),
+    _wick_dept(id="DEPT-1015", name="Components", costCenter="CC-4070",
+               parentDepartmentId="DEPT-1008"),
+    _wick_dept(id="DEPT-1016", name="Laminates", costCenter="CC-4080",
+               parentDepartmentId="DEPT-1008"),
+    _wick_dept(id="DEPT-1017", name="Stack Out", costCenter="CC-4090",
+               parentDepartmentId="DEPT-1008"),
+    _wick_dept(id="DEPT-1018", name="Loading & Yard", costCenter="CC-4100",
+               parentDepartmentId="DEPT-1008", headEmployeeId="EMP-1017"),
+    _wick_dept(id="DEPT-1019", name="Plant — Fork West", costCenter="CC-4200",
+               parentDepartmentId="DEPT-1007", headEmployeeId="EMP-1013",
+               location="Fork West, WI"),
+    _wick_dept(id="DEPT-1020", name="Transportation", costCenter="CC-3500",
+               parentDepartmentId="DEPT-1007", headEmployeeId="EMP-1018"),
+    _wick_dept(id="DEPT-1021", name="Field Construction",
+               costCenter="CC-6000", parentDepartmentId="DEPT-1007",
+               headEmployeeId="EMP-1010"),
+    # The three crews, and the seam S1 declares.
+    _wick_dept(id="DEPT-1022", name="Crew 12", costCenter="12",
+               parentDepartmentId="DEPT-1021", headEmployeeId="EMP-1019"),
+    _wick_dept(id="DEPT-1023", name="Crew 14", costCenter="14",
+               parentDepartmentId="DEPT-1021", headEmployeeId="EMP-1020"),
+    _wick_dept(id="DEPT-1024", name="Crew 18", costCenter="18",
+               parentDepartmentId="DEPT-1021", headEmployeeId="EMP-1021"),
+]
+
+
+def _wick_hris_job(**over) -> dict:
+    row = {
+        "id": "", "jobCode": "", "title": "", "jobFamily": None,
+        "jobLevel": None, "flsaClassification": "Exempt",
+        "minAnnualSalary": None, "maxAnnualSalary": None,
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+    }
+    row.update(over)
+    return row
+
+
+#: The job definitions the recorded workers hold — the ones the workforce
+#: feed dereferences for a title. Fourteen of the estate's twenty-six, and the
+#: eight the recording leaves out belong to workers it leaves out.
+WICK_HRIS_JOBS: list[dict] = [
+    _wick_hris_job(id="JOB-1001", jobCode="EXEC-PRES", title="President",
+                   jobFamily="Executive", jobLevel="E1",
+                   minAnnualSalary=250000, maxAnnualSalary=320000),
+    _wick_hris_job(id="JOB-1003", jobCode="OPS-COORD",
+                   title="Operations Coordinator", jobFamily="Operations",
+                   jobLevel="IC2", minAnnualSalary=65000,
+                   maxAnnualSalary=88000),
+    _wick_hris_job(id="JOB-1004", jobCode="BLD-MGR",
+                   title="Builder Services Manager",
+                   jobFamily="Builder Services", jobLevel="M2",
+                   minAnnualSalary=98000, maxAnnualSalary=128000),
+    _wick_hris_job(id="JOB-1005", jobCode="CON-COORD",
+                   title="Construction Services Coordinator",
+                   jobFamily="Builder Services", jobLevel="IC2",
+                   minAnnualSalary=62000, maxAnnualSalary=85000),
+    _wick_hris_job(id="JOB-1006", jobCode="ENG-MGR",
+                   title="Engineering & Design Manager",
+                   jobFamily="Engineering", jobLevel="M2",
+                   minAnnualSalary=105000, maxAnnualSalary=135000),
+    _wick_hris_job(id="JOB-1007", jobCode="ENG-DES",
+                   title="Construction Plan Designer",
+                   jobFamily="Engineering", jobLevel="IC3",
+                   minAnnualSalary=72000, maxAnnualSalary=98000),
+    _wick_hris_job(id="JOB-1008", jobCode="HR-SAFETY",
+                   title="HR & Safety Manager", jobFamily="People",
+                   jobLevel="M2", minAnnualSalary=92000,
+                   maxAnnualSalary=118000),
+    _wick_hris_job(id="JOB-1009", jobCode="HR-SUP",
+                   title="Safety & Training Supervisor", jobFamily="People",
+                   jobLevel="M1", minAnnualSalary=72000,
+                   maxAnnualSalary=95000),
+    _wick_hris_job(id="JOB-1011", jobCode="FIN-CTL", title="Controller",
+                   jobFamily="Finance", jobLevel="M3",
+                   minAnnualSalary=120000, maxAnnualSalary=155000),
+    _wick_hris_job(id="JOB-1013", jobCode="IT-SYS",
+                   title="Systems Administrator", jobFamily="Technology",
+                   jobLevel="IC3", minAnnualSalary=84000,
+                   maxAnnualSalary=112000),
+    _wick_hris_job(id="JOB-1014", jobCode="PLT-SUPT",
+                   title="Plant Superintendent", jobFamily="Plant",
+                   jobLevel="M2", minAnnualSalary=100000,
+                   maxAnnualSalary=135000),
+    _wick_hris_job(id="JOB-1015", jobCode="PLT-SUP",
+                   title="Plant Supervisor", jobFamily="Plant",
+                   jobLevel="M1", minAnnualSalary=72000,
+                   maxAnnualSalary=95000),
+    _wick_hris_job(id="JOB-1018", jobCode="PLT-SAW",
+                   title="Truss Saw Operator", jobFamily="Plant",
+                   jobLevel="IC2", flsaClassification="Non-exempt"),
+    _wick_hris_job(id="JOB-1022", jobCode="FLD-FOREMAN",
+                   title="Crew Foreman", jobFamily="Field", jobLevel="IC4",
+                   flsaClassification="Non-exempt"),
+    _wick_hris_job(id="JOB-1023", jobCode="FLD-CARP",
+                   title="Field Carpenter", jobFamily="Field",
+                   jobLevel="IC2", flsaClassification="Non-exempt"),
+    _wick_hris_job(id="JOB-1025", jobCode="TRN-SUP",
+                   title="Transportation Supervisor",
+                   jobFamily="Transportation", jobLevel="M1",
+                   minAnnualSalary=82000, maxAnnualSalary=105000),
+    _wick_hris_job(id="JOB-1026", jobCode="DRV-CDL", title="Driver (CDL A)",
+                   jobFamily="Transportation", jobLevel="IC2",
+                   flsaClassification="Non-exempt"),
+]
+
+
+def _wick_worker(index: int, days: int, **over) -> dict:
+    """One HRIS worker, on the same shape `_worker` records for naviant.
+
+    `index` is the worker's position in `hris._SEED["wick"]["employees"]` and
+    `days` is how long ago they were hired, because the estate *derives* five
+    of the columns from exactly those two numbers — the extension on the
+    mobile number, a deterministic date of birth, and the two leave balances
+    (`hris._seed`). Recording the derivation rather than its output is the one
+    place this file computes instead of quoting, and it is the honest choice:
+    a transcribed balance would be wrong the moment somebody re-ordered the
+    roster, and these columns are filler the connector never reads.
+    """
+    birth = datetime(1962 + (index * 5) % 34, (index * 7) % 12 + 1,
+                     (index * 5) % 27 + 1).date()
+    return _worker(**{
+        "mobilePhone": f"(608) 555-0{100 + index:03d}",
+        "dateOfBirth": birth.isoformat(),
+        "workLocation": "Mazomanie, WI",
+        "hireDate": wick_date(-days),
+        "vacationBalanceHours": float(min(160, 40 + days % 90)),
+        "sickBalanceHours": float(16 + days % 30),
+        "createdAt": _WICK_SEEDED,
+        "updatedAt": _WICK_SEEDED,
+        **over,
+    })
+
+
+#: The workers the rest of this block names: every department head, every
+#: credential holder, the three foremen and the four drivers. Twenty-five of
+#: the estate's seventy-one, and each one is here because something else
+#: points at them — the org chart's `headEmployeeId`, a `managerId`, a
+#: training record or a driver file.
+#:
+#: `Jeramy` is spelled the HRIS's way here and `Jeremy` in the Office app —
+#: the estate's own designed misspelling. `Heather Danegelis` sits in Builder
+#: Services and *heads* Field Construction, which is the seed's own shape and
+#: not a transcription slip.
+WICK_EMPLOYEES: list[dict] = [
+    _wick_worker(0, 9500, id="EMP-1001", legalFirstName="Dean",
+                 legalLastName="Ruhland", fullName="Dean Ruhland",
+                 workEmail="dean.ruhland@wickbuildings.com",
+                 jobId="JOB-1001", departmentId="DEPT-1001",
+                 managerId=None, annualSalary=285000),
+    _wick_worker(1, 2600, id="EMP-1002", legalFirstName="Abby",
+                 legalLastName="Wick", fullName="Abby Wick",
+                 workEmail="abby.wick@wickbuildings.com",
+                 jobId="JOB-1003", departmentId="DEPT-1007",
+                 managerId="EMP-1001", annualSalary=78000),
+    _wick_worker(2, 5200, id="EMP-1003", legalFirstName="Gail",
+                 legalLastName="Sprecher", fullName="Gail Sprecher",
+                 workEmail="gail.sprecher@wickbuildings.com",
+                 jobId="JOB-1004", departmentId="DEPT-1002",
+                 managerId="EMP-1001", annualSalary=112000),
+    _wick_worker(3, 4800, id="EMP-1004", legalFirstName="Neil",
+                 legalLastName="Haldiman", fullName="Neil Haldiman",
+                 workEmail="neil.haldiman@wickbuildings.com",
+                 jobId="JOB-1006", departmentId="DEPT-1003",
+                 managerId="EMP-1001", annualSalary=118000),
+    _wick_worker(4, 3100, id="EMP-1005", legalFirstName="Katy",
+                 legalLastName="Tiller", fullName="Katy Tiller",
+                 workEmail="katy.tiller@wickbuildings.com",
+                 jobId="JOB-1008", departmentId="DEPT-1006",
+                 managerId="EMP-1001", annualSalary=104000),
+    _wick_worker(6, 6100, id="EMP-1007", legalFirstName="Duane",
+                 legalLastName="Ziegler", fullName="Duane Ziegler",
+                 workEmail="duane.ziegler@wickbuildings.com",
+                 jobId="JOB-1011", departmentId="DEPT-1004",
+                 managerId="EMP-1001", annualSalary=138000),
+    _wick_worker(7, 2900, id="EMP-1008", legalFirstName="Jeramy",
+                 legalLastName="Bollig", fullName="Jeramy Bollig",
+                 workEmail="jeramy.bollig@wickbuildings.com",
+                 jobId="JOB-1013", departmentId="DEPT-1005",
+                 managerId="EMP-1007", annualSalary=96000),
+    _wick_worker(8, 2200, id="EMP-1009", legalFirstName="Steve",
+                 legalLastName="Woodbury", fullName="Steve Woodbury",
+                 workEmail="steve.woodbury@wickbuildings.com",
+                 jobId="JOB-1009", departmentId="DEPT-1006",
+                 managerId="EMP-1005", annualSalary=82000,
+                 workLocation="Fork West, WI"),
+    _wick_worker(9, 3400, id="EMP-1010", legalFirstName="Heather",
+                 legalLastName="Danegelis", fullName="Heather Danegelis",
+                 workEmail="heather.danegelis@wickbuildings.com",
+                 jobId="JOB-1005", departmentId="DEPT-1002",
+                 managerId="EMP-1003", annualSalary=72000),
+    _wick_worker(10, 2000, id="EMP-1011", legalFirstName="Marlea",
+                 legalLastName="Knox", fullName="Marlea Knox",
+                 workEmail="marlea.knox@wickbuildings.com",
+                 jobId="JOB-1007", departmentId="DEPT-1003",
+                 managerId="EMP-1004", annualSalary=84000),
+    _wick_worker(11, 7300, id="EMP-1012", legalFirstName="Chris",
+                 legalLastName="Robson", fullName="Chris Robson",
+                 workEmail="chris.robson@wickbuildings.com",
+                 jobId="JOB-1014", departmentId="DEPT-1008",
+                 managerId="EMP-1001", annualSalary=126000),
+    _wick_worker(12, 4400, id="EMP-1013", legalFirstName="Kurt",
+                 legalLastName="Ninneman", fullName="Kurt Ninneman",
+                 workEmail="kurt.ninneman@wickbuildings.com",
+                 jobId="JOB-1014", departmentId="DEPT-1019",
+                 managerId="EMP-1001", annualSalary=108000,
+                 workLocation="Fork West, WI"),
+    _wick_worker(13, 6600, id="EMP-1014", legalFirstName="Doug",
+                 legalLastName="Zwettler", fullName="Doug Zwettler",
+                 workEmail="doug.zwettler@wickbuildings.com",
+                 jobId="JOB-1015", departmentId="DEPT-1009",
+                 managerId="EMP-1012", annualSalary=86000),
+    _wick_worker(14, 5800, id="EMP-1015", legalFirstName="Lonnie",
+                 legalLastName="Frei", fullName="Lonnie Frei",
+                 workEmail="lonnie.frei@wickbuildings.com",
+                 jobId="JOB-1015", departmentId="DEPT-1011",
+                 managerId="EMP-1012", annualSalary=84000),
+    _wick_worker(15, 4100, id="EMP-1016", legalFirstName="Denise",
+                 legalLastName="Kalscheur", fullName="Denise Kalscheur",
+                 workEmail="denise.kalscheur@wickbuildings.com",
+                 jobId="JOB-1015", departmentId="DEPT-1014",
+                 managerId="EMP-1012", annualSalary=82000),
+    _wick_worker(16, 5100, id="EMP-1017", legalFirstName="Wade",
+                 legalLastName="Ballweg", fullName="Wade Ballweg",
+                 workEmail="wade.ballweg@wickbuildings.com",
+                 jobId="JOB-1015", departmentId="DEPT-1018",
+                 managerId="EMP-1012", annualSalary=85000),
+    _wick_worker(17, 4600, id="EMP-1018", legalFirstName="Rick",
+                 legalLastName="Endres", fullName="Rick Endres",
+                 workEmail="rick.endres@wickbuildings.com",
+                 jobId="JOB-1025", departmentId="DEPT-1020",
+                 managerId="EMP-1001", annualSalary=92000),
+    # The three foremen. The ERP prints `D. Prellwitz` on a job where the
+    # HRIS holds `Dale Prellwitz`, which is the designed drift (S1) and the
+    # reason the crew binding joins on a cost centre and not on a name.
+    _wick_worker(18, 5600, id="EMP-1019", legalFirstName="Dale",
+                 legalLastName="Prellwitz", fullName="Dale Prellwitz",
+                 workEmail="dale.prellwitz@wickbuildings.com",
+                 jobId="JOB-1022", departmentId="DEPT-1022",
+                 managerId="EMP-1010", payType="Hourly", hourlyRate=34.5),
+    _wick_worker(19, 4200, id="EMP-1020", legalFirstName="Marv",
+                 legalLastName="Tessmann", fullName="Marv Tessmann",
+                 workEmail="marv.tessmann@wickbuildings.com",
+                 jobId="JOB-1022", departmentId="DEPT-1023",
+                 managerId="EMP-1010", payType="Hourly", hourlyRate=33.75),
+    _wick_worker(20, 2400, id="EMP-1021", legalFirstName="Ryan",
+                 legalLastName="Hupf", fullName="Ryan Hupf",
+                 workEmail="ryan.hupf@wickbuildings.com",
+                 jobId="JOB-1022", departmentId="DEPT-1024",
+                 managerId="EMP-1010", payType="Hourly", hourlyRate=32.0),
+    _wick_worker(21, 1500, id="EMP-1022", legalFirstName="Cory",
+                 legalLastName="Meinholz", fullName="Cory Meinholz",
+                 workEmail="cory.meinholz@wickbuildings.com",
+                 jobId="JOB-1023", departmentId="DEPT-1021",
+                 managerId="EMP-1010", payType="Hourly", hourlyRate=27.5),
+    _wick_worker(22, 3900, id="EMP-1023", legalFirstName="Terry",
+                 legalLastName="Nachreiner", fullName="Terry Nachreiner",
+                 workEmail="terry.nachreiner@wickbuildings.com",
+                 jobId="JOB-1026", departmentId="DEPT-1020",
+                 managerId="EMP-1018", payType="Hourly", hourlyRate=28.5),
+    _wick_worker(23, 6800, id="EMP-1024", legalFirstName="Vern",
+                 legalLastName="Oimoen", fullName="Vern Oimoen",
+                 workEmail="vern.oimoen@wickbuildings.com",
+                 jobId="JOB-1026", departmentId="DEPT-1020",
+                 managerId="EMP-1018", payType="Hourly", hourlyRate=29.25),
+    _wick_worker(24, 1100, id="EMP-1025", legalFirstName="Josh",
+                 legalLastName="Ripp", fullName="Josh Ripp",
+                 workEmail="josh.ripp@wickbuildings.com",
+                 jobId="JOB-1026", departmentId="DEPT-1020",
+                 managerId="EMP-1018", payType="Hourly", hourlyRate=26.75),
+    _wick_worker(28, 2838, id="EMP-1029", legalFirstName="Janelle",
+                 legalLastName="Ehrhardt", fullName="Janelle Ehrhardt",
+                 workEmail="janelle.ehrhardt@wickbuildings.com",
+                 jobId="JOB-1018", departmentId="DEPT-1009",
+                 managerId="EMP-1014", payType="Hourly", hourlyRate=24.75),
+]
+
+#: Reachable by id, absent from every list — the dereference case for the
+#: credential feed's `employeeId → workEmail` join, and the reason the feed
+#: pulls `employees` at all.
+#:
+#: A real worker held off the page on purpose: `Cody Statz` is the fifth
+#: driver in the estate's roster, and on an incremental pull — the ordinary
+#: one, where the cursor is past the day the workforce was seeded — the
+#: employees route answers with nothing and *every* holder has to be
+#: dereferenced. Recording one worker off-page is how a single-shot fixture
+#: reproduces that, and it is what makes his four dated permissions count as
+#: holders the workforce feed never landed.
+WICK_WORKER_OFF_PAGE: dict = _wick_worker(
+    25, 620, id="EMP-1026", legalFirstName="Cody", legalLastName="Statz",
+    fullName="Cody Statz", workEmail="cody.statz@wickbuildings.com",
+    jobId="JOB-1026", departmentId="DEPT-1020", managerId="EMP-1018",
+    payType="Hourly", hourlyRate=25.5,
+)
+
+
+def _wick_training(**over) -> dict:
+    row = {
+        "id": "", "employeeId": "", "courseName": "", "provider": None,
+        "category": None, "required": True, "assignedDate": None,
+        "completionDate": None, "expirationDate": None,
+        "status": "Complete", "result": None,
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+    }
+    row.update(over)
+    return row
+
+
+#: The training matrix, and **the expiry ladder**: 61, 45, 30, 21, 15, 7 and
+#: −10 days out, so a compliance sweep finds work at every governed notice
+#: stage and one thing already lapsed. Ten of the estate's fifty-eight — one
+#: per rung, plus the two rows that are not on the ladder at all.
+#:
+#: Two things about the shape are worth naming because a later lane will trip
+#: on them. There is no `employeeEmail`: both credential resources carry
+#: `employeeId` only, which is the whole reason the feed pulls `employees` and
+#: joins. And the HRIS's own `category` vocabulary is **`Safety` and
+#: `Equipment`** — not the `certification | licence | medical | clearance |
+#: training` set `connectors.compliance.CREDENTIAL_CATEGORIES` declares — so
+#: every training row here lands with no category and is counted. That is the
+#: estate as it is; the reconciliation is a governed decision and not this
+#: file's to make.
+WICK_TRAINING_RECORDS: list[dict] = [
+    _wick_training(id="TRN-1001", employeeId="EMP-1014",
+                   courseName="Forklift Operator Certification",
+                   provider="Wick Safety", category="Safety",
+                   assignedDate=wick_date(-2500),
+                   completionDate=wick_date(-1035),
+                   expirationDate=wick_date(61), result="Pass",
+                   updatedAt=_wick_stamp(1)),
+    _wick_training(id="TRN-1003", employeeId="EMP-1017",
+                   courseName="Forklift Operator Certification",
+                   provider="Wick Safety", category="Safety",
+                   assignedDate=wick_date(-2200),
+                   completionDate=wick_date(-1051),
+                   expirationDate=wick_date(45), result="Pass",
+                   updatedAt=_wick_stamp(2)),
+    # A driver who holds a training record *and* a driver file: one roster,
+    # two kinds of permission, distinguished only by category.
+    _wick_training(id="TRN-1004", employeeId="EMP-1023",
+                   courseName="First Aid / CPR / AED",
+                   provider="Wick Safety", category="Safety",
+                   assignedDate=wick_date(-1415),
+                   completionDate=wick_date(-685),
+                   expirationDate=wick_date(45), result="Pass",
+                   updatedAt=_wick_stamp(3)),
+    _wick_training(id="TRN-1005", employeeId="EMP-1016",
+                   courseName="Fall Protection — Competent Person",
+                   provider="Wick Safety", category="Safety",
+                   assignedDate=wick_date(-1800),
+                   completionDate=wick_date(-700),
+                   expirationDate=wick_date(30), result="Pass",
+                   updatedAt=_wick_stamp(4)),
+    _wick_training(id="TRN-1007", employeeId="EMP-1015",
+                   courseName="Scissor Lift Operator Certification",
+                   provider="Badger Lift & Crane Service",
+                   category="Equipment", assignedDate=wick_date(-1105),
+                   completionDate=wick_date(-1075),
+                   expirationDate=wick_date(21), result="Pass",
+                   updatedAt=_wick_stamp(5)),
+    _wick_training(id="TRN-1009", employeeId="EMP-1022",
+                   courseName="Telehandler Operator Certification",
+                   provider="Badger Lift & Crane Service",
+                   category="Equipment", assignedDate=wick_date(-1111),
+                   completionDate=wick_date(-1081),
+                   expirationDate=wick_date(15), result="Pass",
+                   updatedAt=_wick_stamp(6)),
+    _wick_training(id="TRN-1011", employeeId="EMP-1019",
+                   courseName="Crane Signalling & Rigging",
+                   provider="Badger Lift & Crane Service",
+                   category="Equipment", assignedDate=wick_date(-3200),
+                   completionDate=wick_date(-1089),
+                   expirationDate=wick_date(7), result="Pass",
+                   updatedAt=_wick_stamp(7)),
+    # Already lapsed, and it is a foreman's: the crew keeps working, which is
+    # exactly why somebody has to be told.
+    _wick_training(id="TRN-1013", employeeId="EMP-1020",
+                   courseName="First Aid / CPR / AED",
+                   provider="Wick Safety", category="Safety",
+                   assignedDate=wick_date(-1470),
+                   completionDate=wick_date(-740),
+                   expirationDate=wick_date(-10), status="Expired",
+                   result="Pass", updatedAt=_wick_stamp(8)),
+    # Sat and failed, and still in progress: a training record that exists is
+    # not a training record that was passed. Its holder is the worker the
+    # employees page does not carry.
+    _wick_training(id="TRN-1015", employeeId="EMP-1026",
+                   courseName="Telehandler Operator Certification",
+                   provider="Badger Lift & Crane Service",
+                   category="Equipment", assignedDate=wick_date(-42),
+                   completionDate=wick_date(-12), status="In Progress",
+                   result="Fail", updatedAt=_wick_stamp(9)),
+    # No expiry at all: an orientation is a thing that happened once.
+    _wick_training(id="TRN-1019", employeeId="EMP-1029",
+                   courseName="New Employee Safety Orientation",
+                   provider="Wick Safety", category="Safety",
+                   assignedDate=wick_date(-2863),
+                   completionDate=wick_date(-2833), result="Pass",
+                   updatedAt=_wick_stamp(10)),
+]
+
+
+def _wick_driver(**over) -> dict:
+    row = {
+        "id": "", "employeeId": "", "cdlNumber": None, "cdlClass": None,
+        "cdlState": "WI", "cdlExpirationDate": None,
+        "medicalCardExpirationDate": None, "pspDate": None,
+        "clearinghouseDate": None, "status": "Qualified",
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+    }
+    row.update(over)
+    return row
+
+
+#: Driver files: four dated columns on one row, which the connector fans out
+#: into one credential per date. Four of the estate's six.
+#:
+#: Vern Oimoen has **no PSP on file** and Cody Statz's row is the only one
+#: whose holder the employees page does not carry — an absent date is the HRIS
+#: saying there is nothing on file, and it yields no credential rather than an
+#: expiry of nothing. The two expiries ladder forwards; the PSP and
+#: Clearinghouse dates run *backwards*, because they record when a query was
+#: last made rather than when something runs out.
+WICK_DRIVER_QUALIFICATIONS: list[dict] = [
+    _wick_driver(id="DQ-1001", employeeId="EMP-1023",
+                 cdlNumber="N204-3184-7250-01", cdlClass="A",
+                 cdlExpirationDate=wick_date(61),
+                 medicalCardExpirationDate=wick_date(45),
+                 pspDate=wick_date(-320),
+                 clearinghouseDate=wick_date(-298),
+                 updatedAt=_wick_stamp(11)),
+    _wick_driver(id="DQ-1002", employeeId="EMP-1024",
+                 cdlNumber="O514-8830-1164-03", cdlClass="A",
+                 cdlExpirationDate=wick_date(30),
+                 medicalCardExpirationDate=wick_date(21),
+                 pspDate=None, clearinghouseDate=wick_date(-341),
+                 updatedAt=_wick_stamp(12)),
+    # The medical card that has already lapsed, on a driver who is still on
+    # the road.
+    _wick_driver(id="DQ-1003", employeeId="EMP-1025",
+                 cdlNumber="R881-2075-4498-06", cdlClass="A",
+                 cdlExpirationDate=wick_date(15),
+                 medicalCardExpirationDate=wick_date(-10),
+                 pspDate=wick_date(-276),
+                 clearinghouseDate=wick_date(-204),
+                 updatedAt=_wick_stamp(13)),
+    # Class B, and the holder the workforce feed never delivered.
+    _wick_driver(id="DQ-1004", employeeId="EMP-1026",
+                 cdlNumber="S339-6612-8073-02", cdlClass="B",
+                 cdlExpirationDate=wick_date(7),
+                 medicalCardExpirationDate=wick_date(61),
+                 pspDate=wick_date(-352),
+                 clearinghouseDate=wick_date(-355),
+                 updatedAt=_wick_stamp(14)),
+]
+
+
+# ------------------------------------------------------------------- the ERP
+
+
+def _wick_customer(**over) -> dict:
+    row = {
+        "id": "", "companyName": "", "email": None, "phone": None,
+        "terms": "Net 30",
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+    }
+    row.update(over)
+    return row
+
+
+#: The customers the jobs name, ten on the page and two off it. Two Evermores
+#: whose first keyword collides, `The Willows Equine LLC` whose naive first
+#: keyword is `The`, and the stale half of the ERP's own `Hoffman` /
+#: `Hoffmann` duplicate — the traps the packet label and the identity sweep
+#: are graded against.
+#:
+#: **There is no `billingAddress` column.** `erp.ENTITIES["customers"]` holds
+#: `companyName`, `email`, `phone` and `terms` and nothing else, so a fixture
+#: that carried an address would have tested a shape nothing serves.
+WICK_CUSTOMERS: list[dict] = [
+    _wick_customer(id="1000", companyName="Evermore Ridge Estates",
+                   email="office@evermoreridge.example.com",
+                   phone="(608) 555-0412"),
+    _wick_customer(id="1001", companyName="Evermore Farms LLC",
+                   email="office@evermorefarms.example.com",
+                   phone="(608) 555-0437"),
+    # No phone on file, and an article for a first keyword.
+    _wick_customer(id="1002", companyName="The Willows Equine LLC",
+                   email="office@willowsequine.example.com", terms="Net 15"),
+    _wick_customer(id="1003", companyName="Sauk Prairie Dairy LLC",
+                   email="office@saukprairiedairy.example.com",
+                   phone="(608) 555-0455"),
+    # The stale half of the ERP's own duplicate: older terms, no email on
+    # file, no job of its own, and nothing in either row saying they are one
+    # farm. Seeded in the same pass as everything else, so the dates say
+    # nothing about which of the two is the live one — the *content* is the
+    # only evidence there is.
+    _wick_customer(id="1005", companyName="Hoffmann Ridge Farms",
+                   phone="(608) 555-0401", terms="Net 60"),
+    _wick_customer(id="1006", companyName="Kickapoo Valley Builders",
+                   email="office@kickapoovalley.example.com",
+                   phone="(608) 555-0473"),
+    _wick_customer(id="1007", companyName="Blackhawk Equipment Rental",
+                   email="ap@blackhawkrental.example.com",
+                   phone="(815) 555-0482"),
+    _wick_customer(id="1008", companyName="Blue Mounds Farm Supply",
+                   email="orders@bluemoundsfarm.example.com",
+                   phone="(608) 555-0491"),
+    _wick_customer(id="1010", companyName="Pecatonica Valley Beef LLC",
+                   email="office@pecatonicabeef.example.com",
+                   phone="(608) 555-0517"),
+    _wick_customer(id="1011", companyName="Halfway Prairie Cattle Co.",
+                   email="office@halfwayprairie.example.com",
+                   phone="(608) 555-0526", terms="Net 45"),
+]
+
+#: Only referenced, never listed — the customer job `260449` names and the
+#: customers page does not carry. The dereference case for the jobs feed's
+#: `customerId → companyName` join.
+#:
+#: A real customer held off the page on purpose, the way `Cody Statz` is: on
+#: an incremental pull the customers route answers with nothing and every
+#: `customerId` has to be dereferenced. `Lone Rock Ag Services LLC` resembles
+#: nothing the sell side landed, so the joined name mints its own Company —
+#: which is what a name below the governed floor is *supposed* to do.
+WICK_CUSTOMER_OFF_PAGE: dict = _wick_customer(
+    id="1009", companyName="Lone Rock Ag Services LLC",
+    phone="(608) 555-0504",
+)
+
+
+#: The identity trap the ERP seeds on purpose, and the reason the jobs
+#: contract escalates per row. `Hoffman Ridge Farms` is the *live* half of the
+#: duplicate pair — the half every Hoffman job names — and holding it off the
+#: customers page is what makes the sell side land only `Hoffmann Ridge Farms`
+#: and the jobs feed's join produce a name that scores 0.81 against it:
+#: squarely in the steward band the governed policy declares (0.70 to 0.92),
+#: close enough that a resolver must not link it and far enough that it must
+#: not mint a second Hoffman farm either.
+WICK_CUSTOMER_NEAR_MISS: dict = _wick_customer(
+    id="1004", companyName="Hoffman Ridge Farms",
+    email="office@hoffmanridge.example.com", phone="(608) 555-0468",
+)
+
+
+def _wick_vendor(**over) -> dict:
+    row = {
+        "id": "", "companyName": "", "email": None, "phone": None,
+        "terms": None,
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+    }
+    row.update(over)
+    return row
+
+
+#: The vendors, all six — recorded because the fleet points at two of them by
+#: id and a fixture whose `vendorId` named nothing would be a fixture testing
+#: a dangling reference. `Blackhawk Truss Supply` carries no terms, which is
+#: the estate's own null and not an omission here.
+WICK_VENDORS: list[dict] = [
+    _wick_vendor(id="2000", companyName="Badger Lift & Crane Service",
+                 email="service@badgerlift.example.com",
+                 phone="(608) 555-0533", terms="Net 30"),
+    _wick_vendor(id="2001", companyName="Coulee Fleet Services Inc.",
+                 email="billing@couleefleet.example.com",
+                 phone="(608) 555-0548", terms="Net 30"),
+    _wick_vendor(id="2002", companyName="Mazo Occupational Health",
+                 email="records@mazoocchealth.example.com",
+                 phone="(608) 555-0552", terms="Due on receipt"),
+    _wick_vendor(id="2003", companyName="Cross Plains Lumber Co.",
+                 email="ar@crossplainslumber.example.com",
+                 phone="(608) 555-0561", terms="Net 30"),
+    _wick_vendor(id="2004", companyName="Northern Steel & Trim Supply",
+                 email="orders@northernsteeltrim.example.com",
+                 phone="(920) 555-0574", terms="Net 30"),
+    _wick_vendor(id="2005", companyName="Blackhawk Truss Supply",
+                 email="sales@blackhawktruss.example.com",
+                 phone="(815) 555-0588"),
+]
+
+
+#: The ten `<dept>Done` picklists, in the order the plant works them. Named
+#: here because most of Wick's jobs have been through the whole floor and
+#: writing `"Yes"` ten times per row would bury the rows that have not.
+_WICK_DONE_ALL: dict = {
+    "trussCutDone": "Yes", "trussFabDone": "Yes", "steelFabDone": "Yes",
+    "trimFabDone": "Yes", "hardwarePackDone": "Yes", "verticalsDone": "Yes",
+    "componentsDone": "Yes", "laminatesDone": "Yes", "stackOutDone": "Yes",
+    "loadingDone": "Yes",
+}
+
+
+def _wick_job(**over) -> dict:
+    """One AXIS job row, with every column the estate serves.
+
+    Ten `<dept>Done` picklists default to `"No"`, because a job that has not
+    been cut yet is the ordinary case and the flags are what say so. Pass
+    `**_WICK_DONE_ALL` for a job the whole floor has finished with.
+    """
+    row = {
+        "id": "", "jobNumber": "", "customerId": None,
+        "builder": "Wick Buildings — Direct", "jobName": None,
+        "status": "Scheduled", "plantSite": "Mazo",
+        "foreman": None, "crewId": None,
+        "loadDate": None, "shipmentDate": None, "weekPosition": None,
+        "outToYard": "No", "doNotFab": "No", "shipmentType": None,
+        "combinedWith": None, "trailerNumber": None,
+        "buildingWidthFt": None, "buildingLengthFt": None,
+        "buildingHeightFt": None,
+        "wingsTotalWidthFt": None, "wingsTotalLengthFt": None,
+        "trussCutDone": "No", "trussFabDone": "No", "steelFabDone": "No",
+        "trimFabDone": "No", "hardwarePackDone": "No", "verticalsDone": "No",
+        "componentsDone": "No", "laminatesDone": "No", "stackOutDone": "No",
+        "loadingDone": "No",
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+    }
+    row.update(over)
+    return row
+
+
+#: Twelve of the twenty-two jobs, and each one carries a case:
+#:
+#:   * `250553` — the SDD's own number, one of two 2025 carryovers, in
+#:     progress on Crew 12 with the whole floor finished with it. The job the
+#:     crew-reassignment delta below moves.
+#:   * `260402` — in progress on Crew 14; the job whose scanned shipping list
+#:     is at **revision 3**.
+#:   * `260411` — erected by the subcontractor: `crewId` is `SUB-KVB`, which
+#:     no HRIS department holds and none ever will (S2).
+#:   * `250661`, `260452` — `The Willows Equine LLC`, the article-leading
+#:     packet-label trap, twice.
+#:   * `250774` — `Evermore Farms LLC`, the other half of the first-keyword
+#:     collision with `Evermore Ridge Estates`.
+#:   * `260431` — filed in **both** folder trees, and one of the jobs the ERP
+#:     has not crewed: no `foreman`, no `crewId`, no flag ticked.
+#:   * `260440` and `260452` — a **combined load**: `shipmentType` `CT`, each
+#:     naming the other in `combinedWith`, on one trailer. `260440` loads on a
+#:     Saturday.
+#:   * `260449` — the customer the page does not carry, and a job **nothing
+#:     has been filed for** in either tree.
+#:   * `260457` — one flag ticked and nine not: the partial case.
+#:   * `260470` — `doNotFab: Yes`, the only held job in the estate, and
+#:     uncrewed.
+#:   * `260381` — `Complete`, and the reason a status is a column.
+#:
+#: `foreman` is the ERP's typed display name — `D. Prellwitz` where the HRIS
+#: holds `Dale Prellwitz` — which is the designed drift (S1). `builder` is a
+#: typed string too, and `Kickapoo Valley Builders` and `Blue Mounds Farm
+#: Supply` appear in it as dealers who sold a building they did not own.
+#:
+#: **Every one of the twenty-two has `outToYard: "Yes"`**, so the governed
+#: vocabulary's `no → not released` row is never exercised by seeded data.
+#: Recorded as it is rather than bent to give a test the other branch.
+WICK_JOBS: list[dict] = [
+    _wick_job(id="8000", jobNumber="250553", customerId="1000",
+              jobName="40x72x14 machine storage", status="In Progress",
+              foreman="D. Prellwitz", crewId="12",
+              loadDate=wick_date(-12), shipmentDate=wick_date(-12),
+              outToYard="Yes", shipmentType="ST", trailerNumber="TRL-07",
+              buildingWidthFt=40, buildingLengthFt=72, buildingHeightFt=14,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              **_WICK_DONE_ALL, updatedAt=_wick_stamp(21)),
+    _wick_job(id="8001", jobNumber="260402", customerId="1003",
+              builder="Blue Mounds Farm Supply",
+              jobName="60x120x16 freestall addition", status="In Progress",
+              foreman="M. Tessmann", crewId="14",
+              loadDate=wick_date(-9), shipmentDate=wick_date(-9),
+              outToYard="Yes", shipmentType="ST", trailerNumber="TRL-04",
+              buildingWidthFt=60, buildingLengthFt=120, buildingHeightFt=16,
+              wingsTotalWidthFt=12, wingsTotalLengthFt=60,
+              **_WICK_DONE_ALL, updatedAt=_wick_stamp(22)),
+    # The subcontractor. There is no HRIS department for `SUB-KVB` and there
+    # never will be, so the crew id resolves to no Team — an aggregate count,
+    # and an identity question for a person later.
+    _wick_job(id="8003", jobNumber="260411", customerId="1007",
+              builder="Kickapoo Valley Builders",
+              jobName="80x150x18 equipment shed", status="In Progress",
+              plantSite="Fork West", foreman="KICKAPOO VALLEY BUILDERS",
+              crewId="SUB-KVB",
+              loadDate=wick_date(-5), shipmentDate=wick_date(-5),
+              outToYard="Yes", shipmentType="ST", trailerNumber="TRL-07",
+              buildingWidthFt=80, buildingLengthFt=150, buildingHeightFt=18,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              **_WICK_DONE_ALL, updatedAt=_wick_stamp(23)),
+    _wick_job(id="8005", jobNumber="250661", customerId="1002",
+              jobName="72x160x16 riding arena", foreman="R. Hupf",
+              crewId="18", loadDate=wick_date(4), weekPosition="Week 1",
+              outToYard="Yes", shipmentType="ST",
+              buildingWidthFt=72, buildingLengthFt=160, buildingHeightFt=16,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              **_WICK_DONE_ALL, updatedAt=_wick_stamp(24)),
+    _wick_job(id="8006", jobNumber="250774", customerId="1001",
+              builder="Blue Mounds Farm Supply",
+              jobName="54x104x16 heifer barn", foreman="D. Prellwitz",
+              crewId="12", loadDate=wick_date(6), weekPosition="Week 1",
+              outToYard="Yes", shipmentType="ST",
+              buildingWidthFt=54, buildingLengthFt=104, buildingHeightFt=16,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              **_WICK_DONE_ALL, updatedAt=_wick_stamp(25)),
+    # Filed in both trees, and on nobody's crew.
+    _wick_job(id="8013", jobNumber="260431", customerId="1011",
+              jobName="40x72x14 machine storage",
+              loadDate=wick_date(9), weekPosition="Week 2",
+              outToYard="Yes", shipmentType="ST",
+              buildingWidthFt=40, buildingLengthFt=72, buildingHeightFt=14,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              updatedAt=_wick_stamp(26)),
+    # Half of the combined load, and a Saturday.
+    _wick_job(id="8009", jobNumber="260440", customerId="1000",
+              jobName="36x60x14 hay shed", foreman="M. Tessmann",
+              crewId="14", loadDate=wick_saturday(11),
+              weekPosition="Week 2", outToYard="Yes", shipmentType="CT",
+              combinedWith="260452", trailerNumber="TRL-04",
+              buildingWidthFt=36, buildingLengthFt=60, buildingHeightFt=14,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              **_WICK_DONE_ALL, updatedAt=_wick_stamp(27)),
+    # Its customer is off the page: the join's dereference, and the name that
+    # resembles nothing the sell side landed.
+    _wick_job(id="8011", jobNumber="260449", customerId="1009",
+              builder="Lone Rock Ag Svcs",
+              jobName="60x100x16 machine shed", foreman="R. Hupf",
+              crewId="18", loadDate=wick_date(13), weekPosition="Week 2",
+              outToYard="Yes", shipmentType="ST",
+              buildingWidthFt=60, buildingLengthFt=100, buildingHeightFt=16,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              **_WICK_DONE_ALL, updatedAt=_wick_stamp(28)),
+    # The other half of the combined load.
+    _wick_job(id="8012", jobNumber="260452", customerId="1002",
+              jobName="24x36x12 tack building", foreman="D. Prellwitz",
+              crewId="12", loadDate=wick_date(14), weekPosition="Week 2",
+              outToYard="Yes", shipmentType="CT", combinedWith="260440",
+              trailerNumber="TRL-04",
+              buildingWidthFt=24, buildingLengthFt=36, buildingHeightFt=12,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              **_WICK_DONE_ALL, updatedAt=_wick_stamp(29)),
+    # One department has finished with it and nine have not.
+    _wick_job(id="8014", jobNumber="260457", customerId="1003",
+              builder="Blue Mounds Farm Supply",
+              jobName="60x120x16 freestall addition",
+              loadDate=wick_date(16), weekPosition="Week 1",
+              outToYard="Yes", shipmentType="ST",
+              buildingWidthFt=60, buildingLengthFt=120, buildingHeightFt=16,
+              wingsTotalWidthFt=12, wingsTotalLengthFt=60,
+              trussCutDone="Yes", updatedAt=_wick_stamp(30)),
+    # The only held job in the estate.
+    _wick_job(id="8017", jobNumber="260470", customerId="1007",
+              builder="Kickapoo Valley Builders",
+              jobName="100x200x20 rental yard shop", plantSite="Fork West",
+              loadDate=wick_date(21), weekPosition="Week 3",
+              outToYard="Yes", doNotFab="Yes", shipmentType="ST",
+              buildingWidthFt=100, buildingLengthFt=200,
+              buildingHeightFt=20,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              updatedAt=_wick_stamp(31)),
+    # Shipped, and closed.
+    _wick_job(id="8020", jobNumber="260381", customerId="1003",
+              builder="Blue Mounds Farm Supply",
+              jobName="36x48x12 pump house", status="Complete",
+              foreman="D. Prellwitz", crewId="12",
+              loadDate=wick_date(-40), shipmentDate=wick_date(-40),
+              outToYard="Yes", shipmentType="ST", trailerNumber="TRL-04",
+              buildingWidthFt=36, buildingLengthFt=48, buildingHeightFt=12,
+              wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+              **_WICK_DONE_ALL, updatedAt=_wick_stamp(32)),
+]
+
+#: A job the ERP has not put on a crew, delivered on its own. An empty
+#: `crewId` is the production system saying nothing rather than saying
+#: "nobody", which is why it draws no edge, is not counted against the crew
+#: binding, and — the part that matters — does not resolve to whichever
+#: department happens to have a blank cost centre.
+#:
+#: `260478` in the estate: `Evermore Farms LLC`'s dry-cow barn, three weeks
+#: out, nothing done to it and nobody on it yet.
+WICK_JOB_NO_CREW: dict = _wick_job(
+    id="8019", jobNumber="260478", customerId="1001",
+    builder="Blue Mounds Farm Supply", jobName="54x120x16 dry-cow barn",
+    loadDate=wick_date(25), weekPosition="Week 3",
+    outToYard="Yes", shipmentType="ST",
+    buildingWidthFt=54, buildingLengthFt=120, buildingHeightFt=16,
+    wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+    updatedAt=_wick_stamp(44),
+)
+
+#: The job that names the near-miss customer, delivered on its own. The job
+#: lands whatever the steward decides — a batch feed never suspends for one
+#: row — and its `job_for` edge is the one thing left undrawn until somebody
+#: rules.
+#:
+#: `260474` in the estate: `Hoffman Ridge Farms`' shop addition, three weeks
+#: out, loading on a Saturday.
+WICK_JOB_NEAR_MISS: dict = _wick_job(
+    id="8018", jobNumber="260474", customerId="1004",
+    jobName="40x64x14 shop addition", loadDate=wick_saturday(22),
+    weekPosition="Week 3", outToYard="Yes", shipmentType="ST",
+    buildingWidthFt=40, buildingLengthFt=64, buildingHeightFt=14,
+    wingsTotalWidthFt=0, wingsTotalLengthFt=0,
+    updatedAt=_wick_stamp(42),
+)
+
+#: The same job, one crew later. Delivered as a second, one-row delta — which
+#: is how the estate really reports a reassignment: the row's `updatedAt`
+#: moves and everything else about it stays. The flow's job is to withdraw the
+#: edge to Crew 12 rather than delete it, so both crews stay on the record.
+WICK_JOB_REASSIGNED: dict = _wick_job(**{
+    **{k: v for k, v in WICK_JOBS[0].items()
+       if k not in ("foreman", "crewId", "updatedAt")},
+    "foreman": "M. Tessmann",
+    "crewId": "14",
+    "updatedAt": _wick_stamp(41),
+})
+
+
+def _wick_asset(**over) -> dict:
+    row = {
+        "id": "", "assetTag": "", "description": None, "assetType": None,
+        "serialNumber": None, "plateNumber": None, "homeSite": None,
+        "assignedTo": None, "vendorId": None,
+        "lastInspectionDate": None, "nextInspectionDueDate": None,
+        "status": "In Service",
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+    }
+    row.update(over)
+    return row
+
+
+#: The fleet, all fourteen units, because the inspection ladder needs every
+#: rung and each row is one: 61, 45, 30, 25, 21, 15, 7, 5 days out, one
+#: **twelve days overdue**, and two skid steers with a **null**
+#: `nextInspectionDueDate` — the source saying they are on no inspection
+#: cycle, which is a fact about the machine and the reason a sweep must not
+#: report them as overdue forever.
+#:
+#: `assetType` is the ERP's own five-value picklist — `Truck`, `Trailer`,
+#: `Lift`, `Skid Steer`, `Other` — not a free description, so there is no
+#: `Telehandler` or `Boom Lift` here: a telehandler is a `Lift` whose model is
+#: in the description.
+#:
+#: **`homeSite` is `Mazo` or `Fork West` and can be nothing else**: it is
+#: picklisted to `erp.PLANT_SITES`, which is exactly the two words
+#: `connectors.compliance.SITE_DEPARTMENTS` pairs with the two plant
+#: departments. So every unit here resolves through the rename table and none
+#: resolves by matching a department name — and a third, unpaired site cannot
+#: be seeded at all, which is why no row below invents one.
+#:
+#: `assignedTo` is a typed string: a driver's initials or a department's name,
+#: because the ERP holds no people. Nothing reads it, and it is recorded
+#: because the estate sends it.
+WICK_ASSETS: list[dict] = [
+    _wick_asset(id="4000", assetTag="TRK-11",
+                description="2019 Peterbilt 337 flatbed", assetType="Truck",
+                serialNumber="1NP4L70X8KD", plateNumber="WI 44821",
+                homeSite="Mazo", assignedTo="T. Nachreiner", vendorId="2001",
+                lastInspectionDate=wick_date(-350),
+                nextInspectionDueDate=wick_date(15),
+                updatedAt=_wick_stamp(51)),
+    _wick_asset(id="4001", assetTag="TRK-12",
+                description="2021 Freightliner M2 106", assetType="Truck",
+                serialNumber="3ALACWFC5MD", plateNumber="WI 44902",
+                homeSite="Mazo", assignedTo="V. Oimoen", vendorId="2001",
+                lastInspectionDate=wick_date(-335),
+                nextInspectionDueDate=wick_date(30),
+                updatedAt=_wick_stamp(52)),
+    _wick_asset(id="4002", assetTag="TRK-14",
+                description="2017 Kenworth T370", assetType="Truck",
+                serialNumber="2NKHHM7X7HM", plateNumber="WI 45117",
+                homeSite="Fork West", assignedTo="J. Ripp", vendorId="2001",
+                lastInspectionDate=wick_date(-305),
+                nextInspectionDueDate=wick_date(60),
+                updatedAt=_wick_stamp(53)),
+    # No serial on file, so the identifier the connector carries is the plate.
+    _wick_asset(id="4003", assetTag="TRK-17",
+                description="2022 Ford F-750 stake", assetType="Truck",
+                plateNumber="WI 45330", homeSite="Mazo",
+                assignedTo="C. Statz", vendorId="2001",
+                lastInspectionDate=wick_date(-245),
+                nextInspectionDueDate=wick_date(120),
+                updatedAt=_wick_stamp(54)),
+    _wick_asset(id="4004", assetTag="TRK-21",
+                description="2015 International 4300 yard truck",
+                assetType="Truck", serialNumber="1HTMMAAL4FH",
+                plateNumber="WI 45402", homeSite="Mazo",
+                assignedTo="R. Endres", vendorId="2001",
+                lastInspectionDate=wick_date(-360),
+                nextInspectionDueDate=wick_date(5),
+                updatedAt=_wick_stamp(55)),
+    _wick_asset(id="4005", assetTag="TRL-04",
+                description="48 ft flatbed trailer", assetType="Trailer",
+                serialNumber="1DW1A4820JB", plateNumber="WI TR2204",
+                homeSite="Mazo", assignedTo="A. Breunig", vendorId="2001",
+                lastInspectionDate=wick_date(-340),
+                nextInspectionDueDate=wick_date(25),
+                updatedAt=_wick_stamp(56)),
+    _wick_asset(id="4006", assetTag="TRL-07",
+                description="53 ft step deck", assetType="Trailer",
+                plateNumber="WI TR2207", homeSite="Mazo",
+                assignedTo="T. Nachreiner", vendorId="2001",
+                lastInspectionDate=wick_date(-320),
+                nextInspectionDueDate=wick_date(45),
+                updatedAt=_wick_stamp(57)),
+    _wick_asset(id="4007", assetTag="TRL-09",
+                description="48 ft roller trailer", assetType="Trailer",
+                serialNumber="1UYFS2483LU", plateNumber="WI TR2209",
+                homeSite="Mazo", assignedTo="J. Ripp", vendorId="2001",
+                lastInspectionDate=wick_date(-300),
+                nextInspectionDueDate=wick_date(61),
+                updatedAt=_wick_stamp(58)),
+    # Out of service, and nobody assigned to it.
+    _wick_asset(id="4008", assetTag="TRL-12",
+                description="40 ft truss trailer", assetType="Trailer",
+                serialNumber="5JYFA4021GP", plateNumber="WI TR2212",
+                homeSite="Fork West", vendorId="2001",
+                lastInspectionDate=wick_date(-290),
+                nextInspectionDueDate=wick_date(7),
+                status="Out of Service", updatedAt=_wick_stamp(59)),
+    # A department's machine rather than a driver's, and `assignedTo` says so
+    # in the plant's own words.
+    _wick_asset(id="4009", assetTag="LFT-02",
+                description="Genie GTH-844 telehandler", assetType="Lift",
+                serialNumber="GTH844-11902", homeSite="Mazo",
+                assignedTo="Stack Out — Mazo", vendorId="2000",
+                lastInspectionDate=wick_date(-345),
+                nextInspectionDueDate=wick_date(21),
+                updatedAt=_wick_stamp(60)),
+    _wick_asset(id="4010", assetTag="LFT-05",
+                description="JLG 1732 telehandler", assetType="Lift",
+                serialNumber="JLG1732-04416", homeSite="Fork West",
+                assignedTo="Plant — Fork West", vendorId="2000",
+                lastInspectionDate=wick_date(-330),
+                nextInspectionDueDate=wick_date(30),
+                updatedAt=_wick_stamp(61)),
+    # Twelve days overdue, and out of service because of it.
+    _wick_asset(id="4011", assetTag="LFT-08",
+                description="Skyjack SJIII scissor lift", assetType="Lift",
+                serialNumber="SJIII-3219-8817", homeSite="Mazo",
+                assignedTo="Loading & Yard", vendorId="2000",
+                lastInspectionDate=wick_date(-377),
+                nextInspectionDueDate=wick_date(-12),
+                status="Out of Service", updatedAt=_wick_stamp(62)),
+    # The SDD's exclusion, as a fact about the asset: a skid steer nobody
+    # inspects on a cycle, with no inspection history either.
+    _wick_asset(id="4012", assetTag="SKD-01",
+                description="Bobcat S650 skid steer", assetType="Skid Steer",
+                serialNumber="ALJ811902", homeSite="Mazo",
+                updatedAt=_wick_stamp(63)),
+    _wick_asset(id="4013", assetTag="SKD-03",
+                description="Bobcat T740 track loader",
+                assetType="Skid Steer", serialNumber="B3BJ12244",
+                homeSite="Fork West", updatedAt=_wick_stamp(64)),
+]
+
+
+# ------------------------------------------------------------------- the DMS
+
+
+def _wick_folder(**over) -> dict:
+    row = {
+        "id": "", "name": "", "parentId": None,
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+    }
+    row.update(over)
+    return row
+
+
+#: Two trees over the same jobs, which is the whole reason `job_folder` is
+#: many: `Job Documents/<job>` is the office's copy of what the portal
+#: scanned, and `PlantCutSheets/<site>/<job>` is the floor's. `260431` is
+#: filed in both — the only job in the estate that is — so it draws two edges.
+#:
+#: **`Job Documents/250553 Evermore` is the trap.** Somebody once started
+#: filing by packet label instead of job number; the folder holds one
+#: superseded set of plans and has not been touched since. Its leaf is
+#: `250553 Evermore` and not `250553`, so the index by leaf draws nothing from
+#: it — which is the right answer and the reason the folder is recorded.
+#:
+#: The ids are the DMS's own format (`uuid4().hex[:12]`) and are stand-ins:
+#: the estate mints fresh ones every time it is seeded, so a recording can
+#: pin the shape and not the value.
+WICK_FOLDERS: list[dict] = [
+    _wick_folder(id="3a1f0c6b91d4", name="Job Documents"),
+    _wick_folder(id="5f2b8d40a7c1", name="250553", parentId="3a1f0c6b91d4"),
+    _wick_folder(id="9c4e21ab60f7", name="250661", parentId="3a1f0c6b91d4"),
+    _wick_folder(id="6e05af92c184", name="260402", parentId="3a1f0c6b91d4"),
+    _wick_folder(id="47a9e2b0c615", name="260431", parentId="3a1f0c6b91d4"),
+    _wick_folder(id="0f36d8149ae2", name="260440", parentId="3a1f0c6b91d4"),
+    _wick_folder(id="e4920a17d8b5", name="250553 Evermore",
+                 parentId="3a1f0c6b91d4"),
+    _wick_folder(id="72d4be081f39", name="PlantCutSheets"),
+    _wick_folder(id="a5107cf6e4b2", name="Mazo", parentId="72d4be081f39"),
+    _wick_folder(id="38be6d01527a", name="260431", parentId="a5107cf6e4b2"),
+    _wick_folder(id="d0f2a9438c61", name="260457", parentId="a5107cf6e4b2"),
+    _wick_folder(id="16c8047be5d3", name="Fork West",
+                 parentId="72d4be081f39"),
+    _wick_folder(id="9ba3512e70cf", name="260470", parentId="16c8047be5d3"),
+    _wick_folder(id="2e7d84c0b135", name="Compliance"),
+    _wick_folder(id="84f1c50a6d27", name="Training Signoffs",
+                 parentId="2e7d84c0b135"),
+    _wick_folder(id="cf3902ed718a", name="2026", parentId="84f1c50a6d27"),
+    _wick_folder(id="5b6ae4172d90", name="Inspections",
+                 parentId="2e7d84c0b135"),
+    _wick_folder(id="e19c73f4a082", name="2026", parentId="5b6ae4172d90"),
+    _wick_folder(id="60d5e8b21c47", name="DOT", parentId="2e7d84c0b135"),
+    _wick_folder(id="a97f0163bd58", name="Terry Nachreiner",
+                 parentId="60d5e8b21c47"),
+    _wick_folder(id="31eb2a90f5c6", name="Vern Oimoen",
+                 parentId="60d5e8b21c47"),
+    _wick_folder(id="7c48f2e0a91b", name="Employee Files"),
+    _wick_folder(id="d5a10b67c283", name="Katy Tiller",
+                 parentId="7c48f2e0a91b"),
+]
+
+
+def _wick_document(*, id: str, name: str, folderId: str, size: int,
+                   latestVersion: int = 1, **over) -> dict:
+    """One DMS document, with the embedded version list the estate sends.
+
+    A version row is written per revision the design gives a document, and
+    each one repeats the filename the upload carried — which is the document's
+    own name, because the seeder files it under that. `size` is the last
+    version's, the way `dms._seed_document` sets it.
+    """
+    row = {
+        "id": id, "name": name, "folderId": folderId,
+        "contentType": "application/pdf", "size": size,
+        "latestVersion": latestVersion,
+        "createdAt": _WICK_SEEDED, "updatedAt": _WICK_SEEDED,
+        "versions": [
+            {"version": number, "filename": name,
+             "contentType": "application/pdf",
+             "size": size - 40 * (latestVersion - number),
+             "uploadedAt": _WICK_SEEDED}
+            for number in range(1, latestVersion + 1)
+        ],
+    }
+    row.update(over)
+    return row
+
+
+#: The paper, filed the way the estate files it. The Builder Portal's panel
+#: per job — shipping list, engineering plans, job site map, crew hours, in
+#: the order somebody scanned them, with the gaps the design authored: no crew
+#: hours sheet where nobody filled one in, and `250661` carrying the **same
+#: shipping list twice** because the builder reissued it and somebody scanned
+#: it beside the first. Then the floor's own seven-page shipping list and
+#: column cut sheet, and the compliance paper an inspection, a medical card
+#: and a training session really produce.
+#:
+#: `260402 Shipping List.pdf` is at **revision 3**: filed once, then corrected
+#: twice, each correction scanned over the top of the last. That is the
+#: version-pinned `storage_ref` case, and the reason a `Document` row claiming
+#: `latest_version: 3` must resolve to v3 and not to whatever is newest at
+#: read time.
+#:
+#: `size` is the one field here a recording cannot pin — the bytes come out of
+#: a PDF writer at seed time — so these are plausible and consistent rather
+#: than measured.
+WICK_DOCUMENTS: list[dict] = [
+    _wick_document(id="c1a70b3e5d84", name="250553 Shipping List.pdf",
+                   folderId="5f2b8d40a7c1", size=2180,
+                   updatedAt=_wick_stamp(71)),
+    _wick_document(id="4f28d9016bca", name="250553 Engineering Plans.pdf",
+                   folderId="5f2b8d40a7c1", size=2040,
+                   updatedAt=_wick_stamp(72)),
+    _wick_document(id="8b3c6152ea07", name="250553 Crew Hours.pdf",
+                   folderId="5f2b8d40a7c1", size=1960,
+                   updatedAt=_wick_stamp(73)),
+    # The same name twice in one folder, two ids: the reissued sheet, scanned
+    # beside the one it replaces. A document mirror must not merge these.
+    _wick_document(id="d70f2ab48916", name="250661 Shipping List.pdf",
+                   folderId="9c4e21ab60f7", size=2110,
+                   updatedAt=_wick_stamp(74)),
+    _wick_document(id="61e5c0938b2d", name="250661 Shipping List.pdf",
+                   folderId="9c4e21ab60f7", size=2250,
+                   updatedAt=_wick_stamp(75)),
+    _wick_document(id="2c94a7fe1035", name="250661 Engineering Plans.pdf",
+                   folderId="9c4e21ab60f7", size=2060,
+                   updatedAt=_wick_stamp(76)),
+    _wick_document(id="f0b81de624a3", name="250661 Job Site Map.pdf",
+                   folderId="9c4e21ab60f7", size=2010,
+                   updatedAt=_wick_stamp(77)),
+    _wick_document(id="59d3e10c87fb", name="250661 Crew Hours.pdf",
+                   folderId="9c4e21ab60f7", size=1980,
+                   updatedAt=_wick_stamp(78)),
+    # Filed three times.
+    _wick_document(id="a8172fc50d69", name="260402 Shipping List.pdf",
+                   folderId="6e05af92c184", size=2320, latestVersion=3,
+                   updatedAt=_wick_stamp(79)),
+    _wick_document(id="30cb96e2f741", name="260402 Engineering Plans.pdf",
+                   folderId="6e05af92c184", size=2070,
+                   updatedAt=_wick_stamp(80)),
+    _wick_document(id="7e40b5182dac", name="260402 Crew Hours.pdf",
+                   folderId="6e05af92c184", size=1970,
+                   updatedAt=_wick_stamp(81)),
+    _wick_document(id="b6f9024ac317", name="260431 Shipping List.pdf",
+                   folderId="47a9e2b0c615", size=2150,
+                   updatedAt=_wick_stamp(82)),
+    _wick_document(id="1d5872e0bf49", name="260431 Engineering Plans.pdf",
+                   folderId="47a9e2b0c615", size=2050,
+                   updatedAt=_wick_stamp(83)),
+    _wick_document(id="c93ae6704b18", name="260431 Job Site Map.pdf",
+                   folderId="47a9e2b0c615", size=2000,
+                   updatedAt=_wick_stamp(84)),
+    _wick_document(id="05f1b8ed327c", name="260431 Crew Hours.pdf",
+                   folderId="47a9e2b0c615", size=1950,
+                   updatedAt=_wick_stamp(85)),
+    _wick_document(id="e7cb130a95d2", name="260440 Shipping List.pdf",
+                   folderId="0f36d8149ae2", size=2120,
+                   updatedAt=_wick_stamp(86)),
+    _wick_document(id="92a4f7c16e08", name="260440 Job Site Map.pdf",
+                   folderId="0f36d8149ae2", size=1990,
+                   updatedAt=_wick_stamp(87)),
+    # The superseded set, in the folder somebody labelled by packet.
+    _wick_document(id="6ba0917d4ce5", name="250553 Engineering Plans.pdf",
+                   folderId="e4920a17d8b5", size=1930,
+                   updatedAt=_wick_stamp(88)),
+    # The floor's own paper: seven pages of shipping list, in Courier, and
+    # the column cut sheet beside it.
+    _wick_document(id="fa2c60b9187e", name="260431 Shipping List.pdf",
+                   folderId="38be6d01527a", size=8640,
+                   updatedAt=_wick_stamp(89)),
+    _wick_document(id="374be091c5a2", name="260431 Column Cut Sheet.pdf",
+                   folderId="38be6d01527a", size=2410,
+                   updatedAt=_wick_stamp(90)),
+    _wick_document(id="8d10c47ab63f", name="260457 Shipping List.pdf",
+                   folderId="d0f2a9438c61", size=8710,
+                   updatedAt=_wick_stamp(91)),
+    _wick_document(id="20e6f83b1d75", name="260457 Column Cut Sheet.pdf",
+                   folderId="d0f2a9438c61", size=2450,
+                   updatedAt=_wick_stamp(92)),
+    _wick_document(id="bc57a3e04829", name="260470 Shipping List.pdf",
+                   folderId="9ba3512e70cf", size=9020,
+                   updatedAt=_wick_stamp(93)),
+    _wick_document(id="47f2d5b81036", name="260470 Column Cut Sheet.pdf",
+                   folderId="9ba3512e70cf", size=2530,
+                   updatedAt=_wick_stamp(94)),
+    # The "before" picture: a session Steve Woodbury ran and signed himself,
+    # with a fixed date on it because the sheet has a date on it.
+    _wick_document(id="ae3106f5d92b",
+                   name="Fall Protection signoff 2026-04-23.pdf",
+                   folderId="cf3902ed718a", size=2280,
+                   updatedAt=_wick_stamp(95)),
+    # A vendor's certificate, filed under the vendor's own short name, dated
+    # the day the inspection happened — which is `LFT-02`'s
+    # `lastInspectionDate` and nothing else.
+    _wick_document(id="52b8e07a4136",
+                   name=f"Badger Lift inspection cert LFT-02 "
+                        f"{wick_date(-345)}.pdf",
+                   folderId="e19c73f4a082", size=2190,
+                   updatedAt=_wick_stamp(96)),
+    # A medical card is the paper behind `medicalCardExpirationDate`, and the
+    # card is good for the 24 months the body says — so the examination it
+    # records happened 730 days before the expiry the HRIS tracks.
+    _wick_document(id="0c9d4b6f21ea",
+                   name=f"Terry Nachreiner medical card "
+                        f"{wick_date(45 - 730)}.pdf",
+                   folderId="a97f0163bd58", size=2050,
+                   updatedAt=_wick_stamp(97)),
+    _wick_document(id="e618a2f07c53",
+                   name=f"Vern Oimoen medical card "
+                        f"{wick_date(21 - 730)}.pdf",
+                   folderId="31eb2a90f5c6", size=2040,
+                   updatedAt=_wick_stamp(98)),
+    _wick_document(id="93f1c5028dab",
+                   name="Katy Tiller offer letter 2015-08-17.pdf",
+                   folderId="d5a10b67c283", size=2030,
+                   updatedAt=_wick_stamp(99)),
+]
+
+
+#: The wick namespace's list routes, keyed the way `RESOURCES` is. Handed to
+#: `FakeEstate(resources=...)`, which is the injection point the class already
+#: had: the fake reads the app out of the host and the resource out of the
+#: path and ignores the namespace segment, so one instance serves one
+#: namespace's rows and two namespaces never leak into each other.
+#:
+#: **Four resources are declared and empty, and that is a recording boundary
+#: rather than a claim about the estate.** Wick's ERP really does seed
+#: fourteen items, six purchase orders and the receipts written against them,
+#: and its HRIS writes an employment event for every hire, promotion,
+#: transfer and termination; no wick flow reads any of them, so this recording
+#: stops at the plant floor, the fleet, the counterparty book and the
+#: credential registers. `salesOrders` is the one that is genuinely empty in
+#: the seed — Wick sells buildings as jobs, not as sales orders. A declared
+#: key answers with an empty delta, which the connector reads as `unchanged`;
+#: a *missing* key would be a 404, which is a different and much louder thing.
+WICK_RESOURCES: dict[tuple[str, str], list[dict]] = {
+    ("hris", "departments"): WICK_DEPARTMENTS,
+    ("hris", "jobs"): WICK_HRIS_JOBS,
+    ("hris", "employees"): WICK_EMPLOYEES,
+    ("hris", "trainingRecords"): WICK_TRAINING_RECORDS,
+    ("hris", "driverQualifications"): WICK_DRIVER_QUALIFICATIONS,
+    ("hris", "employmentEvents"): [],
+    ("erp", "customers"): WICK_CUSTOMERS,
+    ("erp", "jobs"): WICK_JOBS,
+    ("erp", "assets"): WICK_ASSETS,
+    ("erp", "vendors"): WICK_VENDORS,
+    ("erp", "items"): [],
+    ("erp", "salesOrders"): [],
+    ("erp", "purchaseOrders"): [],
+    ("erp", "receivingReports"): [],
+    ("dms", "folders"): WICK_FOLDERS,
+    ("dms", "documents"): WICK_DOCUMENTS,
+}
+
+#: Reachable by id, absent from every list — the two dereference cases the
+#: plant-floor joins exist for. Both are real rows of the estate's own seed,
+#: held off the page the way an incremental pull holds everything off the page
+#: whose `updatedAt` is behind the cursor.
+WICK_OFF_PAGE: dict[tuple[str, str], dict] = {
+    ("erp", "customers"): WICK_CUSTOMER_OFF_PAGE,
+    ("hris", "employees"): WICK_WORKER_OFF_PAGE,
+}
+
+
+def wick_estate(**over) -> "FakeEstate":
+    """The wick namespace's estate, with the network taken out."""
+    return FakeEstate(
+        namespaces=over.pop("namespaces", WICK_NAMESPACES),
+        resources={**WICK_RESOURCES, **over.pop("resources", {})},
+        off_page=over.pop("off_page", WICK_OFF_PAGE),
+        **over,
+    )

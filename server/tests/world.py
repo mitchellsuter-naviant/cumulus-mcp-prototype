@@ -42,9 +42,24 @@ def install(world: EvalWorld) -> EvalWorld:
     deps._calendar_service = world.calendars
     deps._reimbursement_service = world.expenses
     deps._payable_service = world.payables
+    deps._correction_service = world.corrections
+    deps._ap_intake_service = world.intake
+    deps._credential_tracking_service = world.credentials
+    deps._field_documents_service = world.packets
+    # The plant spine's three, installed together: the sweep starts the
+    # extraction and the extraction's demand rows are what the scheduling flow
+    # fills a day out of, so a test holding one of them and not the others
+    # would exercise a spine with a joint missing.
+    deps._extraction_service = world.extraction
+    deps._plant_eligibility_service = world.plant
+    deps._department_scheduling_service = world.scheduling
     # The eval service copies *this* corpus into each case's world, so a test
     # that seeds the world also seeds what its evals read.
     deps._eval_service = None
+    # The ModelCall ledger is a deps singleton like the rest, and it is
+    # append-only: left in place it would carry one test's rows into the next,
+    # and a spend assertion is exactly the kind that would pass on the leak.
+    deps._modelcall_store = None
     return world
 
 

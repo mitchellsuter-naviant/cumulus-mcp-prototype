@@ -39,11 +39,12 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
-from .anomaly import parse_anomaly_thresholds
-from .auth import Principal, flow_principal
-from .dispatch import Dispatcher, InMemoryEventLog
-from .gateway import ActionGateway, InMemoryLedgerStore, PendingAction
-from .graph import (
+from ..anomaly import parse_anomaly_thresholds
+from ..auth import Principal, flow_principal
+from .. import dispatch
+from ..dispatch import Dispatcher, InMemoryEventLog
+from ..gateway import ActionGateway, InMemoryLedgerStore, PendingAction
+from ..graph import (
     Claim,
     GraphService,
     GraphWriter,
@@ -53,29 +54,30 @@ from .graph import (
     object_id,
     parse_ref,
 )
-from . import disagreement_sweep, identity_sweep
-from .disagreement_sweep import (
+from .. import disagreement_sweep, identity_sweep
+from ..disagreement_sweep import (
     DISAGREEMENT_SWEEP_FLOW_ID,
     ORDER_DESK_QUEUE,
     STATE_WINDOW_EVENT,
 )
-from .identity_sweep import (
+from ..identity_sweep import (
     IDENTITY_SWEEP_FLOW_ID,
     IDENTITY_WINDOW_EVENT,
     SCAN_BY_LINK,
 )
-from .mappings import steward_queue_for, steward_queue_for_type
-from .matching import parse_match_tolerances
-from .models import utcnow
-from .ontology import ONTOLOGY
-from .resolution import (
+from ..mappings import steward_queue_for, steward_queue_for_type
+from ..matching import parse_match_tolerances
+from ..models import utcnow
+from ..ontology import ONTOLOGY
+from ..ontology import names as onto
+from ..resolution import (
     ResolutionOutcome,
     ResolutionThresholds,
     read_resolution_thresholds,
     resolve,
 )
-from .runs import RunContext, RunEngine
-from .tasks import Task, TaskEvidence, TaskProposal, TaskService
+from ..runs import RunContext, RunEngine
+from ..task_queue import Task, TaskEvidence, TaskProposal, TaskService
 
 if TYPE_CHECKING:  # pragma: no cover — the estate reads *this* module's shapes
     # Type-only, and it has to be: `estate_writes` imports `estate`, which
@@ -85,7 +87,7 @@ if TYPE_CHECKING:  # pragma: no cover — the estate reads *this* module's shape
     # where it is used. Nothing on this side of the plane calls `apply`, and
     # `pull_all` runs on a timer above it: that is the property `estate_writes`
     # exists as a sibling to protect.
-    from .estate_writes import EstateWriter
+    from ..estate_writes import EstateWriter
 
 log = logging.getLogger("cumulus.sync")
 
@@ -100,6 +102,23 @@ MAIL_FLOW_ID = "mail-sync"
 EMPLOYMENT_EVENT_FLOW_ID = "employment-event-sync"
 DMS_FLOW_ID = "dms-sync"
 PSA_FLOW_ID = "psa-sync"
+JOB_FLOW_ID = "job-sync"
+CREDENTIAL_FLOW_ID = "credential-sync"
+EQUIPMENT_FLOW_ID = "equipment-sync"
+
+#: The flows this service composes and registers: the fourteen inbound feeds
+#: and the two sweeps that read what the feeds wrote. Each has a versioned
+#: package under `app/tasks/` binding its body; this list is what `__init__`
+#: walks.
+SYNC_COMPOSED_FLOWS: tuple[str, ...] = (
+    VENDOR_FLOW_ID, PO_FLOW_ID, RECEIVING_FLOW_ID, WORKFORCE_FLOW_ID,
+    CALENDAR_FLOW_ID, CRM_FLOW_ID, SALES_FLOW_ID, MAIL_FLOW_ID,
+    EMPLOYMENT_EVENT_FLOW_ID, DMS_FLOW_ID, PSA_FLOW_ID,
+    JOB_FLOW_ID, CREDENTIAL_FLOW_ID, EQUIPMENT_FLOW_ID,
+    identity_sweep.IDENTITY_SWEEP_FLOW_ID,
+    disagreement_sweep.DISAGREEMENT_SWEEP_FLOW_ID,
+)
+
 #: Which desk an ambiguous row or a proposed merge goes to is declared per
 #: Mapping (`Mapping.steward_queue`) and read back through
 #: `mappings.steward_queue_for` (per feed) and `steward_queue_for_type` (per
@@ -123,11 +142,14 @@ MAIL_EVENT = "MailDelivered"
 EMPLOYMENT_EVENT_EVENT = "EmploymentEventsDelivered"
 DOCUMENTS_EVENT = "DocumentsDelivered"
 PSA_EVENT = "PsaBookDelivered"
+JOB_EVENT = "JobRecordsDelivered"
+CREDENTIAL_EVENT = "CredentialRecordsDelivered"
+EQUIPMENT_EVENT = "EquipmentRecordsDelivered"
 
 SyncKind = Literal[
     "vendors", "purchase-orders", "receiving-reports", "workforce",
     "calendars", "crm-book", "sales-records", "mail", "employment-events",
-    "documents", "psa-book",
+    "documents", "psa-book", "jobs", "credentials", "equipment",
 ]
 
 #: Every sync flow, and the kind its runs report under in the Sources lens.
@@ -147,6 +169,9 @@ FEED_FLOWS: dict[str, SyncKind] = {
     EMPLOYMENT_EVENT_FLOW_ID: "employment-events",
     DMS_FLOW_ID: "documents",
     PSA_FLOW_ID: "psa-book",
+    JOB_FLOW_ID: "jobs",
+    CREDENTIAL_FLOW_ID: "credentials",
+    EQUIPMENT_FLOW_ID: "equipment",
 }
 
 
@@ -212,12 +237,23 @@ class ReceivingRecord(BaseModel):
 
 
 class TeamRecord(BaseModel):
-    """One organizational unit as the HRIS holds it."""
+    """One organizational unit as the HRIS holds it.
+
+    `cost_center` is the accounting code beside the department, and it travels
+    beside `external_id` rather than instead of it because they are two
+    different strings: the id is how the HRIS addresses the row, the code is
+    how the *rest of the estate* names the unit. A plant writes the crew's
+    cost centre in `jobs.crewId`, so `erp-jobs` binds `crew_id → Team` on the
+    code — and a department that has none is the ordinary case, which is why
+    this defaults to empty and is claimed only where the source said
+    something.
+    """
 
     external_id: str
     slug: str
     name: str
     mission: str = ""
+    cost_center: str = ""
     # Bind columns: identifiers of other entities, resolved on the way in.
     parent_slug: str = ""
     lead_email: str = ""
@@ -301,8 +337,8 @@ class CalendarEventRecord(BaseModel):
     #: states `status` itself; a bool from one that only has the flag, and then
     #: the flow — not the connector — decides which declared enum value it is.
     #: Which of a source's values belong to which enum is a mapping question,
-    #: and mapping questions are the flow's (`sync_office._importance` states
-    #: the same rule for `importance`).
+    #: and mapping questions are the flow's
+    #: (`connectors.office._importance` states the same rule for `importance`).
     cancelled: bool | None = None
     # Bind columns: attendance by work email, resolved on the way in.
     organizer_email: str = ""
@@ -437,9 +473,10 @@ class MailMessageRecord(BaseModel):
     holding any of them is to know that a conversation happened and who was in
     it. Carrying the body would make Cumulus a second copy of the customer's
     inbox under a governance story it cannot support, so custody stops at the
-    opening line — capped again on the way in by `sync_office.PREVIEW_CHARS`,
-    because a provider that stuffed a whole body into a field named `preview`
-    must not be able to smuggle one past the wire shape.
+    opening line — capped again on the way in by
+    `connectors.office.PREVIEW_CHARS`, because a provider that stuffed a whole
+    body into a field named `preview` must not be able to smuggle one past the
+    wire shape.
 
     `mailbox_address` is a bind column, and the message's own key embeds it:
     a provider message id is only unique inside the mailbox that holds it.
@@ -621,6 +658,157 @@ class TimeEntryRecord(BaseModel):
     billable: bool = True
 
 
+class JobRecord(BaseModel):
+    """One thing the plant is building, as the production system holds it.
+
+    Deliberately not a `SalesOrderRecord`. An order is what was sold, at what
+    price, to whom; this is what is being *made* — a structure with dimensions,
+    a date it has to leave the yard, a crew, and ten departments' worth of
+    completion flags. A business with both should say so with an edge.
+
+    **`out_to_yard`, `do_not_fab` and `week_position` are the estate's own
+    words, carried verbatim.** The ERP has no boolean type: its flags are
+    `"Yes"`/`"No"` picklists and its production window is a phrase. Mapping
+    them onto `Job.release_state`, `Job.hold_reason` and the numeric
+    `week_position` is the flow's work, done against the `## Source
+    vocabulary` table in `plant-scheduling-parameters` — the precedent being
+    `_event_status` and `connectors.office._importance`, which are already
+    where "this estate's word becomes our enum" is decided. A wire shape that
+    declared `released: bool` would have moved a governed decision into a
+    connector, where nobody can read it and nobody can change it without a
+    deploy.
+
+    `customer_name` is **filled by a join**, not by a column: the ERP keeps
+    `customerId`, the feed pulls `customers` first, and the connector reads the
+    name off that row (S4). `foreman` and `crew_id` are the two halves of a
+    crew reference nobody has resolved yet — the printed name and the id the
+    Mapping binds to a `Team` — and both travel because the id can resolve to
+    nothing and the name is then the only thing a person has to go on.
+
+    `secondary_dimensions` keeps the wings measurements as one string rather
+    than as a sum: which of them a labor formula adds up is a governed
+    decision, and a connector that added them would have destroyed the
+    evidence of what was actually measured.
+    """
+
+    external_id: str
+    job_number: str
+    name: str = ""
+    customer_name: str = ""
+    builder_name: str = ""
+    plant_site: str = ""
+    status: str = ""
+    load_date: str = ""
+    shipment_date: str = ""
+    #: The source's own placement in its production window, as a word.
+    week_position: str = ""
+    #: The estate's literal `"Yes"`/`"No"`. See the class docstring.
+    out_to_yard: str = ""
+    do_not_fab: str = ""
+    # Bind columns: a crew by the cost centre the HRIS's department carries,
+    # beside the display name the production system prints. The cost centre
+    # and not the department id — two different strings about one department,
+    # and the code is the one the rest of the estate writes.
+    foreman: str = ""
+    crew_id: str = ""
+    shipment_type: str = ""
+    combined_with: str = ""
+    trailer_number: str = ""
+    width: float = 0.0
+    length: float = 0.0
+    height: float = 0.0
+    secondary_dimensions: str = ""
+    #: The department slugs whose `<dept>Done` column reads `"Yes"` — the
+    #: third column of the governed department table, so neither system has to
+    #: learn the other's spelling (S3).
+    upstream_done: list[str] = Field(default_factory=list)
+
+
+class CredentialRecord(BaseModel):
+    """One dated permission somebody holds, from whichever file tracks it.
+
+    One shape for two resources, and that is the interesting claim: a training
+    certificate, a CDL, a medical card and a clearinghouse query all *expire
+    and get renewed*, which is the only behaviour anything downstream cares
+    about. A second record model for driver files would have produced two
+    compliance sweeps that had to agree with each other.
+
+    A driver-qualification row holds four unrelated expiries, so it arrives as
+    up to four of these, one per date, each with its own `external_id` suffix
+    — `Credential`'s natural key is the source's record id, and four
+    permissions cannot share one.
+
+    `holder_email` is **filled by a join**: both credential resources name a
+    person by the HRIS's own `employeeId` and nothing else, so the feed pulls
+    `employees` and reads `workEmail` off the row. `holder_external_id` is the
+    same reference in the source's own vocabulary, travelling beside it for
+    `EmployeeRecord.manager_external_id`'s reason — a delta of one renewal
+    should not have to buy a translation the graph already holds.
+
+    `status` is the issuing system's word for how the assignment stands
+    (`Completed`, `Assigned`), and is deliberately *not* the derived
+    `Credential.status`: `valid | expiring | expired | withdrawn` is computed
+    from the dates against the governed notice stages, and letting an
+    assignment state land in that field would make the compliance sweep read
+    its own input as its own output.
+    """
+
+    external_id: str
+    # Bind columns: the holder, by an address that is exact, and by the id the
+    # source actually carries.
+    holder_email: str = ""
+    holder_external_id: str = ""
+    credential_type: str = ""
+    #: The issuing system's own word on a training row; the column's identity
+    #: on a driver row (`licence`, `medical`, `clearance`). Slugged against
+    #: the declared vocabulary by the flow, never here.
+    category: str = ""
+    assigned_date: str = ""
+    completion_date: str = ""
+    expiration_date: str = ""
+    status: str = ""
+    result: str = ""
+    provider: str = ""
+
+
+class EquipmentRecord(BaseModel):
+    """One unit the business operates and is answerable for, with two dates.
+
+    **A null `next_inspection_due_date` is the source saying this unit carries
+    no tracked inspection** — a skid steer that never needed a DOT sticker —
+    and the flow derives `inspection_tracked` from it once, on the way in.
+    That is what stops a compliance sweep reporting the same machine as
+    overdue forever, and it is a fact about the asset rather than a gap in the
+    feed.
+
+    There is no `InspectionRecord` beside this one, deliberately. The source
+    holds two dates on the asset and no examination history, so a second wire
+    shape would have described a resource that does not exist; the flow writes
+    one `Inspection` part per landed date, which is the whole of what is
+    known.
+
+    `make`, `model` and `year` are declared and arrive empty from this estate,
+    which does not carry them. Stated rather than parsed out of the
+    description, because a guess in a field that reads as a fact is worse than
+    an absence.
+    """
+
+    external_id: str
+    equipment_id: str = ""
+    name: str = ""
+    #: The source's own asset type. Mapped onto the declared
+    #: `vehicle | trailer | lift | machine | other` vocabulary by the flow.
+    category: str = ""
+    make: str = ""
+    model: str = ""
+    year: float = 0.0
+    identifier: str = ""
+    # Bind column: the site this unit is based out of, by the Team's slug.
+    home_site: str = ""
+    last_inspection_date: str = ""
+    #: Null ⇒ this unit carries no tracked inspection. See the docstring.
+    next_inspection_due_date: str = ""
+
 class SyncRequest(BaseModel):
     """One delivery from one source system.
 
@@ -677,6 +865,25 @@ class SyncRequest(BaseModel):
     project_phases: list[ProjectPhaseRecord] = Field(default_factory=list)
     project_tasks: list[ProjectTaskRecord] = Field(default_factory=list)
     time_entries: list[TimeEntryRecord] = Field(default_factory=list)
+    # The plant floor travels as three lists and not one, which is the
+    # opposite of the rule above it — and the reason is the same rule read the
+    # other way. A phase needs its project in the *same* delivery because it
+    # cannot land without it; a job, a credential and a piece of equipment
+    # need nothing from each other at all. They are three feeds on three
+    # cursors, they arrive in three deliveries, and each starts its own run.
+    # The customer rows the jobs feed joins against are deliberately *not*
+    # here: they belong to `customers` above, which is the sell side's list,
+    # and filling it from a jobs delivery would start `sales-sync` beside
+    # `job-sync` on one pull.
+    jobs: list[JobRecord] = Field(default_factory=list)
+    # A credential names its holder by an address the workforce feed already
+    # landed, so it arrives alone: there is no second half of an edge waiting
+    # on this delivery, and a holder the graph does not hold is counted.
+    credentials: list[CredentialRecord] = Field(default_factory=list)
+    # Equipment travels alone for the same reason, and its inspections travel
+    # *inside* it: the two dates on the row are the whole of what the source
+    # holds, so there is no second list that could arrive without the first.
+    equipment: list[EquipmentRecord] = Field(default_factory=list)
 
 
 class SourceStatus(BaseModel):
@@ -811,13 +1018,13 @@ class MatchTarget:
 
 MATCH_TARGETS: dict[str, MatchTarget] = {
     "vendor": MatchTarget(
-        "Vendor", "link-source-record", VENDOR_FLOW_ID, lambda r: r.name,
+        onto.VENDOR, "link-source-record", VENDOR_FLOW_ID, lambda r: r.name,
     ),
     "company": MatchTarget(
-        "Company", "link-company-record", CRM_FLOW_ID, lambda r: r.name,
+        onto.COMPANY, "link-company-record", CRM_FLOW_ID, lambda r: r.name,
     ),
     "person": MatchTarget(
-        "Person", "link-company-record", CRM_FLOW_ID,
+        onto.PERSON, "link-company-record", CRM_FLOW_ID,
         lambda r: r.email.strip().lower(),
     ),
 }
@@ -859,37 +1066,29 @@ class SyncService:
             Dispatcher(engine, InMemoryEventLog()) if engine is not None else None
         )
         if engine is not None:
-            engine.register(VENDOR_FLOW_ID, self._vendor_body)
-            engine.register(PO_FLOW_ID, self._po_body)
-            engine.register(RECEIVING_FLOW_ID, self._receiving_body)
-            engine.register(WORKFORCE_FLOW_ID, self._workforce_body)
-            engine.register(CALENDAR_FLOW_ID, self._calendar_body)
-            # The commerce bodies live in their own module — this file is
-            # already long enough that a reader looking for the vendor flow
-            # should not have to scroll past the counterparty book to find it
-            # — and they register here so `SyncService` stays the one place
-            # that knows which flows exist. Deferred because they import this
-            # module for its wire shapes.
-            from . import sync_commerce, sync_dms, sync_office, sync_psa
+            # Every feed and sweep this service composes registers through the
+            # versioned package contract: one body per `v<N>/` directory under
+            # `app/tasks/`, exactly the way the per-case processes register.
+            # The bodies stay beside the sync machinery they are made of (this
+            # module and its sidecars); the packages are where each flow's
+            # declarative shape ships and where a second version would land.
+            # Deferred import: the packages bind bodies from this module.
+            from .. import tasks as process_packages
 
-            sync_commerce.register(self)
-            sync_office.register(self)
-            sync_dms.register(self)
-            sync_psa.register(self)
-            # Not a feed: it reads the book the feeds wrote. It registers here
-            # with them because this service is the one place that knows which
-            # flow bodies exist, and because the steward decision it produces
-            # is applied a few hundred lines below, beside its sibling.
-            identity_sweep.register(self)
-            # Its sibling, and downstream of it in the only way that matters:
-            # what the identity sweep has confirmed is what this one is allowed
-            # to join across. Registered beside it for the same reason.
-            disagreement_sweep.register(self)
-            # And the answer to what that one finds — the only flow on this
-            # engine that writes to a system Cumulus does not own. Deferred
-            # like the feed modules above, and for the same reason: it imports
-            # this one for the status vocabulary the ERP's strings land in.
-            from . import order_release
+            for flow_id in SYNC_COMPOSED_FLOWS:
+                default = process_packages.default_version(flow_id)
+                for number, module in sorted(
+                    process_packages.shipped_versions(flow_id).items()
+                ):
+                    engine.register(
+                        flow_id, module.build_body(self),
+                        version=number, default=(number == default),
+                    )
+            # And the answer to what the disagreement sweep finds — the only
+            # flow on this engine that writes to a system Cumulus does not
+            # own. Registered from its own package like the feeds, but through
+            # its domain, which also owns applying the desk's decision.
+            from ..tasks.order_release import domain as order_release
 
             order_release.register(self)
 
@@ -938,6 +1137,12 @@ class SyncService:
             # A single-shape feed like the three above it: one list of rows,
             # landed under `records`, no second resource to arrive with.
             (EMPLOYMENT_EVENT_EVENT, request.employment_events),
+            # The three plant-floor feeds are single-shape like the four
+            # above them: one list of rows each, landed under `records`, with
+            # no second resource they have to arrive with.
+            (JOB_EVENT, request.jobs),
+            (CREDENTIAL_EVENT, request.credentials),
+            (EQUIPMENT_EVENT, request.equipment),
         ]
         if request.teams or request.employees:
             plan.append((WORKFORCE_EVENT, []))
@@ -1045,7 +1250,15 @@ class SyncService:
                     f"{event}:{request.source}:{request.idempotency_key}".encode()
                 ).hexdigest()[:10]
                 run_id = f"run_sync_{digest}"
-                existing = self.engine.get(run_id)
+                # A fact with two responses has two runs, and the first one
+                # answers for the delivery: the Dispatcher starts them in
+                # Trigger order, so if it exists the delivery was made. Asked
+                # through `keyed_run_ids` rather than assuming the bare key,
+                # which stopped being the run id the day `DocumentsDelivered`
+                # grew its second Trigger.
+                existing = self.engine.get(
+                    dispatch.keyed_run_ids(event, run_id)[0]
+                )
                 if existing is not None:
                     outcomes.append({
                         "flow_id": existing.flow_id, "run_id": run_id,
@@ -1149,7 +1362,7 @@ class SyncService:
         self, record: VendorRecord, source: str, thresholds
     ) -> ResolutionOutcome:
         return resolve(
-            self.graph, "Vendor",
+            self.graph, onto.VENDOR,
             [record.name, *record.aliases], thresholds,
             tax_id=record.tax_id, source=source,
             source_external_id=record.external_id,
@@ -1170,7 +1383,7 @@ class SyncService:
         claim_source = f"{_authority(source)}:{source}"
         for record, outcome in zip(records, outcomes):
             source_record = graph.upsert(
-                "SourceRecord", f"{source}:{record.external_id}",
+                onto.SOURCE_RECORD, f"{source}:{record.external_id}",
                 [
                     Claim(field="source", value=source, source=claim_source),
                     Claim(field="external_id", value=record.external_id, source=claim_source),
@@ -1219,7 +1432,7 @@ class SyncService:
             if outcome.disposition == "linked":
                 existing = self.graph.get(outcome.object_id)
                 vendor = graph.upsert(
-                    "Vendor", existing.natural_key if existing else record.name,
+                    onto.VENDOR, existing.natural_key if existing else record.name,
                     claims, label=existing.label if existing else record.name,
                     provenance=f"claims from {source} via {run_id}",
                 )
@@ -1232,7 +1445,7 @@ class SyncService:
                 # status claim — so an ERP that says `active` wins, and an ERP
                 # that says nothing leaves it onboarding.
                 vendor = graph.upsert(
-                    "Vendor", record.name,
+                    onto.VENDOR, record.name,
                     claims + [Claim(
                         field="onboarding_state", value="unconfirmed",
                         source=f"flow:{VENDOR_FLOW_ID}", confidence=0.5,
@@ -1375,7 +1588,7 @@ class SyncService:
         thresholds = read_resolution_thresholds(self.knowledge)
         for record in records:
             order = graph.upsert(
-                "PurchaseOrder", record.po_number,
+                onto.PURCHASE_ORDER, record.po_number,
                 [
                     Claim(field="po_number", value=record.po_number, source=claim_source),
                     Claim(field="ordered_date", value=record.ordered_date, source=claim_source),
@@ -1402,7 +1615,7 @@ class SyncService:
             counts["orders"] += 1
 
             outcome = resolve(
-                self.graph, "Vendor", [record.vendor_name], thresholds,
+                self.graph, onto.VENDOR, [record.vendor_name], thresholds,
                 source=source, source_external_id=record.vendor_external_id,
             )
             if outcome.disposition == "linked":
@@ -1417,7 +1630,7 @@ class SyncService:
 
             for ordinal, line in enumerate(record.lines, start=1):
                 line_obj = graph.upsert(
-                    "PurchaseOrderLine", f"{order.id}#{ordinal}",
+                    onto.PURCHASE_ORDER_LINE, f"{order.id}#{ordinal}",
                     [
                         Claim(field="sku", value=line.sku, source=claim_source),
                         Claim(field="description", value=line.description, source=claim_source),
@@ -1584,8 +1797,20 @@ class SyncService:
                 claims.append(Claim(field="external_id",
                                     value=record.external_id,
                                     source=claim_source))
+            if record.cost_center:
+                # The accounting code, claimed only where the HRIS holds one.
+                # **Most departments have none, and that is not a gap**: an
+                # empty claim would assert that this unit's cost centre is the
+                # empty string and outrank the system that knows better. What
+                # makes the field worth landing is that another system names
+                # the unit by it — `erp-jobs` binds a job's `crew_id` to a
+                # `Team` through this code — so the graph holds the fact the
+                # join runs on instead of a lookup buried in a flow.
+                claims.append(Claim(field="cost_center",
+                                    value=record.cost_center,
+                                    source=claim_source))
             graph.upsert(
-                "Team", record.slug, claims,
+                onto.TEAM, record.slug, claims,
                 label=record.name or record.slug,
                 provenance=f"synced by {run_id}",
             )
@@ -1624,7 +1849,7 @@ class SyncService:
                         Claim(field=field, value=value, source=claim_source)
                     )
             graph.upsert(
-                "Employee", record.email, claims,
+                onto.EMPLOYEE, record.email, claims,
                 label=record.name or record.email,
                 provenance=f"synced by {run_id}",
             )
@@ -1658,17 +1883,17 @@ class SyncService:
                 if o.props.get("external_id")
             }
 
-        people_by_id = by_external("Employee")
-        teams_by_id = by_external("Team")
+        people_by_id = by_external(onto.EMPLOYEE)
+        teams_by_id = by_external(onto.TEAM)
 
         def employee(email: str, external_id: str = ""):
             found = (
-                self.graph.get(object_id("Employee", email)) if email else None
+                self.graph.get(object_id(onto.EMPLOYEE, email)) if email else None
             )
             return found or people_by_id.get(external_id)
 
         def team(slug: str, external_id: str = ""):
-            found = self.graph.get(object_id("Team", slug)) if slug else None
+            found = self.graph.get(object_id(onto.TEAM, slug)) if slug else None
             return found or teams_by_id.get(external_id)
 
         for record in employees:
@@ -1807,7 +2032,7 @@ class SyncService:
         owners = 0
         for record in records:
             calendar = graph.upsert(
-                "Calendar", record.address,
+                onto.CALENDAR, record.address,
                 [
                     Claim(field="address", value=record.address,
                           source=claim_source),
@@ -1827,7 +2052,7 @@ class SyncService:
                 provenance=f"synced by {run_id}",
             )
             owner = (
-                self.graph.get(object_id("Employee", record.owner_email))
+                self.graph.get(object_id(onto.EMPLOYEE, record.owner_email))
                 if record.owner_email
                 else None
             )
@@ -1852,7 +2077,7 @@ class SyncService:
         orphaned = 0
         for record in records:
             calendar = self.graph.get(
-                object_id("Calendar", record.calendar_address)
+                object_id(onto.CALENDAR, record.calendar_address)
             )
             if calendar is None:
                 # No calendar, no event: a part cannot exist without its
@@ -1860,7 +2085,7 @@ class SyncService:
                 orphaned += 1
                 continue
             event = graph.upsert(
-                "CalendarEvent", _event_key(record),
+                onto.CALENDAR_EVENT, _event_key(record),
                 [
                     Claim(field="title", value=record.title, source=claim_source),
                     Claim(field="kind", value=record.kind, source=claim_source),
@@ -1902,13 +2127,13 @@ class SyncService:
         counts = {"attended_by": 0, "organized_by": 0, "unresolved": 0}
         for record in records:
             event = self.graph.get(
-                object_id("CalendarEvent", _event_key(record))
+                object_id(onto.CALENDAR_EVENT, _event_key(record))
             )
             if event is None:
                 continue
             if record.organizer_email:
                 organizer = self.graph.get(
-                    object_id("Employee", record.organizer_email)
+                    object_id(onto.EMPLOYEE, record.organizer_email)
                 )
                 if organizer is None:
                     counts["unresolved"] += 1
@@ -1920,7 +2145,7 @@ class SyncService:
                     counts["organized_by"] += 1
             optional = {e.lower() for e in record.optional_emails}
             for email in record.attendee_emails:
-                person = self.graph.get(object_id("Employee", email))
+                person = self.graph.get(object_id(onto.EMPLOYEE, email))
                 if person is None:
                     # A client sponsor is a real attendee and not our
                     # employee. Counted, never minted.
@@ -1951,7 +2176,7 @@ class SyncService:
         claim_source = f"{_authority(source)}:{source}"
         for record in records:
             report = graph.upsert(
-                "ReceivingReport", record.receipt_number,
+                onto.RECEIVING_REPORT, record.receipt_number,
                 [
                     Claim(field="receipt_number", value=record.receipt_number, source=claim_source),
                     Claim(field="received_date", value=record.received_date, source=claim_source),
@@ -1964,7 +2189,7 @@ class SyncService:
             counts["reports"] += 1
 
             if record.po_number:
-                order = self.graph.get(object_id("PurchaseOrder", record.po_number))
+                order = self.graph.get(object_id(onto.PURCHASE_ORDER, record.po_number))
                 if order is not None:
                     graph.link(
                         "receives_against", report.id, order.id,
@@ -1979,7 +2204,7 @@ class SyncService:
 
             for ordinal, line in enumerate(record.lines, start=1):
                 line_obj = graph.upsert(
-                    "ReceivingReportLine", f"{report.id}#{ordinal}",
+                    onto.RECEIVING_REPORT_LINE, f"{report.id}#{ordinal}",
                     [
                         Claim(field="sku", value=line.sku, source=claim_source),
                         Claim(field="description", value=line.description, source=claim_source),
@@ -2024,12 +2249,12 @@ class SyncService:
             )
             key = f"{source}:{external}"
             digest = _payload_hash(payload)
-            existing = self.graph.get(object_id("SourceRecord", key))
+            existing = self.graph.get(object_id(onto.SOURCE_RECORD, key))
             if existing is not None and existing.props.get("payload_hash") == digest:
                 unchanged += 1
                 continue
             graph.upsert(
-                "SourceRecord", key,
+                onto.SOURCE_RECORD, key,
                 [
                     Claim(field="source", value=source, source=claim_source),
                     Claim(field="external_id", value=external, source=claim_source),
@@ -2108,7 +2333,7 @@ class SyncService:
         Nothing here writes to an estate, and it could not: the journal is all
         it touches on the write plane, and `pull_all` sits above it on a timer.
         """
-        from .estate_writes import awaiting_echo
+        from ..estate_writes import awaiting_echo
 
         writer = self.estate_writer
         if writer is None:
@@ -2328,7 +2553,7 @@ class SyncService:
         # source carried no address at all.
         key = target.key(record) or source_record.natural_key
         claims = [Claim(field="name", value=record.display, source=claim_source)]
-        if "status" in declared and target.object_type == "Vendor":
+        if "status" in declared and target.object_type == onto.VENDOR:
             # An entity nobody has vouched for yet, in the one book whose
             # status vocabulary has a word for that.
             claims.append(Claim(
@@ -2486,7 +2711,7 @@ class SyncService:
         here for the other two — the fact that this service is where a resume
         hook goes looking.
         """
-        from . import order_release
+        from ..tasks.order_release import domain as order_release
 
         return order_release.apply_release_decision(self, task, principal)
 
@@ -2591,8 +2816,8 @@ def _event_status(record: CalendarEventRecord) -> str:
     `CalendarEvent.status` is `confirmed | tentative | cancelled`, and a source
     that reports a boolean `isCancelled` says which of those it means without
     spelling it. Translating that is a vocabulary decision — the same kind
-    `sync_office._importance` makes — so it lives in the flow: the connector
-    carries the flag as it found it and has no opinion about the enum.
+    `connectors.office._importance` makes — so it lives in the flow: the
+    connector carries the flag as it found it and has no opinion about the enum.
 
     A feed that states `status` itself carries no flag and is taken at its
     word, which is what keeps the mock seed's `tentative` a real third value

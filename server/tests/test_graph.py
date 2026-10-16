@@ -217,10 +217,10 @@ def test_the_exported_ontology_document_matches_the_declaration(world):
 
 
 def test_ontology_endpoint_reports_declaration_and_reality(client, world):
-    from app.reimbursements import SubmittedDocument
+    from app.tasks.expense_reimbursement.domain import SubmittedDocument
 
-    world.expenses.submit(
-        "felicia.marks@naviant.com",
+    demo_world.run_expense(
+        world.expenses, "felicia.marks@naviant.com",
         documents=[SubmittedDocument(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
@@ -265,11 +265,11 @@ def test_the_export_renders_types_declared_before_their_writers(client, world):
 
 
 def test_the_analytical_question_is_a_traversal(client, world):
-    from app.reimbursements import SubmittedDocument
+    from app.tasks.expense_reimbursement.domain import SubmittedDocument
 
     for hint in ("total=64.20 category=meals", "total=32.50 category=travel"):
-        world.expenses.submit(
-            "erin.tavares@naviant.com",
+        demo_world.run_expense(
+            world.expenses, "erin.tavares@naviant.com",
             documents=[SubmittedDocument(hint=hint)],
             commentary="Client visit to Acme.",
         )
@@ -314,7 +314,7 @@ def test_an_unknown_employee_is_an_empty_rollup_not_an_error(client, world):
 
 
 def test_object_detail_exposes_claims_and_conflicts(client, world):
-    from app.sync import SyncRequest
+    from app.connectors.sync import SyncRequest
 
     world.sync.deliver(SyncRequest.model_validate({
         "source": "erp-vendors",
@@ -515,10 +515,10 @@ def test_the_invariants_endpoint_reports_conformance(client, world):
 
 
 def test_claims_and_links_name_the_run_and_step_that_wrote_them(world):
-    from app.reimbursements import SubmittedDocument
+    from app.tasks.expense_reimbursement.domain import SubmittedDocument
 
-    request = world.expenses.submit(
-        "felicia.marks@naviant.com",
+    request = demo_world.run_expense(
+        world.expenses, "felicia.marks@naviant.com",
         documents=[SubmittedDocument(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
@@ -533,10 +533,10 @@ def test_claims_and_links_name_the_run_and_step_that_wrote_them(world):
 
 
 def test_a_step_records_what_it_wrote(world):
-    from app.reimbursements import SubmittedDocument
+    from app.tasks.expense_reimbursement.domain import SubmittedDocument
 
-    request = world.expenses.submit(
-        "felicia.marks@naviant.com",
+    request = demo_world.run_expense(
+        world.expenses, "felicia.marks@naviant.com",
         documents=[SubmittedDocument(hint="total=64.20 category=meals")],
         commentary="Team lunch after the Acme review.",
     )
@@ -554,7 +554,7 @@ def test_a_step_records_what_it_wrote(world):
 
 
 def test_a_replayed_step_keeps_its_recorded_write_set(world):
-    from app.reimbursements import SubmittedDocument
+    from app.tasks.expense_reimbursement.domain import SubmittedDocument
 
     request = world.expenses.submit(
         "nathan.pryce@naviant.com",
@@ -736,11 +736,21 @@ def test_part_ness_is_derived_never_declared():
     assert ONTOLOGY.owner_of("Item") is None
     assert ONTOLOGY.owner_of("Folder") is None
     assert ONTOLOGY.owner_of("ProjectPhase") == "Project"
+    # A job owns its department shares, a schedule day owns its rows, and a
+    # piece of equipment owns its inspections — each part identified through
+    # its owner and dead with it. A credential is deliberately *not* one: it
+    # outlives the currency of the employment record it was earned under, so
+    # `holds_credential` is an association and `Credential` is a root.
+    assert ONTOLOGY.owner_of("JobTask") == "Job"
+    assert ONTOLOGY.owner_of("ScheduleEntry") == "ScheduleDay"
+    assert ONTOLOGY.owner_of("Inspection") == "Equipment"
+    assert ONTOLOGY.owner_of("Credential") is None
     assert [o.name for o in ONTOLOGY.roots()] == [
         "Employee", "Team", "Capability", "Calendar", "ExpenseRequest",
         "Document", "Folder", "Vendor", "Company", "Person", "SourceRecord",
         "Invoice", "PurchaseOrder", "ReceivingReport", "Opportunity",
-        "SalesOrder", "Item", "Mailbox", "Project",
+        "SalesOrder", "Item", "Mailbox", "Project", "Job", "ScheduleDay",
+        "Credential", "Equipment",
     ]
 
 
@@ -748,6 +758,42 @@ def test_the_declared_ontology_conforms():
     from app.ontology import validate_ontology
 
     assert validate_ontology() == []
+
+
+def test_a_type_name_the_tbox_does_not_declare_fails_at_import():
+    """A *write* under an unknown type is already refused with
+    `unknown-object-type`. A read is not: `find("Vendors")` and
+    `get(object_id("Employe", email))` return nothing at all, which is exactly
+    what a deployment whose feed has not landed yet looks like. The constants
+    close that gap by failing where the name is written down."""
+    from app.ontology import names
+
+    assert names.VENDOR == "Vendor" and names.PURCHASE_ORDER_LINE
+    with pytest.raises(ValueError, match="Vendors"):
+        names.require_type("Vendors")
+    with pytest.raises(ValueError, match="member_off"):
+        names.require_link("member_off")
+
+
+def test_the_declared_eval_specs_name_only_types_that_exist():
+    """The third registry that writes ontology names down as data. A rule for
+    `Invoic` does not raise — it grades, and the case fails as if the flow had
+    regressed."""
+    from app.eval_specs import validate_specs
+
+    assert validate_specs() == []
+
+
+def test_an_eval_rule_naming_a_ghost_type_is_caught():
+    from app.evals import EvalSpec, Milestone, ObjectRule
+    from app.eval_specs import validate_specs
+
+    ghost = EvalSpec(
+        id="ghost", flow_id="accounts-payable",
+        milestones=[Milestone(id="m1", objects=[ObjectRule(type="Invoic")])],
+    )
+    problems = validate_specs(specs=[ghost], cases={}, fixtures=[])
+    assert any("Invoic" in p for p in problems)
 
 
 def test_precedence_is_an_ordered_argument_not_a_set():

@@ -557,9 +557,13 @@ def test_a_member_sees_their_own_teams_roster(client, owner, act_as):
     assert team["can_administer"] is False
 
 
-def test_deleting_a_person_through_users_cleans_up_like_identities_does(
+def test_deleting_a_person_takes_their_memberships_and_keys_with_them(
     client, owner
 ):
+    """One door for this now. Deleting a person used to have a second spelling
+    on `/users`, and the two had to be kept doing the same three things —
+    revoke the keys, drop the memberships, invalidate the identity — or a
+    person removed through one door stayed half-present behind the other."""
     _team(client, owner, "platform-eng")
     mara = _person(client, owner, "mara@example.com")
     client.put(
@@ -573,7 +577,9 @@ def test_deleting_a_person_through_users_cleans_up_like_identities_does(
         headers=owner,
     ).json()["key"]["id"]
 
-    assert client.delete(f"/api/v1/users/{mara['uid']}", headers=owner).status_code == 204
+    assert client.delete(
+        f"/api/v1/identities/{mara['uid']}", headers=owner
+    ).status_code == 204
 
     team = client.get("/api/v1/teams/platform-eng", headers=owner).json()
     assert team["members"] == []

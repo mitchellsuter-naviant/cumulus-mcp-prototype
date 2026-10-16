@@ -3,7 +3,6 @@ id: model-pricing
 path: platform/standards/model-pricing
 title: Model Pricing
 authority_level: standard
-scope: org
 owner: platform-eng
 tags: models, cost, pricing, governed-knowledge, finops
 status: published

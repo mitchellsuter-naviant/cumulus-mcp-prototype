@@ -31,7 +31,7 @@ from app.estate import (
     team_slug,
 )
 from app.graph import object_id
-from app.sync import SyncRequest
+from app.connectors.sync import SyncRequest
 from tests import estate_fixtures as fx
 from tests import demo_world
 from tests import world as test_world
@@ -552,23 +552,27 @@ def test_the_interval_loop_is_off_unless_asked():
 def test_the_api_reports_an_unregistered_estate(client):
     body = client.get("/api/v1/estate").json()
     assert body["registered"] is False
-    assert client.post(
-        f"/api/v1/estate/feeds/{HRIS_WORKFORCE}/sync-now"
-    ).status_code == 400
     assert client.post("/api/v1/estate/pull").json()["feeds"] == []
 
 
-def test_sync_now_pulls_one_feed_through_the_api(client, world, monkeypatch):
+def test_one_feed_pulled_lands_through_the_real_door(client, world, monkeypatch):
+    """One feed, synchronously, all the way into the graph.
+
+    Driven through `pull_feed_now` — the one implementation an on-demand pull
+    has. It used to be driven through a second `POST /estate/feeds/{feed}/
+    sync-now` route that nothing called; the refusals it restated are exercised
+    at the console door in `test_ui_knowledge.py`, which is where the act is
+    actually reachable from.
+    """
     import app.deps as deps
+    from app.estate_api import pull_feed_now
 
     connector = build(deliver=door(client))
     monkeypatch.setattr(deps, "_estate_connector", connector)
 
-    body = client.post(
-        f"/api/v1/estate/feeds/{HRIS_WORKFORCE}/sync-now"
-    ).json()
-    assert body["outcome"] == "delivered"
-    assert body["pulled"]["employees"] == 10
+    outcome = pull_feed_now(HRIS_WORKFORCE, actor="tests")
+    assert outcome["outcome"] == "delivered"
+    assert outcome["pulled"]["employees"] == 10
     # By id, not by position: the registry's order is not a contract, and a
     # feed inserted above this one would otherwise silently move the assertion
     # onto a feed that never pulled.
@@ -580,22 +584,75 @@ def test_sync_now_pulls_one_feed_through_the_api(client, world, monkeypatch):
     assert world.graph.stats()["by_type"]["Employee"] == 8
 
 
-def test_sync_now_surfaces_an_estate_outage_as_a_bad_gateway(
-    client, world, monkeypatch
-):
-    import app.deps as deps
-
-    connector = build(fx.FakeEstate(fails={("hris", "employees")}))
-    monkeypatch.setattr(deps, "_estate_connector", connector)
-    response = client.post(f"/api/v1/estate/feeds/{HRIS_WORKFORCE}/sync-now")
-    assert response.status_code == 502
-    assert "employees" in response.json()["detail"]
+# ---- content -----------------------------------------------------------------
+#
+# The reference-custody feeds write `storage_ref` down and never call it. One
+# flow does — `ap-intake`, reading a supplier invoice — and it calls it here,
+# because reaching outward is this module's job and nothing else's.
 
 
-def test_an_unknown_feed_is_a_404(client, monkeypatch):
-    import app.deps as deps
+def _content_connector(**over) -> EstateConnector:
+    served = over.pop("served", {})
 
-    monkeypatch.setattr(deps, "_estate_connector", build())
-    assert client.post(
-        "/api/v1/estate/feeds/no-such-feed/sync-now"
-    ).status_code == 404
+    def fetch_bytes(url: str) -> tuple[bytes, str]:
+        for key, payload in served.items():
+            if key in url:
+                return payload, "application/pdf"
+        raise EstateError(f"GET {url} -> 404")
+
+    return EstateConnector(
+        InMemoryConnectorStateStore(),
+        project=over.pop("project", PROJECT),
+        namespace="naviant",
+        fetch_bytes=fetch_bytes,
+        **over,
+    )
+
+
+def test_content_is_fetched_from_the_address_the_reference_recorded():
+    connector = _content_connector(served={"doc-1": b"%PDF-1.4\n"})
+    url = (
+        f"https://{PROJECT}-dms.web.app/api/naviant/v1/documents/doc-1"
+        "/content?version=2"
+    )
+    content, media_type = connector.fetch_content(url)
+    assert content.startswith(b"%PDF")
+    assert media_type == "application/pdf"
+
+
+def test_content_is_refused_for_an_address_outside_the_estate():
+    """A `storage_ref` is a string an external system wrote into our graph.
+
+    Following it wherever it points would hand the customer's document system
+    the ability to aim this service's credentials at any address it likes. The
+    check is the difference between a fetch and an open proxy — and it is not
+    hypothetical: the reference is stored, so the window that follows it may be
+    weeks after whatever wrote it.
+    """
+    connector = _content_connector(served={"doc-1": b"%PDF-1.4\n"})
+    for url in (
+        "http://169.254.169.254/computeMetadata/v1/",
+        "https://evil.example.com/api/naviant/v1/documents/doc-1/content",
+        f"https://{PROJECT}-dms.web.app.evil.example.com/documents/doc-1",
+        f"https://not-{PROJECT}-dms.web.app/documents/doc-1",
+    ):
+        with pytest.raises(EstateError, match="refusing to fetch"):
+            connector.fetch_content(url)
+
+
+def test_an_unregistered_estate_serves_no_content():
+    """Nothing to fetch from, said as a refusal rather than a request."""
+    connector = _content_connector(project="")
+    with pytest.raises(EstateError, match="no estate registered"):
+        connector.fetch_content("https://anything/documents/doc-1/content")
+
+
+def test_a_sibling_app_in_the_same_estate_is_allowed():
+    """An estate is a set of sibling hosts, and a reference may name any of
+    them: the DMS serves documents today, and the ERP will serve an attachment
+    tomorrow. What the guard draws is the estate's boundary, not one app's."""
+    connector = _content_connector(served={"po-9": b"%PDF-1.4\n"})
+    content, _ = connector.fetch_content(
+        f"https://{PROJECT}-erp.web.app/api/naviant/v1/documents/po-9/content"
+    )
+    assert content.startswith(b"%PDF")

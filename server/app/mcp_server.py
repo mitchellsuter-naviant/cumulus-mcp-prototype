@@ -16,7 +16,6 @@ from .auth import principal_from_headers
 from .deps import get_asset_usage
 from .usage import READ, RETRIEVED, current_caller, reset_caller, set_caller
 from .deps import get_service
-from .models import AUTHORITY_ORDER
 from .service import AssetNotFoundError
 
 log = logging.getLogger("cumulus.mcp")
@@ -27,7 +26,11 @@ mcp = MCPServer(
         "Enterprise knowledge layer. Use list_docs/get_doc to browse the taxonomy, "
         "search_docs for hybrid keyword-plus-semantic retrieval, and get_context to "
         "see where a document sits in the hierarchy. Prefer higher authority_level "
-        f"documents ({' > '.join(AUTHORITY_ORDER)}) when sources disagree."
+        "documents when sources disagree; the precedence actually in force is "
+        "the `retrieval-authority` document, which also says how much authority "
+        "is allowed to reorder a ranking. Read it rather than assuming an "
+        "order — these instructions are fixed at handshake and that document "
+        "is not."
     ),
 )
 

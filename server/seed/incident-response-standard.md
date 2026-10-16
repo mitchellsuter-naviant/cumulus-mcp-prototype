@@ -3,7 +3,6 @@ id: incident-response-standard
 path: engineering/standards/incident-response
 title: Incident Response Standard
 authority_level: standard
-scope: org
 owner: platform-eng
 tags: incidents, oncall, sev, engineering
 status: published

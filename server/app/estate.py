@@ -61,17 +61,20 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .models import utcnow
-from .sync import (
+from .connectors.sync import (
     AccountRecord,
     CalendarEventRecord,
     CalendarRecord,
     ContactRecord,
+    CredentialRecord,
     CustomerRecord,
     DmsDocumentRecord,
     EmployeeRecord,
     EmploymentEventRecord,
+    EquipmentRecord,
     FolderRecord,
     ItemRecord,
+    JobRecord,
     MailboxRecord,
     MailMessageRecord,
     OpportunityRecord,
@@ -81,6 +84,8 @@ from .sync import (
     PsaClientRecord,
     PurchaseOrderLineRecord,
     PurchaseOrderRecord,
+    ReceivingLineRecord,
+    ReceivingRecord,
     SalesOrderLineRecord,
     SalesOrderRecord,
     SyncRequest,
@@ -102,8 +107,17 @@ CRM_BOOK = "crm-book"
 ERP_SALES = "erp-sales"
 ERP_VENDORS = "erp-vendors"
 ERP_PURCHASE_ORDERS = "erp-purchase-orders"
+ERP_RECEIVING = "erp-receiving"
 OFFICE_CALENDAR = "office-calendar"
 OFFICE_MAIL = "office-mail"
+#: The plant floor: what is being built, who holds a dated permission to work
+#: on it, and what the business is answerable for operating. Three feeds and
+#: not one, for the reason `erp-receiving` states below its own row — they move
+#: on different clocks and a shared cursor would let one failure hold back rows
+#: that were already safe to keep.
+ERP_JOBS = "erp-jobs"
+HRIS_CREDENTIALS = "hris-credentials"
+ERP_EQUIPMENT = "erp-equipment"
 
 #: The suite behind the estate's Office app, named once. Not an inference: the
 #: app serves Microsoft 365's own shapes — opaque `AAMkA…` message ids,
@@ -306,8 +320,9 @@ def team_slug(name: str) -> str:
 
     What is *not* here is any decision about what a value means: no vocabulary
     mapped onto a declared enum, no score, no precedence, no minting. Those are
-    the flow's, and `sync._event_status` and `sync_office._importance` are
-    where the two enums this estate implies actually get decided.
+    the flow's, and `connectors.sync._event_status` and
+    `connectors.office._importance` are where the two enums this estate
+    implies actually get decided.
     """
     return _SLUG_STRIP.sub("-", (name or "").lower()).strip("-")
 
@@ -391,6 +406,15 @@ def _build_hris_workforce(
             external_id=_text(d, "id"),
             slug=team_slug(_text(d, "name")),
             name=_text(d, "name"),
+            # A rename, and the plainest kind: the HRIS spells the accounting
+            # code `costCenter` and the wire shape spells it `cost_center`.
+            # It rides beside the id rather than replacing it because they are
+            # two different strings about the same department, and the ERP's
+            # job rows name a crew by the *code* — so a feed that dropped it
+            # would leave the `crew_id → Team` binding nothing to resolve
+            # against. Null for most departments, which `_text` turns into the
+            # empty string the flow then declines to claim.
+            cost_center=_text(d, "costCenter"),
             parent_slug=slug_of(_text(d, "parentDepartmentId")),
             lead_email=email_of(_text(d, "headEmployeeId")),
         )
@@ -604,6 +628,74 @@ def _build_erp_purchase_orders(
     return SyncRequest(source=ERP_PURCHASE_ORDERS, purchase_orders=orders)
 
 
+def _build_erp_receiving(
+    rows: dict[str, list[dict]], deref: Deref
+) -> SyncRequest:
+    """ERP receivingReports → the existing `ReceivingRecord`. The third leg.
+
+    Everything downstream of this function was already built and unreachable:
+    `receiving-sync`, the wire shape, the `ReceivingReport`/`ReceivingReportLine`
+    types and the matcher's `receives_against` traversal have all been in place
+    since the AP flow landed, and nothing had ever delivered them — which made a
+    three-way match structurally two-way in production. This feed is the whole
+    fix. No flow, no wire field and no matcher rule changed to accommodate it.
+
+    It dereferences for the reason the purchase-order feed does, and here it is
+    load-bearing rather than cosmetic: `sync._apply_receipts` binds a report to
+    its order by looking `object_id("PurchaseOrder", po_number)` up, a
+    PurchaseOrder's natural key is the ERP's `tranId`, and a receipt row names
+    its order by internal id. The estate does spell one from the other (`PO` +
+    id) and that rule is deliberately not used — a key rebuilt from a naming
+    convention breaks silently on the day the convention does, and the failure
+    it produces is the quietest kind: a receipt that lands looking perfectly
+    correct with no edge to the order it books against, and an invoice that
+    matches on two legs and reports the third as missing. So the order row is
+    read for the key it actually carries. Same declared-key lookup for a line's
+    internal `itemId`, where the shape wants a SKU and a description. `_deref`
+    memoizes both for the whole pull, so a split delivery — two receipts against
+    one order, which this estate really produces — costs one GET and not two.
+
+    **Two fields the ERP cannot source, left empty rather than defaulted.** A
+    receipt carries no status: completeness is a property of the *order*, which
+    the ERP restates to `Partially Received` or `Pending Billing` from the sum
+    of everything received against it, so the wire shape's `complete` default
+    would assert of every partial delivery exactly the thing that is untrue
+    about it. And a line carries no `condition` — `good | damaged | short` is a
+    judgment about a shipment, and a dock that only counts has not made one;
+    deriving `short` from received-under-ordered here would be this connector
+    inventing vocabulary, which is the flow's job and not its own.
+
+    Two source fields go nowhere, which is the honest half of a rename: a line's
+    `quantityOrdered` (the shape holds only what turned up — the ordered figure
+    is the PO's, and the matcher reads it from that leg) and the receipt's
+    `receivedBy`/`memo`, which the shape has no room for. Dropped rather than
+    packed into a field that means something else. There is also no money on a
+    receipt anywhere in this source, and none is invented: what it answers is
+    what turned up, never what it was worth.
+    """
+    reports: list[ReceivingRecord] = []
+    for record in rows.get("receivingReports", []):
+        order = deref("purchaseOrders", _text(record, "purchaseOrderId"))
+        lines: list[ReceivingLineRecord] = []
+        for line in record.get("lines") or []:
+            item = deref("items", _text(line, "itemId"))
+            lines.append(ReceivingLineRecord(
+                sku=_text(item, "itemId"),
+                description=_text(item, "displayName"),
+                quantity_received=_number(line, "quantityReceived"),
+                condition="",
+            ))
+        reports.append(ReceivingRecord(
+            external_id=_text(record, "id"),
+            receipt_number=_text(record, "tranId"),
+            po_number=_text(order, "tranId"),
+            received_date=_text(record, "tranDate"),
+            status="",
+            lines=lines,
+        ))
+    return SyncRequest(source=ERP_RECEIVING, receiving_reports=reports)
+
+
 def _mailbox_addresses(rows: dict[str, list[dict]], deref: Deref):
     """`mailboxId` → the mailbox address, the way both office feeds need it.
 
@@ -690,7 +782,8 @@ def _build_office_mail(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest
     custody line held at the earliest possible point: a field that is never put
     on the wire cannot be landed by mistake, cannot be logged by an
     intermediary, and cannot be quietly relied on by a flow written later. The
-    flow caps the preview again — see `sync_office.PREVIEW_CHARS` — because
+    flow caps the preview again — see `connectors.office.PREVIEW_CHARS` —
+    because
     this is a boundary worth defending twice.
     """
     address_of = _mailbox_addresses(rows, deref)
@@ -884,6 +977,285 @@ def _build_psa_book(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest:
     )
 
 
+#: The estate's ten per-department completion columns, and the slug each one
+#: names — **a rename table, which is what this module is for.** The
+#: precedents are `connectors.sync._event_status` and
+#: `connectors.office._importance`: one estate's word for a thing, spelled the
+#: way everything downstream spells it. Which column belongs to which
+#: department is a fact about the ERP's schema, the same kind of fact
+#: `_build_erp_sales` states when it says `itemId` is the SKU.
+#:
+#: **The pairing is declared for a person in the `## Departments` table of
+#: `plant-scheduling-parameters`** — HRIS department name, ERP Done field,
+#: Cumulus slug — and this is the machine's copy of its middle and right
+#: columns. Two copies of one table can drift, so the governed one is the
+#: authority and this comment is the pointer to it; the corpus is deliberately
+#: not read here, because a connector that reached the knowledge layer would
+#: be as wrong as one that reached the graph (see the module docstring).
+#:
+#: The slugs are the whole point of the third column: neither repo learns the
+#: other's spelling, because both spell the department the same third way
+#: (S3). What a set flag *means* to the department after it — that a missing
+#: upstream stage blocks a share — stays the flow's.
+ERP_DEPARTMENT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("trussCutDone", "truss-cut"),
+    ("trussFabDone", "truss-fab"),
+    ("steelFabDone", "steel-fab"),
+    ("trimFabDone", "trim-fab"),
+    # `hardwarePackDone`, not `hardwareTrimPackDone`: the ERP's column name is
+    # shorter than the department it belongs to, which is exactly the kind of
+    # thing a rename table exists to absorb.
+    ("hardwarePackDone", "hardware-trim-pack"),
+    ("verticalsDone", "verticals"),
+    ("componentsDone", "components"),
+    ("laminatesDone", "laminates"),
+    ("stackOutDone", "stack-out"),
+    ("loadingDone", "loading"),
+)
+
+#: The one value the ERP's picklists use for a set flag. Named because it is
+#: read in one place and delivered verbatim everywhere else: this connector
+#: tests the flag to decide *which slug to list*, which is addressing, and it
+#: never translates the word into a state.
+ERP_FLAG_SET = "Yes"
+
+
+def _build_erp_jobs(rows: dict[str, list[dict]], deref: Deref) -> SyncRequest:
+    """ERP customers/jobs → the `JobRecord` wire shape. One join, no judgment.
+
+    The join is the reason `customers` is pulled first and the reason this
+    feed has two resources at all: an AXIS job names its customer by the ERP's
+    internal `customerId`, and `JobRecord.customer_name` is what the flow
+    matches a `Company` on (S4). The customer row is read for `companyName`
+    off the pulled page where the delta carried it and with one GET where it
+    did not — the same declared-key dereference `_build_erp_purchase_orders`
+    makes for `vendorId`, memoized by `_deref` for the whole pull, so forty
+    jobs against six customers costs six GETs and the same customer
+    reappearing in the next chunk costs none.
+
+    **The customer rows are joined and never delivered.** They travel in this
+    feed's chunk and stop here: `SyncRequest.customers` is the *sell side's*
+    list, and filling it would make `deliver` fire `SalesRecordsDelivered`
+    beside `JobRecordsDelivered` — one delivery starting two flows, the second
+    of them landing an ERP customer book under the name of a jobs feed. The
+    counterparty book is `erp-sales`' to write; this feed only needs the name.
+
+    Three renames worth naming, because each of them is the connector
+    declining to decide something:
+
+    - **`outToYard` and `doNotFab` arrive as the estate's own `"Yes"`/`"No"`
+      strings.** The ERP has no boolean type and these are picklists; mapping
+      them onto `release_state` / `hold_reason` is the flow's job against the
+      `## Source vocabulary` table in `plant-scheduling-parameters`, the same
+      way `connectors.sync._event_status` decides what a provider's
+      cancellation flag means. A connector that shipped `released=True` would
+      have made a governed decision invisible.
+    - **`weekPosition` travels as the source's own word too**, for exactly the
+      same reason: `Job.week_position` is a number, the ERP places a job in a
+      window using its own vocabulary, and the table that turns one into the
+      other is governed knowledge rather than a `float()` call in here.
+    - **`upstream_done` lists the slugs whose column reads `"Yes"`.** Which
+      column is which department is schema (above); what a set flag means to
+      the department after it is the flow's.
+
+    `site_address` is not carried: the shape has a field for it and v1 has no
+    reader, and a column delivered for nobody is a column that gets relied on
+    before anybody has decided what it means.
+    """
+    customers = {c["id"]: c for c in rows.get("customers", []) if c.get("id")}
+
+    def customer_name(customer_id: str) -> str:
+        """The pulled page first, then one GET for what it does not hold."""
+        if not customer_id:
+            return ""
+        page = customers.get(customer_id)
+        return _text(page or deref("customers", customer_id), "companyName")
+
+    jobs: list[JobRecord] = []
+    for row in rows.get("jobs", []):
+        wings = " x ".join(filter(None, (
+            _text(row, "wingsTotalWidthFt"), _text(row, "wingsTotalLengthFt"),
+        )))
+        jobs.append(JobRecord(
+            external_id=_text(row, "id"),
+            job_number=_text(row, "jobNumber"),
+            name=_text(row, "jobName"),
+            customer_name=customer_name(_text(row, "customerId")),
+            builder_name=_text(row, "builder"),
+            plant_site=_text(row, "plantSite"),
+            status=_text(row, "status"),
+            load_date=_text(row, "loadDate"),
+            shipment_date=_text(row, "shipmentDate"),
+            week_position=_text(row, "weekPosition"),
+            out_to_yard=_text(row, "outToYard"),
+            do_not_fab=_text(row, "doNotFab"),
+            foreman=_text(row, "foreman"),
+            crew_id=_text(row, "crewId"),
+            shipment_type=_text(row, "shipmentType"),
+            combined_with=_text(row, "combinedWith"),
+            trailer_number=_text(row, "trailerNumber"),
+            width=_number(row, "buildingWidthFt"),
+            length=_number(row, "buildingLengthFt"),
+            height=_number(row, "buildingHeightFt"),
+            # The two wings measurements as one string, because the type holds
+            # one and the source holds two. Composition of the kind
+            # `team_slug`'s docstring allows — a value assembled from parts a
+            # source hands separately — and deliberately not a sum: which of
+            # them a labor formula adds up is a governed decision, and adding
+            # them here would destroy the only evidence of what was measured.
+            secondary_dimensions=wings,
+            upstream_done=[
+                slug for column, slug in ERP_DEPARTMENT_COLUMNS
+                if _text(row, column) == ERP_FLAG_SET
+            ],
+        ))
+    return SyncRequest(source=ERP_JOBS, jobs=jobs)
+
+
+#: Which credential each dated column on a driver-qualification row is, and
+#: the category the ontology declares for it. **Addressing again**: one HRIS
+#: row holds four unrelated expiries, so the column a record came from is the
+#: only thing that says what the record *is* — a fan-out, not a translation,
+#: and the same kind of statement as "this column is the SKU". A thing that
+#: expires and gets renewed behaves identically whichever department tracks
+#: it, which is why all four land as `Credential` rows distinguished only by
+#: category, and why there is no second record model for driver files.
+HRIS_DRIVER_COLUMNS: tuple[tuple[str, str, str, str], ...] = (
+    ("cdlExpirationDate", "cdl", "CDL", "licence"),
+    ("medicalCardExpirationDate", "medical-card", "Medical card", "medical"),
+    ("pspDate", "psp", "PSP", "clearance"),
+    ("clearinghouseDate", "clearinghouse", "Clearinghouse", "clearance"),
+)
+
+
+def _build_hris_credentials(
+    rows: dict[str, list[dict]], deref: Deref
+) -> SyncRequest:
+    """HRIS employees/trainingRecords/driverQualifications → `CredentialRecord`.
+
+    The second feed with a join, and it exists for the reason the first one
+    does: both credential resources reference a person by the HRIS's own
+    `employeeId` and nothing else, while this contract binds a holder by work
+    email — so the employee row is read for `workEmail`, off the pulled page
+    where the delta carried it and with one memoized GET where it did not.
+    `holder_external_id` travels beside the address, the way
+    `EmployeeRecord.manager_external_id` does: a delta of one renewed
+    certification should not have to buy a translation the graph already
+    holds.
+
+    A **bind** feed, and this is where that shows: nothing is reified because
+    a work email is exact and nobody adjudicates it, so a holder the workforce
+    does not contain is counted rather than minted.
+
+    One row of training becomes one record; one driver-qualification row
+    becomes up to four, one per date it carries (`HRIS_DRIVER_COLUMNS`), each
+    under its own `external_id` suffix because `Credential`'s natural key is
+    the source's record id and four permissions cannot share one. A column the
+    source left null yields no record at all — an absent CDL date is the HRIS
+    saying this driver has no CDL on file, not an expiry of nothing.
+
+    Two columns are carried as the HRIS's own words and translated nowhere
+    here: `category` on a training row (the flow slugs it against the declared
+    vocabulary) and `status`, which is the HRIS's word for how the assignment
+    stands — `Credential.status` is `valid | expiring | expired | withdrawn`
+    derived from the dates against the governed notice stages, and letting an
+    assignment state land in it would make the compliance sweep read its own
+    input as its own output.
+    """
+    workers = {e["id"]: e for e in rows.get("employees", []) if e.get("id")}
+
+    def work_email(employee_id: str) -> str:
+        """The pulled page first, then one GET for what it does not hold."""
+        if not employee_id:
+            return ""
+        page = workers.get(employee_id)
+        return _text(page or deref("employees", employee_id), "workEmail")
+
+    credentials: list[CredentialRecord] = []
+    for row in rows.get("trainingRecords", []):
+        employee_id = _text(row, "employeeId")
+        credentials.append(CredentialRecord(
+            external_id=_text(row, "id"),
+            holder_email=work_email(employee_id),
+            holder_external_id=employee_id,
+            credential_type=_text(row, "courseName"),
+            category=_text(row, "category"),
+            assigned_date=_text(row, "assignedDate"),
+            completion_date=_text(row, "completionDate"),
+            expiration_date=_text(row, "expirationDate"),
+            status=_text(row, "status"),
+            result=_text(row, "result"),
+            provider=_text(row, "provider"),
+        ))
+    for row in rows.get("driverQualifications", []):
+        employee_id = _text(row, "employeeId")
+        email = work_email(employee_id)
+        record_id = _text(row, "id")
+        for column, suffix, label, category in HRIS_DRIVER_COLUMNS:
+            expires = _text(row, column)
+            if not expires:
+                continue
+            credentials.append(CredentialRecord(
+                external_id=f"{record_id}:{suffix}",
+                holder_email=email,
+                holder_external_id=employee_id,
+                credential_type=label,
+                category=category,
+                # A driver file holds the date the permission lapses and
+                # nothing else: no assignment, no completion, no result, no
+                # provider. Left empty rather than filled from the expiry,
+                # which would claim a renewal happened on the day the last one
+                # ran out.
+                expiration_date=expires,
+            ))
+    return SyncRequest(source=HRIS_CREDENTIALS, credentials=credentials)
+
+
+def _build_erp_equipment(
+    rows: dict[str, list[dict]], deref: Deref
+) -> SyncRequest:
+    """ERP assets → `EquipmentRecord`. Renames, and one absence carried whole.
+
+    No dereference: an asset row names its site as a string and its vendor by
+    an id this contract does not bind, so the connector never leaves the page
+    it pulled.
+
+    **A null `nextInspectionDueDate` is delivered as an absent date, not as a
+    zero and not as a flag.** It is the source saying this unit carries no
+    tracked inspection — the skid steers really are like this — and the flow
+    derives `inspection_tracked` from it once, on the way in. Deciding here
+    that "no due date" means "not tracked" would be the connector reading a
+    meaning off a missing value, which is the one thing `_number`'s docstring
+    says it will not do.
+
+    `make`, `model` and `year` are declared on the wire and left empty,
+    because this estate's asset rows do not carry them. Stated rather than
+    filled from the description, which would put a guess in three fields that
+    read as facts.
+    """
+    return SyncRequest(
+        source=ERP_EQUIPMENT,
+        equipment=[
+            EquipmentRecord(
+                external_id=_text(row, "id"),
+                # The estate's `assetTag` is the tag painted on the unit; its
+                # `id` is the record. Both travel, for `ItemRecord`'s reason.
+                equipment_id=_text(row, "assetTag"),
+                name=_text(row, "description"),
+                category=_text(row, "assetType"),
+                # A serial where the source has one, a plate where it does
+                # not: one column on the shape, because what a trailer is
+                # keyed by and what a truck is keyed by are the same question
+                # asked of two kinds of unit.
+                identifier=_text(row, "serialNumber") or _text(row, "plateNumber"),
+                home_site=_text(row, "homeSite"),
+                last_inspection_date=_text(row, "lastInspectionDate"),
+                next_inspection_due_date=_text(row, "nextInspectionDueDate"),
+            )
+            for row in rows.get("assets", [])
+        ],
+    )
+
 def _storage_ref(deref: Deref, row: dict) -> str:
     """The customer-resolvable address of one file's current revision.
 
@@ -944,6 +1316,27 @@ FEEDS: tuple[FeedSpec, ...] = (
         build=_build_erp_purchase_orders,
     ),
     FeedSpec(
+        feed=ERP_RECEIVING,
+        app="erp",
+        # Below the orders and not above them, which is the one thing this
+        # row's position decides: `_apply_receipts` can only draw the
+        # `receives_against` edge if the PurchaseOrder is already in the graph,
+        # and counts `po_missing` when it is not. Ordering the registry this way
+        # makes the edge on the first pull rather than leaving it to whichever
+        # later window happens to touch the order again.
+        #
+        # Still its own feed rather than a second resource on the orders, for
+        # the reason the two office halves are two feeds: the dock moves on a
+        # different clock from purchasing, they are different wire shapes on
+        # different flows, and a shared cursor would let one order that failed
+        # to deliver hold back a week of receipts that were already safe to
+        # keep. That the estate bumps a PO's `updatedAt` when a receipt is
+        # written against it is expected and needs nothing here — the orders
+        # feed re-delivers that row, and the upsert is keyed.
+        resources=("receivingReports",),
+        build=_build_erp_receiving,
+    ),
+    FeedSpec(
         feed=OFFICE_CALENDAR,
         app="office",
         # Mailboxes first, for the reason teams precede employees: an event is
@@ -982,6 +1375,60 @@ FEEDS: tuple[FeedSpec, ...] = (
         build=_build_dms_library,
     ),
     FeedSpec(
+        feed=ERP_JOBS,
+        app="erp",
+        # Customers before jobs, for the reason items precede orders: a job
+        # names its customer by an internal id, and the customer row is the
+        # only thing that translates it to the name this contract matches a
+        # Company on (S4). Above `erp-equipment` because that is the order the
+        # plant floor is read in — what is being built, then what builds it —
+        # and because a reader looking for the production feeds should find
+        # them in the order the flows depend on them.
+        #
+        # Its own feed rather than two more resources on `erp-sales`, for the
+        # reason `erp-receiving` gives at length above: the shop floor moves on
+        # a different clock from order-to-cash, the wire shapes and the flows
+        # are different, and a shared cursor would let one failed order
+        # delivery hold back a week of job changes that were already safe to
+        # keep.
+        resources=("customers", "jobs"),
+        build=_build_erp_jobs,
+    ),
+    FeedSpec(
+        feed=HRIS_CREDENTIALS,
+        app="hris",
+        # Employees first, for the same reason customers precede jobs: both
+        # credential resources name a person by the HRIS's own id and nothing
+        # else, and the employee row is what turns that into the work email
+        # this contract binds a holder by.
+        #
+        # Its own feed and not a fourth resource on `hris-workforce`: a
+        # certification expiring is not a worker changing, the two cursors move
+        # independently, and a workforce pull that failed must not hold back a
+        # renewal that had already landed.
+        resources=("employees", "trainingRecords", "driverQualifications"),
+        build=_build_hris_credentials,
+    ),
+    FeedSpec(
+        feed=ERP_EQUIPMENT,
+        app="erp",
+        # One resource, no join, and nothing above it it depends on: an asset
+        # row names its site as a string. Its own feed for the reason the two
+        # above are: a fleet's inspection dates and a plant's job list have
+        # nothing to say to each other, and sharing a cursor would only mean
+        # sharing a failure.
+        resources=("assets",),
+        build=_build_erp_equipment,
+    ),
+    # **There is no schedule feed, and its absence is the design.** A reader
+    # looking for a fourth row here is looking for the plant's daily
+    # department schedule, which Cumulus is the system of record for
+    # (`ScheduleDay`/`ScheduleEntry` are the only `authoritative=True` types
+    # on the plant floor) because nothing in the estate holds one. A schedule
+    # that lives in a spreadsheet cannot be asked what it deferred or who
+    # signed it. So there is nothing to pull, and a feed declared here would
+    # be a contract with a system that does not exist.
+    FeedSpec(
         feed=PSA_BOOK,
         app="psa",
         # The longest family in the registry, and every step of it is a
@@ -1018,6 +1465,11 @@ class EstateConnector:
         api_key: str = "",
         feeds: tuple[FeedSpec, ...] = FEEDS,
         fetch: Callable[[str], dict] | None = None,
+        #: The bytes half of `fetch`, separate because it answers a different
+        #: shape: a JSON row versus content plus the type the server declared
+        #: for it. Injectable for the same reason — a recorded estate serves
+        #: documents too.
+        fetch_bytes: Callable[[str], tuple[bytes, str]] | None = None,
         deliver: Callable[[dict], dict] | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         interval_seconds: int = 0,
@@ -1034,6 +1486,7 @@ class EstateConnector:
         self.interval_seconds = interval_seconds
         self.timeout = timeout
         self._fetch = fetch or self._http_fetch
+        self._fetch_bytes = fetch_bytes or self._http_fetch_bytes
         self._deliver = deliver or self._http_deliver
         self._discovery: dict | None = None
         self._loop: threading.Thread | None = None
@@ -1386,6 +1839,54 @@ class EstateConnector:
             "records": sum(len(items) for items in chunk.values()),
             "runs": (response or {}).get("runs", []),
         }
+
+    # -- content ------------------------------------------------------------
+
+    def fetch_content(self, url: str) -> tuple[bytes, str]:
+        """One file's bytes, from an address the customer's own system minted.
+
+        The reference-custody feeds write `storage_ref` down and never call it;
+        this is where a flow that genuinely needs the content — `ap-intake`,
+        reading a supplier invoice — calls it, and it is here rather than in
+        the flow because reaching outward is this module's job and nothing
+        else's.
+
+        The address is **checked against the estate's own hosts before it is
+        called**, and that is not belt-and-braces. A `storage_ref` is a string
+        that arrived from an external system and was stored in the graph; a
+        flow that GETs whatever it finds there has handed the customer's
+        document system the ability to point this service's credentials at any
+        address it likes. The check is what makes that a refusal instead.
+        """
+        if not self.registered:
+            raise EstateError("no estate registered (set ESTATE_PROJECT)")
+        if not self._addresses_this_estate(url):
+            raise EstateError(
+                f"refusing to fetch `{url[:120]}`: not an address in the "
+                f"`{self.project}` estate"
+            )
+        return self._fetch_bytes(url)
+
+    def _addresses_this_estate(self, url: str) -> bool:
+        """Is this URL one of the registered estate's app hosts?
+
+        Built from the same template every other address in this module is,
+        with the app left open: an estate is a set of sibling hosts and a
+        reference may name any of them, but nothing outside the set.
+        """
+        prefix, _, suffix = self.url_template.partition("{app}")
+        prefix = prefix.format(project=self.project)
+        if not url.startswith(prefix):
+            return False
+        rest = url[len(prefix):]
+        host, _, _ = rest.partition("/")
+        return host.endswith(suffix) and len(host) > len(suffix)
+
+    def _http_fetch_bytes(self, url: str) -> tuple[bytes, str]:
+        response = httpx.get(url, timeout=self.timeout, follow_redirects=False)
+        if response.status_code >= 400:
+            raise EstateError(f"GET {url} → {response.status_code}")
+        return response.content, response.headers.get("content-type", "")
 
     def _get(self, url: str) -> dict:
         try:

@@ -302,6 +302,35 @@ if [[ -n "$ESTATE_PROJECT" ]]; then
     "Propose cross-source identity links over the counterparty book."
   schedule_job "cumulus-state-sweep" "40 * * * *" "/api/v1/state/sweep" \
     "Find disagreements between systems about the same commitment."
+
+  # The plant floor's two windows, and they are guarded on the namespace
+  # because they are the one pair here that is not general. A naviant
+  # deployment has no jobs and no credentials, so scheduling them there would
+  # run two sweeps a day over an empty graph and put two flows on the fleet
+  # page whose every run found nothing — noise that reads exactly like a
+  # broken feed.
+  #
+  # There is deliberately no third job for `field-documents`. That flow wakes
+  # on `JobRecordsDelivered` and `DocumentsDelivered`, which the pull above
+  # already produces every fifteen minutes, so a timer would ask a question two
+  # deliveries had just answered.
+  if [[ "$ESTATE_NAMESPACE" == "wick" ]]; then
+    echo "==> Scheduling the plant windows ($ESTATE_NAMESPACE)"
+    # Daily, and the cadence is the asset's to change rather than this
+    # script's: `certification-alert-policy` carries `- run cadence: daily`
+    # beside the notice stages, and the run reads it. A window with nothing
+    # due writes nothing and raises nothing, which is what makes daily the
+    # conservative default rather than the noisy one.
+    schedule_job "cumulus-compliance-window" "0 10 * * *" \
+      "/api/v1/compliance/sweep" \
+      "Close a compliance window over the credential and inspection book."
+    # 11:00 CST, the hour the process owner approved, expressed in UTC
+    # because every job here is scheduled in Etc/UTC. Weekdays only: a plant
+    # schedule for a Saturday is a schedule for a day nobody works, and the
+    # eligibility rule would drop every job on it anyway.
+    schedule_job "cumulus-plant-window" "0 17 * * 1-5" "/api/v1/plant/sweep" \
+      "Close a plant window: eligible jobs, their demand, and their days."
+  fi
 fi
 
 echo "==> Configuring Flutter app for Firebase (web)"

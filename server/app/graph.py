@@ -691,32 +691,43 @@ class GraphService:
         if self.strict:
             raise TBoxError(violations)
 
-    def check_invariants(self) -> list[TBoxViolation]:
+    def check_invariants(
+        self,
+        *,
+        objects: list[ObjectRecord] | None = None,
+        links: list[LinkRecord] | None = None,
+    ) -> list[TBoxViolation]:
         """Sweep the whole graph against the ontology.
 
         The universal tier of testing: no per-case labels, and it catches the
         shape of bug that field assertions never see — a second vendor minted
         for the same company, a line with no parent, a match set pointing at an
         invoice that is not there.
+
+        `objects` and `links` let a caller that has already walked the store
+        hand its pass over rather than paying for a second one. Both default to
+        reading the store, which is what every caller but the Ontology screen
+        wants; nothing about the sweep changes either way.
         """
         violations: list[TBoxViolation] = []
-        objects = {o.id: o for o in self.store.objects()}
-        for record in objects.values():
+        records = self.store.objects() if objects is None else objects
+        by_id = {o.id: o for o in records}
+        for record in by_id.values():
             violations.extend(self._validate_claims(record.type, record.claims))
         # One stream, indexed both ways, so the cardinality check inside
         # `_validate_link` reads its neighborhood from memory instead of
         # issuing two store queries per link over the whole book.
-        links = self.store.links()
+        edges = self.store.links() if links is None else links
         inbound: dict[str, list[LinkRecord]] = {}
         outbound: dict[str, list[LinkRecord]] = {}
-        for link in links:
+        for link in edges:
             if link.live:
                 inbound.setdefault(link.to_id, []).append(link)
                 outbound.setdefault(link.from_id, []).append(link)
         # Children of a compositional edge must have one.
         parented: dict[str, set[str]] = {}
         owner_of_part: dict[str, str] = {}
-        for link in links:
+        for link in edges:
             declared = self.ontology.link_type(link.type)
             if declared is None:
                 violations.append(TBoxViolation(
@@ -726,7 +737,7 @@ class GraphService:
                 continue
             if not link.live:
                 continue
-            from_record, to_record = objects.get(link.from_id), objects.get(link.to_id)
+            from_record, to_record = by_id.get(link.from_id), by_id.get(link.to_id)
             violations.extend(self._validate_link(
                 link.type, from_record, to_record, link.from_id, link.to_id,
                 inbound=inbound.get(link.to_id, []),
@@ -740,7 +751,7 @@ class GraphService:
         # above catches seconds; this catches zero), and its natural key must
         # embed its owner's — ER's weak-entity rule, enforced rather than
         # merely followed.
-        for record in objects.values():
+        for record in by_id.values():
             owning = self.ontology.owning_link(record.type)
             if owning is None or record.status == "superseded":
                 continue
@@ -750,7 +761,7 @@ class GraphService:
                     detail=f"{record.type} with no {owning.name} owner",
                 ))
                 continue
-            owner = objects.get(owner_of_part.get(record.id, ""))
+            owner = by_id.get(owner_of_part.get(record.id, ""))
             if (
                 owner is not None
                 and record.natural_key
@@ -1086,15 +1097,30 @@ class GraphWriter:
         self.created: list[str] = []
         self.updated: list[str] = []
         self.linked: list[str] = []
+        self.noted: list[str] = []
 
     # -- the accumulated write-set ----------------------------------------
+
+    def note_write(self, ref: str) -> None:
+        """Record a write this act made somewhere that is not the graph.
+
+        The Gateway builds its ledger entry out of this writer's ref-set, so an
+        Action whose effect lands in a Dataset — the correction set is the
+        standing example — would otherwise commit with an empty write-set: a
+        ledger row indistinguishable from one where nothing happened. Kept in
+        its own list rather than filed under `created`, because "an Object was
+        minted" and "something outside the graph was appended to" are different
+        facts and a reader of the summary should be able to tell them apart.
+        """
+        if ref:
+            self.noted.append(ref)
 
     @property
     def refs(self) -> list[str]:
         """Everything written, newest last, deduplicated in order."""
         seen: set[str] = set()
         out: list[str] = []
-        for ref in [*self.created, *self.updated, *self.linked]:
+        for ref in [*self.created, *self.updated, *self.linked, *self.noted]:
             if ref not in seen:
                 seen.add(ref)
                 out.append(ref)
@@ -1108,6 +1134,8 @@ class GraphWriter:
             parts.append(f"{len(self.updated)} updated")
         if self.linked:
             parts.append(f"{len(self.linked)} link(s)")
+        if self.noted:
+            parts.append(f"{len(self.noted)} record(s) outside the graph")
         return " · ".join(parts) or "nothing written"
 
     # -- the same surface as GraphService, stamped -------------------------

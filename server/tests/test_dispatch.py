@@ -27,8 +27,8 @@ from app.dispatch import (
     is_windowed_flow,
 )
 from app.runs import InMemoryRunStore, RunEngine, RunRecord
-from app.sync import SyncRequest
-from app.tasks import InMemoryTaskDirectory, Task, TaskService
+from app.connectors.sync import SyncRequest
+from app.task_queue import InMemoryTaskDirectory, Task, TaskService
 from tests import world as test_world
 
 CLERK = personas.get("customer-user:ap")
@@ -212,6 +212,80 @@ def test_every_sync_feed_starts_through_the_dispatcher(world):
     for event in dispatched.values():
         [run_id] = event.starts
         assert world.engine.get(run_id).caused_by == event.id
+
+
+# ---- one fact, two responses -----------------------------------------------
+
+
+def test_one_fact_with_two_responses_starts_both_in_declared_order(world):
+    """`DocumentsDelivered` is the event with the most responses, and the
+    order is load-bearing: `ap-intake` and `field-documents` both read the
+    filing tree `dms-sync` lands, so a Dispatcher that started them the other
+    way round would hand the readers an empty graph. Read off the table's
+    declaration order, which is why the three are declared adjacently.
+    """
+    world.sync.deliver(SyncRequest.model_validate({
+        "source": "dms-library",
+        "folders": [{"external_id": "f1", "name": "Accounts Payable"}],
+        "documents": [],
+    }), actor="system:test")
+
+    [event] = [
+        e for e in world.dispatcher.events.list()
+        if e.name == "DocumentsDelivered" and e.triggers
+    ]
+    assert event.triggers == [
+        "documents-delivered", "documents-delivered-ap",
+        "documents-delivered-field",
+    ]
+    assert [world.engine.get(r).flow_id for r in event.starts] == [
+        "dms-sync", "ap-intake", "field-documents"
+    ]
+    # Both name the fact that caused them, and it was logged before either ran.
+    assert all(world.engine.get(r).caused_by == event.id for r in event.starts)
+
+
+def test_a_keyed_redelivery_re_enters_every_run_the_key_named(world):
+    """The idempotency key names a *fact*, and a fact with two responses has
+    two runs.
+
+    Before the second Trigger existed the key was the run id outright, which
+    is what every feed's replay guard was written against and what is already
+    in every deployment's run store — so one response still keeps it verbatim
+    and only a fan-out derives. A retry that started a second copy of each run
+    would double-count a delivery, which is exactly what the key is for.
+    """
+    from app.dispatch import keyed_run_ids
+
+    assert keyed_run_ids("VendorRecordsDelivered", "run_sync_abc") == [
+        "run_sync_abc"
+    ]
+    assert keyed_run_ids("DocumentsDelivered", "run_sync_abc") == [
+        "run_sync_abc_documents-delivered",
+        "run_sync_abc_documents-delivered-ap",
+        "run_sync_abc_documents-delivered-field",
+    ]
+    # And the production fact, which acquired its second response with
+    # `field-documents`: from one Trigger to two is where a verbatim key stops
+    # being the run id, which is harmless in a fresh deployment with no run
+    # history and the reason the pair landed in one commit.
+    assert keyed_run_ids("JobRecordsDelivered", "run_sync_abc") == [
+        "run_sync_abc_jobs-delivered",
+        "run_sync_abc_jobs-delivered-field-documents",
+    ]
+
+    request = SyncRequest.model_validate({
+        "source": "dms-library",
+        "idempotency_key": "dms-library:2026-09-01T00:00:00Z:0",
+        "folders": [{"external_id": "f1", "name": "Accounts Payable"}],
+        "documents": [],
+    })
+    first = world.sync.deliver(request, actor="system:test")
+    assert [o["replayed"] for o in first] == [False]
+    again = world.sync.deliver(request, actor="system:test")
+    assert [o["replayed"] for o in again] == [True]
+    assert len(world.engine.list(flow_id="dms-sync")) == 1
+    assert len(world.engine.list(flow_id="ap-intake")) == 1
 
 
 # ---- the shape the doctrine reads off a Trigger ----------------------------

@@ -11,7 +11,7 @@ import pytest
 
 from app.graph import object_id
 from app.mappings import steward_queue_for, steward_queue_for_type
-from app.sync import (
+from app.connectors.sync import (
     CRM_FLOW_ID,
     SALES_FLOW_ID,
     SyncRequest,
@@ -447,7 +447,7 @@ def test_a_steward_approving_links_the_company_the_run_would_not(booked, world):
     """The routing this stage adds: the decision is applied against the
     Company book because the landed row says `company`, where the same code
     path used to be able to write a Vendor and nothing else."""
-    from app.tasks import TaskDecision
+    from app.task_queue import TaskDecision
 
     _deliver(world, _ambiguous_customer())
     task = next(
@@ -495,7 +495,7 @@ def test_the_decision_commits_under_the_queue_the_task_sat_in(booked, world):
     desk is refused rather than quietly upgraded.
     """
     from app.gateway import Refused
-    from app.tasks import TaskDecision
+    from app.task_queue import TaskDecision
 
     _deliver(world, _ambiguous_customer())
     task = next(
@@ -516,7 +516,7 @@ def test_the_decision_commits_under_the_queue_the_task_sat_in(booked, world):
 
 
 def test_a_steward_rejecting_mints_a_company_not_a_vendor(booked, world):
-    from app.tasks import TaskDecision
+    from app.task_queue import TaskDecision
 
     _deliver(world, _ambiguous_customer())
     task = next(
@@ -542,7 +542,7 @@ def test_a_steward_rejecting_mints_a_company_not_a_vendor(booked, world):
 
 def test_a_vendor_decision_still_writes_a_vendor(world):
     """The routing did not move the ground under the feed it came from."""
-    from app.tasks import TaskDecision
+    from app.task_queue import TaskDecision
 
     world.sync.deliver(SyncRequest.model_validate({
         "source": "erp-vendors",
@@ -641,7 +641,7 @@ def test_a_purchase_order_lands_its_status_in_the_declared_vocabulary(world):
     """
     from app.estate import _build_erp_purchase_orders, _build_erp_vendors
     from app.graph import object_id
-    from app.sync import _slug
+    from app.connectors.sync import _slug
 
     access = _ErpAccess()
     _deliver(world, _build_erp_vendors({"vendors": fx.VENDORS}, access))

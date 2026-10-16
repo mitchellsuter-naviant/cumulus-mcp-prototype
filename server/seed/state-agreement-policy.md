@@ -3,7 +3,6 @@ id: state-agreement-policy
 path: platform/policies/state-agreement
 title: State Agreement Policy
 authority_level: policy
-scope: org
 owner: platform-eng
 tags: disagreement, state, sales-orders, opportunities, governed-knowledge
 status: published

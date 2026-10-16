@@ -3,7 +3,6 @@ id: invoice-extraction-prompt
 path: finance/prompts/invoice-extraction
 title: Invoice Extraction Prompt
 kind: prompt
-scope: org
 owner: finance-ops
 tags: ap, invoices, extraction, prompt
 status: published
@@ -28,7 +27,16 @@ printed, invoice_number, invoice_date (ISO 8601), due_date (ISO 8601),
 po_number, subtotal_usd, freight_usd, tax_usd, total_usd, currency, a short
 line_summary, your confidence 0-1, and lines: an array of the billed lines, each
 with sku, description, quantity, unit_price_usd, amount_usd and kind (goods,
-freight, tax or discount). Respond with only a JSON object with those keys.
+freight, tax or discount).
+
+Also return field_confidence: an object whose keys are the field names above
+and whose values are your confidence 0-1 in that one field, and on each line a
+field_confidence object over that line's own keys. Judge each field on its own
+— how clearly that value is printed and how sure you are you read it correctly
+— rather than repeating one number for the whole page. Omit a field you did not
+find rather than reporting low confidence in a guess.
+
+Respond with only a JSON object with those keys.
 ```
 
 ## What the flow does with the answer
@@ -50,6 +58,14 @@ each field has somewhere it lands.
 - `total_usd` is checked against that policy's auto-post limit, and `confidence`
   against its minimum extraction confidence. Either one out of bounds sends the
   invoice to the ap-clerk queue.
+- `field_confidence` decides **which fields a clerk is asked about**. Anything
+  below the minimum field confidence in the posting policy is put in front of
+  the reviewer with a box drawn around it on the page; everything else is
+  collapsed as context. This is the field that turns "check this invoice" into
+  "check these three numbers", so a score that is the same for every field —
+  or one number copied across all of them — costs a reviewer real time. Say 0
+  for a field you did not find rather than guessing at a value and marking it
+  low; a missing required field is caught separately and named as missing.
 
 ## Editing this safely
 

@@ -83,7 +83,7 @@ from .graph import (
 from .models import utcnow
 from .resolution import name_similarity
 from .runs import RunRecord
-from .sync import SyncRequest
+from .connectors.sync import SyncRequest
 
 log = logging.getLogger("cumulus.evals")
 

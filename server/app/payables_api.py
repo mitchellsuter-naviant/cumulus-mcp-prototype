@@ -2,8 +2,14 @@
 
 Submitting is the trigger of the accounts-payable flow: the invoice runs
 synchronously through one extraction pass → vendor resolution → the three-way
-match → the anomaly screen → the governed posting rule, and lands as a row. Submission is a human act (a person is entering a
-vendor's invoice), so minted API keys are refused.
+match → the anomaly screen → the governed posting rule, and lands as a row.
+Submission is a human act (a person is entering a vendor's invoice), so minted
+API keys are refused — and it carries a document, because an extraction with no
+artifact behind it is a claim nobody can check.
+
+This is the **side door**. In a deployed estate an invoice arrives through
+`ap-intake`, out of the folders the customer already files invoices in; this is
+for the one somebody has in their hand.
 
 Reads are any authenticated role, narrowed to what the reader is accountable
 for: a clerk bound to the AP queue works the whole table, and somebody who
@@ -22,7 +28,7 @@ from .auth import Principal, get_principal, require_human, require_reader
 # from-import, so the singleton installed at wiring/test time is the one
 # every request sees.
 from . import deps
-from .payables import InvoiceRecord, PayableState, PayableStats
+from .tasks.accounts_payable.domain import InvoiceRecord, PayableState, PayableStats
 
 log = logging.getLogger("cumulus.payables.api")
 
@@ -34,11 +40,17 @@ def get_service():
 
 
 class PayableSubmit(BaseModel):
-    # An invoice image, base64-encoded. Optional so text-hint demos work
-    # without a file; the reader treats hint/filename as extraction input.
+    """An invoice image, base64-encoded, and the name it arrived under.
+
+    There used to be a `note`, and it was passed to the flow as the extraction
+    *hint* — so a caller with no file at all could describe an invoice in prose
+    and get back an extraction. That is the one thing this door must not do:
+    a submission carries evidence, and a request that carries none has nothing
+    to submit.
+    """
+
     image_base64: str = Field(default="", max_length=8_000_000)
     filename: str = Field(default="", max_length=200)
-    note: str = Field(default="", max_length=500)
 
 
 @router.get("", response_model=list[InvoiceRecord])
@@ -84,11 +96,15 @@ def submit_payable(
 ) -> InvoiceRecord:
     require_reader(principal)
     require_human(principal, "submit invoices; sign in as yourself")
+    if not body.image_base64:
+        raise HTTPException(
+            status_code=400,
+            detail="Submit a document: this door carries bytes, not a case.",
+        )
     record = get_service().submit(
         submitted_by=principal.email,
         image_b64=body.image_base64,
         filename=body.filename,
-        hint=body.note,
     )
     log.info(
         "Invoice submitted via API",

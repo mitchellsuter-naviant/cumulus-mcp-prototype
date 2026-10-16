@@ -18,7 +18,7 @@ import pytest
 
 from app.graph import object_id
 from app.mappings import steward_queue_for
-from app.sync import PSA_FLOW_ID, SyncRequest
+from app.connectors.sync import PSA_FLOW_ID, SyncRequest
 from tests import estate_fixtures as fx
 from tests import world as test_world
 

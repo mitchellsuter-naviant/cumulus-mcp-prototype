@@ -3,7 +3,6 @@ id: entity-resolution-policy
 path: platform/policies/entity-resolution
 title: Entity Resolution Policy
 authority_level: policy
-scope: org
 owner: platform-eng
 tags: mdm, entity-resolution, vendors, governed-knowledge
 status: published

@@ -9,7 +9,7 @@ the graph has no write route.
 import pytest
 
 from app import data_collections
-from app.reimbursements import SubmittedDocument
+from app.tasks.expense_reimbursement.domain import SubmittedDocument
 from tests import demo_world
 from tests import world as test_world
 
@@ -58,6 +58,27 @@ def test_every_collection_declares_its_governed_properties():
         )
 
 
+def test_the_registry_and_the_ontology_agree_about_which_types_it_governs():
+    """`DataCollection.object_types` and `ObjectType.collection` are the same
+    fact written from both ends, and nothing checked that they matched. A
+    misspelled name is silent: `for_object_type` answers None and the row is
+    written under no retention or custody policy at all."""
+    assert data_collections.validate_collections() == []
+
+
+def test_a_collection_naming_a_ghost_type_is_caught():
+    ghost = data_collections.DataCollection(
+        id="ghosts", name="Ghosts", summary="s", role="data", kind="objects",
+        origin="synced", container="graph", object_types=("Wraith",),
+    )
+    problems = data_collections.validate_collections((ghost,))
+    assert any("Wraith" in p for p in problems)
+    # And the other end: every declared type still names a collection that
+    # lists it, which this fixture registry no longer does.
+    assert any("unknown collection" in p or "does not list it" in p
+               for p in problems)
+
+
 def test_collections_endpoint_carries_live_counts(client, world):
     demo_world.seed_expenses(world.expenses)
     rows = client.get("/api/v1/collections").json()
@@ -88,6 +109,18 @@ def test_the_exported_collections_document_matches_the_registry(world):
 
 
 def test_documents_carry_regions_and_a_retention_date(client, world):
+    """The documents surface: retention on the record, bytes opt-in, boxes
+    served when something actually located them.
+
+    The boxes are put there directly rather than by submitting a receipt, and
+    that is the point. The expense flow used to persist its stub reader's
+    *invented* geometry, so this test passed on numbers nothing had located; no
+    reader on that side produces real regions and v10 stores none. Where boxes
+    come from now is a locate step — see `test_payables_locate.py` — and what
+    this test is about is the endpoint that serves them.
+    """
+    from app.documents import Region
+
     request = world.expenses.submit(
         "felicia.marks@naviant.com",
         documents=[SubmittedDocument(filename="r.jpg", hint="total=64.20 category=meals")],
@@ -98,6 +131,14 @@ def test_documents_carry_regions_and_a_retention_date(client, world):
     assert body["collection_id"] == "audit-documents"
     assert body["retention_until_iso"]
     assert body["content_b64"] == ""  # bytes are opt-in, not free
+    # Nothing located anything on this receipt, and the endpoint says so
+    # rather than drawing something plausible.
+    assert client.get(f"/api/v1/documents/{document_id}/regions").json() == []
+
+    world.documents.set_regions(document_id, [Region(
+        field="receipt.total_usd", page=1, x=0.58, y=0.82, width=0.30,
+        height=0.06, text="64.20", confidence=0.9,
+    )])
     regions = client.get(f"/api/v1/documents/{document_id}/regions").json()
     assert any(r["field"] == "receipt.total_usd" for r in regions)
     stats = client.get("/api/v1/documents/stats").json()
@@ -159,7 +200,9 @@ def test_expiring_is_reported_not_swept(client, world):
 
 def test_sources_are_assembled_from_the_runs(client, world):
     demo_world.seed_payables(world.payables, sync=world.sync)
-    rows = client.get("/api/v1/sources").json()
+    # The read moved to the console door when the bare machine list was
+    # retired; the assembly under it is the same `SyncService.sources()`.
+    rows = client.get("/api/ui/v1/sources").json()["sources"]
     by_key = {(r["source"], r["kind"]): r for r in rows}
     erp = by_key[("erp-vendors", "vendors")]
     assert erp["deliveries"] == 2  # the delivery and the re-delivery

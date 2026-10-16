@@ -24,7 +24,7 @@ from app import personas
 from app.auth import flow_principal, principal_for
 from app.gateway import ACTIONS, Refused
 from app.graph import Claim, object_id
-from app.sync import SyncRequest
+from app.connectors.sync import SyncRequest
 from tests import world as test_world
 
 CLERK = personas.get("customer-user:ap")
@@ -104,7 +104,13 @@ def test_a_decision_write_is_refused_when_the_principal_may_not_make_it(world):
     assert world.payables.get(record.id).state == "pending"
     [entry] = _entries(world, action="post-invoice")
     assert entry.outcome == "refused"
-    assert "ap-clerk" in entry.refusal
+    # The desk named in the refusal is the one the *Task* was routed to — the
+    # submitter's own, per the governed approval table — rather than the
+    # Action's standing pin. Which is the sharper refusal: Kim was not merely
+    # unbound from the AP desk, she was answering somebody else's case.
+    assert world.queues.ensure_personal(
+        "connie.alberts@naviant.com"
+    ).slug in entry.refusal
     assert entry.principal_uid == NO_QUEUES.uid
 
 
@@ -112,6 +118,76 @@ def test_an_undeclared_action_never_reaches_the_graph(world):
     with pytest.raises(Refused):
         world.gateway.action("delete-everything", principal_for(CLERK))
     assert world.gateway.ledger.list() == []
+
+
+# ---- the desk a case belongs to --------------------------------------------
+#
+# A governed approval table may route a review back to the person who
+# submitted the case (`submitter` in routing.py), which resolves to that
+# person's own desk. With `post-invoice` and `record-expense` pinned to a
+# shared queue, the queue that raised the work and the queue that could commit
+# it were different queues, and the submitter would answer their own Task and
+# have the write refused at the Gateway.
+
+
+def _own_desk(world, persona) -> str:
+    return world.queues.ensure_personal(persona.email, persona.person).slug
+
+
+def test_a_case_on_the_submitters_own_desk_commits_from_that_desk(world):
+    """Kim owns no shared queue at all — she is the persona that proves scoping
+    works — and she can still commit the review of her own submission."""
+    desk = _own_desk(world, NO_QUEUES)
+    kim = principal_for(NO_QUEUES)
+    assert kim.owns_queue(desk) and not kim.owns_queue("ap-clerk")
+
+    for action_id, target in (
+        ("post-invoice", "ap-records"), ("record-expense", "expense-records")
+    ):
+        world.gateway.action(
+            action_id, kim, queue=desk, task_id="task_kim_1",
+            decided_by=NO_QUEUES.email,
+        ).commit(lambda _w: None)
+        # The entry is what it always was: same regime, same target, and the
+        # human judgment that authorized it still named beside the principal.
+        [entry] = _entries(world, action=action_id)
+        assert entry.outcome == "committed" and entry.refusal == ""
+        assert entry.regime == "decision" and entry.target == target
+        assert entry.task_id == "task_kim_1"
+        assert entry.decided_by == NO_QUEUES.email
+
+
+def test_holding_the_standing_desk_does_not_buy_somebody_elses_case(world):
+    """The refusal that has to survive the change. Deriving the desk from the
+    Task must not widen the check to "either desk will do": the AP clerk holds
+    the pinned queue and still may not commit a review routed to Kim."""
+    desk = _own_desk(world, NO_QUEUES)
+    clerk = principal_for(CLERK)
+    assert clerk.owns_queue("ap-clerk") and not clerk.owns_queue(desk)
+
+    with pytest.raises(Refused):
+        world.gateway.action("post-invoice", clerk, queue=desk).commit(
+            lambda _w: None
+        )
+    [entry] = _entries(world, action="post-invoice")
+    assert entry.outcome == "refused" and desk in entry.refusal
+
+
+def test_a_commit_no_task_authorized_still_answers_to_the_standing_desk(world):
+    """The other half of carrying both: an invoice under the governed auto-post
+    limit suspends for nobody, so there is no Task and no per-case desk. The
+    pin is what the Flow commits under, and it still refuses whoever lacks it.
+    """
+    world.gateway.action(
+        "post-invoice", flow_principal("accounts-payable", "ap-clerk")
+    ).commit(lambda _w: None)
+    assert _entries(world, action="post-invoice")[0].outcome == "committed"
+
+    with pytest.raises(Refused) as refused:
+        world.gateway.action("post-invoice", principal_for(NO_QUEUES)).commit(
+            lambda _w: None
+        )
+    assert "ap-clerk" in refused.value.reason
 
 
 # ---- validation ------------------------------------------------------------
@@ -340,21 +416,26 @@ def test_the_ledger_route_scopes_reads_and_lists_the_closed_action_set(
     assert {a["id"] for a in actions} == {
         "post-invoice", "record-expense", "link-source-record",
         "link-company-record", "confirm-vendor", "land-source-records",
-        "apply-source-records", "resolve-identities",
+        "apply-source-records", "record-document-read", "resolve-identities",
         "propose-identity-link", "confirm-identity-link",
-        "record-disagreements", "release-sales-order",
+        "record-disagreements", "record-compliance-alert",
+        "link-job-documents", "apply-job-demand",
+        "apply-schedule-day", "mark-day-approved",
+        "release-sales-order", "append-correction",
     }
-    # Eleven Actions write into books Cumulus keeps. Exactly one leaves the
+    # Seventeen Actions write into books Cumulus keeps. Exactly one leaves the
     # building, and it is worth being able to see that in one line: a bad
     # graph write is reversible by a steward and every claim it made is still
     # on the record, where this one ends in a PATCH to a customer's ERP.
     assert [a["id"] for a in actions if a["target"] == "sales-records"] == [
         "release-sales-order"
     ]
-    # Three Actions carry no queue in the table, for two different reasons —
+    # Five Actions carry no queue in the table, for two different reasons —
     # and the table says which. A queue says whose *work* an Action is:
-    # proposing a merge and recording a disagreement are nobody's work (a Flow
-    # does each unasked, on its own authority), and confirming is somebody's
+    # proposing a merge, recording a disagreement, noticing that a
+    # certification is close to expiring and linking a document nobody
+    # disputed are nobody's work (a Flow does each unasked, on its own
+    # authority), and confirming is somebody's
     # work but not always the same somebody, because the sweep proposes across
     # both counterparty books. So the confirmation takes its desk from the Task
     # it answers, which is the only place that knows.
@@ -363,36 +444,69 @@ def test_the_ledger_route_scopes_reads_and_lists_the_closed_action_set(
     assert by_id["propose-identity-link"]["queue_from_task"] is False
     assert by_id["record-disagreements"]["queue"] == ""
     assert by_id["record-disagreements"]["queue_from_task"] is False
+    assert by_id["record-compliance-alert"]["queue"] == ""
+    assert by_id["record-compliance-alert"]["queue_from_task"] is False
+    assert by_id["link-job-documents"]["queue"] == ""
+    assert by_id["link-job-documents"]["queue_from_task"] is False
     assert by_id["confirm-identity-link"]["queue"] == ""
     assert by_id["confirm-identity-link"]["queue_from_task"] is True
     assert by_id["release-sales-order"]["queue"] == ""
     assert by_id["release-sales-order"]["queue_from_task"] is True
     # And nothing else in the table derives its desk: an Action that declares
-    # one must not accept one from a caller. Two do, and they arrived at it
-    # from opposite directions — the identity link because one Action serves
-    # two stewards' books, the release because there is one desk today and
-    # pinning it would be right until the second class of disagreement brings
-    # a second desk behind it.
+    # one and derives none must not accept one from a caller. Eight do, from
+    # three directions — the identity link because one Action serves two
+    # stewards' books, the release because there is one desk today and pinning
+    # it would be right until the second class of disagreement brings a second
+    # desk behind it, and the six writes a governed approval table can route
+    # back to the desk the Task was answered at: the two flow commits, the
+    # vendor a reviewer names inside the invoice review, the plant demand
+    # committed under the desk that answered for it, and the plant day — both
+    # the fill a correction re-runs and the signature that makes it
+    # exportable, which must commit under the desk that signed it.
     assert sorted(a["id"] for a in actions if a["queue_from_task"]) == [
-        "confirm-identity-link", "release-sales-order"
+        "apply-job-demand", "apply-schedule-day", "confirm-identity-link",
+        "confirm-vendor", "mark-day-approved", "post-invoice",
+        "record-expense", "release-sales-order",
     ]
+    # Those three are the only ones carrying both, and that is not a
+    # contradiction: the pin is where a commit no human authorized lands (a
+    # Flow posting under the governed auto-post limit), and the Task's desk
+    # wins whenever a Task authorized it.
+    assert by_id["post-invoice"]["queue"] == "ap-clerk"
+    assert by_id["record-expense"]["queue"] == "expense-review"
+    assert by_id["confirm-vendor"]["queue"] == "ap-clerk"
     # Every Action names one of the three regimes and nothing else.
     assert {a["regime"] for a in actions} == {
         "decision", "observation", "resolution"
     }
 
 
-def test_an_expense_the_flow_approved_is_committed_by_the_flow(world):
-    """Nobody decided it, so nobody is credited with deciding it.
+def test_an_expense_resumed_with_nobody_behind_it_is_committed_by_the_flow(world):
+    """Nobody drove this pass, so nobody is credited with driving it.
 
-    The alternative — crediting the submitter — would be the ledger's first
-    lie, and the expensive kind: an auto-approval that reads as a judgment.
+    v9 had an auto-approval path and this was the ledger row it produced. v10
+    asks its submitter every time, so the Flow's own authority shows up
+    somewhere narrower: a resume with no live caller — a seed, a script, an
+    operator's `POST /runs/{id}/resume`. The *decision* is still named, because
+    a person really made it; the *committer* is the Flow, because crediting a
+    human with an act they were not present for would be the ledger's first
+    lie, and the expensive kind.
     """
     request = world.expenses.submit(
         "john.smith@naviant.com",
         documents=[{"filename": "taxi.jpg", "hint": "vendor=City Cab total=24.50"}],
     )
-    assert request.state == "approved"
+    decided = world.tasks.decide(
+        request.task_id, "approved", "john.smith@naviant.com",
+    )
+    resumed = world.expenses.resume_for_task(decided)  # no principal
+    assert resumed.state == "approved"
     [entry] = _entries(world, action="record-expense")
     assert entry.principal_uid == "flow:expense-reimbursement"
-    assert entry.decided_by == "" and entry.regime == "decision"
+    assert entry.decided_by == "john.smith@naviant.com"
+    assert entry.regime == "decision"
+    # And it committed under the desk the Task was raised to, not under the
+    # Action's standing pin: the queue that raised the work and the queue that
+    # may commit it have to be the same queue, or a submitter answering their
+    # own case is refused their own answer.
+    assert entry.principal_email == "expense-reimbursement@flow"

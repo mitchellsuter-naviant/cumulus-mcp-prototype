@@ -33,6 +33,7 @@ from datetime import timedelta
 from typing import Literal
 
 from .models import utcnow
+from .ontology import ONTOLOGY, Ontology
 
 Role = Literal["knowledge", "data"]
 Custody = Literal["copy", "reference"]
@@ -94,7 +95,16 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         ),
         role="knowledge", kind="eval datasets", origin="flywheel",
         container="flow_golden_sets", retention="indefinite",
-        written_by=("expense-reimbursement", "accounts-payable", "human"),
+        # `ap-corrections` is the writer that makes the second half of that
+        # summary true. The correction set was declared here long before
+        # anything appended to it, which is how the gap was visible at all —
+        # a registry that describes what the system intends is only useful if
+        # somebody eventually reads it back.
+        written_by=(
+            "expense-reimbursement", "accounts-payable", "ap-corrections",
+            "human",
+        ),
+        read_by=("human",),
     ),
     DataCollection(
         id="workforce",
@@ -264,6 +274,100 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         written_by=("psa-sync",),
     ),
     DataCollection(
+        id="production-records",
+        name="Production records",
+        summary=(
+            "What the plant is building and what each department was told to "
+            "run: jobs, the department shares they split into, and the "
+            "approved schedule days those shares were placed on. One "
+            "Collection rather than two because it is one lifecycle — a job "
+            "lands, is split, is placed on a day, and ships — and every "
+            "interesting question is about the seam between those steps. "
+            "Its authority is deliberately **mixed, and the mix is the "
+            "point**: the jobs are the production system's and we mirror "
+            "them, while the schedule is ours, because nothing in the "
+            "customer's estate is the book of record for a plant schedule. "
+            "The flag below is a property of the set — the same way "
+            "`ap-records` is authoritative while the POs inside it are "
+            "mirrors — and which half of the set Cumulus actually owns is "
+            "declared per type, on `ScheduleDay` and `ScheduleEntry` alone."
+        ),
+        role="data", kind="entities", origin="flow-written",
+        container="graph_objects", custody="copy", authoritative=True,
+        retention="P7Y",
+        retention_note=(
+            "seven years, set by the schedule rather than by the jobs: a day "
+            "is the record of what a plant was told to build, who approved "
+            "it, and what it deferred, and that is the document somebody "
+            "comes back to after an incident"
+        ),
+        object_types=("Job", "JobTask", "ScheduleDay", "ScheduleEntry"),
+        # `job-sync` mirrors the jobs; `shipping-list-extraction` writes the
+        # department shares and nothing else does; `department-scheduling`
+        # owns the days; `field-documents` claims the packet stamps on a job.
+        written_by=(
+            "job-sync", "shipping-list-extraction", "department-scheduling",
+            "field-documents",
+        ),
+        read_by=("plant-eligibility-sweep", "department-scheduling"),
+    ),
+    DataCollection(
+        id="compliance-records",
+        name="Compliance records",
+        summary=(
+            "The dated permissions the business has to keep current: what "
+            "people hold, what equipment has passed, and when each was last "
+            "notified. Its own Collection rather than more of `workforce` or "
+            "`equipment-register`, for the reason this module opens with — "
+            "governance hangs off the set. This one has a retention horizon "
+            "nothing else in the map has, and it is the set a regulator asks "
+            "for. It is also the set that outlives its subjects: a "
+            "terminated worker's certification and a sold truck's last "
+            "inspection are both still records here, which is why "
+            "`holds_credential` is an association and not a composition."
+        ),
+        role="data", kind="entities", origin="synced",
+        container="graph_objects", custody="copy", authoritative=False,
+        retention="P7Y",
+        retention_note=(
+            "seven years past the record's own end, which is the horizon the "
+            "customer's own policy states; the retention Task is raised "
+            "against this number and `Credential.retain_until` carries it "
+            "per row"
+        ),
+        object_types=("Credential", "Inspection"),
+        written_by=("credential-sync", "equipment-sync"),
+        read_by=("credential-tracking",),
+    ),
+    DataCollection(
+        id="equipment-register",
+        name="Equipment register",
+        summary=(
+            "The units the business operates: trucks, trailers, lifts, "
+            "machines, and whether each is one whose paperwork is tracked at "
+            "all. Split from the inspections it governs on purpose — the "
+            "register is a live list of what exists and the inspections are "
+            "dated compliance records with a regulator's horizon on them, so "
+            "the two want different retention and reach different readers. "
+            "Not authoritative: the asset system owns the fleet, and a unit "
+            "retired here would be retired in the wrong place."
+        ),
+        role="data", kind="entities", origin="synced",
+        container="graph_objects", custody="copy", authoritative=False,
+        retention="indefinite",
+        retention_note=(
+            "a unit is retained while it is operated and for seven years "
+            "after it leaves the fleet, which is a condition and not a "
+            "duration — stamping a horizon at write time would make a truck "
+            "purgeable while it is still on the road. The dated half of the "
+            "record, which is what the seven years is actually about, is "
+            "governed by `compliance-records`"
+        ),
+        object_types=("Equipment",),
+        written_by=("equipment-sync",),
+        read_by=("credential-tracking",),
+    ),
+    DataCollection(
         id="source-landing",
         name="Source landing",
         summary=(
@@ -333,7 +437,10 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         ),
         authoritative=True,
         object_types=("Document",),
-        written_by=("expense-reimbursement", "accounts-payable"),
+        # `ap-intake` writes here twice over, and both are the same act: the
+        # bytes of a supplier invoice land in the store, and the referenced row
+        # in the library stops saying nobody has read it.
+        written_by=("expense-reimbursement", "accounts-payable", "ap-intake"),
     ),
     DataCollection(
         id="document-library",
@@ -365,6 +472,10 @@ COLLECTIONS: tuple[DataCollection, ...] = (
         # which is what that field is for.
         object_types=("Folder",),
         written_by=("dms-sync",),
+        # Read, not written: `ap-intake` walks the AP folders to the documents
+        # filed under them. What it writes about a document is governed by
+        # `audit-documents`, which owns the `Document` type.
+        read_by=("ap-intake",),
     ),
     # Run journals are deliberately NOT a Collection. The doctrine is explicit
     # that machinery/operational state — "flow run journals, the trigger
@@ -425,6 +536,61 @@ def written_by(flow_id: str) -> tuple[DataCollection, ...]:
 def read_by(flow_id: str) -> tuple[DataCollection, ...]:
     """The Collections this flow is declared to read."""
     return tuple(c for c in COLLECTIONS if flow_id in c.read_by)
+
+
+def validate_collections(
+    collections: tuple[DataCollection, ...] = COLLECTIONS,
+    ontology: Ontology = ONTOLOGY,
+) -> list[str]:
+    """Structural conformance, the same spirit as `validate_mappings`.
+
+    `object_types` here and `ObjectType.collection` there are the same fact
+    written from both ends, and nothing was checking that they agreed. A
+    misspelled type name is the quiet failure: `for_object_type` returns None,
+    the row is written under no retention or custody policy at all, and the
+    Data screen shows a Collection that governs one type fewer than it claims.
+    """
+    problems: list[str] = []
+    declared = {o.name for o in ontology.objects}
+    seen: set[str] = set()
+    owner: dict[str, list[str]] = {}
+    for c in collections:
+        where = f"collection `{c.id}`"
+        if c.id in seen:
+            problems.append(f"{where}: declared twice")
+        seen.add(c.id)
+        for t in c.object_types:
+            if t not in declared:
+                problems.append(f"{where}: unknown object type `{t}`")
+            owner.setdefault(t, []).append(c.id)
+    for object_type, ids in sorted(owner.items()):
+        if len(ids) > 1:
+            problems.append(
+                f"type `{object_type}` is claimed by {len(ids)} collections "
+                f"({', '.join(ids)}); retention and custody are properties of "
+                "one set"
+            )
+    # The other end of the same declaration. A type that names a Collection the
+    # registry does not list it under is governed by nothing on the read path
+    # that matters.
+    for obj in ontology.objects:
+        if not obj.collection:
+            if obj.name in owner:
+                problems.append(
+                    f"type `{obj.name}` is listed by `{owner[obj.name][0]}` "
+                    "but names no collection of its own"
+                )
+            continue
+        if obj.collection not in seen:
+            problems.append(
+                f"type `{obj.name}`: unknown collection `{obj.collection}`"
+            )
+        elif obj.collection not in owner.get(obj.name, []):
+            problems.append(
+                f"type `{obj.name}` names collection `{obj.collection}`, "
+                "which does not list it"
+            )
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +698,6 @@ def collections_asset_fields() -> dict:
         "path": "platform/governance/data-collections",
         "title": "Data collections",
         "kind": "schema-export",
-        "scope": "org",
         "owner": "platform-eng",
         "tags": ["governance", "governed-knowledge", "retention", "collections"],
         "status": "published",

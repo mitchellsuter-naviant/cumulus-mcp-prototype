@@ -7,9 +7,9 @@ import threading
 
 from pydantic import ValidationError
 
+from .authority import AuthorityPolicy, apply_authority_prior, read_authority_policy
 from .embeddings import Embedder, content_fingerprint, embedding_text
 from .models import (
-    AUTHORITY_ORDER,
     Asset,
     AssetCreate,
     AssetFilter,
@@ -25,6 +25,8 @@ from .search import (
     make_snippet,
     mark_weak_hits,
     reciprocal_rank_fusion,
+    semantic_profile,
+    semantic_strength,
 )
 from .storage import AssetRepository, EmbeddingRecord, EmbeddingRepository
 
@@ -391,23 +393,36 @@ class KnowledgeService:
         if mode != "lexical" and self.hybrid_enabled:
             semantic_scored = self._semantic(query, set(eligible))
 
+        # Authority is allowed to reorder documents relevance already found,
+        # and nothing else — see `authority.apply_authority_prior`. Applied
+        # before the cut, because a prior that only reshuffled the page it was
+        # handed could never bring the governing document onto it.
+        policy = self.authority_policy()
+
         if not semantic_scored:
             # Nothing to fuse; keep the raw BM25 scores rather than inventing
             # fusion scores from a single ranking, and report it as lexical.
+            lexical_ranked, coverages, profile = self._by_authority(
+                query, lexical_scored, eligible, policy
+            )
             return _sorted_hits(
                 mark_weak_hits(
                     self._as_hits(
                     query,
-                    lexical_scored,
+                    lexical_ranked,
                     eligible,
                     lexical_positions={d: i for i, d in enumerate(lexical_ids, 1)},
                     semantic_positions={},
                     similarities={},
                         limit=limit,
                         lexical_only=True,
-                    )
+                        policy=policy,
+                        coverages=coverages,
+                    ),
+                    profile,
                 ),
                 sort,
+                policy,
             )
 
         semantic_ids = [doc_id for doc_id, _ in semantic_scored]
@@ -419,11 +434,14 @@ class KnowledgeService:
             ]
         )
         ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+        ranked, coverages, profile = self._by_authority(
+            query, ordered, eligible, policy, similarities
+        )
         return _sorted_hits(
             mark_weak_hits(
                 self._as_hits(
                     query,
-                    ordered,
+                    ranked,
                     eligible,
                     lexical_positions={d: i for i, d in enumerate(lexical_ids, 1)},
                     semantic_positions={
@@ -432,9 +450,78 @@ class KnowledgeService:
                     similarities=similarities,
                     limit=limit,
                     lexical_only=False,
-                )
+                    policy=policy,
+                    coverages=coverages,
+                ),
+                profile,
             ),
             sort,
+            policy,
+        )
+
+    def authority_policy(self) -> AuthorityPolicy:
+        """The governed precedence this corpus ranks under.
+
+        Read per search rather than cached: it is one document fetch against a
+        store this method is already hitting for every candidate, and a cache
+        would mean editing the asset moved the rule everywhere except in the
+        ranking — the drift the governed-knowledge argument exists to prevent.
+        """
+        return read_authority_policy(self)
+
+    def _by_authority(
+        self,
+        query: str,
+        ordered: list[tuple[str, float]],
+        eligible: dict[str, Asset],
+        policy: AuthorityPolicy,
+        similarities: dict[str, float] | None = None,
+    ) -> tuple[
+        list[tuple[str, float]],
+        dict[str, float],
+        tuple[float, float] | None,
+    ]:
+        """The reordered ranking, the coverage, and the semantic pack.
+
+        Both, because the hits report the coverage and computing it twice over
+        the same candidate set would be the second answer to a question with
+        one — and a second answer is how the number on the chip stops matching
+        the number the ranking used.
+
+        The prior is gated on *grounding* rather than coverage alone: the tie
+        band asks "do these two documents answer the question about equally
+        well", and on a hybrid deployment a document the embedder found and the
+        words missed answers it perfectly at coverage zero. Gating on the
+        lexical number there would hand every lift to whichever document
+        happened to share vocabulary with the question.
+        """
+        doc_ids = [doc_id for doc_id, _ in ordered]
+        coverages = self.index.coverages(query, doc_ids)
+        grounding = dict(coverages)
+        # Over the whole candidate set rather than the page, and handed back so
+        # the hits are stamped against the same pack the prior reordered them
+        # against. Profiling the page instead makes a small `limit` report that
+        # nothing led the ranking, because the top few similarities are by
+        # construction the closest together in the corpus.
+        profile = (
+            semantic_profile(list(similarities.values())) if similarities else None
+        )
+        if profile is not None:
+            for doc_id in doc_ids:
+                grounding[doc_id] = max(
+                    coverages.get(doc_id, 0.0),
+                    semantic_strength(similarities.get(doc_id), profile),
+                )
+        return (
+            apply_authority_prior(
+                ordered,
+                {doc_id: eligible[doc_id].authority_level
+                 for doc_id, _ in ordered if doc_id in eligible},
+                policy,
+                grounding,
+            ),
+            coverages,
+            profile,
         )
 
     def _semantic(self, query: str, eligible: set[str]) -> list[tuple[str, float]]:
@@ -458,7 +545,11 @@ class KnowledgeService:
         similarities: dict[str, float],
         limit: int,
         lexical_only: bool,
+        policy: AuthorityPolicy | None = None,
+        coverages: dict[str, float] | None = None,
     ) -> list[SearchHit]:
+        policy = policy or AuthorityPolicy()
+        coverages = coverages if coverages is not None else {}
         hits: list[SearchHit] = []
         for doc_id, score in ordered:
             asset = eligible.get(doc_id)
@@ -487,6 +578,8 @@ class KnowledgeService:
                         if doc_id in similarities
                         else None
                     ),
+                    coverage=coverages.get(doc_id, 0.0),
+                    authority_lift=policy.lift_for(asset.authority_level),
                 )
             )
             if len(hits) >= limit:
@@ -694,26 +787,32 @@ def seed_if_empty(service: KnowledgeService, seed_dir: str | None) -> int:
     return count
 
 
-def _sorted_hits(hits: list[SearchHit], sort: str) -> list[SearchHit]:
+def _sorted_hits(
+    hits: list[SearchHit], sort: str, policy: AuthorityPolicy | None = None
+) -> list[SearchHit]:
     """Reorder a ranked page.
 
     Applied after ranking and truncation, so this reorders the top N rather
     than choosing a different N. Sorting by date before the cut would return
     the newest documents in the corpus rather than the newest *relevant* ones,
     which is a different question than the one that was asked.
+
+    `sort="authority"` is a browse control and not the authority weighting —
+    somebody asked for the policies first and gets them, however relevant. The
+    weighting is `authority.apply_authority_prior`, which runs before the cut
+    and is bounded precisely because a hard sort like this one puts the least
+    relevant policy above the how-to that answers the question. Both read the
+    same governed precedence, so a deployment that reorders the levels moves
+    them together.
     """
     if sort == "updated":
         return sorted(hits, key=lambda h: h.asset.updated_at, reverse=True)
     if sort == "authority":
+        order = policy or AuthorityPolicy()
         return sorted(
             hits,
-            key=lambda h: (
-                # None (a prompt, a schema export) sorts after every document
-                # that actually carries authority.
-                AUTHORITY_ORDER.index(h.asset.authority_level)
-                if h.asset.authority_level in AUTHORITY_ORDER
-                else len(AUTHORITY_ORDER),
-                -h.score,
-            ),
+            # A prompt or a schema export carries no authority and sorts after
+            # every document that does — `rank_of` says so.
+            key=lambda h: (order.rank_of(h.asset.authority_level), -h.score),
         )
     return hits

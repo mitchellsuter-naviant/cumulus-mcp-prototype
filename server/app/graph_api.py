@@ -143,25 +143,6 @@ class OntologyView(BaseModel):
     asset_id: str
 
 
-class VendorView(BaseModel):
-    """A vendor as the AP workspace needs it: identity, sources, activity."""
-
-    id: str
-    label: str
-    slug: str
-    status: str
-    tax_id: str = ""
-    payment_terms: str = ""
-    aliases: list[str] = Field(default_factory=list)
-    source_records: list[dict] = Field(default_factory=list)
-    invoices: int = 0
-    invoiced_usd: float = 0.0
-    purchase_orders: int = 0
-    conflict_fields: list[str] = Field(default_factory=list)
-    revision: int = 1
-    ref: str = ""
-
-
 class ExpenseRollup(BaseModel):
     """The answer to the analytical question, with the path that produced it."""
 
@@ -496,55 +477,6 @@ def get_object(
         object=_summary(record), claims=record.claims,
         conflicts=record.conflicts(), neighbors=neighbors,
     )
-
-
-@router.get("/vendors", response_model=list[VendorView])
-def list_vendors(
-    principal: Principal = Depends(get_principal),
-) -> list[VendorView]:
-    """The vendor master, assembled for the AP workspace.
-
-    One row per canonical vendor, carrying every source system's id for it —
-    which is the thing that was impossible when a vendor was a slug.
-    """
-    require_reader(principal)
-    graph = deps.get_graph_service()
-    out: list[VendorView] = []
-    for vendor in graph.find("Vendor"):
-        if vendor.status == "superseded":
-            continue
-        sources = [
-            {
-                "source": str(other.props.get("source") or ""),
-                "external_id": str(other.props.get("external_id") or ""),
-                "confidence": link.confidence,
-                "method": link.method,
-                "live": link.live,
-                "link_id": link.id,
-            }
-            for link, other in graph.neighbors(
-                vendor.id, "identified_as", "out", include_reversed=True
-            )
-        ]
-        invoices = [o for _, o in graph.neighbors(vendor.id, "issued", "out")]
-        orders = graph.neighbors(vendor.id, "ordered_from", "in")
-        slug = str(vendor.props.get("slug") or normalize_key(vendor.label))
-        out.append(VendorView(
-            id=vendor.id, label=vendor.label, slug=slug,
-            status=str(vendor.props.get("status") or vendor.status),
-            tax_id=str(vendor.props.get("tax_id") or ""),
-            payment_terms=str(vendor.props.get("payment_terms") or ""),
-            aliases=list(vendor.props.get("aliases") or []),
-            source_records=sources,
-            invoices=len(invoices),
-            invoiced_usd=round(
-                sum(float(i.props.get("total_usd") or 0) for i in invoices), 2
-            ),
-            purchase_orders=len(orders),
-            conflict_fields=sorted(vendor.conflicts().keys()),
-            revision=vendor.revision, ref=vendor.ref(),
-        ))
-    return sorted(out, key=lambda v: v.label.lower())
 
 
 @router.get("/employees/{email}/expenses", response_model=ExpenseRollup)

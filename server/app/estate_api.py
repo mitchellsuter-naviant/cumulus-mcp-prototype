@@ -1,19 +1,17 @@
 """REST surface for the estate connector.
 
-Three routes, and the last one is the point of the module: `POST /pull` is
+Two routes, and the second one is the point of the module: `POST /pull` is
 the **port** the Scheduling capability plugs into. Deployed, a managed
 scheduler calls it on a cadence and Cumulus runs nothing warm of its own; in
 dev an interval thread calls the same code path. Nothing about the schedule is
 recorded here, because the schedule belongs to whatever is doing the calling.
 
-`sync-now` is the operator's version of the same act — one feed, synchronously,
-with the delivery outcomes handed straight back so a console can show what
-landed rather than "accepted". An estate that is down surfaces as a 502: the
-failure is upstream, and reporting it as our own 500 would send an operator to
-read the wrong logs. The console has a door onto the same act, and it calls
-`pull_feed_now` below rather than restating those refusals — two spellings of
-"no such feed" and "no estate registered" is two authorization policies waiting
-to drift apart.
+Pulling *one* feed on demand is the operator's version of the same act, and it
+has exactly one door: the console's `POST /api/ui/v1/sources/{source}/
+sync-now`, which calls `pull_feed_now` below. There used to be a second
+spelling of it here, gating the same act on the same role and restating the
+same three refusals — two doors onto one act is two authorization policies
+waiting to drift apart, and the machine door had no caller.
 """
 
 from __future__ import annotations
@@ -48,12 +46,11 @@ def get_estate(principal: Principal = Depends(get_principal)) -> dict:
 def pull_feed_now(feed: str, actor: str) -> dict:
     """Pull one feed, synchronously, with this act's three refusals.
 
-    The one implementation behind both doors — this router's route and the
-    console's `/api/ui/v1/sources/{source}/sync-now`. The caller checks
-    authority (both require `admin`, because a pull writes through the door)
-    and this answers what the act itself can refuse: a feed nobody registers is
-    a 404, no estate at all is a 400, and an estate that is down is a **502**
-    rather than our own 500 — the failure is upstream, and a 500 would send an
+    Called by the console's `/api/ui/v1/sources/{source}/sync-now`. That route
+    checks authority (`admin`, because a pull writes through the door) and this
+    answers what the act itself can refuse: a feed nobody registers is a 404,
+    no estate at all is a 400, and an estate that is down is a **502** rather
+    than our own 500 — the failure is upstream, and a 500 would send an
     operator to read the wrong logs.
     """
     connector = deps.get_estate_connector()
@@ -78,13 +75,6 @@ def pull_feed_now(feed: str, actor: str) -> dict:
                "outcome": outcome["outcome"], "chunks": len(outcome["chunks"])},
     )
     return outcome
-
-
-@router.post("/feeds/{feed}/sync-now")
-def sync_now(feed: str, principal: Principal = Depends(get_principal)) -> dict:
-    """Pull one feed now. Admin, because a pull writes through the door."""
-    require_role(principal, "admin")
-    return pull_feed_now(feed, principal.uid)
 
 
 @router.post("/pull")

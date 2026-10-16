@@ -22,6 +22,7 @@ from tests import world as test_world
 #: on day one — a route that vanishes should fail this list loudly.
 UI_ROUTES = (
     "/api/ui/v1/session",
+    "/api/ui/v1/task-screens",
     "/api/ui/v1/ontology",
     "/api/ui/v1/sources",
     "/api/ui/v1/library",
@@ -37,7 +38,6 @@ API_ROUTES = (
     "/api/v1/graph/stats",
     "/api/v1/graph/objects",
     "/api/v1/graph/links",
-    "/api/v1/graph/vendors",
     "/api/v1/graph/invariants",
     "/api/v1/graph/ontology",
     "/api/v1/graph/search?q=acme",
@@ -45,7 +45,6 @@ API_ROUTES = (
     "/api/v1/calendar/me",
     "/api/v1/employee/me",
     "/api/v1/employee/pto",
-    "/api/v1/sources",
     "/api/v1/mappings",
     "/api/v1/flows",
     "/api/v1/evals",
@@ -74,7 +73,6 @@ def test_the_graph_is_empty_and_says_so_rather_than_failing(client):
     # No mock world means no mock vendor. The search that used to find one is
     # the shortest proof the seed is gone.
     assert client.get("/api/v1/graph/search?q=acme").json() == []
-    assert client.get("/api/v1/graph/vendors").json() == []
 
 
 def test_the_queues_are_empty_rather_than_absent(client):

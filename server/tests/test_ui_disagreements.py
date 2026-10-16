@@ -41,8 +41,8 @@ from app.auth import Principal
 from app.disagreement_sweep import ORDER_DESK_QUEUE, SCAN, STANDING
 from app.estate import EstateConnector, InMemoryConnectorStateStore
 from app.estate_writes import EstateWriter, InMemoryEstateWriteJournal
-from app.order_release import BY_CUMULUS, DISMISSED, EXTERNALLY, RESOLVED
-from app.sync import SyncRequest
+from app.tasks.order_release.domain import BY_CUMULUS, DISMISSED, EXTERNALLY, RESOLVED
+from app.connectors.sync import SyncRequest
 from app.ui_api import get_disagreement_principal, get_ui_principal
 from tests import estate_fixtures as fx
 from tests import world as test_world

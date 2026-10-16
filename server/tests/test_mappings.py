@@ -47,6 +47,19 @@ def test_a_mapping_naming_a_ghost_type_is_caught():
         assert missing in text
 
 
+def test_a_steward_queue_must_be_a_declared_desk():
+    """The escalation target is a desk somebody administers. A slug nothing
+    declares is a row escalated to a queue nobody is bound to, which reads on
+    every screen as a row that resolved itself."""
+    bad = Mapping(
+        id="ghost-desk", source="ghost-desk-feed", system="x", summary="s",
+        transport="push", payload="VendorRecord", strategy="reify",
+        lands_as="SourceRecord", resolves_to=("Vendor",),
+        escalation="per-row task", steward_queue="vendor-stewardhsip",
+    )
+    assert any("vendor-stewardhsip" in p for p in validate_mappings((bad,)))
+
+
 def test_bind_must_not_reify_by_the_back_door():
     """A bind mapping naming `lands_as` would blur the one distinction the
     strategy field exists to keep sharp: bind rows never become objects."""
@@ -64,16 +77,19 @@ def test_every_mapping_describes_a_system_the_estate_actually_runs():
 
     `procurement-coupa`, `legacy-ap-extract` and `wms-receiving` were exactly
     that — invented systems declared so a seeded demo world had somewhere to
-    arrive from — and they retired with the seed. `receiving-sync` keeps its
-    Flow and its Tier-2 definition; what it has no more of is a Mapping,
-    because this estate has no receiving system. That gap is stated, not
-    papered over: a delivery under `wms-receiving` still lands, and the screen
-    reports it as arriving under no declared contract.
+    arrive from — and they retired with the seed.
+
+    `receiving-sync` used to be the standing case for the other direction: a
+    Flow and a Tier-2 definition with no Mapping, because the estate ran no
+    receiving system to contract with. The estate grew one, so `erp-receiving`
+    is asserted below like any other real feed. The invented three stay
+    excluded, and a delivery under one of them still lands and still reports
+    as arriving under no declared contract — which is the finding, not a bug.
     """
     declared = {m.source for m in MAPPINGS}
     for source in (
-        "erp-vendors", "erp-purchase-orders", "erp-sales", "crm-book",
-        "hris-workforce", "office-calendar",
+        "erp-vendors", "erp-purchase-orders", "erp-receiving", "erp-sales",
+        "crm-book", "hris-workforce", "office-calendar",
     ):
         assert source in declared
     assert declared.isdisjoint(
@@ -93,7 +109,7 @@ def test_a_feed_name_resolves_to_an_authority_the_ontology_ranks():
     what is on somebody's Friday.
     """
     from app.ontology import ONTOLOGY
-    from app.sync import _authority
+    from app.connectors.sync import _authority
 
     assert _authority("crm-book") == "crm"
     assert _authority("erp-sales") == "erp"

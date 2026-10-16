@@ -28,7 +28,7 @@ from . import data_collections, deps
 from .anomaly import VendorProfile
 from .auth import Principal, get_principal, require_reader, require_role
 from .documents import DocumentRecord, DocumentSummary, Region
-from .sync import SourceStatus, SyncRequest
+from .connectors.sync import SyncRequest
 
 log = logging.getLogger("cumulus.data.api")
 
@@ -232,14 +232,11 @@ def get_document_content(
 
 
 # ---- sources ---------------------------------------------------------------
-
-
-@router.get("/sources", response_model=list[SourceStatus])
-def list_sources(
-    principal: Principal = Depends(get_principal),
-) -> list[SourceStatus]:
-    require_reader(principal)
-    return deps.get_sync_service().sources()
+#
+# There is deliberately no `GET /sources` here any more: the read is the
+# console's (`/api/ui/v1/sources`, where health, contract and cursor join on
+# one row), and no machine caller ever consumed the bare list. The write door
+# below is the machine surface.
 
 
 @router.post("/sources/deliver", status_code=202)
@@ -352,6 +349,75 @@ def sweep_disagreements(
         },
     )
     return outcome
+
+
+# ---- the two plant-floor windows ------------------------------------------
+#
+# Neither of these is woken by a delivery. Nothing arrives; a window closes over
+# a book Cumulus already holds, and the response reads it. That is why they need
+# a door at all — the estate pull cannot start them, and a scheduler has to.
+#
+# Both are `admin` for the identity sweep's reason, and it is not a formality:
+# each raises work into somebody's queue, and the compliance one can put a
+# lapsed medical card in front of a safety supervisor.
+
+
+@router.post("/compliance/sweep", status_code=202)
+def sweep_compliance(
+    as_of: str = Query(default="", max_length=32),
+    principal: Principal = Depends(get_principal),
+) -> dict:
+    """Close a compliance window: read the credential and inspection book.
+
+    Safe to call at any time, and safer than the identity sweep: the notice
+    stages are keyed on what was already sent, so a second pass on the same day
+    re-sends nothing and writes nothing. What it changes is a notice stamp on
+    rows Cumulus does not own, which a later window would set anyway.
+
+    `as_of` names the window's own day. A window that closes at 23:59 and is
+    answered at 00:01 must be answered as of the window, or the one flow whose
+    whole purpose is being early is a day late.
+    """
+    require_role(principal, "admin")
+    dispatch = deps.get_credential_tracking_service().sweep(
+        actor=principal.uid, as_of=as_of,
+    )
+    runs = [run.id for run in dispatch.runs]
+    log.info(
+        "Compliance sweep run",
+        extra={"actor": principal.uid, "eventId": dispatch.event.id, "runs": runs},
+    )
+    return {"event_id": dispatch.event.id, "runs": runs, "as_of": as_of}
+
+
+@router.post("/plant/sweep", status_code=202)
+def sweep_plant(
+    as_of: str = Query(default="", max_length=32),
+    principal: Principal = Depends(get_principal),
+) -> dict:
+    """Close a plant window: which jobs may the floor build, and on what day.
+
+    The heaviest door in this module, and the one to read the response of. It
+    raises one extraction per eligible job — each a metered ModelCall over a
+    seven-page shipping list — inside the bound the governed parameters set,
+    and then opens a department-day for each department those extractions found
+    work for. So a spurious call is not free the way the sweeps above are: it
+    costs model spend, and the run says how much.
+
+    It is still safe in the sense that matters: nothing it writes leaves the
+    graph, and no schedule becomes final without a supervisor answering its
+    Task.
+    """
+    require_role(principal, "admin")
+    dispatch = deps.get_plant_eligibility_service().sweep(
+        actor=principal.uid, as_of=as_of,
+    )
+    runs = [run.id for run in dispatch.runs]
+    log.info(
+        "Plant sweep run",
+        extra={"actor": principal.uid, "eventId": dispatch.event.id, "runs": runs},
+    )
+    return {"event_id": dispatch.event.id, "runs": runs, "as_of": as_of}
 
 
 # ---- the derived anomaly baseline -----------------------------------------

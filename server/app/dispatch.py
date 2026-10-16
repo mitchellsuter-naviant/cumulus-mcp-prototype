@@ -140,8 +140,61 @@ TRIGGERS: dict[str, Trigger] = {t.id: t for t in (
             starts="employment-event-sync", wakes="window"),
     Trigger(id="documents-delivered", event="DocumentsDelivered",
             starts="dms-sync", wakes="window"),
+    # The first fact with two responses, and the order is load-bearing:
+    # `ap-intake` reads the filing tree out of the graph, so the mirror that
+    # lands it has to have run. Triggers on one event fire in declaration
+    # order (see `_BY_EVENT` below), which makes that a property of this table
+    # rather than of luck — and it is why the pair is declared adjacently.
+    Trigger(id="documents-delivered-ap", event="DocumentsDelivered",
+            starts="ap-intake", wakes="window"),
+    # And the third response to the same fact, declared here for the same
+    # reason the second one is: `field-documents` reads the filing tree and
+    # the files under it out of the graph, so the mirror that lands them has
+    # to have run, and Triggers on one event fire in declaration order.
+    # `DocumentsDelivered` now has **three** — `dms-sync`, `ap-intake`,
+    # `field-documents`, in that order — and `keyed_run_ids` already derives a
+    # distinct run id per Trigger, so an idempotent redelivery re-enters all
+    # three rather than starting copies of any of them.
+    #
+    # A revision arriving for a job that is already scheduled is one of the
+    # two facts that change this flow's answer; the other is on
+    # `JobRecordsDelivered` below, and the pair is why one Flow has two
+    # Triggers rather than two Flows.
+    Trigger(id="documents-delivered-field", event="DocumentsDelivered",
+            starts="field-documents", wakes="window"),
     Trigger(id="psa-book-delivered", event="PsaBookDelivered",
             starts="psa-sync", wakes="window"),
+    # The plant floor's three deliveries. **A Trigger and its Flow's `v1`
+    # package land together, in one commit** — not tidiness, a hard rule that
+    # this table's shape makes load-bearing: `emit` starts every matched
+    # Trigger in a list comprehension below and does *not* guard
+    # `RunEngine.start`, which raises `ValueError` for a flow id nothing
+    # registered. So a row landed ahead of its body would not fail quietly in
+    # one run; it would make the next estate delivery 500 and take
+    # `POST /api/v1/sources/deliver` down with it, for every feed.
+    #
+    # The *second* Trigger on `JobRecordsDelivered` is the row directly below
+    # this one, and it is declared there rather than anywhere else because the
+    # field-documents flow reads the `Job` rows this one lands: declaration
+    # order is the dependency order. The moment this fact acquired a second
+    # response, `keyed_run_ids` stopped handing the first one the verbatim
+    # idempotency key and started deriving a suffix per Trigger — harmless in
+    # a fresh deployment with no run history, and the reason the pair landed
+    # in one commit rather than a week apart.
+    Trigger(id="jobs-delivered", event="JobRecordsDelivered",
+            starts="job-sync", wakes="window"),
+    # A job becoming `Scheduled` is the other half of what wakes
+    # `field-documents` — the first half being a revision arriving for a job
+    # already scheduled, on `DocumentsDelivered` above. Two Triggers on one
+    # Flow, because either half can be the new fact and both change the same
+    # answer: *which scheduled job inside the horizon does not have its four
+    # documents linked at their latest revision?*
+    Trigger(id="jobs-delivered-field-documents", event="JobRecordsDelivered",
+            starts="field-documents", wakes="window"),
+    Trigger(id="credentials-delivered", event="CredentialRecordsDelivered",
+            starts="credential-sync", wakes="window"),
+    Trigger(id="equipment-delivered", event="EquipmentRecordsDelivered",
+            starts="equipment-sync", wakes="window"),
     # The first windowed Trigger that is not a delivery. Nothing arrived; a
     # window closed over the book we already hold, and the response reads the
     # whole counterparty book against itself. It is windowed for the same
@@ -157,6 +210,75 @@ TRIGGERS: dict[str, Trigger] = {t.id: t for t in (
     # party, saying compatible things about what was committed to".
     Trigger(id="state-window-closed", event="StateWindowClosed",
             starts="disagreement-sweep", wakes="window"),
+    # The third of the windowed-but-not-a-delivery kind, and the first one a
+    # *clock* raises rather than a sweep of the whole estate. Nothing arrived:
+    # a window closed over the credential and inspection book Cumulus already
+    # holds, and the standing question is which permissions run out soon enough
+    # that somebody should be told. `POST /api/v1/compliance/sweep` is the door
+    # that emits it, on the governed cadence
+    # (`certification-alert-policy` carries `- run cadence: daily`), which is
+    # also why the flow is safe to run every morning: `last_notice_stage`
+    # makes a window with nothing due write nothing and raise nothing.
+    #
+    # This row and `credential-tracking`'s `v1` package land in one commit, and
+    # the rule is restated here rather than left to the comment above the plant
+    # feeds because the next reader needs to know why: `Dispatcher.emit` below
+    # starts every matched Trigger in a list comprehension and does **not**
+    # guard `RunEngine.start`, which raises `ValueError` for a flow id nothing
+    # registered. A row landed ahead of its body would not fail quietly in one
+    # run.
+    #
+    # What it does *not* carry is the delivery-door hazard the co-landing rule
+    # exists for. `documents-delivered-field` and its siblings sit on an event
+    # the estate pushes, so an orphan row there would 500 the next
+    # `POST /api/v1/sources/deliver` for every feed. This event has one caller
+    # and it is a timer: an orphan here would break the compliance sweep alone.
+    # The rule still holds — the reason it holds is just narrower.
+    Trigger(id="compliance-window-closed", event="ComplianceWindowClosed",
+            starts="credential-tracking", wakes="window"),
+    # The plant spine, and the seam in the middle of it. The window is the
+    # fourth windowed-but-not-a-delivery Trigger and the second a *clock*
+    # raises: 11:00, nothing arrived, and the standing question is which jobs
+    # the production system holds that clear every governed eligibility clause.
+    # `JobEligible` is what that pass emits, one per job, and it is a **case** —
+    # one job, one run, one multi-page extraction, one commitment — which is
+    # exactly where a windowed batch stops being a batch.
+    #
+    # **Both rows land with their flows' `v1` packages, in this lane, and the
+    # reason is the one the plant feeds' comment gives**: `emit` below starts
+    # every matched Trigger in a list comprehension and does not guard
+    # `RunEngine.start`, which raises `ValueError` for a flow id nothing
+    # registered. `plant-window-closed` has one caller and it is a timer, so an
+    # orphan there would break the sweep alone; `job-eligible` is emitted from
+    # **inside** that sweep, so an orphan there would fail the window that
+    # raised it — and the window is what the whole spine hangs off.
+    Trigger(id="plant-window-closed", event="PlantWindowClosed",
+            starts="plant-eligibility-sweep", wakes="window"),
+    Trigger(id="job-eligible", event="JobEligible",
+            starts="shipping-list-extraction"),
+    # And the third row of the plant spine, which is what makes it a spine
+    # rather than three flows. The eligibility sweep emits one of these per
+    # (department, business day) its extractions produced demand rows for —
+    # **after** every extraction has run, so the day is filled out of a graph
+    # that already holds the demand — and this is the response.
+    #
+    # `window` and not a case, and the shape is read off exactly this row.
+    # Capacity, headcount and the incentive are properties of the *day*; "sort
+    # by load date and add until capacity" is a batch decision; and the
+    # approval the original design makes permanent is per department-day. The
+    # ten UiPath queues it replaces were an artifact of a tool, not a fact
+    # about a plant. A windowed Flow may still suspend for a person, which is
+    # what this one does at its approval gate.
+    #
+    # **This row lands with `department_scheduling/v1`, in the same commit**,
+    # for the reason the two rows above carry: `emit` starts every matched
+    # Trigger in a list comprehension and does not guard `RunEngine.start`,
+    # which raises for a flow id nothing registered. `DepartmentDayOpened` is
+    # emitted from **inside** the eligibility sweep, so an orphan here would
+    # fail the window that raised it — and the window is what the whole spine
+    # hangs off.
+    Trigger(id="department-day-opened", event="DepartmentDayOpened",
+            starts="department-scheduling", wakes="window"),
     # Two facts, one response. A question asked of the corpus is a case — one
     # question, one run, one answer — whichever door it arrived at, and the
     # `answer-question` Flow is where the last ungoverned ModelCall in the
@@ -178,6 +300,15 @@ TRIGGERS: dict[str, Trigger] = {t.id: t for t in (
     # than acting on a state somebody looked at last Tuesday.
     Trigger(id="order-release-approved", event="OrderReleaseApproved",
             starts="order-release"),
+    # The flywheel, and the reason it is a Trigger rather than a function call.
+    # Doctrine: a human correction flows back **decoupled, via an Event, not
+    # inline**, so the business path stays lean. The accounts-payable run emits
+    # this when a clerk's correction is accepted and carries on posting the
+    # invoice; capturing what the correction taught is an independent response
+    # whose failure cannot hold up a payment, and whose runs are visible in the
+    # fleet rather than buried in somebody else's step.
+    Trigger(id="extraction-corrected", event="ExtractionCorrected",
+            starts="ap-corrections"),
 )}
 
 #: The trigger index. The doctrine keeps it in a fast key-value store for O(1)
@@ -190,6 +321,23 @@ for _trigger in TRIGGERS.values():
 def triggers_for_flow(flow_id: str) -> list[Trigger]:
     """Every declared Trigger that starts this flow."""
     return [t for t in TRIGGERS.values() if t.starts == flow_id]
+
+
+def keyed_run_ids(event: str, key_run_id: str) -> list[str]:
+    """The run ids a keyed emission of this event will use, in Trigger order.
+
+    A caller holding an idempotency key needs these *before* it emits, so it
+    can recognize a delivery it has already run. One Trigger keeps the key
+    verbatim — that is the id every feed's replay guard was written against and
+    the ids already in every deployment's run store. A fact with several
+    responses cannot: two runs may not share an id, so each response derives
+    one from the same key, which keeps a retry re-entering both rather than
+    starting a second copy of each.
+    """
+    matched = _BY_EVENT.get(event, [])
+    if len(matched) == 1:
+        return [key_run_id]
+    return [f"{key_run_id}_{trigger.id}" for trigger in matched]
 
 
 def is_windowed_flow(flow_id: str) -> bool:
@@ -334,13 +482,16 @@ class Dispatcher:
         """
         inputs = inputs or {}
         matched = _BY_EVENT.get(name, [])
-        # A caller-supplied id is an idempotency key for one binding — a
-        # re-delivered feed re-entering its own run. With several Triggers it
-        # cannot be one id, so they are minted.
+        # A caller-supplied id is an idempotency key for the *fact* — a
+        # re-delivered feed re-entering its own runs. `keyed_run_ids` derives
+        # one id per matched Trigger from it, and the caller asks the same
+        # function what to look for, so the two cannot disagree about which
+        # run a redelivery is.
+        derived = keyed_run_ids(name, run_id) if run_id else []
         ids = [
-            run_id if run_id and len(matched) == 1
+            derived[index] if derived
             else RunEngine.mint_run_id(t.starts, inputs, actor)
-            for t in matched
+            for index, t in enumerate(matched)
         ]
         event = self.events.append(Event(
             id=f"evt_{secrets.token_hex(5)}",

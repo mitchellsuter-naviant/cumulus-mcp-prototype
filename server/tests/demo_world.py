@@ -35,20 +35,20 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from app.eval_specs import ap_demo_deliveries
+from app.eval_specs import ap_catalog_delivery, ap_demo_deliveries
 from app.graph import Claim, GraphService, object_id
 from app.models import utcnow
-from app.payables import PayableService, StubInvoiceReader
-from app.reimbursements import (
+from app.tasks.accounts_payable.domain import PayableService, StubInvoiceReader
+from app.tasks.expense_reimbursement.domain import (
     ReimbursementService,
     StubReceiptReader,
     SubmittedDocument,
 )
 from app.runs import RunEngine
-from app.sync import SyncRequest
-from app.tasks import Task, TaskEvidence, TaskProposal, TaskService
+from app.connectors.sync import SyncRequest
+from app.task_queue import Task, TaskEvidence, TaskProposal, TaskService
 
 HRIS_SOURCE = "hris-workforce"
 CALENDAR_SOURCE = "office-calendar"
@@ -464,25 +464,45 @@ class SeedInvoice(BaseModel):
 
 def seed_invoices() -> list[SeedInvoice]:
     return [
-        # 1. Known vendor, bills its PO exactly, posts with no human.
+        # 1. Known vendor, bills its PO exactly — and a clerk still sees it,
+        #    because the governed auto-post limit is $0.00. The approval is a
+        #    glance rather than an investigation: the match is clean, the
+        #    field verdicts are empty, and there is nothing to correct. That
+        #    is what the policy is buying while the desk learns what the
+        #    extraction gets right.
         SeedInvoice(
             run_id="run_ap_seed01", submitted_by=AP,
             days_ago=13, filename="acme-inv-20881.pdf",
             hint="vendor=acme-industrial po=PO-7741 invoice=ACME-INV-20881 "
                  "lines=STL-0250:2,FAS-M12:3",
+            decisions=[{
+                "verdict": "approved", "decided_by": CONTROLLER,
+                "note": "Matches the order line for line; nothing to check.",
+            }],
         ),
         # 2. Price variance: the clerk corrects the unit price, the match
-        #    re-runs, and the invoice posts on the second round.
+        #    re-runs clean, and they approve on the second round. Two
+        #    decisions rather than one, and that is the $0.00 limit's doing —
+        #    a correction settles the *variance*, and the rule still holds the
+        #    invoice for the limit, so somebody has to say yes. It is also the
+        #    only seeded invoice that feeds the correction set.
         SeedInvoice(
             run_id="run_ap_seed02", submitted_by=AP,
             days_ago=11, filename="northwind-inv-4471.pdf",
             hint="vendor=northwind-traders po=PO-7802 invoice=NW-INV-4471 "
                  "lines=WLD-6013:4,PPE-GLV:2 pricebump",
-            decisions=[{
-                "verdict": "corrected", "decided_by": CONTROLLER,
-                "note": "Vendor billed the old list price; corrected to the PO price.",
-                "payload": {"lines": [{"ordinal": 1, "unit_price_usd": 92.40}]},
-            }],
+            decisions=[
+                {
+                    "verdict": "corrected", "decided_by": CONTROLLER,
+                    "note": "Vendor billed the old list price; corrected to "
+                            "the PO price.",
+                    "payload": {"lines": [{"ordinal": 1, "unit_price_usd": 92.40}]},
+                },
+                {
+                    "verdict": "approved", "decided_by": CONTROLLER,
+                    "note": "Matches the order now.",
+                },
+            ],
         ),
         # 3. The invoice bills more than was received, so the match holds it
         #    at the posting gate — left open, so the AP queue has a live
@@ -561,7 +581,9 @@ def seed_payables(service: PayableService, sync=None) -> int:
     seeded = 0
     try:
         if sync is not None:
-            for delivery in ap_demo_deliveries():
+            # The catalogue first, because the seeded purchase orders bill
+            # the `Item` objects the ERP landed and not a list in code.
+            for delivery in [ap_catalog_delivery(), *ap_demo_deliveries()]:
                 sync.deliver(
                     SyncRequest.model_validate(delivery), actor="system:fixture"
                 )
@@ -607,72 +629,94 @@ class SeedCase(BaseModel):
     days_ago: int
     documents: list[SubmittedDocument]
     commentary: str = ""
-    # None leaves whatever the flow decided (approved, or pending on a Task).
-    decision: dict | None = None
+    #: The decisions this case's submitter makes, in order — v10 raises a gate
+    #: on every run and raises another after every correction, so a seeded case
+    #: that finishes needs as many answers as it asks questions. An empty list
+    #: leaves the case open on its submitter's desk, which is what gives the
+    #: demo live work to look at.
+    decisions: list[dict] = Field(default_factory=list)
 
 
 def seed_cases() -> list[SeedCase]:
-    def doc(hint: str, filename: str = "", note: str = "") -> SubmittedDocument:
+    def doc(hint: str, filename: str = "", memo: str = "") -> SubmittedDocument:
+        # `hint` is the stub reader's steering seam: reachable from the seed
+        # and from no REST body. `memo` is the submitter's own words, which the
+        # run reads and shows back and never gives to the extractor.
         return SubmittedDocument(
-            filename=filename or f"{hint}.jpg", note=note, hint=hint
+            filename=filename or f"{hint}.jpg", memo=memo, hint=hint
         )
 
+    def confirmed(by: str, note: str = "") -> dict:
+        return {"verdict": "approved", "decided_by": by, "note": note}
+
+    # Every case is confirmed by the person who submitted it, because that is
+    # what the governed routing table says and it is the only signature a
+    # reimbursement rests on. Two are left open on purpose so the Task Queue
+    # has live work and the workspace has suspended runs to show.
     return [
         SeedCase(
             run_id="run_er_seed01", employee=AE_REMOTE, days_ago=21,
             documents=[doc("total=64.20 vendor=corner-bistro category=meals")],
             commentary="Team lunch after the Mercer & Vance phase 1 review.",
+            decisions=[confirmed(AE_REMOTE)],
         ),
         SeedCase(
             run_id="run_er_seed02", employee=IT, days_ago=19,
             documents=[doc("total=32.50 vendor=transit-authority category=travel")],
             commentary="Rail fare to the customer site.",
+            decisions=[confirmed(IT)],
         ),
         SeedCase(
             run_id="run_er_seed03", employee=AE_REMOTE, days_ago=16,
             documents=[doc("total=612.00 vendor=harbor-hotel category=lodging")],
             commentary="Conference block rate for the finance summit, three nights.",
-            decision={
-                "verdict": "approved", "decided_by": SALES_MANAGER,
-                "note": "Block rate confirmed against the event contract.",
-            },
+            decisions=[confirmed(
+                AE_REMOTE, "Block rate as booked — matches the event contract."
+            )],
         ),
         SeedCase(
             run_id="run_er_seed04", employee=AE, days_ago=14,
             documents=[doc("total=141.13 vendor=office-depot category=supplies")],
             commentary="Supplies for the onsite customer workshop.",
+            decisions=[confirmed(AE)],
         ),
+        # Withdrawn by its own submitter once they read the policy finding: the
+        # restricted-category flag did its job without anybody being routed a
+        # decision that was never theirs to make.
         SeedCase(
             run_id="run_er_seed05", employee=IT, days_ago=12,
             documents=[doc("total=96.40 vendor=vintners-cellar category=alcohol")],
             commentary="Client gift wine for the Mercer & Vance close.",
-            decision={
-                "verdict": "rejected", "decided_by": SALES_MANAGER,
-                "note": "Gift wine is out of policy §4.2 — use the gifting desk.",
-            },
+            decisions=[{
+                "verdict": "rejected", "decided_by": IT,
+                "note": "Gift wine is out of policy §4.2 — refiling with the "
+                        "gifting desk instead.",
+            }],
         ),
         SeedCase(
             run_id="run_er_seed06", employee=AE, days_ago=8,
             documents=[doc("total=49.00 vendor=cloudline-software category=software")],
             commentary="Monthly seat for the design tool.",
+            decisions=[confirmed(AE)],
         ),
         # The submitter's own split: one receipt, part of it personal. This is
-        # the case the commentary parser exists for, and it auto-approves.
+        # the case the memo parser exists for.
         SeedCase(
             run_id="run_er_seed07", employee=AE_REMOTE, days_ago=6,
             documents=[doc(
                 "total=110.00 vendor=corner-bistro category=meals",
                 filename="dinner-phase2.jpg",
-                note=(
+                memo=(
                     "Dinner with the Mercer & Vance team after the phase 2 "
                     "review. I am only requesting $75 of the $110 — I ordered "
                     "wine on my own tab."
                 ),
             )],
             commentary="Client dinner, Mercer & Vance phase 2.",
+            decisions=[confirmed(AE_REMOTE, "$75 is right — the rest was mine.")],
         ),
-        # A blurry receipt: the extraction is uncertain, a reviewer confirms the
-        # amount, and the run finishes on the second round.
+        # A blurry receipt: the reading is uncertain, the submitter fixes it
+        # against their card statement, and confirms the corrected facts.
         SeedCase(
             run_id="run_er_seed08", employee=AE_REMOTE, days_ago=5,
             documents=[doc(
@@ -680,41 +724,50 @@ def seed_cases() -> list[SeedCase]:
                 filename="taxi-crumpled.jpg",
             )],
             commentary="Airport transfer for the customer visit.",
-            decision={
-                "verdict": "corrected", "decided_by": SALES_MANAGER,
-                "note": "Amount matches the card feed; vendor spelling fixed.",
-                "payload": {"lines": [{
-                    "ordinal": 1, "requested_usd": 58.75,
-                    "vendor": "airport-taxi",
-                    "purpose": "Airport transfer for the customer visit.",
-                }]},
-            },
+            decisions=[
+                {
+                    "verdict": "corrected", "decided_by": AE_REMOTE,
+                    "note": "Amount matches my card statement; vendor spelling "
+                            "fixed.",
+                    "payload": {"lines": [{
+                        "ordinal": 1, "requested_usd": 58.75,
+                        "vendor": "airport-taxi",
+                        "purpose": "Airport transfer for the customer visit.",
+                    }]},
+                },
+                confirmed(AE_REMOTE),
+            ],
         ),
         # A compound receipt over the limit: two lines out of one document, the
-        # reviewer supplies purposes and trims one line, and the re-check passes.
+        # submitter supplies purposes and trims one line, then confirms.
         SeedCase(
             run_id="run_er_seed09", employee=AE, days_ago=4,
             documents=[doc(
                 "compound total=210.00 vendor=harbor-hotel category=lodging",
                 filename="hotel-folio.pdf",
-                note="Room and the parking charge are on one folio.",
+                memo="Room and the parking charge are on one folio.",
             )],
             commentary="Two nights at the customer onsite.",
-            decision={
-                "verdict": "corrected", "decided_by": SALES_MANAGER,
-                "note": (
-                    "Split the folio: room stands, parking trimmed to the "
-                    "reimbursable rate."
-                ),
-                "payload": {"lines": [
-                    {"ordinal": 1, "purpose": "Two nights at the customer onsite.",
-                     "category": "lodging"},
-                    {"ordinal": 2, "requested_usd": 60.00, "category": "travel",
-                     "purpose": "Parking at the customer onsite, capped rate."},
-                ]},
-            },
+            decisions=[
+                {
+                    "verdict": "corrected", "decided_by": AE,
+                    "note": (
+                        "Split the folio: room stands, parking trimmed to the "
+                        "reimbursable rate."
+                    ),
+                    "payload": {"lines": [
+                        {"ordinal": 1,
+                         "purpose": "Two nights at the customer onsite.",
+                         "category": "lodging"},
+                        {"ordinal": 2, "requested_usd": 60.00,
+                         "category": "travel",
+                         "purpose": "Parking at the customer onsite, capped rate."},
+                    ]},
+                },
+                confirmed(AE),
+            ],
         ),
-        # A multi-document submission that needs nobody.
+        # A multi-document submission, confirmed in one pass.
         SeedCase(
             run_id="run_er_seed10", employee=IT, days_ago=3,
             documents=[
@@ -722,6 +775,7 @@ def seed_cases() -> list[SeedCase]:
                 doc("total=38.50 vendor=corner-bistro category=meals"),
             ],
             commentary="Customer visit — cab and lunch.",
+            decisions=[confirmed(IT)],
         ),
         # Two left open on purpose, so the Task Queue has live work and the
         # workspace has suspended runs to show.
@@ -740,6 +794,27 @@ def seed_cases() -> list[SeedCase]:
             )],
         ),
     ]
+
+
+def confirm_expense(service: ReimbursementService, request, **kwargs):
+    """The submitter confirming their own values — v10's ordinary path.
+
+    Every expense run stops for its submitter before anything is recorded, so a
+    test that wants a *finished* expense (a graph write, a ledger row, a cost)
+    has to answer the question the run asked. Kept here rather than repeated in
+    eight test modules, because it is the one line all of them need and none of
+    them are about.
+    """
+    decided = service.tasks.decide(
+        request.task_id, kwargs.pop("verdict", "approved"),
+        kwargs.pop("decided_by", "") or request.employee, **kwargs,
+    )
+    return service.resume_for_task(decided)
+
+
+def run_expense(service: ReimbursementService, employee: str, **kwargs):
+    """Submit and confirm in one move."""
+    return confirm_expense(service, service.submit(employee, **kwargs))
 
 
 def seed_expenses(service: ReimbursementService) -> int:
@@ -763,15 +838,21 @@ def seed_expenses(service: ReimbursementService) -> int:
                 run_id=case.run_id,
                 submitted_at_iso=submitted_at.isoformat(),
             )
-            if case.decision and request.task_id:
+            # One answer per question the run asks. v10 gates on every run and
+            # gates again after a correction, so a case that finishes carries
+            # as many decisions as it has rounds; a case with fewer stays open
+            # on its submitter's desk, which is the point of the last two.
+            for decision in case.decisions:
+                if not request.task_id:
+                    break
                 decided = service.tasks.decide(
                     request.task_id,
-                    verdict=case.decision["verdict"],
-                    decided_by=case.decision["decided_by"],
-                    note=case.decision.get("note", ""),
-                    payload=case.decision.get("payload") or {},
+                    verdict=decision["verdict"],
+                    decided_by=decision["decided_by"],
+                    note=decision.get("note", ""),
+                    payload=decision.get("payload") or {},
                 )
-                service.resume_for_task(decided)
+                request = service.resume_for_task(decided) or request
             backdate(service.engine, service.tasks, case.run_id, case.days_ago)
             seeded += 1
     finally:
@@ -987,7 +1068,7 @@ def seed_task_backlog() -> list[Task]:
             queue="eval-review",
             priority="normal",
             flow_id="expense-reimbursement",
-            case_ref="eval:expense-in-policy-auto-approves",
+            case_ref="eval:expense-in-policy-confirmed",
             refs=[
                 "knowledge:expense-approval-policy@rev1",
                 "knowledge:receipt-extraction-prompt@rev1",

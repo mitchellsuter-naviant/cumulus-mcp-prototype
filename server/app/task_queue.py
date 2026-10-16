@@ -96,6 +96,32 @@ class TaskProposal(BaseModel):
     action: str
     target: str = ""
     summary: str = ""
+    #: The fields of the proposal a reviewer is being asked about, each with
+    #: whatever the raising flow knows about it. Untyped here for
+    #: `TaskDecision.payload`'s reason and with the same rule: the shape is per
+    #: flow, and the flow that raised the Task is the only thing that
+    #: interprets it. Accounts payable puts its `FieldVerdict`s here — a path,
+    #: a status, one sentence and the box on the page — so a review screen can
+    #: focus the three numbers in doubt instead of the thirty that are not.
+    #:
+    #: **`None` and `[]` are different facts and a screen must be able to tell
+    #: them apart.** `None` is a flow version that computes no field verdicts
+    #: at all, and the honest response is to open the whole form; `[]` is a
+    #: version that looked and found nothing in doubt. Defaulting to the empty
+    #: list would tell a reviewer "we checked and it is fine" about an invoice
+    #: nobody had checked.
+    fields: list[dict] | None = None
+    #: A second question the same review answers: which entity this case is
+    #: about, when the resolver could not settle it. Accounts payable puts
+    #: `{resolved, printed, candidates: [{id, name, score}]}` here.
+    #:
+    #: It rides the proposal rather than raising a gate of its own because two
+    #: gates over one document is two interruptions for one reading of it: the
+    #: person looking at the page can see the printed name while they check the
+    #: numbers. `None` is the normal case — the resolver settled it, or the
+    #: flow has no entity question — and a decision answers it by naming the
+    #: chosen id in its payload.
+    vendor: dict | None = None
 
 
 class TaskDecision(BaseModel):
@@ -177,8 +203,28 @@ class Task(BaseModel):
     priority: TaskPriority = "normal"
     status: TaskStatus = "open"
     flow_id: str = ""
+    # The shipped version of the flow whose run raised this task, stamped by
+    # the gate. Zero means unversioned (a feed, or a task from before versions
+    # existed); the console uses it to pick the review screen shipped for the
+    # version that did the work.
+    flow_version: int = 0
     run_id: str = ""
     case_ref: str = ""
+    #: Who the case is *about*: the person who submitted the invoice or the
+    #: expense report. Distinct from `queue` (whose work deciding it is) and
+    #: from `decision.decided_by` (who actually did) — those can be the same
+    #: person, and routing a review back to its submitter is exactly the case
+    #: where they are.
+    #:
+    #: First-class because the submitter was previously display text in an
+    #: evidence row ("Submitted by"), and a consumer that needs the address —
+    #: to route, to filter a hub, to say whose receipt this is — must not have
+    #: to re-parse a list built for a human to read.
+    #:
+    #: `None` rather than `""`, and the difference is a fact: most Tasks are
+    #: about a record and not a person (a merge proposal has no submitter), and
+    #: `None` says so where an empty string is a name a screen might print.
+    subject_email: str | None = None
     # Knowledge/data-layer records this judgment rests on, in the read-set
     # namespaces (`knowledge:…@rev`, `vendor:…`, `graph:…`).
     refs: list[str] = Field(default_factory=list)

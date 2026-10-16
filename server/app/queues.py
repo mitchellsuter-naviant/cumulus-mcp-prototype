@@ -38,7 +38,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, Field
 
-from . import personas
+from . import desks, personas
 from .models import utcnow
 
 log = logging.getLogger("cumulus.queues")
@@ -371,7 +371,7 @@ class QueueService:
 
 
 def bootstrap_from_roster(service: QueueService) -> int:
-    """Give every queue the persona roster names a registry entry.
+    """Give every declared desk a registry entry, and mirror roster membership.
 
     Runs at startup and is idempotent. The roster keeps its authority — a
     persona bound to `ap-clerk` still holds it whatever the registry says, and
@@ -379,15 +379,21 @@ def bootstrap_from_roster(service: QueueService) -> int:
     succeed. It exists so the admin screen opens onto the desks that already
     exist rather than onto nothing, and so a customer's first act is editing
     membership rather than re-declaring the queues from memory.
+
+    The desks come from `desks.py` and their descriptions with them. They used
+    to come from the roster's slug list and a blurb table keyed beside it here,
+    which meant a desk existed in the registry only if a persona happened to
+    bind to it — the roster deciding what the customer's org has, which is
+    backwards.
     """
     created = 0
-    for slug in personas.ALL_QUEUES:
-        if service.get(slug) is not None:
+    for desk in desks.DESKS:
+        if service.get(desk.slug) is not None:
             continue
         service.create(
-            slug,
-            name=slug.replace("-", " ").title(),
-            description=_ROSTER_BLURBS.get(slug, ""),
+            desk.slug,
+            name=desk.name,
+            description=desk.description,
             created_by="system",
         )
         created += 1
@@ -410,30 +416,6 @@ def bootstrap_from_roster(service: QueueService) -> int:
     if created:
         log.info("Queue registry bootstrapped", extra={"queuesCreated": created})
     return created
-
-
-_ROSTER_BLURBS: dict[str, str] = {
-    "expense-review": "Elevated reimbursements: over the governed limit, a "
-                      "restricted category, an uncertain extraction or a "
-                      "missing purpose.",
-    "ap-clerk": "Invoices held at the posting gate, and three-way matches "
-                "that did not clear.",
-    "vendor-stewardship": "Who Cumulus pays: vendor identity that will not "
-                          "resolve on the evidence.",
-    "data-stewardship": "Who Cumulus thinks it is dealing with: counterparty "
-                        "matches and proposed merges.",
-    "order-desk": "Commitments the CRM and the ERP disagree about.",
-    "knowledge-curation": "Corrections proposed for promotion into canonical "
-                          "knowledge.",
-    "eval-review": "Flow evaluations awaiting a reviewer's label.",
-    "hr": "People requests — time off, and the rest of the hub's judgment "
-          "calls.",
-    "expense-review-exec": "Reimbursements above the governed executive "
-                           "threshold, and every restricted category.",
-    "platform-operations": "Flow steps that threw. An engineering fault, not a "
-                           "business judgment — nothing here is somebody's "
-                           "approval to give.",
-}
 
 
 def build_queue_service(

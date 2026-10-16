@@ -23,7 +23,7 @@ from app.estate import (
 from app.flow_projection import SCAN_LIMIT, project_flow, project_flows
 from app.graph import parse_ref
 from app.runs import InMemoryRunStore, RunEngine, RunRecord, StepRecord
-from app.tasks import InMemoryTaskDirectory, TaskService
+from app.task_queue import InMemoryTaskDirectory, TaskService
 from tests import estate_fixtures as fx
 from tests import demo_world
 from tests import world as test_world
@@ -298,17 +298,47 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
         "employment-event-sync",
         "dms-sync",
         "psa-sync",
+        # The plant floor's three. The projection is read off the *engine*, so
+        # a feed appears here as soon as its body is registered — before any
+        # namespace has delivered to it, and with an empty projection, which
+        # is the honest read of a feed that has never run.
+        "job-sync",
+        "credential-sync",
+        "equipment-sync",
         "identity-sweep",
         "disagreement-sweep",
-        # The only one here that touches no graph at all:
-        # a question asked of the corpus is a Flow now, so the engine can name
-        # it. It is projected like everything else and its projection is
-        # empty in both directions, which is the honest read — see the
-        # explicit case below.
+        # The compliance clock, and the third of the windowed-but-not-a-delivery
+        # kind. It reaches the graph the way the sweeps do — reading the book
+        # the feeds wrote and writing back what a governed rule made of it,
+        # here the notice stage each row is now owed.
+        "credential-tracking",
+        # Woken by the same delivery `dms-sync` is, and it reaches the graph
+        # from the other direction: it reads the filing tree and writes back
+        # what it read out of it.
+        "ap-intake",
+        # Woken by that same delivery *and* by the production one, because
+        # either half can be the new fact. It reads the filing tree and the
+        # job book and writes back the packet a governed rule made of them.
+        "field-documents",
+        # The plant floor's three: the sweep that decides which jobs a day
+        # may build, the extraction that turns a shipping list into department
+        # work, and the flow that fills the day those rows call for — the one
+        # that finally writes a schedule, and only at `pending_approval`.
+        "plant-eligibility-sweep",
+        "shipping-list-extraction",
+        "department-scheduling",
+        # The only two here that touch no graph at all. A question asked of the
+        # corpus is a Flow now, so the engine can name it; and a clerk's
+        # correction is answered by a Flow whose one write is a Dataset append,
+        # because the correction set is knowledge rather than entities. Both
+        # are projected like everything else and both projections are empty in
+        # both directions, which is the honest read — see the explicit case
+        # below.
         "answer-question",
+        "ap-corrections",
         "order-release",
     }
-    # Eleven of the seventeen are inbound syncs. They all have FlowDefinitions now,
+    # Fourteen of them are inbound syncs. They all have FlowDefinitions now,
     # but the projection is still drawn from the engine and from stored runs:
     # a definition says what a flow is *meant* to touch, and this module is
     # about what it did.
@@ -322,6 +352,40 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
             # catch a sweep that started inventing findings to look busy.
             assert projection.state == "ran_but_wrote_nothing"
             assert projection.writes == [] and projection.establishes == []
+            continue
+        if projection.flow_id == "ap-intake":
+            # It ran — the DMS delivery wakes it like it wakes `dms-sync` —
+            # and it wrote nothing, because a world has no estate to fetch
+            # bytes from and an intake that cannot read a file has nothing to
+            # say about it. `ran_but_wrote_nothing` is the right answer and
+            # not an excuse: the moment a fetcher is wired, the same run
+            # writes `sha256` onto every row it read.
+            assert projection.state == "ran_but_wrote_nothing"
+            assert projection.writes == []
+            continue
+        if projection.flow_id == "field-documents":
+            # It ran — the DMS delivery wakes it like it wakes `dms-sync` and
+            # `ap-intake` — and it wrote nothing, because this world is the
+            # office estate: no production system has delivered a `Job`, so
+            # the standing question has no rows to answer and the window's one
+            # guarded Action commits an empty write-set.
+            # `ran_but_wrote_nothing` is the honest answer and a
+            # different fact from `never_ran`: this flow *is* woken here,
+            # every delivery, and finds nothing in scope.
+            assert projection.state == "ran_but_wrote_nothing"
+            assert projection.writes == [] and projection.establishes == []
+            continue
+        if projection.flow_id == "ap-corrections":
+            # It ran — a clerk corrected a seeded invoice — and it wrote no
+            # *graph*: its one write is a `dataset:` ref into the correction
+            # set, which this projection deliberately does not map to an
+            # object type, because the set is knowledge and not entities. So
+            # the state is `observed` (something was written) with an empty
+            # `writes` (nothing the ontology names), and the write shows up in
+            # the unprojected count rather than being lost.
+            assert projection.state == "observed"
+            assert projection.writes == [] and projection.establishes == []
+            assert projection.unprojected_refs
             continue
         if projection.flow_id == "answer-question":
             # Registered, never run in this world, and it would write nothing
@@ -339,6 +403,24 @@ def test_every_flow_that_reaches_the_graph_is_projected(seeded):
             # this is the flow whose runs reach a customer's ERP, and "it has
             # never been used in this deployment" is exactly what an operator
             # should be told about it.
+            assert projection.state == "never_ran"
+            continue
+        if projection.flow_id in (
+            "job-sync", "credential-sync", "equipment-sync",
+            "credential-tracking",
+            "plant-eligibility-sweep", "shipping-list-extraction",
+            "department-scheduling",
+        ):
+            # Registered and never run *here*, for a reason worth keeping
+            # distinct from `order-release`'s: these are the plant floor's
+            # feeds, and this world is the office estate, which runs no
+            # production system to deliver from. A deployment where a
+            # contract is declared and its source is absent is the ordinary
+            # multi-namespace case, and `never_ran` is what an operator
+            # should read rather than a flow that looks broken. The compliance
+            # clock is here for the same reason from the other side: its window
+            # is a timer nothing in this world has fired, and a pass over an
+            # empty compliance book would write nothing even if it had.
             assert projection.state == "never_ran"
             continue
         assert projection.state == "observed", projection.flow_id
@@ -375,12 +457,22 @@ def test_the_ap_projection_matches_what_its_runs_did(seeded):
     # So is the price sheet — the run really did read it to say what its model
     # call cost, and a read-set that omitted it would leave the cost on the
     # journal with nothing behind it to check the arithmetic against.
+    #
+    # The resolution policy joined the list with v9, and it is the clearest
+    # case for reading the set off the runs: the thresholds that decided which
+    # vendor an invoice was issued by were always read, and were always the
+    # one governed value the projection could not see, because the read
+    # happened inside the resolver instead of on a step.
     assert ap.knowledge == [
-        "invoice-extraction-prompt", "invoice-posting-policy", "model-pricing",
+        "entity-resolution-policy", "invoice-extraction-prompt",
+        "invoice-posting-policy", "model-pricing",
     ]
     # The bare `graph:PurchaseOrder/PO-7741` form, end to end: a parser that
     # required `@rev` would leave this list empty and nothing would fail.
-    assert ap.reads == ["PurchaseOrder"]
+    # `Vendor` is there because the gather step says so: an invoice with no PO
+    # printed on it is matched against the vendor's own open orders, which is a
+    # read of the vendor object and was previously invisible.
+    assert ap.reads == ["PurchaseOrder", "Vendor"]
 
 
 def test_accounts_payable_diverges_from_its_declaration_in_both_directions(seeded):

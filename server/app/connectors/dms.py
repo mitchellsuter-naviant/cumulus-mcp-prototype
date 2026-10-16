@@ -41,8 +41,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .graph import Claim, GraphWriter, object_id
-from .runs import RunContext
+from ..graph import Claim, GraphWriter, object_id
+from ..ontology import names as onto
+from ..runs import RunContext
 from .sync import (
     DMS_FLOW_ID,
     DOCUMENTS_EVENT,
@@ -64,17 +65,6 @@ log = logging.getLogger("cumulus.sync.dms")
 DOCUMENT_LIBRARY = "document-library"
 
 
-def register(service: SyncService) -> None:
-    """Bind both bodies to the engine `SyncService` was handed."""
-    if service.engine is None:
-        return
-    service.engine.register(
-        DMS_FLOW_ID, lambda ctx, inputs: dms_body(service, ctx, inputs)
-    )
-    service.engine.register(
-        EMPLOYMENT_EVENT_FLOW_ID,
-        lambda ctx, inputs: employment_event_body(service, ctx, inputs),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +164,7 @@ def _known_folder_paths(service: SyncService, source: str) -> dict[str, str]:
     """
     return {
         str(o.props.get("external_id")): str(o.props.get("path") or "")
-        for o in service.graph.find("Folder", prop_equals={"source": source})
+        for o in service.graph.find(onto.FOLDER, prop_equals={"source": source})
         if o.props.get("external_id")
     }
 
@@ -245,7 +235,7 @@ def _apply_folders(
             counts["unplaced"] += 1
             continue
         graph.upsert(
-            "Folder", _folder_key(source, path),
+            onto.FOLDER, _folder_key(source, path),
             [
                 Claim(field="name", value=record.name, source=claim_source),
                 Claim(field="path", value=path, source=claim_source),
@@ -318,7 +308,7 @@ def _apply_documents(
                   source=claim_source),
         ]
         document = graph.upsert(
-            "Document", _document_key(source, record.external_id), claims,
+            onto.DOCUMENT, _document_key(source, record.external_id), claims,
             label=record.name or record.external_id,
             provenance=f"referenced by {run_id}",
         )
@@ -367,7 +357,7 @@ def _document_key(source: str, external_id: str) -> str:
 def _folder(service: SyncService, source: str, path: str) -> Any:
     if not path:
         return None
-    return service.graph.get(object_id("Folder", _folder_key(source, path)))
+    return service.graph.get(object_id(onto.FOLDER, _folder_key(source, path)))
 
 
 def _path_of(

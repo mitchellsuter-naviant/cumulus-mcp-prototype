@@ -12,7 +12,7 @@ import app.deps as deps
 from app.api_keys import InMemoryApiKeyDirectory
 from app.config import settings
 from app.identities import IdentityService, InMemoryMachineIdentityDirectory
-from app.tasks import InMemoryTaskDirectory, TaskService
+from app.task_queue import InMemoryTaskDirectory, TaskService
 from app.users import InMemoryUserDirectory
 from tests import demo_world
 from tests import world as test_world
@@ -119,6 +119,35 @@ def test_get_task_and_missing(client):
     # The task carries its world: evidence, refs, and the proposed action.
     assert task["evidence"] and task["refs"] and task["proposal"]["target"] == "graph"
     assert client.get("/api/v1/tasks/task_nope").status_code == 404
+
+
+# ---- who the case is about ----
+
+
+def test_a_task_names_its_submitter_as_a_field_and_the_wire_carries_it(client):
+    """The submitter used to be display text in an evidence row, which meant a
+    consumer wanting the address — to route a review back, to filter a hub —
+    had to re-parse a list built for a human to read. So it is a field, and it
+    reaches the client as one."""
+    from app.task_queue import Task
+
+    deps._task_service.create(Task(
+        id="task_sub_0001", kind="decision",
+        title="Confirm the values we read off your receipt",
+        queue="person-john-smith-0000", case_ref="expense:req_1",
+        subject_email="john.smith@naviant.com",
+    ))
+
+    row = client.get("/api/v1/tasks/task_sub_0001").json()
+    assert row["subject_email"] == "john.smith@naviant.com"
+    # Durable state and not a response-only echo: it survives the store.
+    stored = deps._task_service.get("task_sub_0001").model_dump(mode="json")
+    assert stored["subject_email"] == "john.smith@naviant.com"
+    listed = {t["id"]: t for t in client.get("/api/v1/tasks").json()}
+    assert listed["task_sub_0001"]["subject_email"] == "john.smith@naviant.com"
+    # A Task about a record rather than a person says exactly that. `None` is
+    # not `""`: an empty string is a name a screen might print.
+    assert listed["task_mdm_0071"]["subject_email"] is None
 
 
 # ---- deciding ----

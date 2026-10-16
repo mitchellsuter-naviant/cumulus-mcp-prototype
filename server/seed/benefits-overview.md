@@ -3,7 +3,6 @@ id: benefits-overview
 path: people/guides/benefits
 title: Benefits Overview
 authority_level: guideline
-scope: org
 owner: people-team
 tags: benefits, medical, dental, retirement, hr
 status: published

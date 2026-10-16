@@ -63,10 +63,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .auth import Principal, flow_principal
-from .disagreement_sweep import ORDER_DESK_QUEUE, SCAN, STANDING
-from .estate import ERP_SALES
-from .estate_writes import (
+from ...auth import Principal, flow_principal
+from ...disagreement_sweep import ORDER_DESK_QUEUE, SCAN, STANDING
+from ...estate import ERP_SALES
+from ...estate_writes import (
     EstateWriteError,
     EstateWriteRecord,
     WritableTarget,
@@ -74,11 +74,11 @@ from .estate_writes import (
     writable,
     write_id,
 )
-from .graph import Claim, GraphWriter, LinkRecord, parse_ref
-from .models import utcnow
-from .runs import RunContext
-from .sync import _slug
-from .tasks import Task, TaskEvidence, TaskService
+from ...graph import Claim, GraphWriter, LinkRecord, parse_ref
+from ...models import utcnow
+from ...runs import RunContext
+from ...connectors.sync import _slug
+from ...task_queue import Task, TaskEvidence, TaskService
 
 log = logging.getLogger("cumulus.order_release")
 
@@ -625,178 +625,21 @@ def tell_the_desk(
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_VERSION = 1
+
+
 def register(service) -> None:
     if service.engine is None:
         return
-    service.engine.register(
-        ORDER_RELEASE_FLOW_ID,
-        lambda ctx, inputs: release_body(service, ctx, inputs),
-    )
+    from .. import shipped_versions
 
-
-def release_body(service, ctx: RunContext, inputs: dict) -> dict:
-    """Read the door, check the row, write it, read it back, tell the desk."""
-    finding_ref = str(inputs.get("finding") or "")
-    task_id = str(inputs.get("task_id") or "")
-    decided_by = str(inputs.get("decided_by") or "")
-    queue = str(inputs.get("queue") or ORDER_DESK_QUEUE)
-    actor = decided_by or ctx.record.actor
-
-    ctx.event(
-        "t1", ORDER_RELEASE_EVENT,
-        f"{decided_by or 'the order desk'} approved the release behind "
-        f"{finding_ref}",
-        kind="trigger",
-    )
-
-    policy = ctx.step(
-        "x1", "read-write-policy", "transform",
-        fn=lambda: read_write_policy(service, finding_ref),
-        summary=lambda out: (
-            f"{out['target']}: {out.get('app', '?')}.{out.get('resource', '?')}"
-            f".{out.get('field', '?')} · "
-            + (
-                " · ".join(
-                    f"`{was}` → {', '.join(f'`{v}`' for v in to)}"
-                    for was, to in (out.get("transitions") or {}).items()
-                )
-                if out["writable"] else f"refused — {out['refusal']}"
-            )
-            + f" · {out['order_number']} is "
-            f"{out.get('resource', '?')}/{out['record_id'] or '(no id)'}"
-        ),
-    )
-    ctx.note_refs(policy["finding_ref"], f"graph:{policy['order_id']}")
-
-    pre = ctx.step(
-        "z1", "check-preconditions", "resolve",
-        fn=lambda: check_preconditions(service, policy),
-        summary=lambda out: f"{out['outcome']} — {out['reason']}",
-        refs=[policy["finding_ref"]],
-    )
-
-    released: dict = {}
-    if pre["outcome"] in SETTLING:
-        act: dict[str, Any] = {}
-
-        def commit() -> dict:
-            # Built inside the step body so a retried attempt gets its own
-            # ledger entry rather than appending one id twice — two attempts
-            # are two things that happened, and an append-only log that
-            # overwrites is not one.
-            act["pending"] = service.gateway.action(
-                RELEASE_ACTION,
-                ctx.principal or flow_principal(ORDER_RELEASE_FLOW_ID, queue),
-                run=ctx.record, step_id="a1", task_id=task_id,
-                decided_by=decided_by, queue=queue,
-            )
-            return act["pending"].commit(lambda w: release(
-                service, ctx, policy, pre, w,
-                task_id=task_id, decided_by=decided_by, actor=actor,
-            ))
-
-        released = ctx.step(
-            "a1", RELEASE_ACTION, "action",
-            fn=commit,
-            writes=lambda _out: (
-                act["pending"].writes if "pending" in act else []
-            ),
-            summary=lambda out: (
-                (
-                    f"PATCH {policy.get('resource')}/{policy['record_id']} "
-                    f"{policy.get('field')}=`{out['value']}` · "
-                    f"journal {out['state']}"
-                    if out["patched"]
-                    else f"no PATCH — {out.get('why') or out['outcome']}"
-                )
-                + (
-                    f" · finding resolved ({out['resolved_how']})"
-                    if out["resolved"] else " · the finding still stands"
-                )
-            ),
-            refs=[policy["finding_ref"]],
-            # Safe only because of the journal guard in `_send`, which is
-            # tested for exactly this: a second attempt issues no second PATCH.
-            retries=1,
-            escalate_queue=queue,
+    for number, module in sorted(shipped_versions(ORDER_RELEASE_FLOW_ID).items()):
+        service.engine.register(
+            ORDER_RELEASE_FLOW_ID, module.build_body(service),
+            version=number, default=(number == DEFAULT_VERSION),
         )
 
-    # Whatever the estate last told us, landed as the ERP's own claim. It runs
-    # on the escalation path too, and that is the useful half: an order that
-    # moved to `Billed` under us is a fact the graph should learn from the read
-    # we just made, not one it waits for the next delta to hear.
-    observed = released.get("verified") or pre.get("observed") or ""
-    landed: dict = {}
-    if observed:
-        watch: dict[str, Any] = {}
 
-        def observe() -> dict:
-            watch["pending"] = service._act(ctx, OBSERVE_ACTION, "s1")
-            return watch["pending"].commit(lambda w: land_the_answer(
-                w, policy, observed, ctx.record.id,
-            ))
-
-        landed = ctx.step(
-            "s1", OBSERVE_ACTION, "action",
-            fn=observe,
-            writes=lambda _out: (
-                watch["pending"].writes if "pending" in watch else []
-            ),
-            summary=lambda out: (
-                f"{policy['order_number']}.status = `{out['status']}` claimed "
-                f"by `{out['source']}` — the ERP's own answer, at the ERP's "
-                "own authority, which is what keeps the next delta a no-op"
-                if out["landed"] else "nothing read back, nothing landed"
-            ),
-        )
-
-    asked = ctx.step(
-        "k1", "tell-the-order-desk", "sync",
-        fn=lambda: tell_the_desk(
-            service.tasks, policy, pre, released,
-            queue=queue, run_id=ctx.record.id, task_id=task_id,
-        ),
-        summary=lambda out: (
-            f"{out['desk_tasks']} Task raised to {out['queue']}"
-            if out["desk_tasks"] else "nothing a person needs to look at"
-        ),
-    )
-
-    outcome = released.get("outcome") or pre["outcome"]
-    settled = bool(released.get("resolved"))
-    ctx.event(
-        "e1", RELEASED_EVENT if settled else WITHHELD_EVENT,
-        (
-            f"{policy['order_number']} is "
-            f"`{released.get('verified') or pre.get('observed')}` in the ERP"
-            + (
-                " — Cumulus moved it" if released.get("patched")
-                else " — it was already there"
-            )
-            if settled else
-            f"{policy['order_number']} was not released: {outcome} — "
-            f"{released.get('reason') or pre['reason']}"
-        ),
-    )
-
-    return {
-        "kind": "order-release",
-        "outcome": outcome,
-        "reason": released.get("reason") or pre["reason"],
-        "order": policy["order_number"],
-        "record_id": policy["record_id"],
-        "finding": policy["finding_ref"],
-        "observed": pre.get("observed", ""),
-        "value": released.get("value", ""),
-        "verified": released.get("verified", ""),
-        "patched": bool(released.get("patched")),
-        "write_state": released.get("state", ""),
-        "write_id": released.get("write_id", ""),
-        "resolved": settled,
-        "resolved_how": released.get("resolved_how", ""),
-        "landed_status": landed.get("status", ""),
-        **asked,
-    }
 
 
 # ---------------------------------------------------------------------------

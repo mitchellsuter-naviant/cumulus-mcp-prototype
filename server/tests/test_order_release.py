@@ -48,7 +48,7 @@ from app.estate_writes import (
 from app.eval_specs import VOSS_DEAL, VOSS_ORDER, VOSS_RECORD, _state_world
 from app.gateway import ACTIONS, Refused
 from app.graph import object_id
-from app.order_release import (
+from app.tasks.order_release.domain import (
     ALREADY_APPLIED,
     ESCALATE,
     ORDER_RELEASE_EVENT,
@@ -57,8 +57,8 @@ from app.order_release import (
     PROCEED,
     RESOLVED_EXTERNALLY,
 )
-from app.sync import SyncRequest, SyncService
-from app.tasks import TaskKind
+from app.connectors.sync import SyncRequest, SyncService
+from app.task_queue import TaskKind
 from tests import estate_fixtures as fx
 from tests import world as test_world
 
@@ -531,7 +531,7 @@ def test_a_transition_the_table_does_not_name_is_refused_before_any_request(
     """The fifth outcome, and the only one that is about Cumulus rather than
     about the customer's data. Nothing is read, nothing is sent, and the desk
     is told that this system refused its own write."""
-    import app.order_release as order_release
+    import app.tasks.order_release.domain as order_release
 
     estate = _estate()
     _wire(found, estate)

@@ -18,12 +18,19 @@ import logging
 import math
 import re
 import struct
-import threading
 from typing import Protocol
 
+from . import modelcall
+from .modelcall import GovernedModelClient
 from .models import Asset
 
 log = logging.getLogger("cumulus.embeddings")
+
+#: What an embedding call is *for*, on its ledger row. Indexing and querying
+#: are separated because they scale on different axes and are billed by the
+#: same rate: one is a backfill somebody triggered, the other is per question.
+DOCUMENT_PURPOSE = "embed-documents"
+QUERY_PURPOSE = "embed-query"
 
 
 class Embedder(Protocol):
@@ -180,12 +187,19 @@ def _max_texts_per_request(model: str, configured: int) -> int:
 
 
 class VertexEmbedder:
-    """Vertex AI text embeddings via the google-genai client.
+    """Vertex AI text embeddings, through the governed model client.
 
     Authenticates with Application Default Credentials, which on Cloud Run is
     the service account already attached to the revision — no new secret to
     manage. That account needs `roles/aiplatform.user` (or a custom role with
     `aiplatform.endpoints.predict`), and `aiplatform.googleapis.com` enabled.
+
+    **This is the call site that was not metered at all.** Three readers took
+    their token counts off `usage_metadata` and filed them on a step; this one
+    took none, filed none, and so a corpus backfill of several thousand
+    documents cost a real number of dollars that appeared nowhere. It appears
+    now, on its own ledger rows — with no run and no step, because an embedding
+    is corpus work rather than a Flow's ModelCall (see `GovernedModelClient.embed`).
 
     Three details here are load-bearing and easy to get wrong:
 
@@ -202,36 +216,19 @@ class VertexEmbedder:
 
     def __init__(
         self,
-        project: str | None,
-        location: str,
         model: str,
+        client: GovernedModelClient,
         dimensions: int,
         max_batch: int,
         max_input_chars: int,
         max_batch_tokens: int = 20_000,
-        retry_attempts: int = 5,
     ) -> None:
-        # Deferred: only needed when this backend is selected.
-        from google import genai
-        from google.genai.types import HttpOptions, HttpRetryOptions
-
-        # The client does not retry by default — one attempt, zero retries —
-        # which is the wrong posture for a bulk backfill against a quota that
-        # answers 429.
-        self._client = genai.Client(
-            vertexai=True,
-            project=project,
-            location=location,
-            http_options=HttpOptions(
-                retry_options=HttpRetryOptions(attempts=retry_attempts)
-            ),
-        )
+        self._client = client
         self.model = model
         self.dimensions = dimensions
         self.max_batch = _max_texts_per_request(model, max_batch)
         self.max_input_chars = max_input_chars
         self.max_batch_tokens = max_batch_tokens
-        self._lock = threading.Lock()
 
     @staticmethod
     def _estimated_tokens(text: str) -> int:
@@ -264,12 +261,16 @@ class VertexEmbedder:
         config = EmbedContentConfig(task_type=task_type)
         if self.dimensions:
             config.output_dimensionality = self.dimensions
-        # The client is not documented as thread-safe, and the backfill thread
-        # can overlap with a query on the request path.
-        with self._lock:
-            response = self._client.models.embed_content(
-                model=self.model, contents=texts, config=config
-            )
+        # The serializing lock the backfill thread needs now lives on the
+        # client, because the client is now shared and the overlap it guards
+        # against is wider than this class.
+        response, _usage = self._client.embed(
+            model=self.model, contents=texts, config=config,
+            purpose=(
+                DOCUMENT_PURPOSE if task_type == "RETRIEVAL_DOCUMENT"
+                else QUERY_PURPOSE
+            ),
+        )
         vectors = [l2_normalize(list(e.values)) for e in response.embeddings]
         if len(vectors) != len(texts):
             # The caller zips these against asset ids, so a short response does
@@ -303,17 +304,29 @@ def build_embedder(
     max_batch: int,
     max_input_chars: int,
     max_batch_tokens: int = 20_000,
+    *,
+    client: GovernedModelClient | None = None,
+    retry_attempts: int = 5,
 ) -> Embedder | None:
-    """None means "no semantic retrieval" — search stays lexical-only."""
+    """None means "no semantic retrieval" — search stays lexical-only.
+
+    `client` is the deployment's governed client. Without one this builds its
+    own — retrying, and serializing its calls, which are the two things this
+    encoder needs and the generation call sites must not have: a bulk backfill
+    against a quota that answers 429 needs the retries, and the backfill thread
+    overlapping a query on the request path needs the lock.
+    """
     if backend == "none":
         return None
     if backend == "hash":
         return HashingEmbedder(dimensions=dimensions or 256)
     if backend == "vertex":
         return VertexEmbedder(
-            project=project,
-            location=location,
-            model=model,
+            model,
+            client or modelcall.vertex_client(
+                project, location,
+                retry_attempts=retry_attempts, serialize=True,
+            ),
             dimensions=dimensions,
             max_batch=max_batch,
             max_input_chars=max_input_chars,

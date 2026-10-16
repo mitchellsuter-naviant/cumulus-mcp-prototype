@@ -191,7 +191,7 @@ def test_an_offset_stamped_event_lands_in_the_window(world):
     that the mock feed had hidden for the life of the screen, because it only
     ever produced naive stamps.
     """
-    from app.sync import SyncRequest
+    from app.connectors.sync import SyncRequest
 
     monday = date.today() - timedelta(days=date.today().weekday())
     world.sync.deliver(SyncRequest.model_validate({

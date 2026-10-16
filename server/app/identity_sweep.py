@@ -66,9 +66,10 @@ from pydantic import BaseModel, Field
 from .graph import GraphService, GraphWriter, ObjectRecord, link_id
 from .mappings import steward_queue_for_type
 from .models import utcnow
+from .ontology import names as onto
 from .resolution import SweepThresholds, name_similarity, read_sweep_thresholds
 from .runs import RunContext
-from .tasks import Task, TaskEvidence, TaskProposal, TaskService
+from .task_queue import Task, TaskEvidence, TaskProposal, TaskService
 
 log = logging.getLogger("cumulus.identity_sweep")
 
@@ -96,10 +97,11 @@ class PairScan:
 
 
 SCANS: tuple[PairScan, ...] = (
-    PairScan("company_same_as", "Company", "Company", "organization", True),
-    PairScan("vendor_same_as", "Vendor", "Vendor", "organization", True),
-    PairScan("company_same_as_vendor", "Company", "Vendor", "organization", False),
-    PairScan("person_same_as", "Person", "Person", "person", True),
+    PairScan("company_same_as", onto.COMPANY, onto.COMPANY, "organization", True),
+    PairScan("vendor_same_as", onto.VENDOR, onto.VENDOR, "organization", True),
+    PairScan("company_same_as_vendor", onto.COMPANY, onto.VENDOR,
+             "organization", False),
+    PairScan("person_same_as", onto.PERSON, onto.PERSON, "person", True),
 )
 
 SCAN_BY_LINK: dict[str, PairScan] = {s.link_type: s for s in SCANS}
@@ -317,7 +319,7 @@ def build_party(graph: GraphService, record: ObjectRecord, kind: PairKind) -> Pa
             break
         if not employer:
             employer = next((f"domain:{d}" for d in sorted(domains) if d), "")
-    elif record.type == "Company":
+    elif record.type == onto.COMPANY:
         # A company's own row often carries no address at all — a CRM account
         # minted off a badge list has neither website nor phone. The people
         # filed under it do, and their addresses are the company's domain by
@@ -767,14 +769,6 @@ def raise_merge_tasks(
 # ---------------------------------------------------------------------------
 
 
-def register(service) -> None:
-    """Bind the body to the engine `SyncService` was handed."""
-    if service.engine is None:
-        return
-    service.engine.register(
-        IDENTITY_SWEEP_FLOW_ID,
-        lambda ctx, inputs: sweep_body(service, ctx, inputs),
-    )
 
 
 def sweep_body(service, ctx: RunContext, inputs: dict) -> dict:

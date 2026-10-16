@@ -27,9 +27,26 @@ SEED = REPO / "server" / "seed"
 
 # The fields an AssetCreate accepts; `revision` and the timestamps are the
 # server's to assign.
+#
+# `kind` and `origin` are here because leaving them out did not mean "keep the
+# default" — it meant every pushed asset arrived as `kind: document`, whatever
+# the seed file said. A prompt landed as a document, and a document with no
+# authority level is precisely what `retrieval-authority` says is not a
+# document, so a deployed corpus ranked its own prompts as if they were policy.
+# The seeded corpus never had the bug (`seed_if_empty` passes the parsed asset
+# whole), which is why it survived: the two paths disagreed and only the
+# deployed one was wrong.
+#
+# One half of it is still open, and cannot be closed here: `AssetUpdate` has no
+# `kind` or `origin`, so the PUT below (the 409 path, which is what a re-push
+# of an existing asset takes) silently ignores both. A corpus that already
+# holds an asset under the wrong kind keeps it until that asset is deleted and
+# re-created, or until `AssetUpdate` grows the fields. Recorded rather than
+# fixed, because widening an update model is a change to the write plane and
+# does not belong in a deploy script.
 FIELDS = [
     "id", "path", "title", "content", "content_type", "authority_level",
-    "scope", "owner", "tags", "status",
+    "kind", "origin", "owner", "tags", "parent", "related", "status",
 ]
 
 

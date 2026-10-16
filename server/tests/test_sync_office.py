@@ -17,8 +17,8 @@ fixture would have removed exactly the drift B5 exists to resolve.
 import pytest
 
 from app.graph import object_id
-from app.sync import MAIL_FLOW_ID, CALENDAR_FLOW_ID, MailMessageRecord, SyncRequest
-from app.sync_office import PREVIEW_CHARS
+from app.connectors.sync import MAIL_FLOW_ID, CALENDAR_FLOW_ID, MailMessageRecord, SyncRequest
+from app.connectors.office import PREVIEW_CHARS
 from tests import estate_fixtures as fx
 from tests import world as test_world
 

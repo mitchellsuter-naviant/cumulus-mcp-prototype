@@ -150,7 +150,8 @@ def test_deleting_a_person_identity_removes_the_account(client, owner):
         headers=owner,
     ).json()
     assert client.delete(f"/api/v1/identities/{person['uid']}", headers=owner).status_code == 204
-    assert person["uid"] not in {u["uid"] for u in client.get("/api/v1/users", headers=owner).json()}
+    remaining = client.get("/api/v1/identities", headers=owner).json()
+    assert person["uid"] not in {i["uid"] for i in remaining}
 
 
 def test_unknown_identity_is_404(client, owner):

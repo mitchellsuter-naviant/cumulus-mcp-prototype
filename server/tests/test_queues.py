@@ -24,7 +24,7 @@ from app.queues import (
     bootstrap_from_roster,
     personal_slug,
 )
-from app.tasks import (
+from app.task_queue import (
     InMemoryTaskDirectory,
     Task,
     TaskAlreadyDecidedError,

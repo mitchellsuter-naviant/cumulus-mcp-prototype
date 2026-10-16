@@ -98,6 +98,14 @@ def principal_for(persona: personas.Persona, *, by: str | None = None) -> Princi
     Impersonation rewrites the principal rather than travelling beside it, so
     everything downstream — the Employee Hub resolving "me", a queue filtering
     to yours, a claim recording its author — scopes correctly with no plumbing.
+
+    Its desks are the roster's *and* the registry's, for the same reason a
+    Firebase credential's are (`queues_for`): the roster is Naviant's fixture
+    and the registry is the customer's, and holding a desk under either is
+    holding it. Read fresh on every call rather than frozen at import, because
+    a personal desk is minted the first time something routes to it — a persona
+    who submits an expense at 09:00 has a desk at 09:01, and a principal built
+    from the roster alone would be refused their own review.
     """
     return Principal(
         uid=persona.uid,
@@ -105,7 +113,7 @@ def principal_for(persona: personas.Persona, *, by: str | None = None) -> Princi
         role=persona.authority,
         persona_id=persona.id,
         scope=persona.scope,
-        queues=persona.queues,
+        queues=_union(persona.queues, _registry_queues(persona.email)),
         impersonated_by=by,
     )
 
@@ -127,10 +135,8 @@ def flow_principal(flow_id: str, *queues: str) -> Principal:
     )
 
 
-# Local development signs in as the engineer, because the console's first job
-# is to be developed against. A machine credential is scoped to the platform
-# but belongs to no persona — it is not a person and must not appear as one.
-_DEV_PRINCIPAL = principal_for(personas.ENGINEER)
+# A machine credential is scoped to the platform but belongs to no persona —
+# it is not a person and must not appear as one.
 _MACHINE_PRINCIPAL = Principal(
     uid="api-key", email="api-key@machine", role="owner",
     persona_id="", scope="platform", queues=(),
@@ -172,15 +178,35 @@ def queues_for(email: str, role: str) -> tuple[str, ...]:
     matters in a real deployment. Neither is authoritative over the other;
     holding a desk under either is holding it.
     """
+    return _union(personas.queues_for_email(email), _registry_queues(email))
+
+
+def _registry_queues(email: str) -> list[str]:
+    """Desks the customer's queue registry says this email holds.
+
+    Guarded, because a registry outage must not lock everyone out: what it
+    costs is the desks only the console knows about, where raising would cost
+    sign-in itself. Which is also why `personas.queues_for_email` is the other
+    half of every union above — the roster answers from code and cannot be
+    unreadable, so a persona still resolves against an empty deployment.
+    """
+    if not email:
+        return []
     from .deps import get_queue_service  # deferred: queues imports auth
 
-    held = list(personas.queues_for_email(email))
     try:
-        for slug in get_queue_service().queues_for(email):
-            if slug not in held:
-                held.append(slug)
+        return list(get_queue_service().queues_for(email))
     except Exception:  # noqa: BLE001 — a registry outage must not lock everyone out
         log.exception("Queue registry unreadable; falling back to the roster")
+        return []
+
+
+def _union(declared: tuple[str, ...], granted: list[str]) -> tuple[str, ...]:
+    """Both sources, declared first, each desk once and in a stable order."""
+    held = list(declared)
+    for slug in granted:
+        if slug not in held:
+            held.append(slug)
     return tuple(held)
 
 
@@ -319,7 +345,13 @@ def _resolve_credential(
         # mode would silently upgrade a revoked credential to owner.
         raise HTTPException(status_code=401, detail="Invalid or revoked API key")
     if settings.auth_backend == "none":
-        return _DEV_PRINCIPAL
+        # Local development signs in as the engineer, because the console's
+        # first job is to be developed against. Built per request rather than
+        # once at import: the desks come partly from the queue registry, which
+        # `principal_for` reads through `deps` — a module that imports this one
+        # — and a principal frozen at import would also miss every desk minted
+        # since the process started.
+        return principal_for(personas.ENGINEER)
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     return _verify_firebase_token(authorization.split(" ", 1)[1])
