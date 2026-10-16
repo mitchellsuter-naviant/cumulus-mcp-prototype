@@ -268,6 +268,7 @@ class RunRecord(BaseModel):
 
 class RunStore(Protocol):
     def list(self) -> list[RunRecord]: ...
+    def list_fresh(self) -> list[RunRecord]: ...
     def get(self, run_id: str) -> RunRecord | None: ...
     def put(self, record: RunRecord) -> RunRecord: ...
 
@@ -280,6 +281,12 @@ class InMemoryRunStore:
     def list(self) -> list[RunRecord]:
         with self._lock:
             return list(self._items.values())
+
+    # Nothing stands between this store and the records, so the cached read
+    # and the fresh one are the same read. The method exists so every store
+    # answers the same question and callers never have to ask which kind of
+    # store they are holding.
+    list_fresh = list
 
     def get(self, run_id: str) -> RunRecord | None:
         with self._lock:
@@ -346,6 +353,10 @@ class FirestoreRunStore:
                 log.exception("Skipping unparseable run", extra={"docId": doc.id})
         return out
 
+    # Every read of this store is a fresh one; see `SnapshotRunStore` for the
+    # wrapper that makes the distinction mean something.
+    list_fresh = list
+
     def get(self, run_id: str) -> RunRecord | None:
         snap = self._col.document(run_id).get()
         if not snap.exists:
@@ -361,6 +372,101 @@ class FirestoreRunStore:
             _encode_nested_arrays(record.model_dump(mode="json"))
         )
         return record
+
+
+class SnapshotRunStore:
+    """A run store that answers "every run" from one recent scan.
+
+    Reading the fleet means reading every journal. A single console page load
+    asked for that between four and nine times: the Flows list fetches the run
+    store twice (once to enumerate the fleet, once to roll it up) and fires
+    alongside the fleet-stats request, which does the same two; a flow's detail
+    page adds a rollup, a usage series, an inventory and a recommendations
+    pass, each with its own full scan. Against 1,200 stored runs that was
+    roughly thirteen seconds for the list and eleven for the stats, measured
+    one at a time against a warm instance — and the estate pull adds runs every
+    fifteen minutes, so the cost only went up. Fired together on one instance
+    they queued, and the console gives an ordinary request twenty seconds
+    (`api_client.dart`), so the Flows pages did not merely load slowly: they
+    timed out on the client and reported failure. Firebase Hosting's rewrite
+    proxy caps a request at ~60s besides, whatever Cloud Run's own timeout is
+    set to, so there was no raising the client's way out of it either.
+
+    So the whole-store read gets a short time-to-live and the scans that arrive
+    together share one. Two properties matter more than the caching itself:
+
+    - **Single flight.** The page fires its requests in parallel, so a naive
+      TTL would have every one of them miss the cold cache and start its own
+      scan — the stampede is the exact case worth fixing. A second caller that
+      arrives mid-scan waits for the one in progress and is served its result.
+    - **A write invalidates.** Anything this process stores is visible to the
+      next read immediately, so a run started, stepped or resumed here never
+      reads back stale to the console that drove it.
+
+    What the TTL does buy staleness on is another instance's writes, and that
+    is why `list_fresh` exists beside `list`. The rollups are a read model and
+    a rollup that is a few seconds behind is still an honest rollup. Finding
+    the run behind a Task a person just answered is not a read model — miss it
+    and the resume silently does nothing — so `RunEngine` reads those fresh.
+
+    One contract this asks of its callers: the records `list` returns are
+    shared, so read them and do not mutate them. Sharing is the point — nine
+    scans used to mean nine parsed copies of every journal resident at once on
+    a 512MiB instance, and one shared set is the smaller of the two. Everything
+    that drives a run forward already loads its record through `get`, which is
+    uncached and hands back a copy of its own.
+    """
+
+    def __init__(self, inner: RunStore, ttl_seconds: float) -> None:
+        self._inner = inner
+        self._ttl = ttl_seconds
+        # Guards the cache fields only; never held across a scan, or the
+        # single-flight wait below would be a queue of full scans.
+        self._lock = threading.Lock()
+        self._scan = threading.Lock()
+        self._cached: list[RunRecord] | None = None
+        self._fetched_at = 0.0
+
+    def _fresh_enough(self) -> list[RunRecord] | None:
+        with self._lock:
+            if self._cached is None:
+                return None
+            if time.monotonic() - self._fetched_at > self._ttl:
+                return None
+            return list(self._cached)
+
+    def list(self) -> list[RunRecord]:
+        hit = self._fresh_enough()
+        if hit is not None:
+            return hit
+        # One scan at a time. Whoever gets here first does it; the rest block
+        # and then find the answer already waiting on the second check.
+        with self._scan:
+            hit = self._fresh_enough()
+            if hit is not None:
+                return hit
+            records = self._inner.list()
+            with self._lock:
+                self._cached = records
+                self._fetched_at = time.monotonic()
+            return list(records)
+
+    def list_fresh(self) -> list[RunRecord]:
+        # Deliberately does not prime the snapshot. The records a fresh read
+        # hands back belong to the caller, and the callers that need one are
+        # the settle paths; keeping them out of the shared snapshot means the
+        # read-only contract above has no exception to carve out. A fresh scan
+        # is not on any page load, so there is nothing here worth warming.
+        return self._inner.list()
+
+    def get(self, run_id: str) -> RunRecord | None:
+        return self._inner.get(run_id)
+
+    def put(self, record: RunRecord) -> RunRecord:
+        stored = self._inner.put(record)
+        with self._lock:
+            self._cached = None
+        return stored
 
 
 # ---------------------------------------------------------------------------
@@ -744,13 +850,19 @@ class RunEngine:
         """
         return sorted(self._bodies)
 
+    # Both lookups below read past the snapshot `list` serves. They answer
+    # "which run is this thing waiting on", and the caller acts on the answer:
+    # a miss is not a slightly stale number, it is a resume that silently does
+    # not happen. A run suspended by another instance moments ago has to be
+    # findable here.
+
     def find_by_case(self, case_ref: str) -> RunRecord | None:
-        matches = [r for r in self.store.list() if r.case_ref == case_ref]
+        matches = [r for r in self.store.list_fresh() if r.case_ref == case_ref]
         matches.sort(key=lambda r: r.started_at_iso, reverse=True)
         return matches[0] if matches else None
 
     def find_by_task(self, task_id: str) -> RunRecord | None:
-        for run in self.store.list():
+        for run in self.store.list_fresh():
             if run.open_task_id == task_id:
                 return run
             if any(s.task_id == task_id for s in run.steps):
@@ -939,11 +1051,20 @@ class RunEngine:
 
 
 def build_run_engine(
-    backend: str, project: str | None, collection: str, tasks: TaskService
+    backend: str,
+    project: str | None,
+    collection: str,
+    tasks: TaskService,
+    snapshot_ttl_seconds: float = 0.0,
 ) -> RunEngine:
     store: RunStore
     if backend == "firestore":
+        # Only the remote store is worth snapshotting: an in-memory list is
+        # already a dictionary read, and wrapping it would buy nothing but a
+        # staleness window for the tests that run against it.
         store = FirestoreRunStore(project, collection)
+        if snapshot_ttl_seconds > 0:
+            store = SnapshotRunStore(store, snapshot_ttl_seconds)
     else:
         store = InMemoryRunStore()
     return RunEngine(store, tasks)

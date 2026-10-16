@@ -146,7 +146,7 @@ def known_flow_ids(engine: RunEngine) -> list[str]:
     "which flows are there", and a second enumeration beside it would be a
     list of the flows somebody remembered to add.
     """
-    return sorted(set(engine.registered()) | {r.flow_id for r in engine.store.list()})
+    return sorted(set(engine.registered()) | {r.flow_id for r in engine.list()})
 
 
 def project_flows(engine: RunEngine) -> list[FlowProjection]:

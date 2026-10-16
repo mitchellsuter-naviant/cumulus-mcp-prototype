@@ -68,6 +68,13 @@ class Settings:
         )
         # Durable Flow runs: the journal a suspended run resumes from.
         self.runs_collection: str = os.environ.get("RUNS_COLLECTION", "flow_runs")
+        # How long a whole-fleet read of the run store stays good for. Every
+        # fleet rollup reads every journal, and a console page asks for that
+        # several times over in parallel; see `runs.SnapshotRunStore`. Zero
+        # turns the snapshot off and every read scans again.
+        self.run_snapshot_ttl_seconds: float = float(
+            os.environ.get("RUN_SNAPSHOT_TTL_SECONDS", "30")
+        )
         # The curation ledger: append-only, one document per Action the
         # Gateway let through or refused. Separate from the runs collection on
         # purpose — a run is deleted when a flow is retired, and the record of

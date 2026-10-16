@@ -3215,7 +3215,7 @@ def _governance_state(
     # One rollup over every run in the deployment, through the same aggregation
     # a single flow's usage chart is drawn from. A second summation here would
     # be a second definition of what a priced ModelCall is.
-    series = flows.usage_series(engine.store.list(), days)
+    series = flows.usage_series(engine.list(), days)
     model_calls = sum(d.model_calls for d in series)
     priced = sum(d.priced_model_calls for d in series)
     return GovernanceState(

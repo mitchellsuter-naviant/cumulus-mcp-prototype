@@ -5,9 +5,20 @@ re-executes, every flow double-writes; if a gate cannot be re-entered, no flow
 can ask a human twice.
 """
 
+import threading
+import time
+
 import pytest
 
-from app.runs import InMemoryRunStore, ModelUsage, RunEngine, StepFailed
+from app.runs import (
+    InMemoryRunStore,
+    ModelUsage,
+    RunEngine,
+    RunRecord,
+    SnapshotRunStore,
+    StepFailed,
+    build_run_engine,
+)
 from app.task_queue import InMemoryTaskDirectory, Task, TaskService
 
 
@@ -255,3 +266,119 @@ def test_nested_arrays_survive_the_firestore_encoding():
     assert no_nested(encoded)
     assert _decode_nested_arrays(encoded) == payload
     assert encoded["untouched"] == {"a": [1, 2], "b": "x"}
+
+
+# ---------------------------------------------------------------------------
+# The fleet snapshot
+# ---------------------------------------------------------------------------
+#
+# Reading the fleet means reading every journal, and one console page load asks
+# for that between four and nine times in parallel. These pin the three
+# properties that turn those into one scan without the rollups going stale on
+# this process's own writes, or the settle path going stale on anybody's.
+
+
+class _CountingRunStore(InMemoryRunStore):
+    """An in-memory store that says how often it was actually read."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scans = 0
+        self.delay = 0.0
+
+    def list(self) -> list[RunRecord]:
+        self.scans += 1
+        if self.delay:
+            time.sleep(self.delay)
+        return super().list()
+
+    list_fresh = list
+
+
+def _record(run_id: str) -> RunRecord:
+    return RunRecord(id=run_id, flow_id="f", inputs={})
+
+
+def test_scans_that_arrive_together_share_one_read_of_the_store():
+    # The detail page fires its five requests at once. A plain TTL would have
+    # every one of them miss the cold snapshot and start its own scan, which
+    # is the stampede worth fixing rather than a corner of it.
+    inner = _CountingRunStore()
+    inner.delay = 0.2
+    inner.put(_record("run_1"))
+    store = SnapshotRunStore(inner, ttl_seconds=30.0)
+
+    seen: list[list[RunRecord]] = []
+    threads = [
+        threading.Thread(target=lambda: seen.append(store.list())) for _ in range(5)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert inner.scans == 1
+    assert [[r.id for r in s] for s in seen] == [["run_1"]] * 5
+
+
+def test_a_read_inside_the_window_does_not_scan_again():
+    inner = _CountingRunStore()
+    inner.put(_record("run_1"))
+    store = SnapshotRunStore(inner, ttl_seconds=30.0)
+
+    store.list()
+    store.list()
+    assert inner.scans == 1
+
+
+def test_a_write_here_is_visible_to_the_next_read_here():
+    # The TTL buys staleness on *another* instance's writes. A run this process
+    # started, stepped or resumed must never read back stale to the console
+    # that drove it.
+    inner = _CountingRunStore()
+    inner.put(_record("run_1"))
+    store = SnapshotRunStore(inner, ttl_seconds=30.0)
+    assert [r.id for r in store.list()] == ["run_1"]
+
+    store.put(_record("run_2"))
+    assert sorted(r.id for r in store.list()) == ["run_1", "run_2"]
+
+
+def test_the_settle_path_reads_past_the_snapshot():
+    # `find_by_task` answers "which run is this Task holding up", and the
+    # caller resumes on the answer: a miss is not a slightly stale number, it
+    # is a resume that silently does not happen. So a run another instance
+    # suspended a moment ago has to be findable while the snapshot is still
+    # warm.
+    inner = _CountingRunStore()
+    store = SnapshotRunStore(inner, ttl_seconds=30.0)
+    engine = RunEngine(store, TaskService(InMemoryTaskDirectory()))
+    store.list()  # warm the snapshot on an empty store
+
+    elsewhere = _record("run_1")
+    elsewhere.open_task_id = "task_1"
+    inner.put(elsewhere)  # straight past the wrapper, as another instance would
+
+    assert store.list() == []  # the read model is entitled to be behind
+    found = engine.find_by_task("task_1")
+    assert found is not None and found.id == "run_1"
+
+
+def test_the_snapshot_expires():
+    inner = _CountingRunStore()
+    inner.put(_record("run_1"))
+    store = SnapshotRunStore(inner, ttl_seconds=0.05)
+
+    store.list()
+    time.sleep(0.1)
+    store.list()
+    assert inner.scans == 2
+
+
+def test_a_ttl_of_zero_leaves_the_store_unwrapped():
+    # The escape hatch has to be real: RUN_SNAPSHOT_TTL_SECONDS=0 means every
+    # read scans, which is what this was before the snapshot existed.
+    engine = build_run_engine(
+        "firestore-not-used", None, "runs", TaskService(InMemoryTaskDirectory()), 0.0
+    )
+    assert not isinstance(engine.store, SnapshotRunStore)

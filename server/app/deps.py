@@ -435,6 +435,7 @@ def get_run_engine() -> RunEngine:
             settings.firestore_project,
             settings.runs_collection,
             tasks,
+            settings.run_snapshot_ttl_seconds,
         )
         # The stored definition owns which shipped version is live; the engine
         # asks at start time. A structural attribute (like `emit`), because the

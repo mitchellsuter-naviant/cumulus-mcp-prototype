@@ -1433,8 +1433,13 @@ class FieldDocumentsService:
         """
         if self.engine is None:
             return {}
+        # Fresh rather than the snapshot `list` serves: this counts
+        # *consecutive* empty windows to decide whether to put work in front of
+        # a person, and a window another instance just finished has to be in
+        # the count. It runs four times an hour, not once per page load, so the
+        # scan it costs is not the one worth saving.
         runs = [
-            run for run in self.engine.store.list()
+            run for run in self.engine.store.list_fresh()
             if run.flow_id == FLOW_ID and run.status == "succeeded"
             and run.id != exclude_run_id
         ]
