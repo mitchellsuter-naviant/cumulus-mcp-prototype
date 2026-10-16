@@ -1,3 +1,5 @@
+> **Archived 2026-10-16.** Lanes P, S, A, E and F done and verified (its own §9 log), 2026-09-03. The prototype itself is superseded by cumulus-vision.
+
 # WORKPLAN-CORE — Two flows that actually work
 
 **Status: EXECUTING 2026-09-03.** Author: orchestrator session. Inputs: three

@@ -1,3 +1,5 @@
+> **Archived 2026-10-16.** WP-A through H and J done 2026-09-02 (its own §8 log); the AP flow was then recut by WORKPLAN-CORE. The prototype itself is superseded by cumulus-vision.
+
 # WORKPLAN-REAL — Make the system work
 
 **Status: RATIFIED 2026-09-02 — D1–D6 accepted with no overrides. Wave 1 launched.**

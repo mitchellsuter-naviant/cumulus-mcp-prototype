@@ -1,3 +1,5 @@
+> **Archived 2026-10-16.** Built and deployed 2026-09-08 as cumulus-knowledge rev 00134 (its own §8c); the 'Nothing is built' line below predates that. The prototype itself is superseded by cumulus-vision.
+
 # WORKPLAN-WICK — a second customer namespace, and three RPA designs become Flows
 
 **Status: PLAN FOR REVIEW, 2026-09-07. Nothing is built.** Author: orchestrator

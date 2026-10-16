@@ -1,3 +1,5 @@
+> **Archived 2026-10-16.** B1-B5 landed; the read plane was complete by 2026-08-31. The prototype itself is superseded by cumulus-vision.
+
 # Track B — the read plane: accepted implementation plan
 
 Architect's plan, accepted 2026-08-30 with all three risk recommendations

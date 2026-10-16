@@ -1,3 +1,5 @@
+> **Archived 2026-10-16.** S2 complete 2026-08-31. The prototype itself is superseded by cumulus-vision.
+
 # Stage 2 — the write plane: accepted implementation plan
 
 Architect's plan, accepted 2026-08-31. Builders implement their stage

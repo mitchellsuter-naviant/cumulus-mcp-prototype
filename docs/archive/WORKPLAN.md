@@ -1,3 +1,5 @@
+> **Archived 2026-10-16.** Waves 0-4 and the demo script ran 2026-08-31; superseded by WORKPLAN-REAL, WORKPLAN-CORE and then by cumulus-vision. The prototype itself is superseded by cumulus-vision.
+
 # Workplan — Cumulus against the live estate
 
 Supersedes the rebuild workplan (folded in below as "Carried debt"; the old
