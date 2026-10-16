@@ -547,7 +547,12 @@ class _CommandSearchState extends State<_CommandSearch> {
           ValueListenableBuilder<TextEditingValue>(
             valueListenable: _palette.input,
             builder: (context, value, _) => value.text.isEmpty
-                ? const _KeyHint('⌘K')
+                ? _KeyHint(
+                    defaultTargetPlatform == TargetPlatform.windows ||
+                            defaultTargetPlatform == TargetPlatform.linux
+                        ? 'Ctrl+K'
+                        : '⌘K',
+                  )
                 : IconButton(
                     icon: const Icon(Icons.close, size: 16),
                     tooltip: 'Clear',
