@@ -19,11 +19,15 @@ Repo layout:
 | Path | What it is |
 | --- | --- |
 | [server/](server/) | FastAPI app — REST + MCP + A2A, BM25 search, Firestore/in-memory storage |
+| [server/app/tasks/](server/app/tasks/) | FDE-authored flow packages — **every** flow in the fleet, one directory per flow, one `v<N>/` per **shipped version**. The two business processes carry their whole body here (`accounts_payable/v6/` + `v7/`, `expense_reimbursement/v9/`); the eleven data-sync feeds, the two sweeps, `order_release/` and `answer_question/` ship a `v1/` holding the declarative steps and the binding to a body that lives beside its machinery. The versions the console offers are exactly the `v<N>/` packages in the deployed code; which one is live is a stored decision the console flips (`POST /api/v1/flows/{id}/versions/{n}/activate`) |
+| [server/app/connectors/](server/app/connectors/) | The sync machinery the feed flows are made of: `sync.py` (landing, echo suppression, the SyncService) and the `commerce`/`office`/`dms`/`psa` per-system sidecars. Machinery only — each feed's *flow* registers and versions from its package under `app/tasks/` |
+| [server/app/ontology/](server/app/ontology/) | The customer's canonical model — the TBox, its precedence policy, and its governed rendering |
 | [server/seed/](server/seed/) | Seed documents loaded on first start when the store is empty |
 | [admin_app/](admin_app/) | Flutter **web** admin UI (`admin_app/`, *not* `app/`) |
+| [admin_app/lib/tasks/](admin_app/lib/tasks/) | The UI mirror of `server/app/tasks/`: per-process, per-version task review screens (`accounts_payable/v6/extraction_review.dart`, `…/verify_three_way_match.dart`, `expense_reimbursement/v9/expense_review.dart`), each flow's workspace and case models, kind-keyed shared screens, and the one registry (`registry.dart`) that picks the screen for a task from `(flow_id, flow_version, kind)` |
 | [deploy/](deploy/) | `deploy.sh` (one-command deploy) and `bootstrap_owner.sh` (first owner account) |
 | [.devcontainer/](.devcontainer/) | Dev container with Flutter, Python, gcloud, and Firebase CLIs — see its [README](.devcontainer/README.md) |
-| [cumulus.code-workspace](cumulus.code-workspace) | Multi-root workspace: this repo plus `cumulus-demo-ecosystem/` (the simulation engine), which the dev container bind-mounts from the sibling directory on the host — see [Two repos, one window](.devcontainer/README.md#two-repos-one-window) |
+| [cumulus.code-workspace](cumulus.code-workspace) | Multi-root workspace: this repo plus `cumulus-demo-ecosystem/` (the simulation engine) and `cumulus-vision/` (Cumulus proper, rebuilt one step at a time with this prototype as the guide), which the dev container bind-mounts from sibling directories on the host — see [Three trees, one window](.devcontainer/README.md#three-trees-one-window) |
 | [firebase.json](firebase.json) | Firebase Hosting config; serves `admin_app/build/web` |
 
 ## Security posture
@@ -36,7 +40,7 @@ Every endpoint requires a credential except two deliberate exceptions:
 | `GET /.well-known/agent-card.json` | **Open** — A2A discovery metadata. Contains no secrets and advertises the accepted schemes via `securitySchemes`. |
 | REST reads (`/api/v1/assets*`, `/api/v1/search`) | Any authenticated role (`user`+) |
 | REST writes (`POST`/`PUT`/`DELETE /api/v1/assets*`) | `admin`+ |
-| User management (`/api/v1/users*`) | `admin`+; touching an admin/owner account needs `owner` |
+| Creating a person (`POST /api/v1/users`) | `admin`+; minting an admin/owner account needs `owner`. Listing, re-roling and deleting a person are identity acts — see Identities below |
 | Identities (`/api/v1/identities*`) | `admin`+ to read; creating, re-scoping, or deleting anything with admin authority needs `owner`. Minted keys may read but not write — see [Identities](#identities) |
 | API keys (`/api/v1/api-keys*`) | `admin`+; keys held by an admin identity need `owner`. Minted keys are refused outright — see [API keys](#api-keys) |
 | Task decisions (`POST /api/v1/tasks/{id}/decide`) | The queue must be **this persona's own work** (`require_queue`) — see [Personas](#personas-and-the-two-front-doors). Minted keys refused: a key deciding a Task would be an agent approving its own proposal |
@@ -130,7 +134,7 @@ Local dev uses the in-memory backend and auto-seeds from [server/seed](server/se
 - Health: `GET /health` — `/healthz` also works locally, but Google's front end
   intercepts `/healthz` on `*.run.app`, so `/health` is the path to use against Cloud Run.
 - REST: `GET/POST /api/v1/assets`, `GET/PUT/DELETE /api/v1/assets/{id}`, `GET /api/v1/assets/{id}/context`, `GET /api/v1/assets/tree`, `GET /api/v1/search?q=...`, `GET /api/v1/search/status`, `POST /api/v1/search/reindex`
-- Users: `GET/POST /api/v1/users`, `PUT /api/v1/users/{uid}/role`, `DELETE /api/v1/users/{uid}`, `GET /api/v1/users/me`
+- Users: `POST /api/v1/users` (mint an account), `GET /api/v1/users/me` — everything else about a person is an identity act, under `/api/v1/identities`
 - Identities: `GET/POST /api/v1/identities`, `PUT /api/v1/identities/{uid}/role`, `DELETE /api/v1/identities/{uid}`
 - Flows: `GET/POST /api/v1/flows`, `GET /api/v1/flows/stats`, `GET/PATCH/DELETE /api/v1/flows/{id}`, `GET .../usage`, `GET .../versions`, `GET .../versions/{v}/diff`, `GET .../recommendations`, `POST .../recommendations/{id}/apply` — see [Flows](#flows)
 - Runs: `GET /api/v1/runs`, `GET /api/v1/runs/stats`, `GET /api/v1/runs/{id}`, `GET .../steps`, `POST .../resume` — the journals every Flow number is read off
@@ -177,7 +181,7 @@ systems.
 | `DOCUMENTS_COLLECTION` | `documents` | Submitted artifacts and the regions an extraction read |
 | `DOCUMENT_MAX_BYTES` | `700000` | Refuse artifacts larger than the document-store adapter can hold |
 | `VENDOR_PROFILES_COLLECTION` | `vendor_profiles` | Derived per-vendor statistics behind the anomaly screen |
-| `MODEL_BACKEND` | `none` | One switch for every ModelCall: `none` (deterministic local readers, retrieval-only `/ask` — no credential, no network, what the tests run against) or `vertex` |
+| `MODEL_BACKEND` | `none` | One switch for every ModelCall: `none` or `stub` (deterministic local readers, retrieval-only `/ask` — no credential, no network, what the tests run against) or `vertex`. Any other value, and a `vertex` client that will not construct, refuse at startup: a deployment that silently fell back to the stub would fabricate every extraction while reporting healthy |
 | `MODEL` | `gemini-3.5-flash-lite` | The model behind every ModelCall — document readers, HR agent, `/ask` planner |
 | `MODEL_LOCATION` | `global` | The Gemini models are served only from the `global` endpoint; a regional one 404s |
 | `AUTH_BACKEND` | `none` | `none` (dev: sessions open as the Naviant Engineer persona) or `firebase` (verify ID tokens) |
@@ -209,6 +213,106 @@ a missing credential, an encoder that raises mid-query, a document that has not
 been embedded yet — each of those costs ranking quality and nothing else. A
 document absent from the semantic ranking simply contributes nothing to fusion,
 which is what lets a half-embedded corpus serve sensible results while it warms.
+
+### Authority: how much a document's standing is worth
+
+Relevance decides whether a document is an answer. Authority decides which of
+the answers governs. Keeping those apart is the whole design, and conflating
+them is the failure it exists to prevent: sorting results by authority puts the
+least relevant policy above the how-to that answers the question, and a ranking
+readers learn to distrust is worse than no ranking.
+
+So **authority buys places, not score.** After relevance ranks the candidates
+and before the page is cut, each document may climb a bounded number of
+positions:
+
+| Authority level | Lift |
+|---|---|
+| `policy` | 3 |
+| `standard` | 2 |
+| `guideline` | 1 |
+| `how-to`, `note` | 0 |
+| none (a prompt, a config, a schema export) | 0, and never an answer |
+
+Three places settles which of the documents that answered is the one that
+governs. It never lifts a document relevance did not already put near the
+answer — a policy at rank 12 stays at rank 9 — and the rule is stable, so it
+only ever breaks ties in authority's favour and never invents one. Every hit
+reports the `authority_lift` it received, because a reader who sees a policy
+above a closer match deserves to know that is the rule working rather than the
+ranking misbehaving.
+
+The lift works in *rank* space rather than on the scores, because the scores
+are not comparable between the two retrieval paths — BM25 is unbounded, a fused
+RRF score sits in a narrow band whose width depends on how many rankings a
+document appeared in. A place is a place in both, so one rule covers
+lexical-only and hybrid, and "authority is worth up to three places" is a
+sentence you can say to a reader and have them check.
+
+**The table is a document, not a constant.** It lives in
+[`retrieval-authority`](server/seed/retrieval-authority.md) — the precedence
+order, the lift, and the two coverage bands below — for the same reason the PTO
+window and the model price sheet do: the order is a statement about how the
+customer's organization is governed, and they own it. Editing the asset moves
+the ranking, the `sort=authority` browse control, the planner's own system
+instruction, and the sentence the HR Agent prints, together. The `MAX_LIFT` cap
+is *not* governed: a lift of 50 written into the document would silently turn
+retrieval into a sort by authority, which is the thing the number bounds.
+
+### Coverage: is the top of the ranking an answer at all?
+
+Every ranking has a first row, and `score` cannot say whether that row is about
+the question. `coverage` can: it is the share of a question's *information* —
+its meaningful words, each weighted by IDF — that a document contains.
+
+Weighting matters. "How much PTO do I have" is one topic word after
+stopwording, so a memo that merely says "much" would clear any floor built on
+word count while answering nothing. A word no document contains is charged at
+the corpus's highest observed IDF and never counted as covered, which is what
+makes a query of invented words score near zero *everywhere* instead of picking
+a winner.
+
+Two spellings of one thing count once. `401(k)` indexes as `401` and `k`; a
+person types `401k`. The mixed token is split at query time — query-side like
+the stopword list, so it changes what is asked and needs no reindex — and the
+parts stay grouped, so a document holding either has covered that part of the
+question. A three-digit floor keeps `401` and drops `10`, which is common
+enough to make a PTO policy look like half an answer about invoices.
+
+A word no document contains *exactly* falls back to a five-character stem at
+retrieval, so "reimbursed" reaches the guideline that says "reimbursement".
+Deliberately narrow: the fallback fires only where the term was scoring nothing
+for anybody, so it adds matches and never reshuffles ones that already matched.
+
+**Coverage is only the lexical half.** On a hybrid deployment the document
+that answers "how do I get money back for a flight I booked" is the guideline
+that says *reimbursement* and *airfare* — it shares no word with the question
+and its coverage is zero. A floor read off that number alone would drop exactly
+the hits embeddings were added to catch, which makes hybrid retrieval worse
+than lexical rather than better. (Found live, not reasoned about: every hit for
+a paraphrased question on the deployed corpus came back at coverage `0.0`.)
+
+So each hit also carries `semantic_strength` — how far up the ranking's *lead*
+it sits, measured against the pack for the reason set out under
+`MIN_SEMANTIC_LEAD`: unrelated documents score 0.48-0.58 against anything, and
+only the lead separates signal from noise. A ranking with no lead reports zero
+strength everywhere, which is what nonsense should score.
+
+`SearchHit.grounding` is the **max** of the two, and the max rather than a
+blend on purpose: these are independent pieces of evidence that the document is
+about the question, and a perfect lexical match must not be dragged under the
+floor by an embedder that happened not to rank it. The bands below are read off
+`grounding`, so either retriever can be the one that found the answer.
+
+The two governed bands are what a grounded answerer does with the number:
+
+| Band | What may be said |
+|---|---|
+| below `Minimum coverage` (0.34) | Not citable. Say the corpus does not answer this and name who owns it. |
+| between the two | *The closest thing in the corpus, which may not answer this* — and the gap is the finding: the document that should have answered does not exist. |
+| at or above `Governing coverage` (0.60) | The highest-authority survivor governs, and the answer says so. |
+
+Three honest things to say, and only two of them are "here is the answer".
 
 ### How vectors are managed
 
@@ -306,6 +410,28 @@ and create the first owner:
 
 `deploy.sh` is the single source of truth for deployment. It writes the generated
 key to `deploy/.admin_api_key` (gitignored) and reuses it on later runs.
+
+### Shipping a change
+
+`deploy.sh` deploys whatever is in the working tree; it does not check that the
+tree is sound first. [deploy/ship.sh](deploy/ship.sh) wraps it with the two
+steps a deploy of changed code needs and that one deliberately does not take —
+running the suites before anything is pushed, and pushing governed knowledge
+that `seed_if_empty` will not update on a corpus that already has documents:
+
+```bash
+./deploy/ship.sh                          # analyze + test, then deploy Cumulus
+./deploy/ship.sh --checks-only            # the suites, and stop
+./deploy/ship.sh --knowledge              # deploy, then push server/seed/
+./deploy/ship.sh --with-estate            # also build and deploy the demo estate
+./deploy/ship.sh --dry-run                # print the plan, touch nothing
+```
+
+It reads the project from `.firebaserc` and the estate project from the estate
+repo's own `.firebaserc`, so neither is retyped; `--project` and `--estate`
+override. A failing check exits non-zero and nothing is deployed. `--help`
+lists every flag. It re-implements none of `deploy.sh` — a deployment step that
+is wrong is wrong there.
 
 ### Shipping new or edited governed knowledge
 
@@ -732,8 +858,8 @@ travels with a `cost_basis` saying which one this is:
 | `no-model-calls` | nothing called a model: a genuine zero |
 
 Pricing the two call sites in
-[server/app/reimbursements.py](server/app/reimbursements.py) and
-[server/app/payables.py](server/app/payables.py) — `ctx.step(..., cost_usd=,
+[server/app/tasks/expense_reimbursement/domain.py](server/app/tasks/expense_reimbursement/domain.py) and
+[server/app/tasks/accounts_payable/domain.py](server/app/tasks/accounts_payable/domain.py) — `ctx.step(..., cost_usd=,
 tokens=)` — is the seam that turns the figure on; nothing else has to change.
 
 This replaces a per-definition **seed profile** that manufactured a plausible
@@ -932,7 +1058,7 @@ interesting behaviour possible:
 Everything non-deterministic — model calls, id minting, clock reads — has to
 happen *inside* a step, or a replay would not be exact.
 
-### The entity layer (`server/app/graph.py`, `ontology.py`)
+### The entity layer (`server/app/graph.py`, `ontology/tbox.py`)
 
 Canonical Objects, typed Links, retained Claims.
 
@@ -1029,7 +1155,7 @@ document, and `retention_until` is stamped on every artifact at write time.
 `GET /api/v1/documents/expiring` reports what is past its horizon; the purge
 pass is *not* built, and saying so is better than implying otherwise.
 
-### Inbound sync as Flows (`server/app/sync.py`)
+### Inbound sync as Flows (`server/app/connectors/sync.py`)
 
 `POST /api/v1/sources/deliver` accepts a push of vendors, purchase orders or
 receiving reports and runs the matching sync Flow. The rules that matter:
@@ -1369,20 +1495,30 @@ world demonstrates it end to end (`run_ap_seed04` mints Meridian and a clerk
 vouches for it at the posting gate; `run_ap_seed05` links to the same object
 rather than minting a second one).
 
-The table lives in the **Accounts Payable** workspace, where an invoice is
-entered two ways. **Upload** a document — and with no extraction model
-configured the screen says plainly that the stub reads the filename, not the
-page. **Compose** one, and every control is a real row out of the graph: the
-vendor master (with its status and every source system's id for it, shown at
-the moment picking a vendor is the reason you care), then *that vendor's*
-purchase orders, then *that order's* lines with quantity steppers defaulting to
-what was ordered.
+**Where an invoice comes from.** In a deployed estate, from the customer's own
+filing tree: the **`ap-intake`** Flow wakes on the same `DocumentsDelivered`
+fact `dms-sync` does, reads the AP folders named by the governed
+`ap-intake-policy` asset, finds the documents under them whose pointer resolves
+to a revision nobody has read, fetches the bytes through that pointer and
+stores them under their content hash — then emits one `InvoiceReceived` per
+invoice. It is windowed: a file that will not fetch is a count on the run and
+never a Task the other thirty-nine queue behind, and the only Task it raises is
+the aggregate, when nothing in a window answered at all.
 
-The choices serialize to a hint string, shown live under the composer and
-labelled *what this sends* — because the hint string is not scaffolding, it is
-the **case-authoring language** of this flow. The seeded world and the eval
-triggers are written in it, and its grammar lives in exactly one place,
-`InvoiceScenario` in [server/app/payables.py](server/app/payables.py):
+The **Accounts Payable** workspace keeps one side door for the invoice somebody
+has in their hand: **upload** a document, and with no extraction model
+configured the screen says plainly that the stub reads the filename, not the
+page. There is no second door. The screen used to offer a *composer* — a vendor
+picker, an order picker, line steppers and four deviation checkboxes that
+serialized to a hint string — and every control was a real graph row and the
+thing it produced was still an invoice nobody wrote. A submission with no bytes
+is now refused at both doors.
+
+The hint string survives as what it always was: the **case-authoring language**
+of this flow, used by the seeded world and the eval triggers, quarantined in
+[server/app/tasks/accounts_payable/scenarios.py](server/app/tasks/accounts_payable/scenarios.py)
+where exactly two kinds of caller may reach it — the opt-in stub reader
+(`MODEL_BACKEND=none` or `stub`) and the fixtures that declare cases:
 
 | Hint | What it exercises |
 | --- | --- |
@@ -1396,11 +1532,13 @@ triggers are written in it, and its grammar lives in exactly one place,
 | `total=9800.00` | over the auto-post limit, and an amount outlier once the vendor has history |
 | `taxid` | prints a tax id — the resolver's strongest signal |
 
-With `MODEL_BACKEND=vertex` the extractions are real multimodal calls.
+With `MODEL_BACKEND=vertex` the extractions are real multimodal calls over the
+stored bytes, and a Vertex client that will not construct **stops the service
+from starting** rather than falling back to the reader that invents.
 
-Nothing on that screen predicts the outcome. The composed total sits *beside*
-the governed value the run will read — `$9,800.00` next to `auto-post ≤
-$2,500.00 · knowledge:invoice-posting-policy@rev1` — and the run answers.
+Nothing on that screen predicts the outcome. The governed value the run will
+read sits *beside* the door — `auto-post ≤ $2,500.00 ·
+knowledge:invoice-posting-policy@rev1` — and the run answers.
 `_posting_check` is the rule; a second implementation in a screen is a second
 rule. Submitting returns a screen rather than a sentence: where the run
 stopped, whether *this* persona may release that gate and why not ("this is in
@@ -1434,10 +1572,50 @@ Agent**. Three behaviors worth knowing:
   `pto-policy` asset); longer requests raise a Task to the `hr` queue, and
   the HR decision resumes the request and deducts the balance.
 - **The HR Agent is grounded and cited.** With `MODEL_BACKEND=vertex` it
-  plans with tools over the knowledge layer; locally it degrades to
-  retrieval over the `people/` taxonomy plus the caller's own structured
-  facts (balance, pending requests, benefits), and labels itself
-  `"backend": "retrieval"` rather than pretending.
+  plans with tools over both planes of the knowledge layer — documents *and*
+  the entity graph, which is where "what have I spent this quarter" actually
+  lives; locally it degrades to retrieval plus the caller's own structured
+  facts (balance, placement, pending requests, benefits) and labels itself
+  `"backend": "retrieval"` rather than pretending. Either way the question is
+  an `HrQuestionAsked` event and the `answer-question` Flow owns the call, so
+  the run, the read-set and the cost land in the journal like everything else.
+
+  Four rules it now keeps, each of which it used to break:
+
+  - **It reads the whole corpus.** It was scoped to the `people/` taxonomy,
+    which made "how do I get reimbursed for a flight" unanswerable — the
+    travel guideline and the expense policy were out of reach — while letting
+    the onboarding checklist answer "what is our expense approval policy",
+    which it does not. Travel, expenses and equipment are employee questions
+    filed under other desks. `people/` is now a one-place tiebreak, not a cage.
+  - **It will say it does not know.** It named `hits[0]` "the governing
+    document" unconditionally, so nonsense got a governing document and an
+    employee had no way to tell a real answer from the top of a bad ranking.
+    It applies the governed coverage bands above instead.
+  - **It cites documents, never machinery.** A prompt, a config and a
+    generated schema export carry no authority by construction; the agent used
+    to cite `source-mappings` at people.
+  - **It says which rule it ranked under.** Every reply carries a `grounding`
+    block — the precedence, the `retrieval-authority` revision it was read at,
+    the floor, how many documents fell below it, and the query actually run —
+    because "the governing document is X" is a claim about precedence that a
+    reader otherwise has no way to check.
+
+  The conversation is the client's. The console replays the transcript on each
+  send (so "what about dental?" is a question rather than two words) and the
+  server keeps no session: a surface that answers from somebody's health plan
+  and PTO balance is the last place to accumulate a record of who asked what,
+  and **New chat** is only an honest control if the history it drops was never
+  anyone else's to keep.
+
+- **A principal outside the workforce gets a page, not a wall of zeros.** The
+  hub used to render the whole personal column for the operator too: two stat
+  tiles reading `0`, an empty third, a request form that would deny whatever
+  it submitted, and a Benefits card with nothing in it — and an HR Agent that
+  opened every reply with "PTO balance: 0 days (accruing 0/month)" and "Next
+  company holiday: .". The personal half is not drawn at all now; what stands
+  in its place says why, and shows the governed PTO rule, which is a fact
+  about the deployment rather than about the reader.
 
 ## Flutter admin app
 
