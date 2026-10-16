@@ -7,6 +7,7 @@ import '../widgets/command_palette.dart';
 import '../theme/cumulus_theme.dart';
 import '../theme/domain_tones.dart';
 import '../widgets/cumulus_shell.dart';
+import '../widgets/skeleton.dart';
 import '../widgets/ui_kit.dart';
 
 const _authorityChoices = {
@@ -24,12 +25,6 @@ const _statusChoices = {
 };
 
 const _typeChoices = {'text/markdown': 'Markdown', 'text/plain': 'Plain text'};
-
-const _scopeChoices = {
-  'org': 'Org',
-  'department': 'Department',
-  'team': 'Team',
-};
 
 /// Full-page editor rendered inside the console shell. Fields are grouped the
 /// way the asset is reasoned about: what it is, how much authority it carries,
@@ -76,17 +71,18 @@ class _AssetEditorViewState extends State<AssetEditorView> {
   /// someone type into a page that cannot take it.
   bool get _generated => _kind == 'schema-export';
   String _status = 'draft';
-  String _scope = 'org';
 
   /// The owning team's slug. Empty means unowned, which the server allows and
   /// which reads as "nobody answers for this yet".
   String _owner = '';
   List<Team> _teams = [];
 
-  /// Supersession is set elsewhere (by the MCP tools), but a PUT sends the
-  /// whole asset — so these have to be carried through the editor or saving
-  /// would clear them.
-  String? _supersedes;
+  /// Read by the MCP fetch, which refuses a superseded document. Nothing here
+  /// writes it, and a PUT sends the whole asset, so it is carried through the
+  /// editor or saving a document would quietly un-supersede it.
+  ///
+  /// Its former other half, `supersedes`, is gone from both sides: this editor
+  /// was the only thing that ever wrote it and nothing ever read it.
   String? _supersededBy;
 
   bool _loading = false;
@@ -139,7 +135,6 @@ class _AssetEditorViewState extends State<AssetEditorView> {
     _contentType,
     _authorityLevel,
     _status,
-    _scope,
     _owner,
   ].join('\u0000');
 
@@ -228,9 +223,7 @@ class _AssetEditorViewState extends State<AssetEditorView> {
         _kind = asset.kind;
         _origin = asset.origin;
         _status = asset.status;
-        _scope = asset.scope;
         _owner = asset.owner;
-        _supersedes = asset.supersedes;
         _supersededBy = asset.supersededBy;
         _loading = false;
       });
@@ -264,9 +257,7 @@ class _AssetEditorViewState extends State<AssetEditorView> {
       authorityLevel: _authorityLevel,
       kind: _kind,
       origin: _origin,
-      scope: _scope,
       owner: _owner,
-      supersedes: _supersedes,
       supersededBy: _supersededBy,
       tags: _splitList(_tagsController.text),
       parent: _parentController.text.trim().isEmpty
@@ -331,7 +322,61 @@ class _AssetEditorViewState extends State<AssetEditorView> {
   @override
   Widget build(BuildContext context) {
     if (_loading) {
-      return const PageBody(children: [CumulusCard(child: CumulusLoading())]);
+      // The way out is chrome, not data: dropping the back link for a spinner
+      // stranded the reader on a page with no exit. The heading's own words —
+      // this asset's path, title and status — are the thing being fetched, so
+      // they stand in as geometry until they arrive.
+      return PageBody(
+        maxWidth: 1080,
+        children: [
+          BackLink(
+            label: 'All assets',
+            onTap: () => widget.onClose(changed: false),
+          ),
+          const SkeletonPulse(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 20,
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SkeletonBar(width: 190, height: 10),
+                    SizedBox(height: 12),
+                    SkeletonBar(width: 320, height: 26),
+                    SizedBox(height: 14),
+                    Row(
+                      spacing: 8,
+                      children: [
+                        SkeletonPill(width: 84),
+                        SkeletonPill(width: 96),
+                      ],
+                    ),
+                  ],
+                ),
+                SkeletonCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SkeletonBar(width: 96, height: 10),
+                      SizedBox(height: 10),
+                      SkeletonBar(height: 38, radius: CumulusRadius.control),
+                      SizedBox(height: 20),
+                      SkeletonBar(width: 72, height: 10),
+                      SizedBox(height: 10),
+                      SkeletonBar(height: 38, radius: CumulusRadius.control),
+                      SizedBox(height: 20),
+                      SkeletonBar(width: 84, height: 10),
+                      SizedBox(height: 10),
+                      SkeletonBar(height: 260, radius: CumulusRadius.control),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      );
     }
     return Form(
       key: _formKey,
@@ -529,17 +574,16 @@ class _AssetEditorViewState extends State<AssetEditorView> {
                   ],
                 ),
                 const SizedBox(height: 16),
+                // A "Scope" dropdown — Org, Department, Team — used to lead
+                // this row. It was "Org" on every document in the corpus, and
+                // nothing anywhere read it: reach is decided by the
+                // Principal's own scope and the path prefixes the callers
+                // check. A control a person can turn that changes nothing is
+                // worse than no control, because it tells them the system
+                // works a way it does not.
                 _Grid(
                   columns: 3,
                   children: [
-                    LabeledField(
-                      label: 'Scope',
-                      child: _dropdown(
-                        value: _scope,
-                        choices: _scopeChoices,
-                        onChanged: (v) => setState(() => _scope = v),
-                      ),
-                    ),
                     LabeledField(
                       label: 'Owning team',
                       hint: 'who answers for this',

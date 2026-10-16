@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../../models/ontology_screen.dart';
 import '../../services/api_client.dart';
 import '../../theme/cumulus_theme.dart';
+import '../skeleton.dart';
 import '../ui_kit.dart';
 import 'ontology_layout.dart';
 
@@ -30,10 +31,17 @@ class OntologyDiagram extends StatefulWidget {
   /// browse until you have said which type you mean.
   final ValueChanged<String> onBrowseInstances;
 
+  /// Open the diagram's own export in the Library. This canvas is a rendering
+  /// of the `enterprise-ontology` asset, and for a long time nothing linked
+  /// the two — the one governed artifact the whole tab is *about* was
+  /// reachable only through the palette.
+  final VoidCallback? onOpenExport;
+
   const OntologyDiagram({
     super.key,
     required this.api,
     required this.onBrowseInstances,
+    this.onOpenExport,
   });
 
   @override
@@ -41,6 +49,11 @@ class OntologyDiagram extends StatefulWidget {
 }
 
 class _OntologyDiagramState extends State<OntologyDiagram> {
+  /// Below this the detail panel goes *under* the canvas rather than beside
+  /// it. Measured against the pane: 320 of panel and its gutter leave a
+  /// canvas worth looking at only above about here.
+  static const _sidePanelBreakpoint = 920.0;
+
   final _view = TransformationController();
 
   OntologyScreen? _screen;
@@ -81,6 +94,13 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
     if ((scale - _scale).abs() > 0.005) setState(() => _scale = scale);
   }
 
+  /// Read the model, keeping whatever is already drawn while the read is in
+  /// flight. Changing the overlay is a re-read of the same thirty boxes in
+  /// the same places, and blanking the canvas to a spinner for it loses the
+  /// reader's place for no information — so the previous screen stays up,
+  /// the toolbar says a read is running, and the new one swaps in when it
+  /// lands. A failure over a screen that is already drawn is a strip above
+  /// the canvas rather than a page that eats it.
   Future<void> _load() async {
     setState(() {
       _loading = true;
@@ -109,14 +129,17 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
     _layout = layoutOntology(screen, expanded: _expanded);
   }
 
+  /// Whether the link names are on. Gated against the scale this pane's own
+  /// "Fit" lands on, so the opening view of the model always carries them
+  /// however far the model grows.
+  bool get _showLabels => ontologyLabelsVisible(
+    _scale,
+    ontologyFitScale(_viewport, _layout.size),
+  );
+
   void _fit() {
     if (_viewport.isEmpty || _layout.size.isEmpty) return;
-    final scale = math
-        .min(
-          _viewport.width / _layout.size.width,
-          _viewport.height / _layout.size.height,
-        )
-        .clamp(0.4, 2.5);
+    final scale = ontologyFitScale(_viewport, _layout.size);
     _view.value = Matrix4.identity()
       ..translateByDouble(
         (_viewport.width - _layout.size.width * scale) / 2,
@@ -141,68 +164,155 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
     });
   }
 
+  /// Every pointer move over the canvas lands here, so it repaints only when
+  /// the answer actually changed: an unguarded `setState` per move rebuilt
+  /// thirty node cards and two painters at the frame rate of the mouse.
   void _hover(Offset scene) {
     final name = _layout.edgeAt(scene, tolerance: 10 / _scale)?.link.name;
     if (name != _hoverLink) setState(() => _hoverLink = name);
   }
 
+  /// Exit is reported per box, and moving from one to the next delivers the
+  /// leave and the enter in either order — so a box only ever clears the
+  /// highlight it is itself holding.
+  void _hoverNode(String name, bool on) {
+    final next = on ? name : (_hoverType == name ? null : _hoverType);
+    if (next != _hoverType) setState(() => _hoverType = next);
+  }
+
+  void _leaveCanvas() {
+    if (_hoverLink == null && _hoverType == null) return;
+    setState(() {
+      _hoverLink = null;
+      // The node cards' own exit handlers do not fire when the pointer leaves
+      // the canvas past the edge of one, which left the diagram lit up around
+      // a box the cursor was no longer on.
+      _hoverType = null;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final screen = _screen;
-    if (_loading && screen == null) {
-      return const CumulusCard(child: CumulusLoading());
-    }
     if (screen == null) {
-      return ErrorNotice(
-        message: _error ?? 'The ontology did not answer.',
-        onRetry: _load,
+      // Nothing has ever landed. The toolbar is chrome and renders now; only
+      // the canvas is a shape, so the section does not change size when the
+      // model arrives.
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _toolbar(null),
+          const SizedBox(height: 12),
+          if (_loading)
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) => SkeletonPulse(
+                  child: SkeletonCanvas(height: constraints.maxHeight),
+                ),
+              ),
+            )
+          else
+            // Nothing is coming, so nothing pulses.
+            ErrorNotice(
+              message: _error ?? 'The ontology did not answer.',
+              onRetry: _load,
+            ),
+        ],
       );
     }
     final overlay = screen.overlay;
-    final wide = MediaQuery.sizeOf(context).width > 1150;
+    final detail = _DetailPanel(
+      screen: screen,
+      selectedType: _selectedType,
+      selectedLink: _selectedLink,
+      onBrowseInstances: widget.onBrowseInstances,
+      onSelectType: (t) => setState(() {
+        _selectedType = t;
+        _selectedLink = null;
+      }),
+      onSelectLink: (l) => setState(() {
+        _selectedLink = l;
+        _selectedType = null;
+      }),
+      onDismiss: () => setState(() {
+        _selectedType = null;
+        _selectedLink = null;
+      }),
+    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _toolbar(screen),
+        if (_error != null) ...[
+          const SizedBox(height: 10),
+          // The screen below is the previous one, and saying so is the whole
+          // point: a stale model with a strip over it beats a blank page.
+          ErrorNotice(
+            message: '$_error — showing the last model that answered.',
+            onRetry: _load,
+          ),
+        ],
         if (overlay != null) ...[
           const SizedBox(height: 10),
           _OverlayBanner(overlay: overlay),
         ],
         const SizedBox(height: 12),
         Expanded(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Expanded(child: _canvas(overlay)),
-              if (wide) ...[
-                const SizedBox(width: 16),
-                SizedBox(
-                  width: 320,
-                  child: _DetailPanel(
-                    screen: screen,
-                    selectedType: _selectedType,
-                    selectedLink: _selectedLink,
-                    onBrowseInstances: widget.onBrowseInstances,
-                    onSelectType: (t) => setState(() {
-                      _selectedType = t;
-                      _selectedLink = null;
-                    }),
-                    onSelectLink: (l) => setState(() {
-                      _selectedLink = l;
-                      _selectedType = null;
-                    }),
-                  ),
-                ),
-              ],
-            ],
+          // The *pane*, not the window. Gating on window width meant a
+          // narrow one dimmed the canvas around a selection and then showed
+          // nothing of it — the fields, the natural key and "browse the
+          // instances" were all unreachable — and subscribing to the window
+          // metrics rebuilt the whole canvas on every resize tick besides.
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              if (constraints.maxWidth > _sidePanelBreakpoint) {
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Expanded(child: _canvas(overlay)),
+                    const SizedBox(width: 16),
+                    SizedBox(width: 320, child: detail),
+                  ],
+                );
+              }
+              // A sheet resting on the canvas rather than a row below it: the
+              // canvas keeps its size, so selecting a box does not resize the
+              // viewport out from under the transform and re-fit the diagram
+              // you had just panned to.
+              final selected = _selectedType != null || _selectedLink != null;
+              return Stack(
+                children: [
+                  Positioned.fill(child: _canvas(overlay)),
+                  if (selected)
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxHeight: math.min(
+                            320,
+                            constraints.maxHeight * 0.6,
+                          ),
+                        ),
+                        child: detail,
+                      ),
+                    ),
+                ],
+              );
+            },
           ),
         ),
       ],
     );
   }
 
-  Widget _toolbar(OntologyScreen screen) {
+  /// The toolbar is chrome, so it draws with or without a model: [screen] is
+  /// null only before the first read has landed, and then the controls are
+  /// present but inert and the counts are simply absent rather than zero.
+  Widget _toolbar(OntologyScreen? screen) {
+    final flows = screen?.flows ?? const <OntologyFlowOption>[];
     return Wrap(
       spacing: 10,
       runSpacing: 8,
@@ -227,40 +337,78 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
                   value: null,
                   child: Text('The model alone'),
                 ),
-                for (final flow in screen.flows)
+                for (final flow in flows)
                   DropdownMenuItem<String?>(
                     value: flow.id,
                     child: Text(flow.label),
                   ),
               ],
-              onChanged: (v) {
-                // A selection made against the previous overlay would leave
-                // the new one dimmed everywhere but one edge, which hides the
-                // very thing the flow was picked to show.
-                setState(() {
-                  _flow = v;
-                  _selectedType = null;
-                  _selectedLink = null;
-                  _hoverType = null;
-                  _hoverLink = null;
-                });
-                _load();
-              },
+              onChanged: screen == null
+                  ? null
+                  : (v) {
+                      // A selection made against the previous overlay would
+                      // leave the new one dimmed everywhere but one edge,
+                      // which hides the very thing the flow was picked to
+                      // show.
+                      setState(() {
+                        _flow = v;
+                        _selectedType = null;
+                        _selectedLink = null;
+                        _hoverType = null;
+                        _hoverLink = null;
+                      });
+                      _load();
+                    },
             ),
           ),
         ),
-        OutlinedButton(onPressed: _fit, child: const Text('Fit')),
-        OutlinedButton(onPressed: _actualSize, child: const Text('1:1')),
-        MetaPill('${screen.types.length} types'),
-        MetaPill('${screen.links.length} links'),
-        if (screen.conformance != null)
-          MetaPill(
-            screen.conformance == 0
-                ? 'conforms'
-                : '${screen.conformance} violation(s)',
-            tone: screen.conformance == 0
-                ? CumulusTone.success
-                : CumulusTone.danger,
+        OutlinedButton(
+          onPressed: screen == null ? null : _fit,
+          child: const Text('Fit'),
+        ),
+        OutlinedButton(
+          onPressed: screen == null ? null : _actualSize,
+          child: const Text('1:1'),
+        ),
+        // A read over a screen that is already drawn says so here rather than
+        // by taking the screen away.
+        if (_loading && screen != null)
+          const Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 13,
+                height: 13,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              SizedBox(width: 8),
+              Text('re-reading the model…', style: CumulusText.meta),
+            ],
+          ),
+        if (screen != null) ...[
+          MetaPill('${screen.types.length} types'),
+          MetaPill('${screen.links.length} links'),
+          if (screen.conformance != null)
+            MetaPill(
+              screen.conformance == 0
+                  ? 'conforms'
+                  : '${screen.conformance} violation(s)',
+              tone: screen.conformance == 0
+                  ? CumulusTone.success
+                  : CumulusTone.danger,
+            ),
+        ],
+        if (widget.onOpenExport != null)
+          Tooltip(
+            message:
+                'This diagram renders the enterprise-ontology asset — the '
+                'declarative export in the Library that the map actually '
+                'carries. Open it to read what a customer would keep.',
+            child: OutlinedButton.icon(
+              onPressed: widget.onOpenExport,
+              icon: const Icon(Icons.description_outlined, size: 15),
+              label: const Text('Open the export'),
+            ),
           ),
       ],
     );
@@ -270,6 +418,20 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
     final activeType = _hoverType ?? _selectedType;
     final activeLink = _hoverLink ?? _selectedLink;
     final focused = activeType != null || activeLink != null;
+    final showLabels = _showLabels;
+    // Both ends of the lit line, found once. Asking each box in turn whether
+    // it touched the active edge walked every edge per box — a thousand-odd
+    // comparisons per rebuild, and a rebuild happens on every hover.
+    final litEnds = <String>{};
+    if (activeLink != null) {
+      for (final edge in _layout.edges) {
+        if (edge.link.name == activeLink) {
+          litEnds
+            ..add(edge.link.fromType)
+            ..add(edge.link.toType);
+        }
+      }
+    }
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -292,8 +454,8 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
             borderRadius: BorderRadius.circular(CumulusRadius.card),
             child: InteractiveViewer(
               transformationController: _view,
-              minScale: 0.4,
-              maxScale: 2.5,
+              minScale: ontologyMinScale,
+              maxScale: ontologyMaxScale,
               constrained: false,
               boundaryMargin: const EdgeInsets.all(double.infinity),
               child: SizedBox(
@@ -305,7 +467,7 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
                 // line feel unclickable, and it is invisible until you zoom.
                 child: MouseRegion(
                   onHover: (e) => _hover(e.localPosition),
-                  onExit: (_) => setState(() => _hoverLink = null),
+                  onExit: (_) => _leaveCanvas(),
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onTapUp: (d) => _tap(d.localPosition),
@@ -320,7 +482,7 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
                             activeType: activeType,
                             activeLink: activeLink,
                             focused: focused,
-                            showLabels: _scale >= 0.7,
+                            showLabels: showLabels,
                           ),
                         ),
                         for (final node in _layout.nodes)
@@ -333,14 +495,12 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
                               dimmed:
                                   focused &&
                                   node.name != activeType &&
-                                  !_onActiveEdge(node.name),
+                                  !litEnds.contains(node.name),
                               onTap: () => setState(() {
                                 _selectedType = node.name;
                                 _selectedLink = null;
                               }),
-                              onHover: (on) => setState(
-                                () => _hoverType = on ? node.name : null,
-                              ),
+                              onHover: (on) => _hoverNode(node.name, on),
                             ),
                           ),
                         // The names ride *above* the boxes: a label the node
@@ -355,7 +515,7 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
                               activeType: activeType,
                               activeLink: activeLink,
                               focused: focused,
-                              showLabels: _scale >= 0.7,
+                              showLabels: showLabels,
                               labelLayer: true,
                             ),
                           ),
@@ -402,15 +562,6 @@ class _OntologyDiagramState extends State<OntologyDiagram> {
     );
   }
 
-  /// Whether a box is an endpoint of the line currently lit, so hovering an
-  /// edge lights both the types it joins rather than the line alone.
-  bool _onActiveEdge(String typeName) {
-    final link = _hoverLink ?? _selectedLink;
-    if (link == null) return false;
-    return _layout
-        .edgesTouching(typeName)
-        .any((edge) => edge.link.name == link);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -935,10 +1086,15 @@ class _DiagramPainter extends CustomPainter {
     return dashed;
   }
 
+  /// A hover rebuilds this subtree, so the cheap answer matters: the layout
+  /// and the overlay are whole objects replaced only when a read lands or a
+  /// stub is expanded, and comparing them by identity is both correct and
+  /// O(1) — a field-by-field `==` over forty-five edges would cost more per
+  /// pointer move than the repaint it is trying to avoid.
   @override
   bool shouldRepaint(covariant _DiagramPainter old) =>
-      old.layout != layout ||
-      old.overlay != overlay ||
+      !identical(old.layout, layout) ||
+      !identical(old.overlay, overlay) ||
       old.activeType != activeType ||
       old.activeLink != activeLink ||
       old.focused != focused ||
@@ -958,6 +1114,11 @@ class _DetailPanel extends StatelessWidget {
   final ValueChanged<String> onSelectLink;
   final ValueChanged<String> onBrowseInstances;
 
+  /// Clears the selection. Offered where the panel is stacked under the
+  /// canvas and is taking room the diagram wants back; the side panel has
+  /// nothing to give up, so it does not show it.
+  final VoidCallback? onDismiss;
+
   const _DetailPanel({
     required this.screen,
     required this.selectedType,
@@ -965,6 +1126,7 @@ class _DetailPanel extends StatelessWidget {
     required this.onSelectType,
     required this.onSelectLink,
     required this.onBrowseInstances,
+    this.onDismiss,
   });
 
   @override
@@ -984,6 +1146,22 @@ class _DetailPanel extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (onDismiss != null && (type != null || link != null))
+              Align(
+                alignment: Alignment.topRight,
+                child: InkWell(
+                  onTap: onDismiss,
+                  borderRadius: BorderRadius.circular(CumulusRadius.pill),
+                  child: const Padding(
+                    padding: EdgeInsets.all(4),
+                    child: Icon(
+                      Icons.close,
+                      size: 15,
+                      color: CumulusColors.inkMuted,
+                    ),
+                  ),
+                ),
+              ),
             if (type != null)
               ..._type(type)
             else if (link != null)

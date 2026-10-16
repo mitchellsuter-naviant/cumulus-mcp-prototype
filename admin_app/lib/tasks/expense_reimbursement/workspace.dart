@@ -1,13 +1,14 @@
 import 'package:flutter/material.dart';
 
-import '../models/reimbursement.dart';
-import '../models/session.dart';
-import '../services/api_client.dart';
-import '../theme/cumulus_theme.dart';
-import 'command_palette.dart' show expenseQueue, ownsWorkspace;
-import 'mini_charts.dart';
-import 'run_workbench.dart';
-import 'ui_kit.dart';
+import 'models.dart';
+import '../../models/session.dart';
+import '../../services/api_client.dart';
+import '../../theme/cumulus_theme.dart';
+import '../../widgets/command_palette.dart' show expenseQueue, ownsWorkspace;
+import '../../widgets/mini_charts.dart';
+import '../../widgets/run_workbench.dart';
+import '../../widgets/skeleton.dart';
+import '../../widgets/ui_kit.dart';
 
 /// The Expense Reimbursement workspace: the reimbursements table.
 ///
@@ -42,6 +43,11 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
 
   List<Reimbursement>? _rows;
   ReimbursementStats? _stats;
+
+  /// The 28-day series, bucketed once when the rows land. It is a function of
+  /// the table and nothing else, so recomputing a map and a list of 28 points
+  /// on every rebuild — every lens click, every row expansion — bought nothing.
+  List<ChartPoint> _spend = const [];
   String? _error;
   String _lens = 'all';
   String? _expanded;
@@ -53,13 +59,24 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
   }
 
   Future<void> _load() async {
+    // The table and its totals are independent reads; the screen waits for the
+    // slower of the two rather than for their sum.
+    final Future<List<Reimbursement>> rowsRead = widget.api
+        .listReimbursements();
+    final Future<ReimbursementStats> statsRead = widget.api
+        .reimbursementStats();
     try {
-      final rows = await widget.api.listReimbursements();
-      final stats = await widget.api.reimbursementStats();
+      // Grouped rather than awaited in a row: a first failure would otherwise
+      // escape while the second read is still in flight, and its error would
+      // land with nobody listening.
+      await Future.wait<void>([rowsRead, statsRead]);
+      final rows = await rowsRead;
+      final stats = await statsRead;
       if (mounted) {
         setState(() {
           _rows = rows;
           _stats = stats;
+          _spend = _dailySpend(rows);
           _error = null;
         });
       }
@@ -68,7 +85,7 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
     }
   }
 
-  List<ChartPoint> _dailySpend(List<Reimbursement> rows) {
+  static List<ChartPoint> _dailySpend(List<Reimbursement> rows) {
     final byDay = <String, double>{};
     final now = DateTime.now();
     for (var i = 27; i >= 0; i--) {
@@ -96,9 +113,7 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
     }
     final rows = _rows;
     final stats = _stats;
-    if (rows == null || stats == null) {
-      return const Center(child: CircularProgressIndicator(strokeWidth: 2.5));
-    }
+    if (rows == null || stats == null) return _skeleton();
 
     final visible = _lens == 'all'
         ? rows
@@ -109,18 +124,7 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          PageHeading(
-            eyebrow: 'Workspace',
-            title: 'Expense Reimbursement',
-            subtitle:
-                'The expense-reimbursement flow writes this table — every row '
-                'carries the run journal that produced it.',
-            trailing: OutlinedButton.icon(
-              onPressed: _load,
-              icon: const Icon(Icons.refresh, size: 16),
-              label: const Text('Refresh'),
-            ),
-          ),
+          _heading(),
           const SizedBox(height: 18),
           StatStrip(
             tiles: [
@@ -162,7 +166,7 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
             subtitle: 'last 28 days',
             child: DailyBarChart(
               title: 'Approved spend',
-              points: _dailySpend(rows),
+              points: _spend,
               format: (v) => '\$${v.toStringAsFixed(2)}',
               height: 140,
               showTitle: false,
@@ -177,23 +181,7 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
                 'governed reads, and replays · click one to open it',
           ),
           const SizedBox(height: 16),
-          Wrap(
-            spacing: 8,
-            children: [
-              for (final lens in const [
-                ('all', CumulusTone.neutral),
-                ('approved', CumulusTone.success),
-                ('pending', CumulusTone.warn),
-                ('denied', CumulusTone.danger),
-              ])
-                LensChip(
-                  label: lens.$1.toUpperCase(),
-                  tone: lens.$2,
-                  selected: _lens == lens.$1,
-                  onTap: () => setState(() => _lens = lens.$1),
-                ),
-            ],
-          ),
+          _lensRail(),
           const SizedBox(height: 14),
           if (visible.isEmpty)
             // Three states, and only one of them used to be said. "Nothing at
@@ -228,6 +216,79 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
       ),
     );
   }
+
+  /// The chrome that owes the table nothing — the same widget before the rows
+  /// arrive and after.
+  Widget _heading() => PageHeading(
+    eyebrow: 'Workspace',
+    title: 'Expense Reimbursement',
+    subtitle:
+        'The expense-reimbursement flow writes this table — every row '
+        'carries the run journal that produced it.',
+    trailing: OutlinedButton.icon(
+      onPressed: _rows == null ? null : _load,
+      icon: const Icon(Icons.refresh, size: 16),
+      label: const Text('Refresh'),
+    ),
+  );
+
+  Widget _lensRail() => Wrap(
+    spacing: 8,
+    children: [
+      for (final lens in const [
+        ('all', CumulusTone.neutral),
+        ('approved', CumulusTone.success),
+        ('pending', CumulusTone.warn),
+        ('denied', CumulusTone.danger),
+      ])
+        LensChip(
+          label: lens.$1.toUpperCase(),
+          tone: lens.$2,
+          selected: _lens == lens.$1,
+          onTap: () => setState(() => _lens = lens.$1),
+        ),
+    ],
+  );
+
+  /// The page while the table is in flight: real heading and lens rail, grey
+  /// geometry where the strip, the daily chart and the rows will be.
+  Widget _skeleton() => SingleChildScrollView(
+    padding: const EdgeInsets.fromLTRB(28, 20, 28, 40),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _heading(),
+        const SizedBox(height: 18),
+        const SkeletonPulse(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SkeletonStatStrip(count: 6),
+              SizedBox(height: 16),
+              SkeletonCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SkeletonBar(width: 168, height: 13),
+                    SizedBox(height: 10),
+                    SkeletonBar(width: 96, height: 10),
+                    SizedBox(height: 18),
+                    SkeletonBar(height: 140, radius: CumulusRadius.control),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        _lensRail(),
+        const SizedBox(height: 14),
+        const SkeletonPulse(
+          child: SkeletonListCard(rows: 6, leadingCircle: false),
+        ),
+      ],
+    ),
+  );
 
   Widget _row(Reimbursement r) {
     final expanded = _expanded == r.id;
@@ -445,7 +506,7 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
     final document = r.documents.firstWhere(
       (d) => d.documentId == line.documentId,
       orElse: () => const DocumentSlot(
-        documentId: '', filename: '', note: '', byteSize: 0, mediaType: '',
+        documentId: '', filename: '', memo: '', byteSize: 0, mediaType: '',
       ),
     );
     return Padding(
@@ -488,7 +549,7 @@ class _ReimbursementsViewState extends State<ReimbursementsView> {
                 if (document.filename.isNotEmpty)
                   Text(
                     '${document.filename}'
-                    '${document.note.isEmpty ? '' : ' — \u201c${document.note}\u201d'}',
+                    '${document.memo.isEmpty ? '' : ' — \u201c${document.memo}\u201d'}',
                     style: CumulusText.meta,
                   ),
               ],

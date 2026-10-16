@@ -1,6 +1,6 @@
-/// The Sources screen, the artifact store, and the derived vendor profile.
-/// Mirrors `SourcesScreen` in `server/app/ui_api.py`, plus `documents.py`
-/// and `anomaly.py`.
+/// The Systems and Data screens, the artifact store, and the derived vendor
+/// profile. Mirrors `SourcesScreen` and `DataScreen` in `server/app/ui_api.py`,
+/// plus `documents.py` and `anomaly.py`.
 library;
 
 /// Where on the page a value was read from. Normalized 0–1 coordinates, so a
@@ -98,12 +98,36 @@ class StoredDocument {
   );
 }
 
+/// One identity binding on a contract: which column names which object type,
+/// by which key.
+class ContractIdentity {
+  final String column;
+  final String objectType;
+  final String key;
+
+  const ContractIdentity({
+    required this.column,
+    required this.objectType,
+    required this.key,
+  });
+
+  factory ContractIdentity.fromJson(Map<String, dynamic> json) =>
+      ContractIdentity(
+        column: json['column'] as String? ?? '',
+        objectType: json['object_type'] as String? ?? '',
+        key: json['key'] as String? ?? '',
+      );
+}
+
 /// The Mapping a feed lands under — the declared half of the arrangement,
 /// carried on the feed itself so health and contract are never read off two
 /// lists side by side.
 class SourceContract {
   final String id;
   final String system;
+  final String summary;
+  final String notes;
+  final List<ContractIdentity> identity;
   final String transport;
   final String payload;
 
@@ -123,6 +147,9 @@ class SourceContract {
   const SourceContract({
     required this.id,
     required this.system,
+    this.summary = '',
+    this.notes = '',
+    this.identity = const [],
     required this.transport,
     required this.payload,
     required this.strategy,
@@ -139,6 +166,11 @@ class SourceContract {
   factory SourceContract.fromJson(Map<String, dynamic> json) => SourceContract(
     id: json['id'] as String? ?? '',
     system: json['system'] as String? ?? '',
+    summary: json['summary'] as String? ?? '',
+    notes: json['notes'] as String? ?? '',
+    identity: (json['identity'] as List<dynamic>? ?? const [])
+        .map((e) => ContractIdentity.fromJson(e as Map<String, dynamic>))
+        .toList(),
     transport: json['transport'] as String? ?? '',
     payload: json['payload'] as String? ?? '',
     strategy: json['strategy'] as String? ?? '',
@@ -484,12 +516,198 @@ class SourceFeed {
   );
 }
 
-/// Everything the Sources screen draws, in one round trip.
+/// One legal move on a writable target: from the value the estate currently
+/// holds, to the values Cumulus may set. Keyed on the *current* value, which
+/// is what makes the table a state machine rather than a permission.
+class WriteTransition {
+  final String fromValue;
+  final List<String> toValues;
+
+  const WriteTransition({required this.fromValue, required this.toValues});
+
+  factory WriteTransition.fromJson(Map<String, dynamic> json) =>
+      WriteTransition(
+        fromValue: json['from_value'] as String? ?? '',
+        toValues: (json['to_values'] as List<dynamic>? ?? const [])
+            .map((e) => '$e')
+            .toList(),
+      );
+}
+
+/// One row of the WRITABLE table — every write this system can make, in one
+/// screen. Adding a row is a governance change with a review attached.
+class WritableTarget {
+  final String id;
+  final String app;
+  final String resource;
+  final String field;
+
+  /// The gateway Action this target is written through, so a journal row and
+  /// a ledger entry name the same event from two sides.
+  final String action;
+
+  final List<WriteTransition> transitions;
+
+  const WritableTarget({
+    required this.id,
+    required this.app,
+    required this.resource,
+    required this.field,
+    required this.action,
+    required this.transitions,
+  });
+
+  factory WritableTarget.fromJson(Map<String, dynamic> json) => WritableTarget(
+    id: json['id'] as String? ?? '',
+    app: json['app'] as String? ?? '',
+    resource: json['resource'] as String? ?? '',
+    field: json['field'] as String? ?? '',
+    action: json['action'] as String? ?? '',
+    transitions: (json['transitions'] as List<dynamic>? ?? const [])
+        .map((e) => WriteTransition.fromJson(e as Map<String, dynamic>))
+        .toList(),
+  );
+}
+
+/// One outbound write, from intent to however it settled. A row here may be
+/// the only surviving statement that Cumulus changed somebody's data.
+class WriteJournalRow {
+  final String id;
+  final String target;
+  final String app;
+  final String resource;
+  final String recordId;
+  final String field;
+
+  /// What the estate held when the decision was made.
+  final String observed;
+
+  /// What we asked it to hold.
+  final String value;
+
+  /// `intent` · `applied` · `unverified` · `failed` · `echoed` · `diverged`
+  /// · `unechoed`.
+  final String state;
+
+  /// What the re-read actually found — the same string as [value] on the
+  /// happy path, and the interesting one otherwise.
+  final String verified;
+
+  final String action;
+  final String runId;
+  final String actor;
+  final String intendedAt;
+  final String settledAt;
+  final String error;
+
+  /// Deliveries of this row's own feed since the write that did not carry it
+  /// home. Pulls rather than minutes, because the feed's cadence is somebody
+  /// else's decision.
+  final int echoPulls;
+
+  const WriteJournalRow({
+    required this.id,
+    required this.target,
+    required this.app,
+    required this.resource,
+    required this.recordId,
+    required this.field,
+    required this.observed,
+    required this.value,
+    required this.state,
+    required this.verified,
+    required this.action,
+    required this.runId,
+    required this.actor,
+    required this.intendedAt,
+    required this.settledAt,
+    required this.error,
+    required this.echoPulls,
+  });
+
+  /// The estate may hold our value and the graph does not know it yet.
+  bool get open => state == 'applied' || state == 'unverified';
+
+  bool get failed => state == 'failed' || state == 'diverged';
+
+  factory WriteJournalRow.fromJson(Map<String, dynamic> json) =>
+      WriteJournalRow(
+        id: json['id'] as String? ?? '',
+        target: json['target'] as String? ?? '',
+        app: json['app'] as String? ?? '',
+        resource: json['resource'] as String? ?? '',
+        recordId: json['record_id'] as String? ?? '',
+        field: json['field'] as String? ?? '',
+        observed: json['observed'] as String? ?? '',
+        value: json['value'] as String? ?? '',
+        state: json['state'] as String? ?? '',
+        verified: json['verified'] as String? ?? '',
+        action: json['action'] as String? ?? '',
+        runId: json['run_id'] as String? ?? '',
+        actor: json['actor'] as String? ?? '',
+        intendedAt: json['intended_at'] as String? ?? '',
+        settledAt: json['settled_at'] as String? ?? '',
+        error: json['error'] as String? ?? '',
+        echoPulls: json['echo_pulls'] as int? ?? 0,
+      );
+}
+
+/// What Cumulus may change out there, and everything it ever has: the other
+/// half of the terms a registered system is talked to on.
+class WritePlane {
+  /// Whether the live door exists at all. Off means the writer holds no
+  /// callable that could reach a network — not a refusal in front of one.
+  final bool enabled;
+
+  final List<WritableTarget> targets;
+  final List<WriteJournalRow> journal;
+
+  /// What [journal] is a window onto.
+  final int journalTotal;
+
+  /// Writes the estate may be holding that the graph has not yet seen echo
+  /// home — `applied` and `unverified`.
+  final int openWrites;
+
+  const WritePlane({
+    required this.enabled,
+    required this.targets,
+    required this.journal,
+    required this.journalTotal,
+    required this.openWrites,
+  });
+
+  static const none = WritePlane(
+    enabled: false,
+    targets: [],
+    journal: [],
+    journalTotal: 0,
+    openWrites: 0,
+  );
+
+  factory WritePlane.fromJson(Map<String, dynamic> json) => WritePlane(
+    enabled: json['enabled'] as bool? ?? false,
+    targets: (json['targets'] as List<dynamic>? ?? const [])
+        .map((e) => WritableTarget.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    journal: (json['journal'] as List<dynamic>? ?? const [])
+        .map((e) => WriteJournalRow.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    journalTotal: json['journal_total'] as int? ?? 0,
+    openWrites: json['open_writes'] as int? ?? 0,
+  );
+}
+
+/// Everything the Systems screen draws, in one round trip. (The route is
+/// still spelled `/sources`; the feeds are the screen's spine.)
 class SourcesScreen {
   final List<SourceFeed> sources;
 
   /// The estate the pulled feeds below are pulled from.
   final EstateCard estate;
+
+  /// The outbound half: the WRITABLE table and the journal against it.
+  final WritePlane writes;
 
   /// Mappings naming a type or Collection that does not exist. Null — not
   /// empty — for a tenant-scoped persona: a registry bug is a Naviant bug,
@@ -499,6 +717,7 @@ class SourcesScreen {
   const SourcesScreen({
     required this.sources,
     required this.estate,
+    this.writes = WritePlane.none,
     required this.problems,
   });
 
@@ -513,6 +732,7 @@ class SourcesScreen {
         f.source == feed.source && f.kind == feed.kind ? feed : f,
     ],
     estate: estate,
+    writes: writes,
     problems: problems,
   );
 
@@ -523,9 +743,127 @@ class SourcesScreen {
     estate: json['estate'] == null
         ? EstateCard.none
         : EstateCard.fromJson(json['estate'] as Map<String, dynamic>),
+    writes: json['writes'] == null
+        ? WritePlane.none
+        : WritePlane.fromJson(json['writes'] as Map<String, dynamic>),
     problems: (json['problems'] as List<dynamic>?)
         ?.map((e) => '$e')
         .toList(),
+  );
+}
+
+/// One Collection: what it holds, under what policy, counted honestly.
+class DataCollection {
+  final String id;
+  final String name;
+  final String summary;
+
+  /// `data` — delete it and history is lost — or `knowledge` — delete it and
+  /// the agents get dumber.
+  final String role;
+
+  final String kind;
+  final String origin;
+  final String container;
+  final String custody;
+  final String retention;
+  final String retentionNote;
+  final bool authoritative;
+  final bool legalHold;
+  final List<String> objectTypes;
+  final List<String> writtenBy;
+  final List<String> readBy;
+
+  /// Null — never zero — when the store cannot be counted honestly. The
+  /// screen draws the two differently.
+  final int? rows;
+
+  final String rowsCaption;
+
+  const DataCollection({
+    required this.id,
+    required this.name,
+    required this.summary,
+    required this.role,
+    required this.kind,
+    required this.origin,
+    required this.container,
+    required this.custody,
+    required this.retention,
+    required this.retentionNote,
+    required this.authoritative,
+    required this.legalHold,
+    required this.objectTypes,
+    required this.writtenBy,
+    required this.readBy,
+    required this.rows,
+    required this.rowsCaption,
+  });
+
+  factory DataCollection.fromJson(Map<String, dynamic> json) => DataCollection(
+    id: json['id'] as String? ?? '',
+    name: json['name'] as String? ?? '',
+    summary: json['summary'] as String? ?? '',
+    role: json['role'] as String? ?? '',
+    kind: json['kind'] as String? ?? '',
+    origin: json['origin'] as String? ?? '',
+    container: json['container'] as String? ?? '',
+    custody: json['custody'] as String? ?? '',
+    retention: json['retention'] as String? ?? '',
+    retentionNote: json['retention_note'] as String? ?? '',
+    authoritative: json['authoritative'] as bool? ?? false,
+    legalHold: json['legal_hold'] as bool? ?? false,
+    objectTypes: (json['object_types'] as List<dynamic>? ?? const [])
+        .map((e) => '$e')
+        .toList(),
+    writtenBy: (json['written_by'] as List<dynamic>? ?? const [])
+        .map((e) => '$e')
+        .toList(),
+    readBy: (json['read_by'] as List<dynamic>? ?? const [])
+        .map((e) => '$e')
+        .toList(),
+    rows: json['rows'] as int?,
+    rowsCaption: json['rows_caption'] as String? ?? '',
+  );
+}
+
+/// Everything the Data screen draws: every Collection against its live count,
+/// and the retention policy read back against what is actually held.
+class DataScreen {
+  final List<DataCollection> collections;
+
+  /// Stored artifacts and their bytes — the document store's own numbers.
+  final int documents;
+  final int storedBytes;
+
+  /// Past their Collection's retention horizon. Reported, not swept.
+  final List<SourceArtifact> expiring;
+  final int expiringTotal;
+
+  /// False today, and the screen says so: an empty expiring list must not
+  /// read as enforcement while no purge pass exists.
+  final bool purgeBuilt;
+
+  const DataScreen({
+    required this.collections,
+    required this.documents,
+    required this.storedBytes,
+    required this.expiring,
+    required this.expiringTotal,
+    required this.purgeBuilt,
+  });
+
+  factory DataScreen.fromJson(Map<String, dynamic> json) => DataScreen(
+    collections: (json['collections'] as List<dynamic>? ?? const [])
+        .map((e) => DataCollection.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    documents: json['documents'] as int? ?? 0,
+    storedBytes: json['stored_bytes'] as int? ?? 0,
+    expiring: (json['expiring'] as List<dynamic>? ?? const [])
+        .map((e) => SourceArtifact.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    expiringTotal: json['expiring_total'] as int? ?? 0,
+    purgeBuilt: json['purge_built'] as bool? ?? false,
   );
 }
 

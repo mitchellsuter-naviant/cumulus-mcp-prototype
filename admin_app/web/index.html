@@ -29,14 +29,10 @@
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <!-- Typography: Inter for the UI, JetBrains Mono for document content. The
-       app declares matching fallbacks, so a blocked request degrades to the
-       system sans/mono rather than breaking the layout. -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
-    rel="stylesheet">
+  <!-- No webfont link here on purpose. Inter and JetBrains Mono are bundled as
+       assets (see pubspec.yaml): CanvasKit draws text with Skia and never sees
+       a face the browser loaded over CSS, so linking them fetched both
+       families a second time for nothing. -->
 
   <title>Cumulus Knowledge Admin</title>
   <link rel="manifest" href="manifest.json">

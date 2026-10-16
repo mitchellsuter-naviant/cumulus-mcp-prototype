@@ -5,6 +5,7 @@ import '../models/graph.dart';
 import '../models/world.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'skeleton.dart';
 import 'tbox_graph.dart';
 import 'ui_kit.dart';
 
@@ -143,24 +144,56 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
     super.dispose();
   }
 
+  /// Null instead of a throw, with the handler attached at the call site
+  /// rather than at the await: a future that fails while a sibling is still
+  /// in flight would otherwise surface as an unhandled asynchronous error.
+  static Future<T?> _optional<T>(Future<T> call) =>
+      call.then<T?>((value) => value, onError: (Object _) => null);
+
+  /// The world, or why it did not come. Every read here is caught the same
+  /// way — `on ApiException` alone let a cast or a format error escape into
+  /// nothing, and the pane spun forever with no message and no retry.
+  static Future<(MaterializedWorld?, String?)> _attempt(
+    Future<MaterializedWorld> call,
+  ) => call.then<(MaterializedWorld?, String?)>(
+    (world) => (world, null),
+    onError: (Object e) => (null, e is ApiException ? e.message : '$e'),
+  );
+
+  /// The three reads the explorer opens on. They do not depend on each other
+  /// — the schema, the fragment list and the live world — so they go out
+  /// together; chained, the first paint waited on the sum of three round
+  /// trips, and the biggest of the three was last in the queue.
   Future<void> _loadWorlds() async {
     // The schema is what makes the instances readable — which fields a type
     // declares, which links are composition — so it is fetched here rather
     // than handed down. A world without it renders as untyped rows.
-    try {
-      final ontology = await widget.api.ontology();
-      if (mounted) setState(() => _ontology = ontology);
-    } on ApiException {
-      // The rail falls back to whatever types the world itself contains.
+    final schema = _optional(widget.api.ontology());
+    final fragments = _optional(widget.api.listWorlds());
+    final live = _attempt(_fetch(_live));
+
+    final loadedSchema = await schema;
+    final loadedFragments = await fragments;
+    if (mounted) {
+      setState(() {
+        // Either may be absent and the screen still works: the rail falls
+        // back to whatever types the world itself contains, and the selector
+        // just shows LIVE.
+        if (loadedSchema != null) _ontology = loadedSchema;
+        if (loadedFragments != null) _worlds = loadedFragments;
+      });
     }
-    try {
-      final worlds = await widget.api.listWorlds();
-      if (mounted) setState(() => _worlds = worlds);
-    } on ApiException {
-      // The selector just shows LIVE; the fragments are a bonus.
-    }
-    await _loadWorld(_live);
+    _settle(_live, await live);
   }
+
+  Future<MaterializedWorld> _fetch(String id) => id == _live
+      // The whole live world in one payload; every query below runs
+      // client-side against it. Raised from 400 when the calendar mirror
+      // landed: a week of blocks per person is a few hundred instances on its
+      // own, and a truncated world would answer questions wrongly rather than
+      // visibly failing.
+      ? widget.api.graphInstances(limit: 1200)
+      : widget.api.materializeWorld(id);
 
   Future<void> _loadWorld(String id) async {
     setState(() {
@@ -171,52 +204,45 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
       _ask = null;
       _askedQuestion = '';
     });
-    try {
-      final world = id == _live
-          // The whole live world in one payload; every query below runs
-          // client-side against it. Raised from 400 when the calendar mirror
-          // landed: a week of blocks per person is a few hundred instances on
-          // its own, and a truncated world would answer questions wrongly
-          // rather than visibly failing.
-          ? await widget.api.graphInstances(limit: 1200)
-          : await widget.api.materializeWorld(id);
-      if (!mounted) return;
-      setState(() {
-        _world = world;
-        _loadingWorld = false;
-        // Land on the type you arrived from; otherwise on the busiest core
-        // type this world actually has.
-        final counts = world.byType;
-        // A part is identified through its owner and is not offered in the
-        // rail on its own, so arriving on one lands on the owner — the same
-        // resolution a `graph:` ref gets.
-        final clicked = widget.initialType;
-        final arrived = clicked == null
-            ? null
-            : (_declared(clicked)?.isPart ?? false)
-                  ? _declared(clicked)!.ownerType
-                  : clicked;
-        if (arrived != null && (counts[arrived] ?? 0) > 0) {
-          _type = arrived;
-          return;
-        }
-        final candidates = _rootTypes
-            .where((t) => (counts[t.name] ?? 0) > 0)
-            .toList()
-          ..sort((a, b) =>
-              (counts[b.name] ?? 0).compareTo(counts[a.name] ?? 0));
-        _type = candidates.any((t) => t.name == 'Employee')
-            ? 'Employee'
-            : (candidates.isNotEmpty ? candidates.first.name : null);
-      });
-    } on ApiException catch (e) {
-      if (mounted) {
-        setState(() {
-          _error = e.message;
-          _loadingWorld = false;
-        });
+    _settle(id, await _attempt(_fetch(id)));
+  }
+
+  /// Adopt a world, or say why there is none. Keyed on the world that was
+  /// asked for, so two quick picks in the selector cannot land out of order.
+  void _settle(String id, (MaterializedWorld?, String?) result) {
+    if (!mounted || _worldId != id) return;
+    final (world, error) = result;
+    setState(() {
+      _loadingWorld = false;
+      if (world == null) {
+        _error = error ?? 'The world did not answer.';
+        return;
       }
-    }
+      _world = world;
+      _type = _landOn(world);
+    });
+  }
+
+  /// The type to open on: the one you arrived from, else the busiest core
+  /// type this world actually holds.
+  String? _landOn(MaterializedWorld world) {
+    final counts = world.byType;
+    // A part is identified through its owner and is not offered in the rail
+    // on its own, so arriving on one lands on the owner — the same resolution
+    // a `graph:` ref gets.
+    final clicked = widget.initialType;
+    final arrived = clicked == null
+        ? null
+        : (_declared(clicked)?.isPart ?? false)
+              ? _declared(clicked)!.ownerType
+              : clicked;
+    if (arrived != null && (counts[arrived] ?? 0) > 0) return arrived;
+    final candidates = _rootTypes
+        .where((t) => (counts[t.name] ?? 0) > 0)
+        .toList()
+      ..sort((a, b) => (counts[b.name] ?? 0).compareTo(counts[a.name] ?? 0));
+    if (candidates.any((t) => t.name == 'Employee')) return 'Employee';
+    return candidates.isNotEmpty ? candidates.first.name : null;
   }
 
   // -- world queries (all client-side: the payload is the world) -------------------
@@ -275,10 +301,10 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
           _asking = false;
         });
       }
-    } on ApiException catch (e) {
+    } catch (e) {
       if (mounted) {
         setState(() {
-          _error = e.message;
+          _error = e is ApiException ? e.message : '$e';
           _asking = false;
         });
       }
@@ -351,20 +377,75 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
           const SizedBox(height: 12),
         ],
         Expanded(
-          child: _loadingWorld
-              ? const CumulusCard(child: CumulusLoading())
-              : Row(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Expanded(flex: 1, child: _rail()),
-                    const SizedBox(width: 16),
-                    Expanded(flex: 2, child: _instancePane()),
-                  ],
-                ),
+          // The world bar, the ask bar and the split are chrome and stay put;
+          // only the two data panes become shapes, in the flexes they will
+          // land in, so nothing moves when the world arrives.
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                flex: 1,
+                child: _loadingWorld ? _railSkeleton() : _rail(),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                flex: 2,
+                child: _loadingWorld ? _paneSkeleton() : _instancePane(),
+              ),
+            ],
+          ),
         ),
       ],
     );
   }
+
+  /// The filter box and the type rows, in the shape [_rail] will fill —
+  /// scrollable for the same reason the real one is, so a short pane crops
+  /// the placeholder instead of overflowing it.
+  Widget _railSkeleton() => SkeletonPulse(
+    child: SkeletonCard(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const SkeletonBar(height: 34, radius: CumulusRadius.control),
+          const SizedBox(height: 14),
+          const SkeletonBar(width: 110, height: 10),
+          const SizedBox(height: 8),
+          Expanded(
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (var i = 0; i < 9; i++)
+                    const SkeletonListRow(leadingCircle: false),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  Widget _paneSkeleton() => const SkeletonPulse(
+    child: SkeletonCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SkeletonBar(width: 200, height: 16),
+          SizedBox(height: 10),
+          SkeletonBar(width: 320, height: 10),
+          SizedBox(height: 18),
+          Expanded(
+            child: SingleChildScrollView(
+              child: SkeletonTableRows(rows: 8, columnFlex: [3, 3, 1]),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
 
   // -- world bar ----------------------------------------------------------------------
 
@@ -569,7 +650,17 @@ class _ABoxExplorerState extends State<ABoxExplorer> {
 
   Widget _rail() {
     final world = _world;
-    if (world == null) return const CumulusCard(child: CumulusLoading());
+    // Not loading and still nothing: the read failed, and the strip above
+    // already says why. A spinner here would claim something is still coming.
+    if (world == null) {
+      return const CumulusCard(
+        child: CumulusEmptyState(
+          icon: Icons.hub_outlined,
+          title: 'No world loaded',
+          message: 'Retry the read above, or pick another world.',
+        ),
+      );
+    }
     final counts = world.byType;
     final core = _rootTypes
         .where((t) => !_isInfrastructure(t) && _matchesRailFilter(t))

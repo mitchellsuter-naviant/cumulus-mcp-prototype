@@ -12,7 +12,18 @@ class ChartPoint {
   // Extra tooltip lines beyond the value, e.g. "7 tasks raised".
   final List<String> extra;
 
-  const ChartPoint(this.label, this.value, {this.extra = const []});
+  /// What the tooltip says instead of `format(value)`. A measure that can be
+  /// *absent* rather than zero needs this: a day on which nothing finished
+  /// has no success rate, and plotting it at 0 while the tooltip reads "0%"
+  /// reports a total collapse where there was simply no evidence.
+  final String? valueLabel;
+
+  const ChartPoint(
+    this.label,
+    this.value, {
+    this.extra = const [],
+    this.valueLabel,
+  });
 }
 
 /// Single-hue daily bar chart in the console's voice: thin indigo bars with
@@ -30,6 +41,12 @@ class DailyBarChart extends StatefulWidget {
   /// carried by the surrounding card instead.
   final bool showTitle;
 
+  /// Floor for the top of the axis. A bounded measure has a scale of its own
+  /// — a success rate tops out at 1.0 whatever the best day managed — and
+  /// letting the data set the ceiling would redraw the axis every time the
+  /// window moved, so two readings of the same chart would not compare.
+  final double? axisMax;
+
   const DailyBarChart({
     super.key,
     required this.title,
@@ -37,6 +54,7 @@ class DailyBarChart extends StatefulWidget {
     required this.format,
     this.height = 150,
     this.showTitle = true,
+    this.axisMax,
   });
 
   @override
@@ -64,6 +82,7 @@ class _DailyBarChartState extends State<DailyBarChart> {
               points: widget.points,
               hover: _hover,
               format: widget.format,
+              axisMax: widget.axisMax,
             ),
           ),
         );
@@ -99,11 +118,13 @@ class _DailyBarPainter extends CustomPainter {
   final List<ChartPoint> points;
   final int? hover;
   final String Function(double) format;
+  final double? axisMax;
 
   _DailyBarPainter({
     required this.points,
     required this.hover,
     required this.format,
+    this.axisMax,
   });
 
   @override
@@ -117,7 +138,11 @@ class _DailyBarPainter extends CustomPainter {
       ..strokeWidth = 1;
 
     final maxValue = points.fold<double>(0, (m, p) => math.max(m, p.value));
-    final top = maxValue <= 0 ? 1.0 : maxValue * 1.05;
+    final top = axisMax != null
+        ? math.max(axisMax!, maxValue)
+        : maxValue <= 0
+        ? 1.0
+        : maxValue * 1.05;
 
     // Two gridlines plus the baseline keep the scale readable and recessive.
     canvas.drawLine(Offset(plot.left, plot.top), Offset(plot.right, plot.top), grid);
@@ -188,7 +213,11 @@ class _DailyBarPainter extends CustomPainter {
   void _tooltip(Canvas canvas, Rect plot, double cx, ChartPoint point) {
     final lines = <TextPainter>[
       _painter(point.label, Colors.white, FontWeight.w600),
-      _painter(format(point.value), const Color(0xFFC9CDD6), FontWeight.w400),
+      _painter(
+        point.valueLabel ?? format(point.value),
+        const Color(0xFFC9CDD6),
+        FontWeight.w400,
+      ),
       for (final extra in point.extra)
         _painter(extra, const Color(0xFFC9CDD6), FontWeight.w400),
     ];
@@ -243,7 +272,7 @@ class _DailyBarPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_DailyBarPainter old) =>
-      old.points != points || old.hover != hover;
+      old.points != points || old.hover != hover || old.axisMax != axisMax;
 }
 
 /// Tiny indigo trend line for list rows. Renders nothing meaningful for

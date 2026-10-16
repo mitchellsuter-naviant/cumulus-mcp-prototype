@@ -4,7 +4,8 @@ import '../models/identity_screen.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'cumulus_shell.dart' show PageBody;
-import 'merge_review.dart';
+import '../tasks/shared/merge_review.dart';
+import 'skeleton.dart';
 import 'ui_kit.dart';
 
 /// Counterparty identity — the curation desk for the book itself.
@@ -189,7 +190,16 @@ class _IdentityWorkbenchState extends State<IdentityWorkbench> {
               ),
             );
     }
-    if (screen == null) return const CumulusLoading();
+    if (screen == null) {
+      // The heading above is real already; what is unknown is the split — the
+      // proposal list and the record pane beside it — so that is what stands in.
+      return const SkeletonPulse(
+        child: Padding(
+          padding: EdgeInsets.fromLTRB(28, 0, 28, 24),
+          child: SkeletonMasterDetail(listWidth: 420, rows: 7),
+        ),
+      );
+    }
     if (screen.lastSweep == null && screen.standing.isEmpty) {
       return _NeverSwept(screen: screen);
     }

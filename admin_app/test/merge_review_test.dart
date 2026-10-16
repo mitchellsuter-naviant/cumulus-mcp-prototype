@@ -3,7 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:cumulus_admin/models/identity_screen.dart';
 import 'package:cumulus_admin/services/api_client.dart';
-import 'package:cumulus_admin/widgets/merge_review.dart';
+import 'package:cumulus_admin/tasks/shared/merge_review.dart';
 
 /// The four states a proposed merge has to be legible in, and the one thing
 /// that must be true in all of them.

@@ -2,20 +2,20 @@ import 'dart:convert';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
-import '../models/data_layer.dart';
-import '../models/payable.dart';
-import '../models/run.dart';
-import '../models/session.dart';
-import '../models/task.dart';
-import '../services/api_client.dart';
-import '../theme/cumulus_theme.dart';
-import 'command_palette.dart' show ownsWorkspace, payablesQueue;
-import 'ref_chips.dart';
-import 'run_workbench.dart';
-import 'side_drawer.dart';
-import 'ui_kit.dart';
+import 'models.dart';
+import '../../models/run.dart';
+import '../../models/session.dart';
+import '../../models/task.dart';
+import '../../services/api_client.dart';
+import '../../theme/cumulus_theme.dart';
+import '../../widgets/command_palette.dart' show ownsWorkspace, payablesQueue;
+import '../../widgets/document_drawer.dart';
+import '../../widgets/ref_chips.dart';
+import '../../widgets/run_workbench.dart';
+import '../../widgets/side_drawer.dart';
+import '../../widgets/skeleton.dart';
+import '../../widgets/ui_kit.dart';
 
 /// The Accounts Payable workspace: enter an invoice, and the table of what the
 /// accounts-payable flow made of every invoice so far.
@@ -90,9 +90,7 @@ class _PayablesViewState extends State<PayablesView> {
       );
     }
     final screen = _screen;
-    if (screen == null) {
-      return const Center(child: CircularProgressIndicator(strokeWidth: 2.5));
-    }
+    if (screen == null) return _skeleton();
     final stats = screen.stats;
     final visible = _lens == 'all'
         ? screen.invoices
@@ -103,19 +101,7 @@ class _PayablesViewState extends State<PayablesView> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          PageHeading(
-            eyebrow: 'Workspace',
-            title: 'Accounts Payable',
-            subtitle:
-                'The accounts-payable flow writes this table: one extraction '
-                'pass over the document, the vendor resolved against the '
-                'master, then matched, screened and posted under policy.',
-            trailing: OutlinedButton.icon(
-              onPressed: _load,
-              icon: const Icon(Icons.refresh, size: 16),
-              label: const Text('Refresh'),
-            ),
-          ),
+          _heading(),
           const SizedBox(height: 18),
           StatStrip(
             tiles: [
@@ -155,9 +141,9 @@ class _PayablesViewState extends State<PayablesView> {
             ],
           ),
           const SizedBox(height: 16),
-          InvoiceComposerCard(
+          InvoiceUploadCard(
             api: widget.api,
-            composer: screen.composer,
+            submission: screen.submission,
             onSubmitted: (outcome) {
               setState(() => _submitted = outcome);
               _load();
@@ -188,23 +174,7 @@ class _PayablesViewState extends State<PayablesView> {
                 'and governed read · click one to open it',
           ),
           const SizedBox(height: 16),
-          Wrap(
-            spacing: 8,
-            children: [
-              for (final lens in const [
-                ('all', CumulusTone.neutral),
-                ('posted', CumulusTone.success),
-                ('pending', CumulusTone.warn),
-                ('denied', CumulusTone.danger),
-              ])
-                LensChip(
-                  label: lens.$1.toUpperCase(),
-                  tone: lens.$2,
-                  selected: _lens == lens.$1,
-                  onTap: () => setState(() => _lens = lens.$1),
-                ),
-            ],
-          ),
+          _lensRail(),
           const SizedBox(height: 14),
           if (visible.isEmpty)
             // Three states, and only one of them used to be said. "Nothing at
@@ -226,7 +196,8 @@ class _PayablesViewState extends State<PayablesView> {
                         'you can see, not what there is.'
                   : _lens == 'all'
                   ? 'The accounts-payable flow has written no rows here. '
-                        'Compose one above and it runs now.'
+                        'Upload a document above, or let ap-intake '
+                        'find one in the document system.'
                   : 'No invoice is in the $_lens state. Clear the lens to see '
                         'the whole table.',
             )
@@ -240,6 +211,96 @@ class _PayablesViewState extends State<PayablesView> {
       ),
     );
   }
+
+  /// The chrome that owes the table nothing. It is the same widget on the first
+  /// frame and the hundredth, so the page can say what it is before it knows
+  /// what is in it.
+  Widget _heading() => PageHeading(
+    eyebrow: 'Workspace',
+    title: 'Accounts Payable',
+    subtitle:
+        'The accounts-payable flow writes this table: one extraction '
+        'pass over the document, the vendor resolved against the '
+        'master, then matched, screened and posted under policy.',
+    trailing: OutlinedButton.icon(
+      onPressed: _screen == null ? null : _load,
+      icon: const Icon(Icons.refresh, size: 16),
+      label: const Text('Refresh'),
+    ),
+  );
+
+  Widget _lensRail() => Wrap(
+    spacing: 8,
+    children: [
+      for (final lens in const [
+        ('all', CumulusTone.neutral),
+        ('posted', CumulusTone.success),
+        ('pending', CumulusTone.warn),
+        ('denied', CumulusTone.danger),
+      ])
+        LensChip(
+          label: lens.$1.toUpperCase(),
+          tone: lens.$2,
+          selected: _lens == lens.$1,
+          onTap: () => setState(() => _lens = lens.$1),
+        ),
+    ],
+  );
+
+  /// The page while the screen is in flight: heading and lens rail for real,
+  /// grey geometry in the shape of the six-tile strip, the submission door and
+  /// the invoice table. Nothing moves when the rows land except the fill.
+  Widget _skeleton() => SingleChildScrollView(
+    padding: const EdgeInsets.fromLTRB(28, 20, 28, 40),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _heading(),
+        const SizedBox(height: 18),
+        const SkeletonPulse(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SkeletonStatStrip(count: 6),
+              SizedBox(height: 16),
+              SkeletonCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SkeletonBar(width: 130, height: 13),
+                    SizedBox(height: 10),
+                    SkeletonBar(width: 340, height: 10),
+                    SizedBox(height: 18),
+                    Row(
+                      children: [
+                        SkeletonBar(
+                          width: 232,
+                          height: 34,
+                          radius: CumulusRadius.control,
+                        ),
+                        SizedBox(width: 12),
+                        SkeletonBar(
+                          width: 108,
+                          height: 34,
+                          radius: CumulusRadius.control,
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        _lensRail(),
+        const SizedBox(height: 14),
+        const SkeletonPulse(
+          child: SkeletonListCard(rows: 6, leadingCircle: false),
+        ),
+      ],
+    ),
+  );
 
   Widget _row(PayableOutcome outcome) {
     final r = outcome.invoice;
@@ -363,138 +424,45 @@ CumulusTone stateTone(String state) => switch (state) {
 };
 
 // ---------------------------------------------------------------------------
-// The composer
+// The submission door
 // ---------------------------------------------------------------------------
 
-/// Entering an invoice, two ways, and they are not variations of each other.
+/// Entering an invoice by hand: a document, and nothing else.
 ///
-/// **Upload** is a document. It says nothing about the case, and with the stub
-/// extractor wired it says so plainly: the reader reads the filename, not the
-/// page.
+/// There used to be a second tab. **Compose** let a person pick a vendor, then
+/// one of that vendor's purchase orders, then step the quantities on that
+/// order's lines and tick a deviation — and the choices serialized to the hint
+/// string the extractor reads. Every control was a real row out of the graph
+/// and the thing it produced was still an invoice nobody wrote: an extraction
+/// out of a form, indistinguishable afterwards from one a model made of a page.
 ///
-/// **Compose** is a case. Every control is a real row out of the graph — the
-/// vendor master, then *that vendor's* purchase orders, then *that order's*
-/// lines with their ordered and received quantities — and the choices
-/// serialize to the hint string shown live underneath. That string is the
-/// case-authoring language of this flow: the seeded world and the eval
-/// triggers are written in it. Nobody has to be taught it, because they watch
-/// it assemble.
+/// In a deployed estate invoices do not arrive here at all. They arrive
+/// through `ap-intake`, out of the folders the customer already files them in,
+/// and this door is for the one somebody has in their hand.
 ///
-/// One restraint is deliberate: nothing here predicts the outcome. The
-/// composed total sits *beside* the governed limit a run will read, and the
-/// reader draws the conclusion. `_posting_check` in `payables.py` is the rule,
-/// and a second implementation of it here would eventually disagree with the
-/// first.
-class InvoiceComposerCard extends StatefulWidget {
+/// The caption is load-bearing rather than decorative: with the stub extractor
+/// wired, the reader reads the *filename*, and a person is owed that before
+/// they read anything into what comes back.
+class InvoiceUploadCard extends StatefulWidget {
   final ApiClient api;
-  final InvoiceComposer composer;
+  final SubmissionPanel submission;
   final void Function(PayableOutcome) onSubmitted;
 
-  const InvoiceComposerCard({
+  const InvoiceUploadCard({
     super.key,
     required this.api,
-    required this.composer,
+    required this.submission,
     required this.onSubmitted,
   });
 
   @override
-  State<InvoiceComposerCard> createState() => _InvoiceComposerCardState();
+  State<InvoiceUploadCard> createState() => _InvoiceUploadCardState();
 }
 
-class _InvoiceComposerCardState extends State<InvoiceComposerCard> {
-  static const _unknownVendor = 'meridian-supply';
-
-  int _tab = 0;
-  ComposerVendor? _vendor;
-  ComposerOrder? _order;
-  final Map<String, double> _quantities = {};
-  final Set<String> _twists = {};
-  bool _overrideTotal = false;
-  final _total = TextEditingController();
-  final _invoice = TextEditingController();
-  final _newVendor = TextEditingController(text: _unknownVendor);
+class _InvoiceUploadCardState extends State<InvoiceUploadCard> {
   XFile? _file;
   bool _busy = false;
   String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    _pickVendor(
-      widget.composer.vendors.isEmpty ? null : widget.composer.vendors.first,
-    );
-  }
-
-  @override
-  void dispose() {
-    _total.dispose();
-    _invoice.dispose();
-    _newVendor.dispose();
-    super.dispose();
-  }
-
-  /// Choosing a vendor re-seeds everything downstream of it, because
-  /// everything downstream of it belongs to that vendor: its orders, its
-  /// order's lines, and an invoice number in its own series.
-  void _pickVendor(ComposerVendor? vendor) {
-    _vendor = vendor;
-    _pickOrder(
-      vendor == null || vendor.orders.isEmpty ? null : vendor.orders.first,
-    );
-    final slug = vendor?.slug ?? _newVendor.text;
-    final prefix = slug.isEmpty
-        ? 'INV'
-        : slug.split('-').first.toUpperCase();
-    _invoice.text =
-        '$prefix-INV-${DateTime.now().millisecondsSinceEpoch % 100000}';
-  }
-
-  /// The stepper defaults to what the order ordered, so the untouched
-  /// composition is the invoice that matches exactly — every deviation from a
-  /// clean three-way match is then something a person deliberately did.
-  void _pickOrder(ComposerOrder? order) {
-    _order = order;
-    _quantities.clear();
-    if (order != null) {
-      for (final line in order.lines) {
-        _quantities[line.sku] = line.quantityOrdered;
-      }
-    } else if (widget.composer.catalog.isNotEmpty) {
-      _quantities[widget.composer.catalog.first.sku] = 1;
-    }
-  }
-
-  List<ComposerLine> get _lines => _order?.lines ?? widget.composer.catalog;
-
-  /// What the stepped lines come to. Kept separate from [_composedUsd] so
-  /// that turning the override *on* can seed the field from the lines rather
-  /// than from the empty field it is about to read.
-  double get _linesUsd {
-    var sum = 0.0;
-    for (final line in _lines) {
-      sum += (_quantities[line.sku] ?? 0) * line.unitPriceUsd;
-    }
-    return sum;
-  }
-
-  double get _composedUsd => _overrideTotal
-      ? (double.tryParse(_total.text.trim()) ?? 0)
-      : _linesUsd;
-
-  InvoiceScenario get _scenario => InvoiceScenario(
-    vendorSlug: _vendor?.slug ?? '',
-    newVendor: _vendor == null ? _newVendor.text.trim().toLowerCase() : '',
-    poNumber: _order?.poNumber ?? '',
-    noPo: _order == null,
-    invoiceNumber: _invoice.text.trim().toUpperCase(),
-    lines: [
-      for (final line in _lines)
-        if ((_quantities[line.sku] ?? 0) > 0)
-          ScenarioLine(sku: line.sku, quantity: _quantities[line.sku]!),
-    ],
-    totalUsd: _overrideTotal ? _composedUsd : 0,
-    twists: _twists,
-  );
 
   Future<void> _pickFile() async {
     final file = await openFile(
@@ -506,16 +474,17 @@ class _InvoiceComposerCardState extends State<InvoiceComposerCard> {
   }
 
   Future<void> _submit() async {
+    final file = _file;
+    if (file == null) return;
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
-      final bytes = _tab == 1 && _file != null ? await _file!.readAsBytes() : null;
+      final bytes = await file.readAsBytes();
       final outcome = await widget.api.submitInvoice(
-        scenario: _tab == 0 ? _scenario : null,
-        imageBase64: bytes == null ? '' : base64Encode(bytes),
-        filename: _tab == 1 ? (_file?.name ?? '') : '',
+        imageBase64: base64Encode(bytes),
+        filename: file.name,
       );
       if (!mounted) return;
       setState(() {
@@ -535,496 +504,69 @@ class _InvoiceComposerCardState extends State<InvoiceComposerCard> {
 
   @override
   Widget build(BuildContext context) {
+    final extractor = widget.submission.extractor;
+    final limit = widget.submission.clause('auto-post-limit');
     return SectionCard(
       title: 'Enter an invoice',
       subtitle:
-          'runs the accounts-payable flow now, against the vendor master and '
-          'the purchase orders already in the graph',
+          'the side door — a document you have in your hand. Filed invoices '
+          'reach the flow through ap-intake, out of the document system',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SegmentedTabs(
-            labels: const ['Compose', 'Upload a document'],
-            selectedIndex: _tab,
-            onChanged: (i) => setState(() => _tab = i),
+          Row(
+            children: [
+              OutlinedButton.icon(
+                onPressed: _busy ? null : _pickFile,
+                icon: const Icon(Icons.description_outlined, size: 16),
+                label: Text(_file?.name ?? 'Choose an invoice image or PDF'),
+              ),
+              const SizedBox(width: 12),
+              FilledButton(
+                onPressed: _busy || _file == null ? null : _submit,
+                child: _busy
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Run the flow'),
+              ),
+            ],
           ),
-          const SizedBox(height: 16),
-          if (_tab == 0) ..._compose() else ..._upload(),
+          const SizedBox(height: 10),
+          Text(
+            extractor == 'stub'
+                ? 'No extraction model is configured in this deployment. The '
+                      'reader behind the ModelCall is the stub: it reads the '
+                      'filename, not the page, and invents the rest '
+                      'deterministically from the bytes. Everything after '
+                      'extraction — the resolver, the three-way match, the '
+                      'screen, the posting rule — is the real thing.'
+                : 'Extracted by the $extractor reader, one ModelCall over the '
+                      'document, against the governed extraction prompt this '
+                      'run reads at its revision.',
+            style: CumulusText.meta,
+          ),
+          if (limit != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              'This run will be judged against ${limit.label.toLowerCase()} '
+              '${limit.value}, read at ${limit.ref}.',
+              style: CumulusText.meta,
+            ),
+          ],
           if (_error != null) ...[
             const SizedBox(height: 12),
-            Text(_error!, style: CumulusText.body.copyWith(
-              color: CumulusColors.danger,
-            )),
+            Text(
+              _error!,
+              style: CumulusText.body.copyWith(color: CumulusColors.danger),
+            ),
           ],
         ],
       ),
     );
   }
-
-  // -- upload ---------------------------------------------------------------
-
-  List<Widget> _upload() => [
-    Row(
-      children: [
-        OutlinedButton.icon(
-          onPressed: _busy ? null : _pickFile,
-          icon: const Icon(Icons.description_outlined, size: 16),
-          label: Text(_file?.name ?? 'Choose an invoice image or PDF'),
-        ),
-        const SizedBox(width: 12),
-        _submitButton(enabled: _file != null),
-      ],
-    ),
-    const SizedBox(height: 10),
-    Text(
-      widget.composer.extractor == 'stub'
-          ? 'No extraction model is configured in this deployment. The reader '
-                'behind the ModelCall is the stub: it reads the filename, not '
-                'the page, and invents the rest deterministically from the '
-                'bytes. Everything after extraction — the resolver, the '
-                'three-way match, the screen, the posting rule — is the real '
-                'thing. To steer a run deliberately, compose one instead.'
-          : 'Extracted by the ${widget.composer.extractor} reader, one '
-                'ModelCall over the document, against the governed extraction '
-                'prompt this run reads at its revision.',
-      style: CumulusText.meta,
-    ),
-  ];
-
-  // -- compose --------------------------------------------------------------
-
-  List<Widget> _compose() {
-    final vendor = _vendor;
-    return [
-      Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(flex: 3, child: _vendorPicker()),
-          const SizedBox(width: 16),
-          Expanded(flex: 2, child: _orderPicker()),
-          const SizedBox(width: 16),
-          Expanded(
-            flex: 2,
-            child: LabeledField(
-              label: 'Invoice number',
-              child: TextField(
-                controller: _invoice,
-                enabled: !_busy,
-                onChanged: (_) => setState(() {}),
-                textCapitalization: TextCapitalization.characters,
-                inputFormatters: [
-                  // The grammar's charset. Refusing the keystroke is kinder
-                  // than refusing the submission, and it is the same rule:
-                  // a character `to_hint` cannot write is one `parse` cannot
-                  // read back.
-                  FilteringTextInputFormatter.allow(RegExp(r'[A-Za-z0-9\-]')),
-                ],
-                decoration: const InputDecoration(isDense: true),
-              ),
-            ),
-          ),
-        ],
-      ),
-      if (vendor != null) ...[
-        const SizedBox(height: 8),
-        _vendorFacts(vendor),
-      ],
-      const SizedBox(height: 16),
-      // The receiving column is named only where there is one. This estate has
-      // no receiving system — the feed has never delivered and the book holds
-      // no receipt — so an order with no receipts pairs against the purchase
-      // order and nothing else, and saying otherwise described a leg the
-      // reader cannot go and find.
-      FieldLabel(
-        _order == null ? 'Lines, from the catalog' : 'Lines on ${_order!.poNumber}',
-        hint: _order == null
-            ? 'no purchase order behind this invoice, so nothing to bill '
-                  'against — the match will have nothing to pair with'
-            : _order!.receipts.isEmpty
-            ? 'stepped from what the order ordered; nothing has been received '
-                  'against it, so the match has only the order to pair with'
-            : 'stepped from what the order ordered; the receiving column is '
-                  'what was actually booked in',
-      ),
-      for (final line in _lines) _lineRow(line),
-      const SizedBox(height: 14),
-      _totalRow(),
-      const SizedBox(height: 16),
-      const FieldLabel(
-        'Twists',
-        hint: 'each one reaches a different branch, decided by a governed '
-            'clause this run reads',
-      ),
-      for (final twist in widget.composer.twists) _twistRow(twist),
-      const SizedBox(height: 16),
-      _hintPreview(),
-    ];
-  }
-
-  Widget _vendorPicker() => LabeledField(
-    label: 'Vendor',
-    child: DropdownButtonFormField<String>(
-      initialValue: _vendor?.slug ?? '',
-      isDense: true,
-      decoration: const InputDecoration(isDense: true),
-      items: [
-        for (final vendor in widget.composer.vendors)
-          DropdownMenuItem(value: vendor.slug, child: Text(vendor.label)),
-        const DropdownMenuItem(
-          value: '',
-          child: Text('A vendor we do not know'),
-        ),
-      ],
-      onChanged: _busy
-          ? null
-          : (slug) => setState(() {
-              _pickVendor(
-                slug == null || slug.isEmpty
-                    ? null
-                    : widget.composer.vendors.firstWhere((v) => v.slug == slug),
-              );
-            }),
-    ),
-  );
-
-  Widget _orderPicker() => LabeledField(
-    label: 'Purchase order',
-    child: DropdownButtonFormField<String>(
-      initialValue: _order?.poNumber ?? '',
-      isDense: true,
-      decoration: const InputDecoration(isDense: true),
-      items: [
-        for (final order in _vendor?.orders ?? const <ComposerOrder>[])
-          DropdownMenuItem(value: order.poNumber, child: Text(order.poNumber)),
-        const DropdownMenuItem(value: '', child: Text('No purchase order')),
-      ],
-      onChanged: _busy
-          ? null
-          : (number) => setState(() {
-              _pickOrder(
-                number == null || number.isEmpty
-                    ? null
-                    : _vendor!.orders.firstWhere((o) => o.poNumber == number),
-              );
-            }),
-    ),
-  );
-
-  /// What the vendor master holds for the vendor you just chose. This used to
-  /// be a card of its own further down the page, which meant its most useful
-  /// column — every source system's id for one canonical company — was read
-  /// nowhere near the moment it mattered.
-  Widget _vendorFacts(ComposerVendor vendor) => Wrap(
-    spacing: 6,
-    runSpacing: 6,
-    crossAxisAlignment: WrapCrossAlignment.center,
-    children: [
-      StatusBadge(
-        vendor.status,
-        tone: vendor.status == 'active' ? CumulusTone.success : CumulusTone.warn,
-        dense: true,
-      ),
-      // "Open" is now true of the list this counts: the composer is served
-      // only orders that can still be billed against, so the count and the
-      // word agree at the source rather than in this caption.
-      Text(
-        [
-          if (vendor.taxId.isNotEmpty) 'tax ${vendor.taxId}',
-          if (vendor.paymentTerms.isNotEmpty) vendor.paymentTerms,
-          '${vendor.invoices} invoice(s)',
-          '${vendor.orders.length} open PO(s)',
-        ].join('  ·  '),
-        style: CumulusText.meta,
-      ),
-      for (final source in vendor.sources)
-        Tooltip(
-          message: source.live
-              ? 'One canonical vendor carrying this system\'s id for it. When '
-                    'a vendor was a slug on a row, the same company in two '
-                    'systems was two vendors.'
-              : 'Withdrawn by a steward — kept, and no longer resolving.',
-          child: _monoChip(
-            '${source.source}:${source.externalId}',
-            strike: !source.live,
-          ),
-        ),
-    ],
-  );
-
-  Widget _lineRow(ComposerLine line) {
-    final quantity = _quantities[line.sku] ?? 0;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: Row(
-        children: [
-          SizedBox(width: 96, child: _monoChip(line.sku)),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              line.description,
-              style: CumulusText.body.copyWith(
-                fontSize: 12.5,
-                color: quantity > 0
-                    ? CumulusColors.ink
-                    : CumulusColors.inkMuted,
-              ),
-            ),
-          ),
-          if (line.quantityReceived >= 0)
-            SizedBox(
-              width: 150,
-              child: Text(
-                '${_qty(line.quantityOrdered)} ordered · '
-                '${_qty(line.quantityReceived)} received',
-                textAlign: TextAlign.right,
-                style: CumulusText.meta,
-              ),
-            ),
-          const SizedBox(width: 12),
-          SizedBox(
-            width: 84,
-            child: Text(
-              '\$${line.unitPriceUsd.toStringAsFixed(2)}',
-              textAlign: TextAlign.right,
-              style: CumulusText.meta,
-            ),
-          ),
-          const SizedBox(width: 12),
-          _stepper(line.sku, quantity),
-          SizedBox(
-            width: 96,
-            child: Text(
-              '\$${(quantity * line.unitPriceUsd).toStringAsFixed(2)}',
-              textAlign: TextAlign.right,
-              style: CumulusText.body.copyWith(
-                fontSize: 12.5,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _stepper(String sku, double quantity) => Row(
-    mainAxisSize: MainAxisSize.min,
-    children: [
-      _step(Icons.remove, quantity > 0
-          ? () => setState(() => _quantities[sku] = quantity - 1)
-          : null),
-      SizedBox(
-        width: 34,
-        child: Text(
-          _qty(quantity),
-          textAlign: TextAlign.center,
-          style: CumulusText.mono.copyWith(fontSize: 12),
-        ),
-      ),
-      _step(Icons.add, () => setState(() => _quantities[sku] = quantity + 1)),
-    ],
-  );
-
-  Widget _step(IconData icon, VoidCallback? onTap) => InkWell(
-    onTap: _busy ? null : onTap,
-    borderRadius: BorderRadius.circular(6),
-    child: Container(
-      width: 24,
-      height: 24,
-      alignment: Alignment.center,
-      decoration: BoxDecoration(
-        color: CumulusColors.surfaceMuted,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: CumulusColors.border),
-      ),
-      child: Icon(
-        icon,
-        size: 14,
-        color: onTap == null ? CumulusColors.inkMuted : CumulusColors.ink,
-      ),
-    ),
-  );
-
-  /// The juxtaposition, and the whole of it. What you composed on the left,
-  /// what the run will read on the right, and no verdict in between.
-  Widget _totalRow() {
-    final limit = widget.composer.clause('auto-post-limit');
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
-      children: [
-        Checkbox(
-          value: _overrideTotal,
-          visualDensity: VisualDensity.compact,
-          onChanged: _busy
-              ? null
-              : (on) => setState(() {
-                  _overrideTotal = on ?? false;
-                  if (_overrideTotal && _total.text.isEmpty) {
-                    _total.text = _linesUsd.toStringAsFixed(2);
-                  }
-                }),
-        ),
-        Text('Bill a different total', style: CumulusText.body),
-        const SizedBox(width: 10),
-        if (_overrideTotal)
-          SizedBox(
-            width: 120,
-            child: TextField(
-              controller: _total,
-              enabled: !_busy,
-              onChanged: (_) => setState(() {}),
-              keyboardType: TextInputType.number,
-              inputFormatters: [
-                FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
-              ],
-              decoration: const InputDecoration(
-                isDense: true,
-                prefixText: '\$',
-              ),
-            ),
-          ),
-        const Spacer(),
-        Text(
-          '\$${_composedUsd.toStringAsFixed(2)}',
-          style: CumulusText.statValue.copyWith(fontSize: 20),
-        ),
-        const SizedBox(width: 14),
-        if (limit != null)
-          Tooltip(
-            message:
-                'The value the posting rule will read at this revision. What '
-                'it makes of your amount is the run\'s answer, not this '
-                'screen\'s.',
-            child: _monoChip(
-              'auto-post ≤ ${limit.value} · ${limit.ref}',
-              tone: CumulusTone.accent,
-            ),
-          ),
-      ],
-    );
-  }
-
-  /// One twist, and whether the branch it advertises can be reached from here.
-  ///
-  /// The quantity-variance branch compares billed against *received*, so it
-  /// needs a receiving report. This estate has none — the feed has never
-  /// delivered — and the checkbox promised a branch that cannot fire, which
-  /// teaches the wrong thing while looking right. Derived from the chosen
-  /// order's own receipts rather than asserted, so it starts telling the truth
-  /// the day a receiving feed lands one.
-  Widget _twistRow(ScenarioTwist twist) {
-    final clause = widget.composer.clause(twist.clauseId);
-    final unreachable =
-        twist.branch == 'quantity variance' &&
-        (_order == null || _order!.receipts.isEmpty);
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 2),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Checkbox(
-            value: _twists.contains(twist.id),
-            visualDensity: VisualDensity.compact,
-            onChanged: _busy
-                ? null
-                : (on) => setState(() {
-                    if (on ?? false) {
-                      _twists.add(twist.id);
-                    } else {
-                      _twists.remove(twist.id);
-                    }
-                  }),
-          ),
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.only(top: 9),
-              child: Wrap(
-                spacing: 8,
-                runSpacing: 4,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  Text(twist.label, style: CumulusText.body),
-                  Text('→ ${twist.branch} →', style: CumulusText.meta),
-                  if (clause != null)
-                    Tooltip(
-                      message: clause.ref,
-                      child: _monoChip(
-                        '${clause.label}: ${clause.value}',
-                        tone: CumulusTone.accent,
-                      ),
-                    ),
-                  if (unreachable)
-                    const Tooltip(
-                      message:
-                          'The branch compares billed against received. '
-                          'Nothing has been received against this order, so '
-                          'the match has no receiving leg to find a variance '
-                          'in — the run will take the not-received path '
-                          'instead.',
-                      child: StatusBadge(
-                        'unreachable here — nothing received',
-                        tone: CumulusTone.warn,
-                        dense: true,
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _hintPreview() {
-    final hint = _scenario.toHint(widget.composer.twists);
-    return Container(
-      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-      decoration: BoxDecoration(
-        color: CumulusColors.surfaceMuted,
-        borderRadius: BorderRadius.circular(CumulusRadius.control),
-        border: Border.all(color: CumulusColors.border),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('WHAT THIS SENDS', style: CumulusText.statLabel),
-                const SizedBox(height: 6),
-                SelectableText(
-                  hint.isEmpty ? '(nothing yet — pick a vendor)' : hint,
-                  style: CumulusText.mono.copyWith(fontSize: 12.5),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  'The same language the seeded invoices and the eval cases '
-                  'are written in. It is composed here and serialized on the '
-                  'server, so this is the string the run receives.',
-                  style: CumulusText.meta,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 16),
-          _submitButton(enabled: hint.isNotEmpty),
-        ],
-      ),
-    );
-  }
-
-  Widget _submitButton({required bool enabled}) => FilledButton(
-    onPressed: _busy || !enabled ? null : _submit,
-    child: _busy
-        ? const SizedBox(
-            width: 14,
-            height: 14,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          )
-        : const Text('Run the flow'),
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,21 +627,13 @@ class InvoiceOutcomeView extends StatelessWidget {
             if (r.documentId.isNotEmpty)
               _action(context, Icons.description_outlined, 'Open the document',
                   () {
-                _openDocument(context, api, r.documentId);
+                openDocumentDrawer(context, api, r.documentId);
               }),
           ],
         ),
         if (gate != null) ...[
           const SizedBox(height: 12),
           _GateCard(gate: gate),
-        ],
-        if (outcome.hint.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          const FieldLabel('What this sent'),
-          SelectableText(
-            outcome.hint,
-            style: CumulusText.mono.copyWith(fontSize: 12),
-          ),
         ],
         if (outcome.policy.isNotEmpty) ...[
           const SizedBox(height: 12),
@@ -1507,59 +1041,6 @@ void _openTask(BuildContext context, ApiClient api, String taskId) =>
           ),
           if (task.decision!.note.isNotEmpty)
             Text('“${task.decision!.note}”', style: CumulusText.body),
-        ],
-      ]),
-    );
-
-void _openDocument(BuildContext context, ApiClient api, String documentId) =>
-    _openDetail(
-      context,
-      title: documentId,
-      subtitle:
-          'The artifact this run read, and the custody it is held under. Its '
-          'regions are where the extractor claims it read each field.',
-      pending: api.getDocument(documentId),
-      body: (StoredDocument doc) => _drawerBody([
-        Text(
-          doc.filename.isEmpty ? '(no filename)' : doc.filename,
-          style: CumulusText.sectionTitle,
-        ),
-        const SizedBox(height: 8),
-        Text(
-          [
-            doc.mediaType,
-            '${doc.byteSize} bytes',
-            '${doc.pages} page(s)',
-            doc.collectionId,
-            if (doc.retentionUntilIso.isNotEmpty)
-              'retained until ${doc.retentionUntilIso.split("T").first}',
-          ].join('  ·  '),
-          style: CumulusText.meta,
-        ),
-        if (!doc.hasBytes) ...[
-          const SizedBox(height: 10),
-          Text(
-            'No bytes: this run was composed rather than uploaded, so the '
-            'artifact is a placeholder the journal can still point at. '
-            'Everything downstream of extraction ran on the real machinery '
-            'either way.',
-            style: CumulusText.body,
-          ),
-        ],
-        if (doc.regions.isNotEmpty) ...[
-          const SizedBox(height: 14),
-          FieldLabel(
-            'Regions',
-            hint: '${doc.regionCount} field(s) located on the page',
-          ),
-          _facts([
-            for (final region in doc.regions)
-              (
-                region.field,
-                '${region.text}  ·  confidence '
-                    '${region.confidence.toStringAsFixed(2)}',
-              ),
-          ]),
         ],
       ]),
     );

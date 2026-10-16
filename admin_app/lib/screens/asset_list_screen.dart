@@ -6,6 +6,7 @@ import '../theme/cumulus_theme.dart';
 import '../theme/domain_tones.dart';
 import '../widgets/command_palette.dart';
 import '../widgets/cumulus_shell.dart';
+import '../widgets/skeleton.dart';
 import '../widgets/ui_kit.dart';
 import 'asset_editor_screen.dart';
 import 'search_screen.dart';
@@ -53,11 +54,16 @@ class _AssetsSectionState extends State<AssetsSection> {
   List<AssetSummary> _assets = [];
   Map<String, AssetUsage> _usage = const {};
 
-  /// The whole corpus, including what this screen filters out. Kept so the
-  /// caption can name what is not here rather than leaving the reader to
-  /// wonder why 9 documents sit under a "15 assets" corpus everywhere else.
+  /// The rest of the corpus: prompts, schema exports and config. Shown in
+  /// their own section rather than filtered out — the old caption promised
+  /// they were "read under Ontology and Flows", and neither tab linked back,
+  /// so the four generated assets were reachable only through the palette.
+  List<AssetSummary> _machineReadables = const [];
+  Map<String, AssetUsage> _machineUsage = const {};
+
+  /// The whole corpus. Kept so the caption can say how the two sections add
+  /// up rather than leaving the reader to reconcile the counts.
   int _corpusTotal = 0;
-  Map<String, int> _otherKinds = const {};
 
   /// The traffic window, echoed by the server. Held rather than written into
   /// the caption as `30d`, which is a number that keeps itself when the
@@ -169,11 +175,17 @@ class _AssetsSectionState extends State<AssetsSection> {
       final screen = await _api.libraryScreen();
       if (!mounted) return;
       setState(() {
-        // The Library is documents people wrote. The route returns the whole
-        // corpus because the Ontology's generated exports and the flows'
-        // prompts are governed alongside them; this screen shows the half
-        // that argues and carries authority.
-        _assets = screen.assets.where((a) => a.kind == 'document').toList();
+        // Documents people wrote — the half that argues and carries
+        // authority — grouped by taxonomy; the machine-readable half gets
+        // its own section below, so the whole corpus is on this one screen.
+        // Sorted here, once, and never again: path order is a property of the
+        // corpus, so every list downstream of these two inherits it rather
+        // than re-establishing it on each build.
+        _assets = screen.assets.where((a) => a.kind == 'document').toList()
+          ..sort(_byPath);
+        _machineReadables =
+            screen.assets.where((a) => a.kind != 'document').toList()
+              ..sort(_byPath);
         // Usage folded over the *same* set. It used to fold over all fifteen
         // assets while the count beside it said nine, so one number described
         // the documents and its neighbour described the corpus.
@@ -182,12 +194,11 @@ class _AssetsSectionState extends State<AssetsSection> {
           for (final entry in screen.usage.entries)
             if (shown.contains(entry.key)) entry.key: entry.value,
         };
+        _machineUsage = {
+          for (final entry in screen.usage.entries)
+            if (!shown.contains(entry.key)) entry.key: entry.value,
+        };
         _corpusTotal = screen.assets.length;
-        _otherKinds = {};
-        for (final asset in screen.assets) {
-          if (asset.kind == 'document') continue;
-          _otherKinds[asset.kind] = (_otherKinds[asset.kind] ?? 0) + 1;
-        }
         _windowDays = screen.days;
         _newest = _assets.isEmpty
             ? null
@@ -195,6 +206,7 @@ class _AssetsSectionState extends State<AssetsSection> {
                   .map((a) => a.updatedAt)
                   .reduce((a, b) => a.isAfter(b) ? a : b);
         _loading = false;
+        _regroup();
       });
     } catch (e) {
       if (!mounted) return;
@@ -231,10 +243,38 @@ class _AssetsSectionState extends State<AssetsSection> {
     }
   }
 
-  List<AssetSummary> get _visibleAssets => _assets
-      .where((a) => _lens == null || a.authorityLevel == _lens)
-      .where(_matchesUsageLens)
-      .toList();
+  /// The taxonomy as the cards below draw it: branch → its documents, in path
+  /// order, and the branch names in their own order.
+  ///
+  /// A function of the corpus and the two lenses, so it is computed when one
+  /// of those three changes rather than on every build. It used to be built —
+  /// and sorted, in place, mutating the map's own lists — once per frame,
+  /// which meant a scroll or a hover paid for a regroup of the whole corpus.
+  Map<String, List<AssetSummary>> _groups = const {};
+  List<String> _branches = const [];
+  int _shownCount = 0;
+
+  void _regroup() {
+    final visible = _assets
+        .where((a) => _lens == null || a.authorityLevel == _lens)
+        .where(_matchesUsageLens)
+        .toList();
+    final groups = <String, List<AssetSummary>>{};
+    for (final asset in visible) {
+      groups.putIfAbsent(asset.path.split('/').first, () => []).add(asset);
+    }
+    _groups = groups;
+    _branches = groups.keys.toList()..sort();
+    _shownCount = visible.length;
+  }
+
+  /// Every lens change goes through here, so the grouping cannot fall behind
+  /// the chips that decide it.
+  void _setLenses({String? authority, String? usage}) => setState(() {
+    _lens = authority;
+    _usageLens = usage;
+    _regroup();
+  });
 
   bool _matchesUsageLens(AssetSummary asset) {
     if (_usageLens == null || !_hasTraffic) return true;
@@ -281,7 +321,42 @@ class _AssetsSectionState extends State<AssetsSection> {
         _heading(),
         if (_error != null) ErrorNotice(message: _error!, onRetry: _refresh),
         if (_loading)
-          const CumulusCard(child: CumulusLoading())
+          // The plane header above is real; what is unknown is the lens card
+          // and the taxonomy branches under it.
+          const SkeletonPulse(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 16,
+              children: [
+                SkeletonCard(
+                  padding: EdgeInsets.fromLTRB(20, 18, 20, 18),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SkeletonBar(width: 118, height: 13),
+                      SizedBox(height: 8),
+                      SkeletonBar(width: 300, height: 10),
+                      SizedBox(height: 16),
+                      Row(
+                        spacing: 8,
+                        children: [
+                          SkeletonPill(width: 44),
+                          SkeletonPill(width: 58),
+                          SkeletonPill(width: 74),
+                          SkeletonPill(width: 76),
+                          SkeletonPill(width: 62),
+                          SkeletonPill(width: 52),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                SkeletonListCard(rows: 4),
+                SkeletonListCard(rows: 3),
+                SkeletonListCard(rows: 3),
+              ],
+            ),
+          )
         else
           ..._taxonomyCards(),
       ],
@@ -305,20 +380,22 @@ class _AssetsSectionState extends State<AssetsSection> {
   Widget _heading() {
     final published = _assets.where((a) => a.status == 'published').length;
     return PlaneHeader(
-      // The corpus is bigger than this screen, and the summary now names what
-      // it holds back rather than only the exports — the prompts a flow reads
-      // are governed here too, and a reader counting 15 assets elsewhere
-      // against 9 here was owed both halves.
+      // The whole corpus, on one screen: the documents that argue and carry
+      // authority, and — below them — the machine-readables the flows and
+      // engines read. The old caption said the latter were "read under
+      // Ontology and Flows", and neither tab linked back.
       summary:
-          'What people wrote down that agents must obey: policies, standards, '
-          'guidelines and notes — the documents that argue and carry '
-          'authority. The generated schema exports and the flows\' prompts are '
-          'governed in the same corpus and are read under Ontology and Flows.',
+          'What must be obeyed: policies, standards, guidelines and notes — '
+          'the documents that argue and carry authority — and, below them, '
+          'the governed machine-readables: the prompts flows read, the '
+          'schema exports the ontology publishes, and config. One corpus, '
+          'all of it versioned, cited and audited the same way.',
       pills: [
         MetaPill(
-          _otherKinds.isEmpty
+          _machineReadables.isEmpty
               ? '${_assets.length} documents'
-              : '${_assets.length} of $_corpusTotal assets are documents',
+              : '${_assets.length} documents · ${_machineReadables.length} '
+                    'machine-readable(s) · $_corpusTotal in the corpus',
         ),
         MetaPill('$published published', tone: CumulusTone.success),
         // Traffic belongs here rather than on a survey screen, because the
@@ -354,14 +431,17 @@ class _AssetsSectionState extends State<AssetsSection> {
         LensChip(
           label: 'All',
           selected: _lens == null,
-          onTap: () => setState(() => _lens = null),
+          onTap: () => _setLenses(usage: _usageLens),
         ),
         for (final level in _authorityLevels)
           LensChip(
             label: level,
             tone: toneForAuthority(level),
             selected: _lens == level,
-            onTap: () => setState(() => _lens = _lens == level ? null : level),
+            onTap: () => _setLenses(
+              authority: _lens == level ? null : level,
+              usage: _usageLens,
+            ),
           ),
         if (_hasTraffic) ...[
           const SizedBox(width: 12),
@@ -369,17 +449,18 @@ class _AssetsSectionState extends State<AssetsSection> {
             label: 'ignored',
             tone: CumulusTone.warn,
             selected: _usageLens == 'ignored',
-            onTap: () => setState(
-              () => _usageLens = _usageLens == 'ignored' ? null : 'ignored',
+            onTap: () => _setLenses(
+              authority: _lens,
+              usage: _usageLens == 'ignored' ? null : 'ignored',
             ),
           ),
           LensChip(
             label: 'undiscovered',
             tone: CumulusTone.danger,
             selected: _usageLens == 'undiscovered',
-            onTap: () => setState(
-              () => _usageLens =
-                  _usageLens == 'undiscovered' ? null : 'undiscovered',
+            onTap: () => _setLenses(
+              authority: _lens,
+              usage: _usageLens == 'undiscovered' ? null : 'undiscovered',
             ),
           ),
         ],
@@ -388,13 +469,6 @@ class _AssetsSectionState extends State<AssetsSection> {
   }
 
   List<Widget> _taxonomyCards() {
-    final visible = _visibleAssets;
-    final groups = <String, List<AssetSummary>>{};
-    for (final asset in visible) {
-      groups.putIfAbsent(asset.path.split('/').first, () => []).add(asset);
-    }
-    final branches = groups.keys.toList()..sort();
-
     return [
       CumulusCard(
         padding: const EdgeInsets.fromLTRB(20, 18, 20, 18),
@@ -408,7 +482,7 @@ class _AssetsSectionState extends State<AssetsSection> {
                         'it is failing to be used'
                   : 'filter by how much force a document carries',
               trailing: Text(
-                '${visible.length} shown',
+                '$_shownCount shown',
                 style: CumulusText.sectionSubtitle,
               ),
             ),
@@ -417,7 +491,7 @@ class _AssetsSectionState extends State<AssetsSection> {
           ],
         ),
       ),
-      if (branches.isEmpty)
+      if (_branches.isEmpty)
         CumulusCard(
           child: CumulusEmptyState(
             icon: Icons.inventory_2_outlined,
@@ -434,24 +508,77 @@ class _AssetsSectionState extends State<AssetsSection> {
                     label: const Text('New asset'),
                   )
                 : OutlinedButton(
-                    onPressed: () => setState(() => _lens = null),
+                    onPressed: () => _setLenses(usage: _usageLens),
                     child: const Text('Clear lens'),
                   ),
           ),
         )
       else
-        for (final branch in branches)
+        for (final branch in _branches)
           ListCard(
             title: branch,
             subtitle:
-                '${groups[branch]!.length} '
-                '${groups[branch]!.length == 1 ? "document" : "documents"}',
+                '${_groups[branch]!.length} '
+                '${_groups[branch]!.length == 1 ? "document" : "documents"}',
             children: [
-              for (final asset in groups[branch]!..sort(_byPath))
-                _assetRow(asset),
+              for (final asset in _groups[branch]!) _assetRow(asset),
             ],
           ),
+      // The machine-readable half of the corpus, below the taxonomy rather
+      // than filtered out of the screen. Deliberately outside the authority
+      // lens: a schema export carries no authority level, and hiding it under
+      // a lens it can never match would re-orphan it.
+      if (_machineReadables.isNotEmpty)
+        ListCard(
+          title: 'Governed machine-readables',
+          subtitle:
+              'what flows and engines read: prompts, schema exports, config '
+              '— versioned and cited like every document above',
+          children: [
+            for (final asset in _machineReadables) _machineRow(asset),
+          ],
+        ),
     ];
+  }
+
+  /// A machine-readable asset: same row, keyed by kind rather than authority.
+  ///
+  /// A generated export opens read-only in the editor — regenerated from
+  /// Python on every start, so an edit would be overwritten by the next
+  /// deploy and the editor refuses rather than pretending.
+  Widget _machineRow(AssetSummary asset) {
+    return CumulusListRow(
+      leading: Monogram(
+        asset.kind.substring(0, 1).toUpperCase(),
+        tone: CumulusTone.neutral,
+      ),
+      title: Row(
+        children: [
+          Flexible(child: Text(asset.title, overflow: TextOverflow.ellipsis)),
+          const SizedBox(width: 10),
+          StatusBadge(asset.kind, dense: true, uppercase: true),
+        ],
+      ),
+      subtitle: Text(
+        '${asset.path} · rev ${asset.revision} · '
+        'updated ${agoLabel(asset.updatedAt)}'
+        '${asset.tags.isEmpty ? "" : " · ${asset.tags.join(", ")}"}',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: [
+        _UsagePip(
+          usage: _machineUsage[asset.id],
+          known: _hasTraffic,
+          days: _windowDays,
+        ),
+        const SizedBox(width: 8),
+        StatusBadge(asset.status, tone: toneForStatus(asset.status)),
+        const SizedBox(width: 8),
+        RowAction(label: 'Open', onTap: () => _openEditor(assetId: asset.id)),
+      ],
+      onTap: () => _openEditor(assetId: asset.id),
+    );
   }
 
   static int _byPath(AssetSummary a, AssetSummary b) =>

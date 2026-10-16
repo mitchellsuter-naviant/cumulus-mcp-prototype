@@ -1,8 +1,11 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 
 import '../models/run.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'document_drawer.dart';
 import 'ref_chips.dart';
 import 'ui_kit.dart';
 
@@ -295,6 +298,10 @@ class RunJournalView extends StatelessWidget {
             spacing: 10,
             runSpacing: 8,
             children: [
+              // The definition that ran, not the one that is live. A journal
+              // read months later is evidence about a specific graph, and the
+              // engine pinned which one at the first step.
+              if (run.claimsVersion) MetaPill('ran v${run.flowVersion}'),
               MetaPill('${run.humanRounds} human round(s)'),
               MetaPill('${run.modelCalls} ModelCall(s)'),
               if (run.costUsd > 0)
@@ -351,7 +358,7 @@ class RunJournalView extends StatelessWidget {
           const SizedBox(height: 16),
           Text('JOURNAL', style: CumulusText.statLabel),
           const SizedBox(height: 8),
-          for (final step in run.steps) _StepTile(step: step),
+          for (final step in run.steps) _StepTile(api: api, step: step),
         ],
       ),
     );
@@ -448,15 +455,80 @@ class _RunInputs extends StatelessWidget {
   }
 }
 
-class _StepTile extends StatelessWidget {
+/// Every `document:` this step touched, from either side of the journal.
+///
+/// A step that read an artifact names it in its read-set and a step that
+/// stored one names it in its write-set — but an extractor does neither: it
+/// hands the id downstream in its output, which is how the invoice a run
+/// actually looked at could be named on the tile and reachable from nowhere.
+///
+/// Bare ids are qualified on the way out, because a journal writes
+/// `document_id: doc_28fee883` and a ref is `document:doc_28fee883`, and the
+/// drawer opens on either.
+List<String> stepDocuments(RunStep step) {
+  final found = <String>{};
+  void add(Object? value) {
+    if (value is! String || value.isEmpty) return;
+    found.add(value.startsWith('document:') ? value : 'document:$value');
+  }
+
+  for (final ref in [...step.refs, ...step.writes]) {
+    if (ref.startsWith('document:')) found.add(ref);
+  }
+  final output = step.output;
+  if (output is Map) {
+    for (final key in const ['document_id', 'document_ref']) {
+      add(output[key]);
+    }
+    final many = output['document_ids'];
+    if (many is List) {
+      for (final value in many) {
+        add(value is String ? value : '$value');
+      }
+    }
+  }
+  return found.toList();
+}
+
+/// One journal entry, with its evidence live rather than printed.
+///
+/// The read-set and the write-set were rendered here as plain text and the
+/// output was not rendered at all: a step could say it read `knowledge:ap/
+/// posting-policy@rev4` and there was nothing to click, and what the step
+/// actually returned — the thing the next step saw — was visible only from
+/// the canvas inspector. Both halves are the same objects the run-level
+/// chips already dereference, so they get the same chips.
+class _StepTile extends StatefulWidget {
+  final ApiClient api;
   final RunStep step;
 
-  const _StepTile({required this.step});
+  const _StepTile({required this.api, required this.step});
+
+  @override
+  State<_StepTile> createState() => _StepTileState();
+}
+
+class _StepTileState extends State<_StepTile> {
+  /// Collapsed by default. A journal is read down the left edge for the shape
+  /// of what happened; an output is opened when a particular step is the
+  /// question, and a dozen expanded payloads would bury the shape.
+  bool _outputOpen = false;
+
+  RunStep get step => widget.step;
 
   @override
   Widget build(BuildContext context) {
     final tone = _toneForKind(step.kind);
     final failed = step.status == 'failed';
+    // A document already standing in the read- or write-set is already a
+    // chip; offering it a second time would read as two artifacts.
+    final documents = [
+      for (final ref in stepDocuments(step))
+        if (!step.refs.contains(ref) && !step.writes.contains(ref)) ref,
+    ];
+    final output = step.output == null
+        ? ''
+        : const JsonEncoder.withIndent('  ').convert(step.output);
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: Row(
@@ -529,19 +601,55 @@ class _StepTile extends StatelessWidget {
                   ),
                 ],
                 if (step.refs.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    'read  ${step.refs.join('  ·  ')}',
-                    style: CumulusText.mono,
+                  const SizedBox(height: 6),
+                  _EvidenceRow(
+                    label: 'read',
+                    child: RefChips(
+                      api: widget.api,
+                      refs: step.refs,
+                      tooltip:
+                          'Pinned at the revision this step read, so the '
+                          'decision stays explainable against the record as '
+                          'it was.',
+                    ),
                   ),
                 ],
                 if (step.writes.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    'wrote ${step.writes.join('  ·  ')}',
-                    style: CumulusText.mono.copyWith(
-                      color: CumulusTone.success.foreground,
+                  const SizedBox(height: 6),
+                  _EvidenceRow(
+                    label: 'wrote',
+                    child: RefChips(
+                      api: widget.api,
+                      refs: step.writes,
+                      tone: CumulusTone.success,
                     ),
+                  ),
+                ],
+                // The artifact itself, when the sets above did not already
+                // name it. An extractor reads knowledge and writes objects and
+                // carries its document id only in its output — which is how
+                // the invoice a run looked at could be reachable from nowhere.
+                if (documents.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  _EvidenceRow(
+                    label: 'file',
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      children: [
+                        for (final ref in documents)
+                          _OpenDocumentButton(api: widget.api, ref: ref),
+                      ],
+                    ),
+                  ),
+                ],
+                if (output.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  _StepOutput(
+                    payload: output,
+                    open: _outputOpen,
+                    onToggle: () =>
+                        setState(() => _outputOpen = !_outputOpen),
                   ),
                 ],
                 if (step.error.isNotEmpty) ...[
@@ -565,6 +673,154 @@ class _StepTile extends StatelessWidget {
       ),
     );
   }
+}
+
+/// A verb in the gutter, and the evidence beside it. One column width across
+/// read/wrote/file, so the three sets line up down the journal instead of
+/// each starting wherever its label happens to end.
+class _EvidenceRow extends StatelessWidget {
+  final String label;
+  final Widget child;
+
+  const _EvidenceRow({required this.label, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 42,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(label, style: CumulusText.statCaption),
+          ),
+        ),
+        Expanded(child: child),
+      ],
+    );
+  }
+}
+
+/// Straight into the artifact, from the step that handled it.
+///
+/// Deliberately not a chip: the read-set and write-set are lists of what was
+/// touched, and this is the one thing on the tile a reviewer opens to check
+/// the machine's work with their own eyes.
+class _OpenDocumentButton extends StatelessWidget {
+  final ApiClient api;
+  final String ref;
+
+  const _OpenDocumentButton({required this.api, required this.ref});
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message:
+          'Open the artifact itself — the page, with the boxes the extractor '
+          'claims it read each value from.',
+      child: Material(
+        color: CumulusColors.accentSoft,
+        borderRadius: BorderRadius.circular(7),
+        child: InkWell(
+          onTap: () => openDocumentDrawer(context, api, ref),
+          borderRadius: BorderRadius.circular(7),
+          hoverColor: CumulusColors.surfaceMuted,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.description_outlined,
+                  size: 13,
+                  color: CumulusColors.accentInk,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  ref.startsWith('document:') ? ref.substring(9) : ref,
+                  style: CumulusText.mono.copyWith(
+                    color: CumulusColors.accentInk,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// What the step returned, on request.
+///
+/// The journal records the whole of what the next step saw — a step whose
+/// result cannot be serialized is a step doing too much — so this is not a
+/// summary of the output, it is the output. It stays folded because a journal
+/// is read for the shape of a run first and one step's payload second.
+class _StepOutput extends StatelessWidget {
+  final String payload;
+  final bool open;
+  final VoidCallback onToggle;
+
+  const _StepOutput({
+    required this.payload,
+    required this.open,
+    required this.onToggle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: onToggle,
+          borderRadius: BorderRadius.circular(6),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 2),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  open ? Icons.expand_less : Icons.expand_more,
+                  size: 15,
+                  color: CumulusColors.inkMuted,
+                ),
+                const SizedBox(width: 4),
+                Text('OUTPUT', style: CumulusText.statLabel),
+                const SizedBox(width: 8),
+                Text(
+                  open ? 'what the next step saw' : '${_lines(payload)} lines',
+                  style: CumulusText.statCaption,
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (open)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(top: 5),
+            constraints: const BoxConstraints(maxHeight: 260),
+            padding: const EdgeInsets.all(11),
+            decoration: BoxDecoration(
+              color: CumulusColors.surface,
+              borderRadius: BorderRadius.circular(CumulusRadius.control),
+              border: Border.all(color: CumulusColors.border),
+            ),
+            child: SingleChildScrollView(
+              child: SelectableText(
+                payload,
+                style: CumulusText.mono.copyWith(fontSize: 11.5, height: 1.45),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  static int _lines(String payload) => '\n'.allMatches(payload).length + 1;
 }
 
 CumulusTone _toneForKind(String kind) => switch (kind) {

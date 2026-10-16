@@ -75,6 +75,40 @@ class PersonaGroup {
   );
 }
 
+/// Whether this deployment has a workspace at all, and why not when it does not.
+///
+/// Mirrors `WorkspaceAvailability` in `server/app/ui_api.py`. The console used
+/// to answer this with a compiled boolean per workspace — a second copy of a
+/// rule the server already holds, which could be shipped believing in a
+/// deployment it had never reached. The two facts that actually decide it are
+/// the server's: whether anybody in this deployment's cast holds the desk the
+/// workspace *is*, and whether estate discovery says the namespace runs the
+/// app it rests on.
+///
+/// [reason] is written to be shown verbatim, and its estate half is the same
+/// sentence the Sources screen gives for a feed with nothing to pull — one
+/// finding, said one way.
+class WorkspaceAvailability {
+  /// The console's section slug, so navigation and availability are keyed on
+  /// one string.
+  final String slug;
+  final bool available;
+  final String reason;
+
+  const WorkspaceAvailability({
+    required this.slug,
+    required this.available,
+    required this.reason,
+  });
+
+  factory WorkspaceAvailability.fromJson(Map<String, dynamic> json) =>
+      WorkspaceAvailability(
+        slug: json['slug'] as String? ?? '',
+        available: json['available'] as bool? ?? false,
+        reason: json['reason'] as String? ?? '',
+      );
+}
+
 class Session {
   final String uid;
   final String email;
@@ -97,6 +131,12 @@ class Session {
   /// alternative was a copy of the queue names in Dart, drifting the moment a
   /// Mapping changed hands.
   final bool mayOpenIdentity;
+
+  /// One entry per workspace the rail can offer. Empty from a server that
+  /// predates the field, which every reader below treats as "no opinion" —
+  /// the rail then behaves exactly as it did before, which is the right
+  /// degrade for a console talking to an older deployment.
+  final List<WorkspaceAvailability> workspaces;
   final List<PersonaGroup> groups;
 
   const Session({
@@ -113,6 +153,7 @@ class Session {
     required this.impersonatedBy,
     required this.maySwitchPersona,
     required this.mayOpenIdentity,
+    required this.workspaces,
     required this.groups,
   });
 
@@ -131,12 +172,34 @@ class Session {
     impersonatedBy: json['impersonated_by'] as String?,
     maySwitchPersona: json['may_switch_persona'] as bool? ?? false,
     mayOpenIdentity: json['may_open_identity'] as bool? ?? false,
+    workspaces: [
+      for (final row in (json['workspaces'] as List<dynamic>? ?? const []))
+        WorkspaceAvailability.fromJson((row as Map).cast<String, dynamic>()),
+    ],
     groups: (json['groups'] as List<dynamic>? ?? [])
         .map((g) => PersonaGroup.fromJson(g as Map<String, dynamic>))
         .toList(),
   );
 
   String get displayName => person.isEmpty ? label : person;
+
+  /// What the server says about one workspace, or null when it said nothing
+  /// about it — an older deployment, or a slug this build knows and that one
+  /// does not.
+  WorkspaceAvailability? workspaceFor(String slug) {
+    for (final row in workspaces) {
+      if (row.slug == slug) return row;
+    }
+    return null;
+  }
+
+  /// Whether this deployment has the workspace. Silence is *yes*: offering a
+  /// stop that turns out not to exist is the better of the two errors, and the
+  /// route behind it refuses in a sentence.
+  bool workspaceAvailable(String slug) => workspaceFor(slug)?.available ?? true;
+
+  /// Why a workspace is not here, or empty when it is.
+  String workspaceReason(String slug) => workspaceFor(slug)?.reason ?? '';
 
   /// True when the operator is watching the console as somebody else.
   bool get impersonating => impersonatedBy != null;

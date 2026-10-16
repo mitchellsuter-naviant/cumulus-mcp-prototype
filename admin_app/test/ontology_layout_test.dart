@@ -1,3 +1,5 @@
+import 'dart:ui' show Size;
+
 import 'package:cumulus_admin/models/ontology_screen.dart';
 import 'package:cumulus_admin/widgets/ontology/ontology_layout.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -196,6 +198,45 @@ void main() {
 
       expect(layout.edgeAt(edge.labelAt)?.link.name, edge.link.name);
       expect(layout.edgeAt(Offset(-500, -500)), isNull);
+    });
+
+    test('opens at a scale that still carries the link names', () {
+      // A pane the size the console actually gives the diagram.
+      const pane = Size(1200, 760);
+      final fit = ontologyFitScale(pane, layoutOntology(_seeded()).size);
+
+      // "Fit to view" is the diagram's opening view, so it is legible by
+      // definition — at whatever scale the pane and the scene agree on.
+      expect(ontologyLabelsVisible(fit, fit), isTrue);
+      // Zooming out past the fit still declutters.
+      expect(ontologyLabelsVisible(fit * 0.8, fit), isFalse);
+
+      // The regression, stated at the size the model has actually reached.
+      // This fixture is a seventeen-type snapshot and still opens near 1:1;
+      // the live model wraps into more bands and runs to about 1250 × 1280,
+      // which fits this pane at six tenths — and against the absolute 0.7
+      // gate this replaces, the whole-model view (the only view the tab
+      // offers by default) carried no link names at all.
+      final grown = ontologyFitScale(pane, const Size(1254, 1282));
+      expect(grown, lessThan(0.7));
+      expect(ontologyLabelsVisible(grown, grown), isTrue);
+
+      // The floor still holds where even the boxes stop being readable.
+      expect(ontologyLabelsVisible(0.3, ontologyMinScale), isFalse);
+    });
+
+    test('bounds every edge, so a hit test can reject it without sampling', () {
+      final layout = layoutOntology(_seeded());
+
+      for (final edge in layout.edges) {
+        for (var i = 0; i <= 20; i++) {
+          expect(
+            edge.bounds.inflate(0.01).contains(edge.pointAt(i / 20)),
+            isTrue,
+            reason: '${edge.link.name} leaves its own bounding box',
+          );
+        }
+      }
     });
 
     test('survives an empty model rather than dividing by its size', () {

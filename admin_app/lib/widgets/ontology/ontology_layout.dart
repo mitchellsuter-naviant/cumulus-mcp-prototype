@@ -35,6 +35,38 @@ import '../../models/ontology_screen.dart';
 /// hatch for a payload that arrives inconsistent.
 const ungovernedCluster = 'ungoverned';
 
+/// The canvas's zoom limits. Here rather than in the widget so the scale
+/// "Fit to view" lands on — and therefore whether that view is legible — can
+/// be argued with in a test instead of by resizing a window.
+const ontologyMinScale = 0.4;
+const ontologyMaxScale = 2.5;
+
+/// However far out the fit happens to sit, below this the boxes themselves
+/// are a smudge and the names are only noise on top of it. A floor under the
+/// relative gate, not the gate.
+const ontologyLabelFloor = 0.35;
+
+/// The scale that fits [scene] into [viewport], clamped to the canvas's own
+/// limits.
+double ontologyFitScale(Size viewport, Size scene) {
+  if (viewport.isEmpty || scene.isEmpty) return 1;
+  return math
+      .min(viewport.width / scene.width, viewport.height / scene.height)
+      .clamp(ontologyMinScale, ontologyMaxScale);
+}
+
+/// Whether the link names are drawn at [scale].
+///
+/// Measured *against the fit* rather than against a fixed number. The gate
+/// used to be an absolute 0.7, which was fine at seventeen types and silently
+/// stopped being fine as the model grew: a scene the pane can only show at
+/// half size opens with every edge label suppressed, so the one view the
+/// diagram offers by default — the whole model — was the one view that could
+/// not be read. Fit to view is legible by definition; zooming out past it
+/// still declutters.
+bool ontologyLabelsVisible(double scale, double fitScale) =>
+    scale >= math.max(ontologyLabelFloor, fitScale * 0.95);
+
 const _nodeW = 158.0;
 const _nodeH = 54.0;
 const _rowGap = 26.0;
@@ -112,7 +144,7 @@ class OntologyEdge {
   /// a label printed over a type name costs more than it tells.
   final bool labelFits;
 
-  const OntologyEdge({
+  OntologyEdge({
     required this.link,
     required this.start,
     required this.end,
@@ -120,6 +152,17 @@ class OntologyEdge {
     required this.backEdge,
     required this.labelFits,
   });
+
+  /// The box the curve cannot leave. A quadratic Bézier lies inside the
+  /// triangle of its three points, so this is exact enough to reject a hit
+  /// test before sampling twenty segments — which is the difference between
+  /// a hover costing nine hundred segment distances and costing a few.
+  late final Rect bounds = Rect.fromLTRB(
+    math.min(start.dx, math.min(control.dx, end.dx)),
+    math.min(start.dy, math.min(control.dy, end.dy)),
+    math.max(start.dx, math.max(control.dx, end.dx)),
+    math.max(start.dy, math.max(control.dy, end.dy)),
+  );
 
   /// Quadratic Bézier, which is all the curve this needs: one control point
   /// carries both the parallel-edge offset and the swing around a box.
@@ -209,6 +252,10 @@ class OntologyDiagramLayout {
     OntologyEdge? best;
     var bestDistance = tolerance;
     for (final edge in edges) {
+      // The cheap rejection first. This runs on every pointer move over the
+      // canvas, and sampling a curve the cursor is nowhere near is nearly all
+      // of the work it used to do.
+      if (!edge.bounds.inflate(tolerance).contains(scene)) continue;
       final d = edge.distanceTo(scene);
       if (d <= bestDistance) {
         bestDistance = d;

@@ -9,7 +9,6 @@ class AssetSummary {
   final String authorityLevel;
   final String kind; // document | schema-export | prompt | config
   final String origin; // authored | flywheel | derived | synced | flow-written
-  final String scope;
   final String owner;
   final List<String> tags;
   final String status;
@@ -24,7 +23,6 @@ class AssetSummary {
     required this.authorityLevel,
     this.kind = 'document',
     this.origin = 'authored',
-    required this.scope,
     required this.owner,
     required this.tags,
     required this.status,
@@ -40,7 +38,6 @@ class AssetSummary {
     authorityLevel: json['authority_level'] as String? ?? '',
     kind: json['kind'] as String? ?? 'document',
     origin: json['origin'] as String? ?? 'authored',
-    scope: json['scope'] as String? ?? 'org',
     owner: json['owner'] as String? ?? '',
     tags: (json['tags'] as List<dynamic>? ?? []).cast<String>(),
     status: json['status'] as String,
@@ -49,6 +46,17 @@ class AssetSummary {
   );
 }
 
+/// One asset, as the editor round-trips it.
+///
+/// Two fields used to sit here and are gone from both sides. `scope` was "org"
+/// on every document and authorized nothing — reach is decided by the
+/// Principal's own scope and the path prefixes the callers check — and
+/// `supersedes` was written by this editor and read by nobody, while
+/// [supersededBy] is the half that is actually consulted (the MCP fetch
+/// refuses a superseded document with it). A dial a person can turn that
+/// changes nothing is a claim to them that something does, and a PUT that
+/// carried a key the server had dropped was the console asserting a field that
+/// no longer exists.
 class Asset {
   final String id;
   String path;
@@ -58,12 +66,10 @@ class Asset {
   String authorityLevel; // empty when kind != document
   String kind;
   String origin;
-  String scope;
   String owner;
   List<String> tags;
   String? parent;
   List<String> related;
-  String? supersedes;
   String? supersededBy;
   String status;
 
@@ -76,12 +82,10 @@ class Asset {
     this.authorityLevel = 'note',
     this.kind = 'document',
     this.origin = 'authored',
-    this.scope = 'org',
     this.owner = '',
     this.tags = const [],
     this.parent,
     this.related = const [],
-    this.supersedes,
     this.supersededBy,
     this.status = 'draft',
   });
@@ -95,12 +99,10 @@ class Asset {
     authorityLevel: json['authority_level'] as String? ?? '',
     kind: json['kind'] as String? ?? 'document',
     origin: json['origin'] as String? ?? 'authored',
-    scope: json['scope'] as String? ?? 'org',
     owner: json['owner'] as String? ?? '',
     tags: (json['tags'] as List<dynamic>? ?? []).cast<String>(),
     parent: json['parent'] as String?,
     related: (json['related'] as List<dynamic>? ?? []).cast<String>(),
-    supersedes: json['supersedes'] as String?,
     supersededBy: json['superseded_by'] as String?,
     status: json['status'] as String,
   );
@@ -114,12 +116,10 @@ class Asset {
     'authority_level': authorityLevel.isEmpty ? null : authorityLevel,
     'kind': kind,
     'origin': origin,
-    'scope': scope,
     'owner': owner,
     'tags': tags,
     'parent': parent,
     'related': related,
-    'supersedes': supersedes,
     'superseded_by': supersededBy,
     'status': status,
   };

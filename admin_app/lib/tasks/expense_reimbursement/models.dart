@@ -89,14 +89,27 @@ class ExpenseLine {
 class DocumentSlot {
   final String documentId;
   final String filename;
-  final String note;
+
+  /// The submitter's own words about *this* document — not about the
+  /// submission, which is `Reimbursement.commentary`. Three receipts in one
+  /// envelope each get their own sentence, and the confirm screen shows each
+  /// one beside the extraction it is about.
+  ///
+  /// It was `note` on the wire, and the rename is the point of v10: the same
+  /// string used to be concatenated into the stub reader's hint, so a
+  /// submitter who typed `total=500` steered the extraction of their own
+  /// receipt. The field the wire carries has one job now and its name says
+  /// which. `note` is still read so a run recorded before the rename still
+  /// renders.
+  final String memo;
+
   final int byteSize;
   final String mediaType;
 
   const DocumentSlot({
     required this.documentId,
     required this.filename,
-    required this.note,
+    required this.memo,
     required this.byteSize,
     required this.mediaType,
   });
@@ -104,7 +117,7 @@ class DocumentSlot {
   factory DocumentSlot.fromJson(Map<String, dynamic> json) => DocumentSlot(
     documentId: json['document_id'] as String? ?? '',
     filename: json['filename'] as String? ?? '',
-    note: json['note'] as String? ?? '',
+    memo: json['memo'] as String? ?? json['note'] as String? ?? '',
     byteSize: json['byte_size'] as int? ?? 0,
     mediaType: json['media_type'] as String? ?? '',
   );

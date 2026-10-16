@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -16,7 +17,14 @@ import 'ui_kit.dart';
 class RailDestination {
   final IconData icon;
   final String label;
-  final int badge;
+
+  /// The count drawn over the glyph, or null for a stop that carries none.
+  ///
+  /// A listenable rather than a number, because the one stop that has a badge
+  /// — the queue — moves on its own schedule: every decision, every persona
+  /// switch. Passed as an `int` it was shell state, so changing one digit meant
+  /// rebuilding the console and every section mounted inside it.
+  final ValueListenable<int>? badge;
 
   /// The section this stop shows. Null on a dropdown stop — its children
   /// carry the indices instead.
@@ -37,7 +45,7 @@ class RailDestination {
     required this.label,
     this.index,
     this.children = const [],
-    this.badge = 0,
+    this.badge,
     this.startsGroup = false,
   });
 
@@ -82,8 +90,9 @@ class CumulusShell extends StatefulWidget {
   /// first session request is still in flight.
   final Session? session;
 
-  /// Acts as another persona. The switcher is only offered when this is
-  /// non-null *and* the session says the operator may switch.
+  /// Acts as another persona. The switcher lives in the account menu and is
+  /// only offered when this is non-null *and* the session says the operator
+  /// may switch.
   final ValueChanged<String>? onSwitchPersona;
 
   /// Opens the API reference from the help menu.
@@ -130,12 +139,22 @@ const double _searchMaxWidth = 680;
 /// The two fixed end slots of the top bar. Equal on purpose: the search pill
 /// centres inside what is left over, so unequal ends would drag the console's
 /// command line off the middle of the window.
-const double _endSlot = 344;
+const double _endSlot = 306;
 
-/// The persona control is a fixed width rather than sized to its contents,
-/// because a persona with a longer title would otherwise widen the right slot
-/// and shift the search pill every time you switched.
-const double _personaWidth = 250;
+/// The acting-as chip is a fixed width rather than sized to its contents, for
+/// the same reason the persona control it replaced was: a longer name would
+/// otherwise widen the right slot and shift the search pill every time you
+/// switched.
+const double _actingChipWidth = 218;
+
+/// The round buttons at the end of the bar — help and account — which are
+/// also what their menus hang from.
+const double _roundButtonSize = 34;
+
+/// How far a menu hangs below its button: clear of the bar rather than over
+/// its bottom edge, which during an impersonation is the accent rule that says
+/// the session is not yours.
+const double _menuDrop = (_topBarHeight - _roundButtonSize) / 2 + 6;
 
 class _CumulusShellState extends State<CumulusShell> {
   @override
@@ -182,7 +201,15 @@ class _CumulusShellState extends State<CumulusShell> {
     }
     // The second, browser-proof way in. Consumed, so the slash that opened the
     // palette is not also typed into it.
+    //
+    // Bare slash only. This handler runs on `HardwareKeyboard` — before any
+    // widget in the tree gets a look — so without the modifier check it also
+    // ate ⌘/ and sent an operator reaching for the filter on the page to the
+    // global palette instead. A screen that wants its own find binds ⌘/ and
+    // this leaves it alone.
     if (event.logicalKey == LogicalKeyboardKey.slash &&
+        !keyboard.isMetaPressed &&
+        !keyboard.isControlPressed &&
         !palette.isOpen &&
         !_isTypingIntoAField) {
       palette.open();
@@ -195,73 +222,85 @@ class _CumulusShellState extends State<CumulusShell> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: CumulusColors.canvas,
-      body: ListenableBuilder(
-        listenable: widget.palette,
-        builder: (context, _) {
-          final open = widget.palette.isOpen;
-          return Stack(
+      body: Stack(
+        children: [
+          Column(
             children: [
-              Column(
+              _TopBar(
+                palette: widget.palette,
+                hint: widget.searchHint,
+                accountLabel: widget.accountLabel,
+                onSignOut: widget.onSignOut,
+                session: widget.session,
+                onSwitchPersona: widget.onSwitchPersona,
+                onOpenApiDocs: widget.onOpenApiDocs,
+                onOpenEmployeeHub: widget.onOpenEmployeeHub,
+                employeeHubActive: widget.employeeHubActive,
+              ),
+              Expanded(
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _Rail(
+                      destinations: widget.destinations,
+                      selectedIndex: widget.selectedIndex,
+                      onSelected: widget.onDestinationSelected,
+                    ),
+                    Expanded(child: widget.child),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          // Only the overlay listens to the palette, and it is deliberately a
+          // sibling of the Column rather than its parent. The controller
+          // notifies on every keystroke and on every catalog load, and the
+          // Column holds `widget.child` — which is the IndexedStack of every
+          // section the console has ever opened. Listening above it meant a
+          // letter typed into the search pill rebuilt the whole app.
+          //
+          // Nothing in the top bar reads palette *state*: the search pill is
+          // its own StatefulWidget listening to the focus node, and its clear
+          // button to the text controller.
+          ListenableBuilder(
+            listenable: widget.palette,
+            builder: (context, _) {
+              if (!widget.palette.isOpen) return const SizedBox.shrink();
+              return Stack(
                 children: [
-                  _TopBar(
-                    palette: widget.palette,
-                    hint: widget.searchHint,
-                    accountLabel: widget.accountLabel,
-                    onSignOut: widget.onSignOut,
-                    session: widget.session,
-                    onSwitchPersona: widget.onSwitchPersona,
-                    onOpenApiDocs: widget.onOpenApiDocs,
-                    onOpenEmployeeHub: widget.onOpenEmployeeHub,
-                    employeeHubActive: widget.employeeHubActive,
+                  // Starts below the top bar so the search field, the help menu
+                  // and the account menu stay live while the palette is open.
+                  Positioned(
+                    top: _topBarHeight,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: GestureDetector(
+                      onTap: widget.palette.close,
+                      behavior: HitTestBehavior.opaque,
+                      child: ColoredBox(
+                        color: CumulusColors.ink.withValues(alpha: 0.06),
+                      ),
+                    ),
                   ),
-                  Expanded(
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        _Rail(
-                          destinations: widget.destinations,
-                          selectedIndex: widget.selectedIndex,
-                          onSelected: widget.onDestinationSelected,
+                  Positioned(
+                    top: _paletteTop,
+                    left: 0,
+                    right: 0,
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          maxWidth: _searchMaxWidth,
                         ),
-                        Expanded(child: widget.child),
-                      ],
+                        child: CommandPalettePanel(palette: widget.palette),
+                      ),
                     ),
                   ),
                 ],
-              ),
-              // Starts below the top bar so the search field, the help menu and
-              // the account menu stay live while the palette is open.
-              if (open)
-                Positioned(
-                  top: _topBarHeight,
-                  left: 0,
-                  right: 0,
-                  bottom: 0,
-                  child: GestureDetector(
-                    onTap: widget.palette.close,
-                    behavior: HitTestBehavior.opaque,
-                    child: ColoredBox(
-                      color: CumulusColors.ink.withValues(alpha: 0.06),
-                    ),
-                  ),
-                ),
-              if (open)
-                Positioned(
-                  top: _paletteTop,
-                  left: 0,
-                  right: 0,
-                  child: Center(
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(
-                        maxWidth: _searchMaxWidth,
-                      ),
-                      child: CommandPalettePanel(palette: widget.palette),
-                    ),
-                  ),
-                ),
-            ],
-          );
-        },
+              );
+            },
+          ),
+        ],
       ),
     );
   }
@@ -324,15 +363,17 @@ class _TopBar extends StatelessWidget {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
-                if (session != null) ...[
-                  _PersonaButton(session: session!, onSwitch: onSwitchPersona),
+                if (acting) ...[
+                  _ActingChip(session: session!),
                   const SizedBox(width: 10),
                 ],
                 _HelpButton(onOpenApiDocs: onOpenApiDocs),
                 const SizedBox(width: 10),
                 _AccountButton(
                   label: accountLabel,
+                  session: session,
                   onSignOut: onSignOut,
+                  onSwitchPersona: onSwitchPersona,
                   onOpenEmployeeHub: onOpenEmployeeHub,
                   hubActive: employeeHubActive,
                 ),
@@ -342,76 +383,6 @@ class _TopBar extends StatelessWidget {
         ],
       ),
     );
-  }
-}
-
-/// Who the console is answering as, and the way to become somebody else.
-///
-/// Deliberately not folded into the account button beside it: the account is
-/// who signed in and the persona is who the server is answering as, and while
-/// impersonation is running those are two different people. One control for
-/// both would be the fastest way to lose that distinction.
-class _PersonaButton extends StatelessWidget {
-  final Session session;
-  final ValueChanged<String>? onSwitch;
-
-  const _PersonaButton({required this.session, this.onSwitch});
-
-  bool get _canSwitch => session.maySwitchPersona && onSwitch != null;
-
-  String get _tooltip {
-    final name = session.displayName;
-    return [
-      session.label == name ? name : '$name · ${session.label}',
-      session.title,
-      if (!session.inWorkforce)
-        'No Employee record behind this persona, so the Hub, the calendar '
-            'and the personal queues are empty by design.',
-    ].join('\n');
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (!_canSwitch) {
-      return Tooltip(
-        message: _tooltip,
-        child: _PersonaFace(session: session, canSwitch: false),
-      );
-    }
-    return PopupMenuButton<String>(
-      tooltip: _tooltip,
-      offset: const Offset(0, 62),
-      constraints: const BoxConstraints(minWidth: 400, maxWidth: 420),
-      onSelected: onSwitch,
-      itemBuilder: (context) => _items(),
-      child: _PersonaFace(session: session, canSwitch: true),
-    );
-  }
-
-  List<PopupMenuEntry<String>> _items() {
-    final entries = <PopupMenuEntry<String>>[];
-    for (final group in session.groups) {
-      if (entries.isNotEmpty) entries.add(const PopupMenuDivider());
-      entries.add(
-        PopupMenuItem<String>(
-          enabled: false,
-          height: 34,
-          child: Text(group.label.toUpperCase(), style: CumulusText.statLabel),
-        ),
-      );
-      for (final option in group.personas) {
-        entries.add(
-          PopupMenuItem<String>(
-            value: option.id,
-            child: _PersonaEntry(
-              option: option,
-              selected: option.id == session.personaId,
-            ),
-          ),
-        );
-      }
-    }
-    return entries;
   }
 }
 
@@ -616,109 +587,80 @@ class _KeyHint extends StatelessWidget {
   }
 }
 
-/// The persona as it reads in the bar: role above, person, title below —
-/// the same eyebrow/title/subtitle rhythm every page heading uses.
+/// The one thing the account button cannot say while its menu is shut: this
+/// session is answering as somebody else.
 ///
-/// While an impersonation is running the eyebrow spends itself on the operator
-/// instead of the role — "MITCHELL SUTER · ACTING AS" over "John Smith" — so
-/// the bar answers *whose session is this* with two names rather than one and
-/// an inference. The role is worth the line the rest of the time, except when
-/// it is the person's own name, which is how the customer-user personas are
-/// named on the server: "TOMAS BERG" above "Connie Alberts" says nothing.
-class _PersonaFace extends StatelessWidget {
+/// Rendered only during an impersonation. The tinted chrome says that
+/// something has changed; the chip says who, because the cost of forgetting
+/// whose session you are in is a decision recorded against the wrong person.
+/// Two names rather than one — "MITCHELL SUTER · ACTING AS" over "John Smith"
+/// — so the bar answers *whose session is this* without an inference. An
+/// operator who is not on the roster cannot be named, so the eyebrow then
+/// falls back to saying only that an impersonation is running.
+class _ActingChip extends StatelessWidget {
   final Session session;
-  final bool canSwitch;
 
-  const _PersonaFace({required this.session, required this.canSwitch});
-
-  String get _role =>
-      session.label == session.displayName ? '' : session.label;
-
-  String get _eyebrow {
-    if (!session.impersonating) return _role.toUpperCase();
-    // An operator who is not on the roster cannot be named, so the eyebrow
-    // falls back to saying only that this is an impersonation.
-    final operator = session.operator;
-    final parts = operator != null
-        ? [operator.displayName, 'Acting as']
-        : ['Acting as', if (_role.isNotEmpty) _role];
-    return parts.join(' · ').toUpperCase();
-  }
-
-  /// The title, plus the reason a persona's personal surfaces will be empty.
-  /// Naviant Support is not in the customer's org chart, and a hub with
-  /// nothing in it should read as correct rather than as a failed request.
-  String get _subtitle => session.inWorkforce
-      ? session.title
-      : '${session.title} · no employee record';
+  const _ActingChip({required this.session});
 
   @override
   Widget build(BuildContext context) {
-    final acting = session.impersonating;
-    final eyebrow = _eyebrow;
-    return Container(
-      width: _personaWidth,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-      decoration: BoxDecoration(
-        color: CumulusColors.surface,
-        borderRadius: BorderRadius.circular(CumulusRadius.control),
-        border: Border.all(
-          color: acting ? CumulusColors.accent : CumulusColors.border,
-          width: acting ? 1.5 : 1,
+    final operator = session.operator;
+    final eyebrow = operator == null
+        ? 'ACTING AS'
+        : '${operator.displayName} · Acting as'.toUpperCase();
+    return Tooltip(
+      message: [
+        operator == null
+            ? 'Acting as ${session.displayName}'
+            : '${operator.displayName} acting as ${session.displayName}',
+        session.title,
+      ].join('\n'),
+      child: Container(
+        width: _actingChipWidth,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: CumulusColors.surface,
+          borderRadius: BorderRadius.circular(CumulusRadius.control),
+          border: Border.all(color: CumulusColors.accent, width: 1.5),
+          boxShadow: CumulusShadows.card,
         ),
-        boxShadow: CumulusShadows.card,
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (eyebrow.isNotEmpty)
+        child: Row(
+          children: [
+            const Icon(
+              Icons.visibility_outlined,
+              size: 15,
+              color: CumulusColors.accentInk,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
                   Text(
                     eyebrow,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: CumulusText.statLabel.copyWith(
-                      fontSize: 10,
+                      fontSize: 9.5,
                       height: 1.3,
-                      color: acting
-                          ? CumulusColors.accentInk
-                          : CumulusColors.inkMuted,
+                      color: CumulusColors.accentInk,
                     ),
                   ),
-                Text(
-                  session.displayName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: CumulusText.rowTitle.copyWith(
-                    fontSize: 13,
-                    height: 1.25,
+                  Text(
+                    session.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: CumulusText.rowTitle.copyWith(
+                      fontSize: 12.5,
+                      height: 1.25,
+                    ),
                   ),
-                ),
-                Text(
-                  _subtitle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: CumulusText.sectionSubtitle.copyWith(
-                    fontSize: 11,
-                    height: 1.25,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (canSwitch)
-            const Padding(
-              padding: EdgeInsets.only(left: 6),
-              child: Icon(
-                Icons.unfold_more,
-                size: 16,
-                color: CumulusColors.inkMuted,
+                ],
               ),
             ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -743,11 +685,7 @@ class _PersonaEntry extends StatelessWidget {
           SizedBox(
             width: 22,
             child: selected
-                ? const Icon(
-                    Icons.check,
-                    size: 15,
-                    color: CumulusColors.accent,
-                  )
+                ? const Icon(Icons.check, size: 15, color: CumulusColors.accent)
                 : null,
           ),
           Expanded(
@@ -784,7 +722,8 @@ class _PersonaEntry extends StatelessWidget {
 
 /// Help menu. Sits immediately left of the account button and mirrors its
 /// shape, so the two read as one cluster of account-level affordances rather
-/// than as a control that belongs to the page underneath.
+/// than as a control that belongs to the page underneath. Same panel, same
+/// drop, same right edge, for the same reason.
 class _HelpButton extends StatelessWidget {
   final VoidCallback? onOpenApiDocs;
 
@@ -792,80 +731,170 @@ class _HelpButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return PopupMenuButton<String>(
-      tooltip: 'Help',
-      offset: const Offset(0, 44),
-      onSelected: (value) {
-        if (value == 'api-docs') onOpenApiDocs?.call();
-      },
-      itemBuilder: (context) => [
-        const PopupMenuItem<String>(
-          enabled: false,
-          height: 36,
+    return MenuAnchor(
+      style: _cumulusMenuStyle(_helpMenuWidth),
+      alignmentOffset: const Offset(
+        -(_helpMenuWidth - _roundButtonSize),
+        _menuDrop,
+      ),
+      menuChildren: _menuRows(_helpMenuWidth, [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 6, 16, 2),
           child: Text('HELP', style: CumulusText.statLabel),
         ),
-        const PopupMenuDivider(),
-        PopupMenuItem<String>(
-          value: 'api-docs',
-          height: 52,
-          child: Row(
-            children: [
-              const Icon(
-                Icons.code,
-                size: 16,
-                color: CumulusColors.inkSecondary,
-              ),
-              const SizedBox(width: 10),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text(
-                    'API documentation',
-                    style: TextStyle(fontSize: 13),
-                  ),
-                  Text(
-                    'REST, MCP, and A2A endpoints',
-                    style: CumulusText.sectionSubtitle,
-                  ),
-                ],
-              ),
-            ],
+        MenuItemButton(
+          style: _menuRowStyle(context),
+          leadingIcon: const Icon(
+            Icons.code,
+            size: 16,
+            color: CumulusColors.inkSecondary,
+          ),
+          onPressed: onOpenApiDocs,
+          child: const _MenuRowLabel(
+            title: 'API documentation',
+            subtitle: 'REST, MCP, and A2A endpoints',
           ),
         ),
-      ],
-      child: Container(
-        width: 34,
-        height: 34,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: CumulusColors.surface,
-          shape: BoxShape.circle,
-          border: Border.all(color: CumulusColors.border),
-          boxShadow: CumulusShadows.card,
-        ),
-        child: const Icon(
-          Icons.help_outline,
-          size: 17,
-          color: CumulusColors.inkSecondary,
+      ]),
+      builder: (context, controller, _) => Tooltip(
+        message: 'Help',
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: () =>
+              controller.isOpen ? controller.close() : controller.open(),
+          child: Container(
+            width: _roundButtonSize,
+            height: _roundButtonSize,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: CumulusColors.surface,
+              shape: BoxShape.circle,
+              border: Border.all(color: CumulusColors.border),
+              boxShadow: CumulusShadows.card,
+            ),
+            child: const Icon(
+              Icons.help_outline,
+              size: 17,
+              color: CumulusColors.inkSecondary,
+            ),
+          ),
         ),
       ),
     );
   }
 }
 
+/// Menu geometry. The account menu is sized to its own rows; the roster is
+/// sized to a persona's blurb, which is the only thing that tells one test
+/// subject from another.
+const double _accountMenuWidth = 300;
+const double _helpMenuWidth = 268;
+const double _rosterMenuWidth = 400;
+
+/// Every menu in the bar's right cluster wears the popup menus' clothes —
+/// surface, hairline border, no elevation and no tint — because `MenuAnchor`
+/// reads none of `popupMenuTheme`, and the rail's menus, which are still
+/// `PopupMenuButton`s, do.
+MenuStyle _cumulusMenuStyle(double width) => MenuStyle(
+  backgroundColor: const WidgetStatePropertyAll(CumulusColors.surface),
+  surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
+  shadowColor: const WidgetStatePropertyAll(Colors.transparent),
+  elevation: const WidgetStatePropertyAll(0),
+  padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 6)),
+  minimumSize: WidgetStatePropertyAll(Size(width, 0)),
+  maximumSize: WidgetStatePropertyAll(Size(width, double.infinity)),
+  shape: WidgetStatePropertyAll(
+    RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(CumulusRadius.control),
+      side: const BorderSide(color: CumulusColors.border),
+    ),
+  ),
+);
+
+/// One row of either menu: the 13px type the popup menus use, and a hover
+/// wash rather than the theme's accent ripple, which on a menu this dense
+/// reads as a selection that has already happened.
+///
+/// The style is built from the text theme rather than written out, because a
+/// `ButtonStyle.textStyle` *replaces* the ambient default rather than merging
+/// with it: a bare `TextStyle(fontSize: 13)` drops the console's font and the
+/// rows come back in the platform's.
+ButtonStyle _menuRowStyle(BuildContext context, {EdgeInsetsGeometry? padding}) {
+  final base = Theme.of(context).textTheme.bodyMedium ?? const TextStyle();
+  return ButtonStyle(
+    textStyle: WidgetStatePropertyAll(
+      base.copyWith(fontSize: 13, color: CumulusColors.ink),
+    ),
+    padding: WidgetStatePropertyAll(
+      padding ?? const EdgeInsets.symmetric(horizontal: 14),
+    ),
+    overlayColor: WidgetStateProperty.resolveWith(
+      (states) => states.isEmpty ? null : CumulusColors.surfaceMuted,
+    ),
+  );
+}
+
+/// Gives every row of a menu the panel's width.
+///
+/// `MenuStyle.minimumSize` does not do this: it widens the box the panel is
+/// laid out in, while the panel itself still hugs its widest row — so a menu
+/// sized that way reserves 300px, paints 240, and sits 60px from where
+/// anything anchored to it expects the edge to be.
+List<Widget> _menuRows(double width, List<Widget> rows) => [
+  for (final row in rows) SizedBox(width: width, child: row),
+];
+
+/// A hairline between regions of a menu.
+class _MenuRule extends StatelessWidget {
+  const _MenuRule();
+
+  @override
+  Widget build(BuildContext context) => const Padding(
+    padding: EdgeInsets.symmetric(vertical: 6),
+    child: Divider(height: 1),
+  );
+}
+
+/// The console's one identity control: who signed in, who the server is
+/// answering as, and — for an operator the session allows — the roster to
+/// become somebody else.
+///
+/// The switcher used to be its own 250px control in the bar, on the argument
+/// that the account is who signed in and the persona is who the server is
+/// answering as, and that one control for both would lose the distinction.
+/// They are still two different people during an impersonation, but this menu
+/// names both without spending a quarter of the bar on it, and the acting-as
+/// chip carries the distinction while the menu is shut.
+///
+/// The roster is a submenu rather than more rows in this menu. Inlined, a
+/// dozen personas — each of which needs the width of a blurb to be worth
+/// reading — would bury Sign out under a wall of test subjects and drag the
+/// account menu to the width of the roster. It flies out to the left: this
+/// button is the last thing on the bar, so there is never room to its right,
+/// and the layout flips a submenu that would run off the edge.
 class _AccountButton extends StatelessWidget {
   final String? label;
+
+  /// The acting persona and the roster behind the switcher, or null while the
+  /// first session request is still in flight.
+  final Session? session;
+
   final VoidCallback? onSignOut;
+  final ValueChanged<String>? onSwitchPersona;
   final VoidCallback? onOpenEmployeeHub;
   final bool hubActive;
 
   const _AccountButton({
     this.label,
+    this.session,
     this.onSignOut,
+    this.onSwitchPersona,
     this.onOpenEmployeeHub,
     this.hubActive = false,
   });
+
+  bool get _canSwitch =>
+      (session?.maySwitchPersona ?? false) && onSwitchPersona != null;
 
   String get _initials {
     final source = (label ?? '').trim();
@@ -882,78 +911,256 @@ class _AccountButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return PopupMenuButton<String>(
-      tooltip: label ?? 'Account',
-      offset: const Offset(0, 44),
-      onSelected: (value) {
-        if (value == 'signout') onSignOut?.call();
-        if (value == 'employee-hub') onOpenEmployeeHub?.call();
-      },
-      itemBuilder: (context) => [
-        PopupMenuItem<String>(
-          enabled: false,
-          height: 36,
-          child: Text(label ?? 'Signed in', style: CumulusText.meta),
+    final acting = session?.impersonating ?? false;
+    return MenuAnchor(
+      style: _cumulusMenuStyle(_accountMenuWidth),
+      // Hangs from the button's right edge, not its left: the button is 18px
+      // from the window edge, and the default alignment would push a 300px
+      // menu off the screen and leave the overlay to clamp it flush.
+      alignmentOffset: const Offset(
+        -(_accountMenuWidth - _roundButtonSize),
+        _menuDrop,
+      ),
+      menuChildren: _menuRows(_accountMenuWidth, [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          child: _AccountHeader(label: label, session: session),
         ),
-        const PopupMenuDivider(),
-        PopupMenuItem<String>(
-          value: 'employee-hub',
-          height: 52,
-          child: Row(
-            children: [
-              const Icon(
-                Icons.badge_outlined,
-                size: 16,
-                color: CumulusColors.inkSecondary,
+        if (_canSwitch) ...[
+          const _MenuRule(),
+          _PersonaSubmenu(session: session!, onSwitch: onSwitchPersona!),
+        ],
+        const _MenuRule(),
+        MenuItemButton(
+          style: _menuRowStyle(context),
+          leadingIcon: const Icon(
+            Icons.badge_outlined,
+            size: 16,
+            color: CumulusColors.inkSecondary,
+          ),
+          onPressed: onOpenEmployeeHub,
+          child: const _MenuRowLabel(
+            title: 'Employee Hub',
+            subtitle: 'PTO, benefits, and the HR Agent',
+          ),
+        ),
+        MenuItemButton(
+          style: _menuRowStyle(context),
+          leadingIcon: const Icon(
+            Icons.logout,
+            size: 16,
+            color: CumulusColors.inkSecondary,
+          ),
+          onPressed: onSignOut,
+          child: const Text('Sign out'),
+        ),
+      ]),
+      builder: (context, controller, _) => Tooltip(
+        message: label ?? 'Account',
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: () =>
+              controller.isOpen ? controller.close() : controller.open(),
+          child: Container(
+            width: _roundButtonSize,
+            height: _roundButtonSize,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: hubActive ? CumulusColors.ink : CumulusColors.surface,
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: hubActive
+                    ? CumulusColors.ink
+                    : acting
+                    ? CumulusColors.accent
+                    : CumulusColors.border,
+                width: acting && !hubActive ? 1.5 : 1,
               ),
-              const SizedBox(width: 10),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text('Employee Hub', style: TextStyle(fontSize: 13)),
-                  Text(
-                    'PTO, benefits, and the HR Agent',
-                    style: CumulusText.sectionSubtitle,
-                  ),
-                ],
+              boxShadow: CumulusShadows.card,
+            ),
+            child: Text(
+              _initials.toUpperCase(),
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.4,
+                color: hubActive ? Colors.white : CumulusColors.inkSecondary,
               ),
-            ],
+            ),
           ),
         ),
-        const PopupMenuItem<String>(
-          value: 'signout',
-          height: 40,
-          child: Row(
-            children: [
-              Icon(Icons.logout, size: 16, color: CumulusColors.inkSecondary),
-              SizedBox(width: 10),
-              Text('Sign out', style: TextStyle(fontSize: 13)),
-            ],
-          ),
+      ),
+    );
+  }
+}
+
+/// The row that opens the roster, and the roster it opens.
+///
+/// The row names who you are acting as now, so the switcher answers "who am I"
+/// on the way to "who else could I be" — and so the menu is worth opening for
+/// an operator who only wanted to check.
+class _PersonaSubmenu extends StatelessWidget {
+  final Session session;
+  final ValueChanged<String> onSwitch;
+
+  const _PersonaSubmenu({required this.session, required this.onSwitch});
+
+  int get _rosterSize =>
+      session.groups.fold(0, (n, group) => n + group.personas.length);
+
+  @override
+  Widget build(BuildContext context) {
+    return SubmenuButton(
+      style: _menuRowStyle(context),
+      menuStyle: _cumulusMenuStyle(_rosterMenuWidth),
+      // Hugs the account menu's edge rather than the row's, so the two panels
+      // read as one control opening sideways instead of two loose cards.
+      alignmentOffset: const Offset(6, -6),
+      leadingIcon: const Icon(
+        Icons.switch_account_outlined,
+        size: 16,
+        color: CumulusColors.inkSecondary,
+      ),
+      submenuIcon: const WidgetStatePropertyAll(
+        Icon(Icons.chevron_left, size: 18, color: CumulusColors.inkMuted),
+      ),
+      menuChildren: _menuRows(_rosterMenuWidth, _roster(context)),
+      child: _MenuRowLabel(
+        title: 'Switch persona',
+        subtitle: _rosterSize == 1
+            ? '1 persona on the roster'
+            : '$_rosterSize personas on the roster',
+      ),
+    );
+  }
+
+  /// The roster, grouped as the server grouped it, with a rule between groups
+  /// so "Naviant" and the customer's own people do not read as one list.
+  List<Widget> _roster(BuildContext context) {
+    final rows = <Widget>[];
+    for (final group in session.groups) {
+      if (rows.isNotEmpty) rows.add(const _MenuRule());
+      rows.add(
+        Padding(
+          // Over the names it groups, not over the gutter the check sits in.
+          padding: const EdgeInsets.fromLTRB(30, 6, 16, 2),
+          child: Text(group.label.toUpperCase(), style: CumulusText.statLabel),
         ),
-      ],
-      child: Container(
-        width: 34,
-        height: 34,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: hubActive ? CumulusColors.ink : CumulusColors.surface,
-          shape: BoxShape.circle,
-          border: Border.all(
-            color: hubActive ? CumulusColors.ink : CumulusColors.border,
+      );
+      for (final option in group.personas) {
+        rows.add(
+          MenuItemButton(
+            style: _menuRowStyle(
+              context,
+              padding: const EdgeInsets.only(left: 8, right: 16),
+            ),
+            onPressed: () => onSwitch(option.id),
+            child: _PersonaEntry(
+              option: option,
+              selected: option.id == session.personaId,
+            ),
           ),
-          boxShadow: CumulusShadows.card,
-        ),
-        child: Text(
-          _initials.toUpperCase(),
-          style: TextStyle(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 0.4,
-            color: hubActive ? Colors.white : CumulusColors.inkSecondary,
+        );
+      }
+    }
+    return rows;
+  }
+}
+
+/// A menu row's two lines: what it does, and the one fact you need to decide
+/// whether to press it.
+class _MenuRowLabel extends StatelessWidget {
+  final String title;
+  final String subtitle;
+
+  const _MenuRowLabel({required this.title, required this.subtitle});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(title, style: const TextStyle(fontSize: 13)),
+          Text(
+            subtitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: CumulusText.sectionSubtitle,
           ),
-        ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The menu's first rows: the person actually signed in, then the persona the
+/// server is answering as. Two blocks rather than one, because during an
+/// impersonation they are two different people and this is the anchor that has
+/// to keep saying which is which.
+///
+/// The role is worth its line except when it is the person's own name, which
+/// is how the customer-user personas are named on the server: "TOMAS BERG"
+/// above "Connie Alberts" says nothing.
+class _AccountHeader extends StatelessWidget {
+  final String? label;
+  final Session? session;
+
+  const _AccountHeader({this.label, this.session});
+
+  /// The title, plus the reason a persona's personal surfaces will be empty.
+  /// Naviant Support is not in the customer's org chart, and a hub with
+  /// nothing in it should read as correct rather than as a failed request.
+  String _subtitle(Session session) => session.inWorkforce
+      ? session.title
+      : '${session.title} · no employee record';
+
+  String _eyebrow(Session session) {
+    if (session.impersonating) return 'ACTING AS';
+    final role = session.label == session.displayName ? '' : session.label;
+    return role.isEmpty ? 'SIGNED IN AS' : role.toUpperCase();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final session = this.session;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(label ?? 'Signed in', style: CumulusText.meta),
+          if (session != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              _eyebrow(session),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: CumulusText.statLabel.copyWith(
+                fontSize: 9.5,
+                height: 1.3,
+                color: session.impersonating
+                    ? CumulusColors.accentInk
+                    : CumulusColors.inkMuted,
+              ),
+            ),
+            Text(
+              session.displayName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: CumulusText.rowTitle.copyWith(fontSize: 13, height: 1.25),
+            ),
+            Text(
+              _subtitle(session),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: CumulusText.sectionSubtitle.copyWith(height: 1.25),
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -1175,27 +1382,35 @@ class _RailGlyph extends StatelessWidget {
             size: 19,
             color: selected ? CumulusColors.accent : CumulusColors.inkMuted,
           ),
-          if (destination.badge > 0)
+          if (destination.badge != null)
             Positioned(
               top: 5,
               right: 4,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 4,
-                  vertical: 1,
-                ),
-                decoration: BoxDecoration(
-                  color: CumulusColors.ink,
-                  borderRadius: BorderRadius.circular(999),
-                ),
-                child: Text(
-                  '${destination.badge}',
-                  style: const TextStyle(
-                    fontSize: 8.5,
-                    fontWeight: FontWeight.w700,
-                    color: Colors.white,
-                  ),
-                ),
+              // The only thing on the rail that redraws without a navigation:
+              // listening here is what keeps the count from being a reason to
+              // rebuild the page beside it.
+              child: ValueListenableBuilder<int>(
+                valueListenable: destination.badge!,
+                builder: (context, count, _) => count == 0
+                    ? const SizedBox.shrink()
+                    : Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 1,
+                        ),
+                        decoration: BoxDecoration(
+                          color: CumulusColors.ink,
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          '$count',
+                          style: const TextStyle(
+                            fontSize: 8.5,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
               ),
             ),
         ],

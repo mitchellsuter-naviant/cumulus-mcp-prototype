@@ -56,6 +56,17 @@ class _SearchViewState extends State<SearchView> {
   SearchSort _sort = SearchSort.relevance;
   String _mode = 'hybrid';
 
+  /// Whether this deployment has a vector half at all, per
+  /// `GET /api/v1/search/status`. Null until the probe lands.
+  ///
+  /// The retriever chips used to be drawn unconditionally, so on a deployment
+  /// with no embedder a person could select `semantic`, watch the result list
+  /// go empty, and have no way to learn that the mode they picked was never
+  /// running — the server degrades to lexical internally and says so only
+  /// here. A control that cannot do what its label says is worse than a
+  /// missing control, so it is not drawn.
+  bool? _hybrid;
+
   bool _loading = true;
   String? _error;
   bool _showWeak = false;
@@ -72,7 +83,23 @@ class _SearchViewState extends State<SearchView> {
   void initState() {
     super.initState();
     _run();
+    _probeRetrieval();
     if (looksLikeQuestion(widget.query)) _ask();
+  }
+
+  /// Asks what the retrieval stack is actually doing, once.
+  ///
+  /// Not awaited before the first paint and deliberately not re-running the
+  /// search when it lands: a lexical-only server already answers a `hybrid`
+  /// request lexically, so the hits on screen are correct either way. What
+  /// changes is what the console is willing to *claim* about them.
+  Future<void> _probeRetrieval() async {
+    final hybrid = await _api.hybridSearchEnabled();
+    if (!mounted) return;
+    setState(() {
+      _hybrid = hybrid;
+      if (!hybrid) _mode = 'lexical';
+    });
   }
 
   @override
@@ -392,25 +419,37 @@ class _SearchViewState extends State<SearchView> {
             },
           ),
           const Spacer(),
+          // Lexical only, and said out loud rather than left as one chip that
+          // looks like a choice. A deployment with no embedder is a normal
+          // deployment, not a broken one, and the honest thing is to name what
+          // is ranking the results.
+          if (_hybrid == false)
+            Text(
+              'lexical only — this deployment has no embedder',
+              style: CumulusText.meta,
+            ),
           // The API has always supported forcing one retriever. Exposing it is
           // the fastest way to answer "why did this match?" — flip to lexical
-          // and a result that vanishes was never a keyword match.
-          for (final mode in const ['hybrid', 'lexical', 'semantic'])
-            Padding(
-              padding: const EdgeInsets.only(left: 8),
-              child: LensChip(
-                label: mode,
-                selected: _mode == mode,
-                tone: mode == 'semantic'
-                    ? CumulusTone.violet
-                    : CumulusTone.accent,
-                onTap: () {
-                  if (_mode == mode) return;
-                  setState(() => _mode = mode);
-                  _run();
-                },
+          // and a result that vanishes was never a keyword match. Drawn only
+          // once the server has confirmed both retrievers exist: a chip that
+          // returns an empty list and cannot say why is a dead end.
+          if (_hybrid == true)
+            for (final mode in const ['hybrid', 'lexical', 'semantic'])
+              Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: LensChip(
+                  label: mode,
+                  selected: _mode == mode,
+                  tone: mode == 'semantic'
+                      ? CumulusTone.violet
+                      : CumulusTone.accent,
+                  onTap: () {
+                    if (_mode == mode) return;
+                    setState(() => _mode = mode);
+                    _run();
+                  },
+                ),
               ),
-            ),
         ],
       ),
     );

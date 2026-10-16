@@ -5,6 +5,7 @@ import '../models/session.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'cumulus_shell.dart';
+import 'skeleton.dart';
 import 'sources_plane.dart' show EstateHeaderCard;
 // One vocabulary for a Task kind across the console. A desk here counting
 // `merge_review` while My Tasks calls it a Proposed merge would be two names
@@ -156,7 +157,28 @@ class _SystemStateSectionState extends State<SystemStateSection> {
         children: [ErrorNotice(message: _error!, onRetry: _load)],
       );
     }
-    if (screen == null) return const CumulusLoading();
+    if (screen == null) {
+      // The heading above already stands; the four panels are what the read is
+      // for, so the grid they will occupy is held open rather than collapsed
+      // behind a spinner.
+      return const PageBody(
+        padding: EdgeInsets.fromLTRB(28, 18, 28, 48),
+        children: [
+          SkeletonPulse(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 16,
+              children: [
+                _PanelSkeleton(),
+                _PanelSkeleton(),
+                _PanelSkeleton(),
+                _PanelSkeleton(),
+              ],
+            ),
+          ),
+        ],
+      );
+    }
     return PageBody(
       padding: const EdgeInsets.fromLTRB(28, 18, 28, 48),
       children: [
@@ -203,6 +225,56 @@ class SystemStateNotYours extends StatelessWidget {
               'queues are on Home and My Tasks.',
         ),
       ),
+    ],
+  );
+}
+
+/// One of the four panels, before its figures: a section header, a row of
+/// counts, and the list the counts are answerable by.
+class _PanelSkeleton extends StatelessWidget {
+  const _PanelSkeleton();
+
+  @override
+  Widget build(BuildContext context) => const SkeletonCard(
+    padding: EdgeInsets.fromLTRB(22, 20, 22, 22),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SkeletonBar(width: 168, height: 14),
+        SizedBox(height: 10),
+        SkeletonBar(width: 380, height: 10),
+        SizedBox(height: 20),
+        Row(
+          spacing: 28,
+          children: [
+            _CountSkeleton(),
+            _CountSkeleton(),
+            _CountSkeleton(),
+            _CountSkeleton(),
+          ],
+        ),
+        SizedBox(height: 22),
+        SkeletonBar(height: 11),
+        SizedBox(height: 12),
+        SkeletonBar(height: 11),
+        SizedBox(height: 12),
+        SkeletonBar(width: 260, height: 11),
+      ],
+    ),
+  );
+}
+
+class _CountSkeleton extends StatelessWidget {
+  const _CountSkeleton();
+
+  @override
+  Widget build(BuildContext context) => const Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      SkeletonBar(width: 64, height: 22),
+      SizedBox(height: 8),
+      SkeletonBar(width: 92, height: 9),
     ],
   );
 }

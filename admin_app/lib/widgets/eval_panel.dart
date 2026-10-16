@@ -4,6 +4,7 @@ import '../models/eval.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'side_drawer.dart';
+import 'skeleton.dart';
 import 'ui_kit.dart';
 
 /// A flow's evaluation, answering three questions in the order they get asked.
@@ -34,14 +35,39 @@ class EvalPanel extends StatefulWidget {
   State<EvalPanel> createState() => _EvalPanelState();
 }
 
+/// Column widths for the test matrix. One place, so the head and its rows
+/// cannot drift apart.
+const _evalResultW = 92.0;
+const _evalWhenW = 100.0;
+const _evalActionsW = 84.0;
+const _evalGap = 14.0;
+
+/// Below this the expected-behaviour column is dropped: the case name and its
+/// verdict are what the table is for, and squeezing three text columns into a
+/// narrow card gives you three ellipses.
+const _evalWideWidth = 900.0;
+
 class _EvalPanelState extends State<EvalPanel> {
   EvalSpecSummary? _summary;
   EvalSpec? _spec;
   List<EvalCase> _cases = const [];
+
+  /// The last full run — the only thing that can carry a gate. A gate is a
+  /// comparison of a whole suite against a baseline, and re-running one case
+  /// does not produce one.
   EvalRunResult? _result;
+
+  /// The current verdict per case, and when it was reached. Held beside
+  /// [_result] rather than read out of it because a single case can be re-run
+  /// on its own, and when it is, every other row has to keep the verdict it
+  /// already has instead of blanking.
+  final Map<String, EvalCaseResult> _outcomes = {};
+  final Map<String, String> _gradedAtIso = {};
+
   String? _error;
   bool _loading = true;
   bool _running = false;
+  String? _runningCase;
   String? _openCase;
 
   @override
@@ -61,15 +87,27 @@ class _EvalPanelState extends State<EvalPanel> {
         if (mounted) setState(() => _loading = false);
         return;
       }
-      final spec = await widget.api.getEvalSpec(specs.first.id);
-      final cases = await widget.api.listEvalCases(specs.first.id);
-      final last = await widget.api.lastEvalResult(specs.first.id);
+      // Once the spec id is known the three reads behind it are independent of
+      // one another, so they go out together and the panel waits for the
+      // slowest rather than for their sum. Grouped by `Future.wait` rather
+      // than awaited in a row: a first failure would otherwise escape while
+      // the other two are still in flight, and their errors would land with
+      // nobody listening.
+      final specId = specs.first.id;
+      final Future<EvalSpec> specRead = widget.api.getEvalSpec(specId);
+      final Future<List<EvalCase>> casesRead = widget.api.listEvalCases(specId);
+      final Future<EvalRunResult?> lastRead = widget.api.lastEvalResult(specId);
+      await Future.wait<void>([specRead, casesRead, lastRead]);
+      final spec = await specRead;
+      final cases = await casesRead;
+      final last = await lastRead;
       if (!mounted) return;
       setState(() {
         _summary = specs.first;
         _spec = spec;
         _cases = cases;
         _result = last;
+        if (last != null) _absorb(last, full: true);
         _loading = false;
       });
     } on ApiException catch (e) {
@@ -82,29 +120,55 @@ class _EvalPanelState extends State<EvalPanel> {
     }
   }
 
-  Future<void> _run() async {
+  /// Fold a result into the per-case verdicts. A full run replaces them; a
+  /// single case updates its own row and leaves the others standing.
+  void _absorb(EvalRunResult result, {required bool full}) {
+    if (full) {
+      _outcomes.clear();
+      _gradedAtIso.clear();
+    }
+    for (final outcome in result.cases) {
+      _outcomes[outcome.caseId] = outcome;
+      _gradedAtIso[outcome.caseId] = result.atIso;
+    }
+  }
+
+  /// Run the suite, or one case of it. The same call either way — the API
+  /// takes the case ids it should grade, and an empty list means all of them.
+  Future<void> _launch({EvalCase? single}) async {
     final summary = _summary;
     if (summary == null) return;
     setState(() {
-      _running = true;
+      if (single == null) {
+        _running = true;
+      } else {
+        _runningCase = single.id;
+      }
       _error = null;
     });
     try {
-      final result = await widget.api.runEval(summary.id);
-      if (mounted) {
-        setState(() {
-          _result = result;
-          _running = false;
-        });
-      }
+      final result = await widget.api.runEval(
+        summary.id,
+        caseIds: single == null ? const [] : [single.id],
+      );
+      if (!mounted) return;
+      setState(() {
+        if (single == null) _result = result;
+        _absorb(result, full: single == null);
+      });
     } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.statusCode == 403
+            ? 'Launching an eval needs admin. (A CI key may do it — that is '
+                  'the one write here a credential should make.)'
+            : e.message;
+      });
+    } finally {
       if (mounted) {
         setState(() {
-          _error = e.statusCode == 403
-              ? 'Launching an eval needs admin. (A CI key may do it — that is '
-                    'the one write here a credential should make.)'
-              : e.message;
           _running = false;
+          _runningCase = null;
         });
       }
     }
@@ -112,7 +176,47 @@ class _EvalPanelState extends State<EvalPanel> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) return const CumulusCard(child: CumulusLoading());
+    if (_loading) {
+      // The panel is a header bar over a test matrix; while the spec is in
+      // flight it holds that shape rather than collapsing to a spinner.
+      return const SkeletonPulse(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          spacing: 16,
+          children: [
+            SkeletonCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SkeletonBar(width: 210, height: 14),
+                  SizedBox(height: 10),
+                  SkeletonBar(width: 320, height: 10),
+                  SizedBox(height: 18),
+                  Row(
+                    spacing: 10,
+                    children: [
+                      SkeletonPill(width: 88),
+                      SkeletonPill(width: 104),
+                      SkeletonPill(width: 72),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            SkeletonCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SkeletonBar(width: 148, height: 10),
+                  SizedBox(height: 10),
+                  SkeletonTableRows(rows: 6, columnFlex: [4, 3, 2, 2]),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    }
     final spec = _spec;
     final summary = _summary;
     if (spec == null || summary == null) {
@@ -131,79 +235,91 @@ class _EvalPanelState extends State<EvalPanel> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       spacing: 16,
       children: [
-        _promiseCard(spec, summary),
+        _headerBar(spec, summary),
         if (_error != null) ErrorNotice(message: _error!),
-        _casesCard(spec),
+        _matrixCard(spec),
       ],
     );
   }
 
-  // ---- 1. what does this flow promise? ------------------------------------
+  // ---- the header bar -----------------------------------------------------
 
-  Widget _promiseCard(EvalSpec spec, EvalSpecSummary summary) {
-    final ignored = _ignoredFields(spec);
+  /// What is being graded, how much of it passes, and the two controls.
+  ///
+  /// This replaced a card that spent four paragraphs and a chip cloud saying
+  /// what the spec *is* — which is a thing to read once, in the drawer, not a
+  /// thing to scroll past every time somebody checks a pass rate.
+  Widget _headerBar(EvalSpec spec, EvalSpecSummary summary) {
+    final passed = _outcomes.values.where((o) => o.passed).length;
+    final failed = _outcomes.length - passed;
+    final gate = _result?.gate;
+    final busy = _running || _runningCase != null;
     return CumulusCard(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 18),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SectionHeader(
-            title: spec.id,
-            subtitle:
-                'v${spec.version} · what this flow is answerable for, graded '
-                'in a world of its own',
-            trailing: OutlinedButton.icon(
-              onPressed: () => _openSpecDrawer(context, spec),
-              icon: const Icon(Icons.gavel_outlined, size: 15),
-              label: const Text('How this flow is judged'),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Prose(spec.summary),
-          const SizedBox(height: 16),
-          Text(
-            '${summary.gradedFields} field'
-            '${summary.gradedFields == 1 ? '' : 's'} and '
-            '${summary.gradedLinks} edge${summary.gradedLinks == 1 ? '' : 's'} '
-            'are graded, at ${summary.milestones} point'
-            '${summary.milestones == 1 ? '' : 's'} in the run.',
-            style: CumulusText.body.copyWith(color: CumulusColors.ink),
-          ),
-          if (ignored.isNotEmpty) ...[
-            const SizedBox(height: 14),
-            const FieldLabel(
-              'Ignored on purpose',
-              hint:
-                  'these belong to another system — grading them would grade it',
-            ),
-            Wrap(
-              spacing: 8,
-              runSpacing: 6,
-              children: [
-                for (final entry in ignored)
-                  Tooltip(
-                    message: entry.$2.isEmpty
-                        ? 'Not something this flow establishes.'
-                        : plainProse(entry.$2),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 5,
-                      ),
-                      decoration: BoxDecoration(
-                        color: CumulusColors.canvas,
-                        borderRadius: BorderRadius.circular(7),
-                        border: Border.all(color: CumulusColors.borderStrong),
-                      ),
-                      child: Text(
-                        entry.$1,
-                        style: CumulusText.mono.copyWith(
-                          color: CumulusColors.inkMuted,
-                          decoration: TextDecoration.lineThrough,
-                        ),
+          Row(
+            children: [
+              Expanded(
+                child: Wrap(
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 10,
+                  runSpacing: 6,
+                  children: [
+                    Text(
+                      spec.id,
+                      style: CumulusText.mono.copyWith(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
-                  ),
-              ],
+                    StatusBadge('v${spec.version}', dense: true),
+                    if (gate != null)
+                      StatusBadge(
+                        _gateLabel(gate),
+                        tone: _gateTone(gate),
+                        dense: true,
+                        uppercase: true,
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              OutlinedButton.icon(
+                onPressed: () => _openSpecDrawer(context, spec),
+                icon: const Icon(Icons.gavel_outlined, size: 15),
+                label: const Text('How this flow is judged'),
+              ),
+              const SizedBox(width: 10),
+              FilledButton.icon(
+                onPressed: busy ? null : () => _launch(),
+                icon: _running
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.play_arrow, size: 16),
+                label: Text(_running ? 'Running…' : 'Run all evals'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          _PassRateBar(passed: passed, failed: failed, total: _cases.length),
+          const SizedBox(height: 9),
+          Text(
+            _summaryLine(summary, passed, failed),
+            style: CumulusText.meta,
+          ),
+          // The gate expands only when it blocks. A promotable one has
+          // nothing to say that the badge has not already said.
+          if (gate != null && !gate.passed) ...[
+            const SizedBox(height: 12),
+            _GateDetail(
+              gate: gate,
+              result: _result!,
+              onOpenCase: (id) => setState(() => _openCase = id),
             ),
           ],
         ],
@@ -211,156 +327,366 @@ class _EvalPanelState extends State<EvalPanel> {
     );
   }
 
-  /// Every ignored field the spec declares, as `Type.field` with its note.
-  /// Deduped: the same rule restated at two milestones is one decision.
-  List<(String, String)> _ignoredFields(EvalSpec spec) {
-    final seen = <String, String>{};
-    for (final milestone in spec.milestones) {
-      for (final rule in milestone.objects) {
-        for (final field in rule.fields.where((f) => f.ignored)) {
-          seen.putIfAbsent('${rule.type}.${field.field}', () => field.note);
-        }
-      }
+  String _summaryLine(EvalSpecSummary summary, int passed, int failed) {
+    final total = _cases.length;
+    final graded = passed + failed;
+    if (graded == 0) {
+      return '$total case${total == 1 ? '' : 's'} declared, none graded yet · '
+          '${summary.gradedFields} field'
+          '${summary.gradedFields == 1 ? '' : 's'} and ${summary.gradedLinks} '
+          'edge${summary.gradedLinks == 1 ? '' : 's'} are graded at '
+          '${summary.milestones} point'
+          '${summary.milestones == 1 ? '' : 's'} in the run';
     }
-    return [for (final e in seen.entries) (e.key, e.value)];
-  }
-
-  // ---- 2 and 3. does it keep it, and how do I add one? --------------------
-
-  Widget _casesCard(EvalSpec spec) {
     final result = _result;
-    final byId = {
-      for (final outcome in result?.cases ?? const <EvalCaseResult>[])
-        outcome.caseId: outcome,
-    };
-    final milestones = {for (final m in spec.milestones) m.id: m};
-    return ListCard(
-      title: 'Cases · ${_cases.length}',
-      subtitle: 'each pins one behaviour that would otherwise regress silently',
-      headerTrailing: FilledButton.icon(
-        onPressed: _running ? null : _run,
-        icon: _running
-            ? const SizedBox(
-                width: 14,
-                height: 14,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : const Icon(Icons.play_arrow, size: 16),
-        label: Text(
-          _running
-              ? 'Running…'
-              : 'Run ${_cases.length} case${_cases.length == 1 ? '' : 's'}',
-        ),
-      ),
-      children: [
-        if (result != null)
-          _ResultBanner(
-            result: result,
-            declared: _cases.length,
-            // Opens rather than toggles: a regressed chip is a request to
-            // look at that case, never to put it away.
-            onOpenCase: (id) => setState(() => _openCase = id),
-          )
-        else
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 4, 20, 14),
-            child: Text(
-              'No result yet. Results are not persisted — a pass rate only '
-              'means something against the knowledge revisions it read — so '
-              'running the cases here is what produces one.',
-              style: CumulusText.meta,
-            ),
-          ),
-        for (final testCase in _cases) ...[
-          _caseRow(testCase, byId[testCase.id]),
-          if (_openCase == testCase.id && byId[testCase.id] != null)
-            _CaseChecks(outcome: byId[testCase.id]!, milestones: milestones),
-        ],
-        _authoringFooter(),
-      ],
-    );
+    return '$passed of $graded graded case${graded == 1 ? '' : 's'} passing'
+        '${graded == total ? '' : ' · ${total - graded} not yet graded'}'
+        '${result == null ? '' : ' · ${result.assertions - result.failedAssertions}/${result.assertions} checks'}'
+        '${result == null || result.invariantViolations == 0 ? '' : ' · ${result.invariantViolations} ontology violations'}'
+        '${result == null ? '' : ' · last full run ${agoIso(result.atIso)}'}'
+        '${result == null || result.launchedBy.isEmpty ? '' : ' by ${result.launchedBy}'}';
   }
+
+  // ---- the test matrix ----------------------------------------------------
 
   void _open(String caseId) =>
       setState(() => _openCase = _openCase == caseId ? null : caseId);
 
-  Widget _caseRow(EvalCase testCase, EvalCaseResult? outcome) {
-    final open = _openCase == testCase.id;
-    return CumulusListRow(
-      onTap: outcome == null ? null : () => _open(testCase.id),
-      leading: Icon(
-        outcome == null
-            ? Icons.radio_button_unchecked
-            : outcome.passed
-            ? Icons.check_circle
-            : Icons.cancel,
-        size: 19,
-        color: outcome == null
-            ? CumulusColors.inkMuted
-            : outcome.passed
-            ? CumulusTone.success.foreground
-            : CumulusTone.danger.foreground,
-      ),
-      // Case prose is authored in Python beside a Markdown export, so it
-      // arrives with its markers on.
-      title: Prose(testCase.name, style: CumulusText.rowTitle),
-      subtitle: Prose(
-        testCase.summary.isEmpty ? testCase.id : testCase.summary,
-        style: CumulusText.meta,
-      ),
-      trailing: [
-        if (outcome != null) ...[
-          if (outcome.failures.isNotEmpty)
-            StatusBadge(
-              '${outcome.failures.length} failed',
-              tone: CumulusTone.danger,
-              dense: true,
-            )
-          else
-            Text(
-              '${outcome.assertions.length} checks',
-              style: CumulusText.meta,
-            ),
-          if (outcome.invariants.isNotEmpty) ...[
-            const SizedBox(width: 6),
-            StatusBadge(
-              '${outcome.invariants.length} ontology',
-              tone: CumulusTone.danger,
-              dense: true,
-            ),
+  Widget _matrixCard(EvalSpec spec) {
+    final milestones = {for (final m in spec.milestones) m.id: m};
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final wide = constraints.maxWidth >= _evalWideWidth;
+        return ListCard(
+          title: 'Test cases · ${_cases.length}',
+          subtitle:
+              'each pins one behaviour that would otherwise regress silently',
+          children: [
+            _MatrixHead(wide: wide),
+            for (final testCase in _cases) ...[
+              _MatrixRow(
+                testCase: testCase,
+                outcome: _outcomes[testCase.id],
+                gradedAtIso: _gradedAtIso[testCase.id] ?? '',
+                open: _openCase == testCase.id,
+                running: _runningCase == testCase.id,
+                busy: _running || _runningCase != null,
+                wide: wide,
+                onOpen: () => _open(testCase.id),
+                onRun: () => _launch(single: testCase),
+              ),
+              if (_openCase == testCase.id && _outcomes[testCase.id] != null)
+                _CaseChecks(
+                  outcome: _outcomes[testCase.id]!,
+                  milestones: milestones,
+                ),
+            ],
+            _authoringFooter(),
           ],
-          const SizedBox(width: 8),
-          Icon(
-            open ? Icons.expand_less : Icons.expand_more,
-            size: 20,
-            color: CumulusColors.inkMuted,
-          ),
-        ],
-      ],
+        );
+      },
     );
   }
 
+  /// Where the cases come from and what they run against, in one line. It
+  /// used to be a paragraph; nothing in it was worth four.
   Widget _authoringFooter() {
     final worlds = {
       for (final c in _cases)
         if (c.fixtureId.isNotEmpty) c.fixtureId,
     };
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const FieldLabel('Adding a case'),
-          Prose(
-            'Cases are declared in `server/app/eval_specs.py` and exported to '
-            '`knowledge:${_summary?.assetId ?? 'flow-eval-specs'}`. A case '
-            'names the world it runs in rather than carrying one, so these '
-            '${_cases.length} cases share ${worlds.length} '
-            'world${worlds.length == 1 ? '' : 's'} — re-author a world and '
-            'every case naming it comes along.',
-            style: CumulusText.meta,
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 4),
+      child: Text(
+        'Declared in server/app/eval_specs.py, exported to '
+        'knowledge:${_summary?.assetId ?? 'flow-eval-specs'} · '
+        '${_cases.length} case${_cases.length == 1 ? '' : 's'} over '
+        '${worlds.length} shared world${worlds.length == 1 ? '' : 's'} · '
+        'results are not persisted — a pass rate only means something against '
+        'the knowledge revisions it read, so it is only ever the one you just '
+        'ran',
+        style: CumulusText.meta,
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Matrix head, rows and the pass-rate bar
+// ---------------------------------------------------------------------------
+
+/// Pass, fail and not-yet-graded as one bar. Three segments rather than a
+/// percentage, because "8 of 14" and "8 of 8, six ungraded" are different
+/// states that round to very different confidence.
+class _PassRateBar extends StatelessWidget {
+  final int passed;
+  final int failed;
+  final int total;
+
+  const _PassRateBar({
+    required this.passed,
+    required this.failed,
+    required this.total,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final ungraded = (total - passed - failed).clamp(0, total);
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(CumulusRadius.pill),
+      child: SizedBox(
+        height: 7,
+        child: (passed + failed + ungraded) == 0
+            ? const ColoredBox(color: CumulusColors.border)
+            : Row(
+                children: [
+                  if (passed > 0)
+                    Expanded(
+                      flex: passed,
+                      child: const ColoredBox(color: CumulusColors.success),
+                    ),
+                  if (failed > 0)
+                    Expanded(
+                      flex: failed,
+                      child: const ColoredBox(color: CumulusColors.danger),
+                    ),
+                  if (ungraded > 0)
+                    Expanded(
+                      flex: ungraded,
+                      child: const ColoredBox(color: CumulusColors.border),
+                    ),
+                ],
+              ),
+      ),
+    );
+  }
+}
+
+class _MatrixHead extends StatelessWidget {
+  final bool wide;
+
+  const _MatrixHead({required this.wide});
+
+  @override
+  Widget build(BuildContext context) {
+    Widget cell(String text, double width, {TextAlign align = TextAlign.left}) =>
+        SizedBox(
+          width: width,
+          child: Text(
+            text.toUpperCase(),
+            textAlign: align,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: CumulusText.statLabel,
           ),
+        );
+    return Container(
+      color: CumulusColors.surfaceMuted.withValues(alpha: 0.45),
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+      child: Row(
+        children: [
+          cell('Result', _evalResultW),
+          const SizedBox(width: _evalGap),
+          Expanded(
+            flex: 5,
+            child: Text('TEST CASE', style: CumulusText.statLabel),
+          ),
+          if (wide) ...[
+            const SizedBox(width: _evalGap),
+            Expanded(
+              flex: 6,
+              child: Text('EXPECTED BEHAVIOUR', style: CumulusText.statLabel),
+            ),
+          ],
+          const SizedBox(width: _evalGap),
+          cell('Last eval', _evalWhenW),
+          const SizedBox(width: _evalGap),
+          cell('Actions', _evalActionsW, align: TextAlign.right),
         ],
+      ),
+    );
+  }
+}
+
+/// One case: its verdict, what it pins, what it expects, when that was last
+/// established, and the button that establishes it again.
+class _MatrixRow extends StatefulWidget {
+  final EvalCase testCase;
+  final EvalCaseResult? outcome;
+  final String gradedAtIso;
+  final bool open;
+  final bool running;
+  final bool busy;
+  final bool wide;
+  final VoidCallback onOpen;
+  final VoidCallback onRun;
+
+  const _MatrixRow({
+    required this.testCase,
+    required this.outcome,
+    required this.gradedAtIso,
+    required this.open,
+    required this.running,
+    required this.busy,
+    required this.wide,
+    required this.onOpen,
+    required this.onRun,
+  });
+
+  @override
+  State<_MatrixRow> createState() => _MatrixRowState();
+}
+
+class _MatrixRowState extends State<_MatrixRow> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final outcome = widget.outcome;
+    final tone = outcome == null
+        ? CumulusTone.neutral
+        : outcome.passed
+        ? CumulusTone.success
+        : CumulusTone.danger;
+    // A failure tints its row. Ungraded does not: not having run a case is
+    // not the case telling you something.
+    final failing = outcome != null && !outcome.passed;
+    final tint = widget.open
+        ? CumulusColors.surfaceMuted.withValues(alpha: 0.7)
+        : failing
+        ? tone.background.withValues(alpha: _hover ? 0.9 : 0.5)
+        : _hover
+        ? CumulusColors.surfaceMuted.withValues(alpha: 0.55)
+        : Colors.transparent;
+
+    return MouseRegion(
+      cursor: outcome == null
+          ? MouseCursor.defer
+          : SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: GestureDetector(
+        onTap: outcome == null ? null : widget.onOpen,
+        behavior: HitTestBehavior.opaque,
+        child: Container(
+          color: tint,
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 9),
+          child: Row(
+            children: [
+              SizedBox(
+                width: _evalResultW,
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: StatusBadge(
+                    outcome == null
+                        ? 'ungraded'
+                        : outcome.passed
+                        ? 'pass'
+                        : 'fail',
+                    tone: tone,
+                    dense: true,
+                    uppercase: true,
+                  ),
+                ),
+              ),
+              const SizedBox(width: _evalGap),
+              Expanded(
+                flex: 5,
+                child: Text.rich(
+                  TextSpan(
+                    children: proseSpans(
+                      widget.testCase.name,
+                      CumulusText.rowTitle,
+                    ),
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: CumulusText.rowTitle,
+                ),
+              ),
+              if (widget.wide) ...[
+                const SizedBox(width: _evalGap),
+                Expanded(
+                  flex: 6,
+                  child: Text.rich(
+                    TextSpan(
+                      children: proseSpans(
+                        widget.testCase.summary.isEmpty
+                            ? widget.testCase.id
+                            : widget.testCase.summary,
+                        CumulusText.meta,
+                      ),
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: CumulusText.meta,
+                  ),
+                ),
+              ],
+              const SizedBox(width: _evalGap),
+              SizedBox(
+                width: _evalWhenW,
+                child: Text(
+                  widget.gradedAtIso.isEmpty
+                      ? 'never'
+                      : agoIso(widget.gradedAtIso),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    color: widget.gradedAtIso.isEmpty
+                        ? CumulusColors.inkMuted
+                        : CumulusColors.inkSecondary,
+                  ),
+                ),
+              ),
+              const SizedBox(width: _evalGap),
+              SizedBox(
+                width: _evalActionsW,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    // The failure counts the row used to carry as badges are
+                    // one click away, under the chevron; what belongs in an
+                    // actions column is an action.
+                    if (outcome != null && outcome.failures.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 4),
+                        child: Text(
+                          '${outcome.failures.length}',
+                          style: const TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w600,
+                            color: CumulusColors.danger,
+                          ),
+                        ),
+                      ),
+                    IconButton(
+                      tooltip: 'Run this case',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: widget.busy ? null : widget.onRun,
+                      icon: widget.running
+                          ? const SizedBox(
+                              width: 13,
+                              height: 13,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.play_arrow, size: 16),
+                      color: CumulusColors.inkSecondary,
+                    ),
+                    Icon(
+                      widget.open ? Icons.expand_less : Icons.expand_more,
+                      size: 18,
+                      color: outcome == null
+                          ? Colors.transparent
+                          : CumulusColors.inkMuted,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -369,78 +695,6 @@ class _EvalPanelState extends State<EvalPanel> {
 // ---------------------------------------------------------------------------
 // The result
 // ---------------------------------------------------------------------------
-
-class _ResultBanner extends StatelessWidget {
-  final EvalRunResult result;
-
-  /// How many cases the spec declares. A run graded all of them unless
-  /// somebody asked the API for a subset, and then the difference is worth
-  /// saying rather than leaving two counts to disagree on screen.
-  final int declared;
-  final ValueChanged<String> onOpenCase;
-
-  const _ResultBanner({
-    required this.result,
-    required this.declared,
-    required this.onOpenCase,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final total = result.passed + result.failed;
-    final ok = result.failed == 0 && result.invariantViolations == 0;
-    final tone = ok ? CumulusTone.success : CumulusTone.danger;
-    final gate = result.gate;
-    return Container(
-      color: tone.background.withValues(alpha: 0.5),
-      padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(
-                ok ? Icons.check_circle : Icons.cancel,
-                size: 18,
-                color: tone.foreground,
-              ),
-              const SizedBox(width: 10),
-              Text(
-                '${result.passed} of $total passed',
-                style: CumulusText.rowTitle.copyWith(color: tone.foreground),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  '${result.assertions - result.failedAssertions}'
-                  '/${result.assertions} checks'
-                  '${total == declared ? '' : ' · ${declared - total} of the $declared cases were not graded'}'
-                  '${result.invariantViolations == 0 ? '' : ' · ${result.invariantViolations} ontology violations'}'
-                  ' · ${agoIso(result.atIso)}'
-                  '${result.launchedBy.isEmpty ? '' : ' by ${result.launchedBy}'}',
-                  style: CumulusText.meta,
-                ),
-              ),
-              if (gate != null)
-                StatusBadge(
-                  _gateLabel(gate),
-                  tone: _gateTone(gate),
-                  dense: true,
-                  uppercase: true,
-                ),
-            ],
-          ),
-          // The gate expands only when it blocks. A promotable one has
-          // nothing to say that the badge has not already said.
-          if (gate != null && !gate.passed) ...[
-            const SizedBox(height: 10),
-            _GateDetail(gate: gate, result: result, onOpenCase: onOpenCase),
-          ],
-        ],
-      ),
-    );
-  }
-}
 
 String _gateLabel(EvalGate gate) => !gate.comparable
     ? 'comparison refused'

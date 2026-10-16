@@ -236,7 +236,7 @@ void main() {
         SearchHit(
           asset: AssetSummary(
             id: 'a', path: 'p/a', title: 'A', contentType: 'text/markdown',
-            authorityLevel: 'note', scope: 'org', owner: '', tags: const [],
+            authorityLevel: 'note', owner: '', tags: const [],
             status: 'published', updatedAt: DateTime(2026),
           ),
           score: 0, snippet: '', retrieval: retrieval, weak: weak,
@@ -295,6 +295,13 @@ void main() {
         'Desks': queuesIndex,
         'Expense Reimbursement': expenseWorkspaceIndex,
         'Accounts Payable': payablesWorkspaceIndex,
+        // The plant workspaces. A session that says nothing about
+        // availability is read as "no opinion", so these are offered here for
+        // the same reason the rest are: the assertion is about the vocabulary
+        // the palette speaks, not about which desks a reader holds.
+        'Field Documents': fieldDocumentsWorkspaceIndex,
+        'Compliance': complianceWorkspaceIndex,
+        'Plant Schedule': plantScheduleWorkspaceIndex,
         'Counterparty identity': identityWorkspaceIndex,
       });
     });
@@ -360,6 +367,10 @@ Session _session({required String scope, required List<String> queues}) =>
       // The workbench's own rule, answered by the server. Off unless a
       // steward desk is held; `platform` reach turns it on there.
       mayOpenIdentity: scope != 'own',
+      // Nothing said about availability, which the rail reads as "no opinion"
+      // — the pre-existing behaviour, so these assertions still test the
+      // desk rule and not the deployment one.
+      workspaces: const [],
       groups: const [],
     );
 

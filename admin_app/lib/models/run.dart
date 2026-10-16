@@ -74,9 +74,24 @@ class RunStep {
   );
 }
 
-class FlowRun {
+/// The definition a run executed, or the absence of a claim.
+///
+/// The engine pins the version at start and honours it on resume, so a run is
+/// evidence about *that* graph and no other. A record written before the
+/// field carries 0, which is not version zero — it is silence, and the console
+/// says so rather than putting the run on whatever is active today.
+mixin RanUnderVersion {
+  int get flowVersion;
+
+  bool get claimsVersion => flowVersion > 0;
+}
+
+class FlowRun with RanUnderVersion {
   final String id;
   final String flowId;
+
+  @override
+  final int flowVersion;
   final String status; // running | suspended | succeeded | failed
   final String caseRef;
   final String actor;
@@ -96,6 +111,7 @@ class FlowRun {
   const FlowRun({
     required this.id,
     required this.flowId,
+    this.flowVersion = 0,
     required this.status,
     required this.caseRef,
     required this.actor,
@@ -132,6 +148,7 @@ class FlowRun {
   factory FlowRun.fromJson(Map<String, dynamic> json) => FlowRun(
     id: json['id'] as String? ?? '',
     flowId: json['flow_id'] as String? ?? '',
+    flowVersion: json['flow_version'] as int? ?? 0,
     status: json['status'] as String? ?? '',
     caseRef: json['case_ref'] as String? ?? '',
     actor: json['actor'] as String? ?? '',
@@ -153,9 +170,12 @@ class FlowRun {
 }
 
 /// A run as a list row: enough to triage without loading the journal.
-class FlowRunSummary {
+class FlowRunSummary with RanUnderVersion {
   final String id;
   final String flowId;
+
+  @override
+  final int flowVersion;
   final String status;
   final String caseRef;
   final String actor;
@@ -175,6 +195,7 @@ class FlowRunSummary {
   const FlowRunSummary({
     required this.id,
     required this.flowId,
+    this.flowVersion = 0,
     required this.status,
     required this.caseRef,
     required this.actor,
@@ -195,6 +216,7 @@ class FlowRunSummary {
   factory FlowRunSummary.fromJson(Map<String, dynamic> json) => FlowRunSummary(
     id: json['id'] as String? ?? '',
     flowId: json['flow_id'] as String? ?? '',
+    flowVersion: json['flow_version'] as int? ?? 0,
     status: json['status'] as String? ?? '',
     caseRef: json['case_ref'] as String? ?? '',
     actor: json['actor'] as String? ?? '',

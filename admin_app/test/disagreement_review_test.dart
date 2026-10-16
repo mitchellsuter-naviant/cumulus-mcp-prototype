@@ -3,9 +3,10 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:cumulus_admin/models/disagreement_screen.dart';
 import 'package:cumulus_admin/models/task.dart';
+import 'package:cumulus_admin/models/task_screens.dart';
 import 'package:cumulus_admin/services/api_client.dart';
-import 'package:cumulus_admin/widgets/disagreement_review.dart';
-import 'package:cumulus_admin/widgets/tasks_view.dart';
+import 'package:cumulus_admin/tasks/registry.dart';
+import 'package:cumulus_admin/tasks/shared/disagreement_review.dart';
 
 /// The states a cross-system disagreement has to be legible in, and the one
 /// thing that must be true in all of them.
@@ -511,22 +512,53 @@ void main() {
   });
 
   group('the queue reaches it', () {
+    tearDown(() => TaskScreens.manifest = null);
+
     test('a disagreement Task opens the screen rather than a bare Approve', () {
-      // Two registries have to agree for this screen to be reachable at all:
-      // `openReviewScreen` picks the body, and `hasReviewScreen` decides
-      // whether My Tasks offers the button that calls it. A kind in the first
-      // and not the second is a screen nobody can get to — which is what this
-      // pins, on the one kind where the fallback is not merely thin but wrong.
-      // The generic pane's whole account of releasing an order into a
-      // customer's ERP was the word "Approve".
+      // Two things have to agree for this screen to be reachable at all: the
+      // server has to name it, and this build has to have a constructor under
+      // the id it names. A kind the server declares with no widget behind it —
+      // or a widget with no declaration — is a screen nobody can get to, on
+      // the one kind where the fallback is not merely thin but wrong: the
+      // generic pane's whole account of releasing an order into a customer's
+      // ERP was the word "Approve".
+      //
+      // The declaration is the deployment's, so it arrives rather than being
+      // compiled in — `SHARED_SCREENS` in `server/app/task_screens.py`. Its
+      // strings are written out here rather than imported, because a test that
+      // read them from the same place the code does would pass through a
+      // rewording of the sentence a controller reads before pressing the
+      // button.
+      TaskScreens.manifest = const TaskScreenManifest(
+        shared: {
+          'state_disagreement': TaskScreenSpec(
+            screenId: 'shared/disagreement-review',
+            label: 'Open the disagreement',
+            hint: 'Opens what each system says, the evidence that correlated '
+                'them, and exactly what releasing would change in the ERP — '
+                'and what it would leave alone.',
+          ),
+        },
+      );
+
       expect(hasReviewScreen(_task), isTrue);
       expect(reviewLabel(_task), 'Open the disagreement');
       expect(
         reviewHint(_task),
         contains('exactly what releasing would change in the ERP'),
       );
-      // And the label is not the fallback, which would send a controller to an
-      // invoice review.
+      expect(
+        taskScreenFactories.containsKey('shared/disagreement-review'),
+        isTrue,
+      );
+    });
+
+    test('and with no manifest it is the pane, not another flow’s screen', () {
+      // The console cannot reach its server. What a controller loses is this
+      // screen; what they must not get is a different one — a label from a
+      // compiled table would send them to an invoice review over an order.
+      TaskScreens.manifest = null;
+      expect(hasReviewScreen(_task), isFalse);
       expect(reviewLabel(_task), isNot('Open the invoice review'));
     });
   });

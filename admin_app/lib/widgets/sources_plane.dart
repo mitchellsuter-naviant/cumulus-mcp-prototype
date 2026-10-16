@@ -4,6 +4,7 @@ import '../models/data_layer.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'cumulus_shell.dart';
+import 'skeleton.dart';
 import 'ui_kit.dart';
 
 /// Sources: did the outside world deliver, and was it clean.
@@ -153,7 +154,36 @@ class _SourcesPlaneState extends State<SourcesPlane> {
         ),
         if (_error != null) ErrorNotice(message: _error!, onRetry: _load),
         if (_loading && screen == null)
-          const CumulusCard(child: CumulusLoading())
+          // The plane header is already real; the estate card and the feed
+          // list are what the read is for.
+          const SkeletonPulse(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 16,
+              children: [
+                SkeletonCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SkeletonBar(width: 176, height: 13),
+                      SizedBox(height: 10),
+                      SkeletonBar(width: 320, height: 10),
+                      SizedBox(height: 16),
+                      Row(
+                        spacing: 8,
+                        children: [
+                          SkeletonPill(width: 96),
+                          SkeletonPill(width: 118),
+                          SkeletonPill(width: 84),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                SkeletonListCard(rows: 5),
+              ],
+            ),
+          )
         else ...[
           if (screen != null) EstateHeaderCard(estate: screen.estate),
           // Withheld from a tenant, so an empty list is not proof of health.
@@ -203,6 +233,7 @@ class _SourcesPlaneState extends State<SourcesPlane> {
                   ),
               ],
             ),
+          if (screen != null) _WritePlaneCard(writes: screen.writes),
           CumulusCard(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -240,6 +271,158 @@ class _SourcesPlaneState extends State<SourcesPlane> {
           ),
         ],
       ],
+    );
+  }
+}
+
+/// The outbound half of the terms: what Cumulus may write back, and every
+/// write it ever sent.
+///
+/// On this screen because a registered system is talked to on two-way terms —
+/// the feeds above are what it tells us, the table here is what we may tell
+/// it, and the journal is what we actually said. The journal is quoted rather
+/// than re-derived from runs: the row it exists for is the one whose run died
+/// between the PATCH and its own bookkeeping, and a row here with no run
+/// around it may be the only surviving statement that Cumulus changed
+/// somebody's data.
+class _WritePlaneCard extends StatelessWidget {
+  final WritePlane writes;
+
+  const _WritePlaneCard({required this.writes});
+
+  @override
+  Widget build(BuildContext context) {
+    final journal = writes.journal;
+    return CumulusCard(
+      borderColor: writes.openWrites > 0 ? CumulusColors.danger : null,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SectionHeader(
+            title: 'What Cumulus may write back',
+            subtitle:
+                'the closed table of permitted writes, and the journal of '
+                'every one ever sent',
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              // A fact about this process: off means the writer holds no
+              // callable that could reach a network at all, not a polite
+              // refusal in front of one that could.
+              MetaPill(
+                writes.enabled
+                    ? 'outbound writes enabled'
+                    : 'outbound writes disabled — the live door does not exist '
+                          'in this deployment',
+                tone: writes.enabled ? CumulusTone.warn : CumulusTone.neutral,
+              ),
+              MetaPill('${writes.targets.length} writable target(s)'),
+              if (writes.journalTotal > 0)
+                MetaPill('${writes.journalTotal} write(s) ever sent'),
+              if (writes.openWrites > 0)
+                MetaPill(
+                  '${writes.openWrites} awaiting echo',
+                  tone: CumulusTone.warn,
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          // The table verbatim: every write this system can make, in one
+          // screen. Adding a row is a governance change with a review
+          // attached — which is the point of it being a closed literal.
+          for (final target in writes.targets)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Wrap(
+                spacing: 12,
+                runSpacing: 4,
+                children: [
+                  Text(
+                    '${target.app} · ${target.resource}.${target.field}',
+                    style: CumulusText.mono,
+                  ),
+                  for (final t in target.transitions)
+                    Text(
+                      '· ${t.fromValue} → ${t.toValues.join(" | ")}',
+                      style: CumulusText.meta,
+                    ),
+                  Text('· Action ${target.action}', style: CumulusText.meta),
+                ],
+              ),
+            ),
+          if (journal.isEmpty) ...[
+            const SizedBox(height: 4),
+            Text(
+              'Nothing has ever been written to the estate from this '
+              'deployment. Every outbound write journals its intent before '
+              'the request leaves, so an empty journal is evidence, not '
+              'absence of bookkeeping.',
+              style: CumulusText.body,
+            ),
+          ] else ...[
+            const SizedBox(height: 6),
+            for (final row in journal) _WriteJournalLine(row: row),
+            if (writes.journalTotal > journal.length)
+              Text(
+                '… the ${journal.length} most recent of '
+                '${writes.journalTotal}.',
+                style: CumulusText.meta,
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// One journal row: the transition as approved, how it settled, who asked.
+class _WriteJournalLine extends StatelessWidget {
+  final WriteJournalRow row;
+
+  const _WriteJournalLine({required this.row});
+
+  @override
+  Widget build(BuildContext context) {
+    final tone = row.failed
+        ? CumulusTone.danger
+        : row.open
+        ? CumulusTone.warn
+        : CumulusTone.success;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Wrap(
+        spacing: 12,
+        runSpacing: 4,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          StatusBadge(row.state, tone: tone, dense: true),
+          Text(
+            '${row.resource}/${row.recordId} · ${row.field}: '
+            '${row.observed} → ${row.value}',
+            style: CumulusText.mono,
+          ),
+          // What the estate held afterwards — the same string on the happy
+          // path, and the whole finding otherwise.
+          if (row.verified.isNotEmpty && row.verified != row.value)
+            Text(
+              '· re-read found "${row.verified}"',
+              style: CumulusText.meta.copyWith(color: CumulusColors.danger),
+            ),
+          if (row.actor.isNotEmpty)
+            Text('· by ${row.actor}', style: CumulusText.meta),
+          if (row.runId.isNotEmpty)
+            Text('· ${row.runId}', style: CumulusText.mono),
+          Text('· ${_ago(row.intendedAt)}', style: CumulusText.meta),
+          if (row.error.isNotEmpty)
+            Text(
+              '· ${row.error}',
+              style: CumulusText.meta.copyWith(color: CumulusColors.danger),
+            ),
+        ],
+      ),
     );
   }
 }

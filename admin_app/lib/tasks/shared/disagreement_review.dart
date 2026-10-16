@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 
-import '../models/disagreement_screen.dart';
-import '../services/api_client.dart';
-import '../theme/cumulus_theme.dart';
-import 'ref_chips.dart';
-import 'ui_kit.dart';
+import '../../models/disagreement_screen.dart';
+import '../../models/task.dart';
+import '../../services/api_client.dart';
+import '../../theme/cumulus_theme.dart';
+import '../../widgets/ref_chips.dart';
+import '../../widgets/ui_kit.dart';
+import 'review_frame.dart';
 
 /// Reading a disagreement between two of the customer's own systems, and
 /// answering it.
@@ -31,9 +33,9 @@ import 'ui_kit.dart';
 ///   change is derived there from the column above it rather than typed, which
 ///   is why this file has no list of untouched fields in it.
 ///
-/// Split from `review_screens.dart` for `merge_review.dart`'s reason: the panel
-/// is the thing worth testing on its own, in each of the states a finding can
-/// be read in, without a Task or a dialog around it.
+/// Kept apart from [DisagreementReview] below for `merge_review.dart`'s
+/// reason: the panel is the thing worth testing on its own, in each of the
+/// states a finding can be read in, without a Task or a dialog around it.
 class DisagreementReviewPanel extends StatelessWidget {
   final DisagreementCase finding;
 
@@ -877,6 +879,99 @@ class _GateStatement extends StatelessWidget {
           ],
         ],
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The Task screen
+// ---------------------------------------------------------------------------
+
+/// A `state_disagreement` Task, opened onto the finding it points at.
+///
+/// The merge review's sibling, with one difference that governs everything
+/// about it: approving here **leaves Cumulus**. The other screens change what
+/// this system holds — a corrected total, a first write on a record, an edge's
+/// status. This one asks a customer's ERP to move a sales order, and there is
+/// no undo.
+///
+/// It loads the order desk's own payload and finds this Task's case in it,
+/// rather than fetching the finding, the two rows and the write table itself.
+/// One composition, two surfaces — what a controller reads in the modal is what
+/// the dashboard counts, so the two can never describe one finding differently.
+class DisagreementReview extends StatefulWidget {
+  final ApiClient api;
+  final QueueTask task;
+
+  const DisagreementReview({super.key, required this.api, required this.task});
+
+  @override
+  State<DisagreementReview> createState() => _DisagreementReviewState();
+}
+
+class _DisagreementReviewState extends State<DisagreementReview> {
+  DisagreementCase? _finding;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final screen = await widget.api.disagreementScreen();
+      if (!mounted) return;
+      setState(() {
+        _finding = screen.byCaseRef(widget.task.caseRef);
+        _error = _finding == null
+            ? 'This task points at ${widget.task.caseRef}, and the order desk '
+                  'holds no such finding. It may have been superseded by a '
+                  'later sweep, or raised against another world.'
+            : null;
+      });
+    } on ApiException catch (e) {
+      if (mounted) setState(() => _error = e.message);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final finding = _finding;
+    return ReviewFrame(
+      eyebrow: 'Systems disagree · ${widget.task.queue}',
+      title: widget.task.title,
+      subtitle:
+          'Two of the customer\'s own systems, one commitment, two answers. '
+          'Cumulus found the pair and has written to neither — releasing is a '
+          'decision you make here, and it reaches the ERP.',
+      footer: Text(
+        finding == null
+            ? 'Reading the finding this task points at.'
+            : 'Found by the disagreement sweep on the evidence above. A '
+                  'verdict is recorded against ${widget.task.id}; approving '
+                  'starts a run that writes to the ERP and reads it back, and '
+                  'leaving it as it is settles the finding here.',
+        style: CumulusText.meta,
+      ),
+      child: _error != null
+          ? ErrorNotice(message: _error!, onRetry: _load)
+          : finding == null
+          ? const CumulusLoading()
+          : DisagreementReviewPanel(
+              finding: finding,
+              api: widget.api,
+              // The dialog does not commit. It answers with a verdict and the
+              // Task pane posts it, so a release decision travels the same
+              // authorization path as every other decision in the queue —
+              // which is where the Action Gateway actually checks it.
+              onDecide: finding.gate.mayDecide
+                  ? (verdict, note) => Navigator.of(
+                      context,
+                    ).pop(ReviewOutcome(verdict: verdict, note: note))
+                  : null,
+            ),
     );
   }
 }

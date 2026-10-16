@@ -19,13 +19,17 @@ import '../models/graph.dart';
 import '../models/disagreement_screen.dart';
 import '../models/identity_screen.dart';
 import '../models/ontology_screen.dart';
-import '../models/payable.dart';
 import '../models/queue.dart';
-import '../models/reimbursement.dart';
 import '../models/run.dart';
 import '../models/session.dart';
 import '../models/task.dart';
+import '../models/task_screens.dart';
 import '../models/world.dart';
+import '../tasks/accounts_payable/models.dart';
+import '../tasks/compliance/models.dart';
+import '../tasks/expense_reimbursement/models.dart';
+import '../tasks/field_documents/models.dart';
+import '../tasks/plant_schedule/models.dart';
 import 'auth_service.dart';
 
 /// Configure at build/run time:
@@ -58,8 +62,51 @@ class ApiException implements Exception {
   String toString() => 'API error $statusCode: $message';
 }
 
+/// The client every request actually goes out through: one retry, with a
+/// freshly minted token, when the server says 401 while the token cache still
+/// believed what it held was alive.
+///
+/// It sits at this level rather than at each of the hundred call sites because
+/// this is the only place a request is still rebuildable — by the time a caller
+/// has a [http.Response] the headers it was sent with are gone.
+class _AuthRetryClient extends http.BaseClient {
+  final http.Client _inner;
+
+  _AuthRetryClient(this._inner);
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    // Only a request that can be replayed byte for byte is retried, which is
+    // every request this client makes: `get`/`post`/`patch`/`put`/`delete`
+    // build a plain `Request` with a bytes body.
+    final sent = request.headers['Authorization'];
+    if (request is! http.Request || sent == null) return _inner.send(request);
+    final first = await _inner.send(request);
+    if (first.statusCode != 401) return first;
+    // The cache said the token had minutes left and the server disagreed.
+    // Believing the server costs one round trip; believing the cache locks the
+    // console out of every screen until somebody reloads the page.
+    AuthService.instance.invalidateToken();
+    final fresh = await AuthService.instance.idToken();
+    // Nothing new to say — a genuine 401 is answered once, not twice.
+    if (fresh == null || 'Bearer $fresh' == sent) return first;
+    await first.stream.drain<void>();
+    final again = http.Request(request.method, request.url)
+      ..headers.addAll(request.headers)
+      ..headers['Authorization'] = 'Bearer $fresh'
+      ..bodyBytes = request.bodyBytes
+      ..followRedirects = request.followRedirects
+      ..maxRedirects = request.maxRedirects
+      ..persistentConnection = request.persistentConnection;
+    return _inner.send(again);
+  }
+
+  @override
+  void close() => _inner.close();
+}
+
 class ApiClient {
-  final http.Client _http = http.Client();
+  final http.Client _http = _AuthRetryClient(http.Client());
 
   /// The persona every request acts as, or null to be whoever signed in.
   ///
@@ -208,6 +255,33 @@ class ApiClient {
     );
   }
 
+  /// Whether this deployment's retrieval stack has a vector half at all.
+  ///
+  /// `mode` is `hybrid` when an embedder and an embedding store are both
+  /// configured, and `lexical` when either is missing. It matters to the UI
+  /// because a deployment with no embedder answers a semantic query with
+  /// nothing — the server degrades to lexical internally and the retriever
+  /// chip goes on claiming a mode that is not running.
+  ///
+  /// False on any failure. A retrieval control that appears only when the
+  /// server confirms it works is the right default for a probe that did not
+  /// come back.
+  Future<bool> hybridSearchEnabled() async {
+    try {
+      final resp = await _send(
+        _http.get(
+          _uri('/api/v1/search/status'),
+          headers: await _headers(),
+        ),
+      );
+      _check(resp);
+      final status = jsonDecode(resp.body) as Map<String, dynamic>;
+      return status['mode'] == 'hybrid';
+    } on ApiException {
+      return false;
+    }
+  }
+
   /// Ask a question rather than search for a document.
   ///
   /// The server plans over both the document text and the corpus metadata, so
@@ -284,7 +358,6 @@ class ApiClient {
             authorityLevel: row['authority_level'] as String? ?? '',
             kind: row['kind'] as String? ?? 'document',
             origin: row['origin'] as String? ?? 'authored',
-            scope: row['scope'] as String? ?? 'org',
             owner: row['owner'] as String? ?? '',
             tags: (row['tags'] as List<dynamic>? ?? const [])
                 .map((e) => '$e')
@@ -591,6 +664,10 @@ class ApiClient {
         }),
       ),
     );
+    // Without this, a 4xx body went straight into `fromJson`, which threw a
+    // TypeError on the missing `id` rather than the ApiException the caller
+    // catches — and the Submit button stayed busy forever.
+    _check(resp);
     return Reimbursement.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
@@ -643,9 +720,9 @@ class ApiClient {
   }
 
   /// The whole AP workspace in one call: the rows this reader is accountable
-  /// for, the strip's counts over exactly that slice, and the composer —
-  /// the vendor master, its orders and their lines, and the governed values a
-  /// run will read.
+  /// for, the strip's counts over exactly that slice, and the submission
+  /// panel — the governed clauses a run will read, and the extractor that
+  /// will read the document.
   Future<PayablesScreen> payablesScreen() async {
     final resp = await _send(
       _http.get(_uri('/api/ui/v1/payables'), headers: await _headers()),
@@ -659,12 +736,13 @@ class ApiClient {
   /// One live run of the accounts-payable flow: extract → resolve the vendor
   /// → three-way match → anomaly screen → post or review.
   ///
-  /// The *scenario* is posted rather than the hint string it prints, so the
-  /// string the run receives is serialized in one place — the server's
-  /// `InvoiceScenario.to_hint` — and comes back on the outcome as sent.
+  /// Bytes, and the name the file arrived under. There used to be a `scenario`
+  /// here that serialized to a hint string, which is how this console could
+  /// produce an extraction nobody had read a page for; the server refuses a
+  /// submission with no document now, and there is no field left to describe
+  /// one with.
   Future<PayableOutcome> submitInvoice({
-    InvoiceScenario? scenario,
-    String imageBase64 = '',
+    required String imageBase64,
     String filename = '',
   }) async {
     final resp = await _send(
@@ -672,8 +750,7 @@ class ApiClient {
         _uri('/api/ui/v1/payables/submissions'),
         headers: await _headers(),
         body: jsonEncode({
-          if (scenario != null) 'scenario': scenario.toJson(),
-          if (imageBase64.isNotEmpty) 'image_base64': imageBase64,
+          'image_base64': imageBase64,
           if (filename.isNotEmpty) 'filename': filename,
         }),
       ),
@@ -728,12 +805,27 @@ class ApiClient {
     return PtoRequest.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  Future<HrChatReply> hrChat(String message) async {
+  /// One question, plus the conversation it belongs to.
+  ///
+  /// The transcript is replayed rather than remembered server-side, so a new
+  /// chat is genuinely new: nothing on the other end outlives the panel.
+  Future<HrChatReply> hrChat(
+    String message, {
+    List<HrTurn> history = const [],
+  }) async {
     final resp = await _send(
       _http.post(
         _uri('/api/v1/employee/hr-chat'),
         headers: await _headers(),
-        body: jsonEncode({'message': message}),
+        body: jsonEncode({
+          'message': message,
+          // Capped at the server's limit; the oldest turns go first, because a
+          // follow-up leans on what was just said and not on turn one.
+          'history': history
+              .sublist(history.length > 20 ? history.length - 20 : 0)
+              .map((t) => t.toJson())
+              .toList(),
+        }),
       ),
       // A planner-backed answer can take a while.
       timeout: const Duration(seconds: 60),
@@ -806,6 +898,18 @@ class ApiClient {
     );
     _check(resp);
     return TaskStats.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  /// Which review screen answers which task, resolved against what the server
+  /// actually shipped. Fetched once at boot — see `tasks/registry.dart`.
+  Future<TaskScreenManifest> taskScreens() async {
+    final resp = await _send(
+      _http.get(_uri('/api/ui/v1/task-screens'), headers: await _headers()),
+    );
+    _check(resp);
+    return TaskScreenManifest.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
   }
 
   /// Record a human judgment. The server refuses API keys (403) and a second
@@ -1122,6 +1226,10 @@ class ApiClient {
         }),
         headers: await _headers(),
       ),
+      // The heaviest aggregate on the server: the TBox, the Collections, and a
+      // full walk of the observed footprint, in one round trip. The default
+      // window is a UI timeout on a call that is still working.
+      timeout: _askTimeout,
     );
     _check(resp);
     return OntologyScreen.fromJson(
@@ -1244,6 +1352,56 @@ class ApiClient {
     return Dashboard.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
+  /// The Field Documents workspace in one call: every scheduled job's packet
+  /// as the graph holds it, the crews, and the governed convention that named
+  /// them.
+  ///
+  /// Refused with a sentence naming the `field-operations` desk when this
+  /// persona neither holds it nor reads past its own work.
+  Future<FieldDocumentsScreen> fieldDocumentsScreen() async {
+    final resp = await _send(
+      _http.get(_uri('/api/ui/v1/field-documents'), headers: await _headers()),
+    );
+    _check(resp);
+    return FieldDocumentsScreen.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// The Compliance workspace in one call: credentials and inspections by
+  /// days to expiry, the notice trail, the four exception classes, and the
+  /// units the register tracks no inspection for.
+  Future<ComplianceScreen> complianceScreen() async {
+    final resp = await _send(
+      _http.get(_uri('/api/ui/v1/compliance'), headers: await _headers()),
+    );
+    _check(resp);
+    return ComplianceScreen.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
+  /// One week of the plant schedule, as a department × day grid.
+  ///
+  /// `week` is an ISO week (`2026-W37`); omitting it asks the server for the
+  /// current one rather than computing a week here, so the grid and the
+  /// export route can never disagree about which seven days that is.
+  Future<PlantScheduleScreen> plantScheduleScreen({String? week}) async {
+    final query = (week == null || week.isEmpty)
+        ? ''
+        : '?week=${Uri.encodeQueryComponent(week)}';
+    final resp = await _send(
+      _http.get(
+        _uri('/api/ui/v1/plant-schedule$query'),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return PlantScheduleScreen.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
   /// Every inbound feed against the contract it lands under, plus the
   /// artifacts its runs left — the whole Sources screen in one call.
   ///
@@ -1259,6 +1417,19 @@ class ApiClient {
     return SourcesScreen.fromJson(
       jsonDecode(resp.body) as Map<String, dynamic>,
     );
+  }
+
+  /// Every Collection against its live count, plus retention read back
+  /// against what is actually held — the whole Data screen in one call.
+  ///
+  /// The counts are honest: null where a store cannot be counted, which is a
+  /// different fact from zero and is drawn differently.
+  Future<DataScreen> dataScreen() async {
+    final resp = await _send(
+      _http.get(_uri('/api/ui/v1/data'), headers: await _headers()),
+    );
+    _check(resp);
+    return DataScreen.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
   /// Pull one feed now, and get back the row the screen redraws.
@@ -1377,10 +1548,12 @@ class ApiClient {
     String? kind,
     String? status,
     String? team,
+    int days = 30,
   }) async {
     final resp = await _send(
       _http.get(
         _uri('/api/v1/flows', {
+          'days': '$days',
           if (q.isNotEmpty) 'q': q,
           if (kind != null && kind.isNotEmpty) 'kind': kind,
           if (status != null && status.isNotEmpty) 'status': status,
@@ -1458,6 +1631,24 @@ class ApiClient {
     );
   }
 
+  /// What this flow is wired to: the models it calls, the ontology and
+  /// collections it reads and writes, the desks and gateways it reaches.
+  ///
+  /// Takes no window. An inventory is the wiring, and a wiring the last
+  /// thirty days did not exercise is still the wiring.
+  Future<FlowInventory> flowInventory(String id) async {
+    final resp = await _send(
+      _http.get(
+        _uri('/api/v1/flows/$id/inventory'),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return FlowInventory.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
+  }
+
   /// Published history plus any open draft, newest first.
   Future<List<FlowVersion>> flowVersions(String id) async {
     final resp = await _send(
@@ -1470,6 +1661,22 @@ class ApiClient {
     return (jsonDecode(resp.body) as List<dynamic>)
         .map((j) => FlowVersion.fromJson(j as Map<String, dynamic>))
         .toList();
+  }
+
+  /// Make [version] the live one. The definition and the executable package
+  /// are two artifacts, so this is refused for a version the deployed code
+  /// does not ship — the server decides that, not the button.
+  Future<FlowDetail> activateFlowVersion(String flowId, int version) async {
+    final resp = await _send(
+      _http.post(
+        _uri('/api/v1/flows/$flowId/versions/$version/activate'),
+        headers: await _headers(),
+      ),
+    );
+    _check(resp);
+    return FlowDetail.fromJson(
+      jsonDecode(resp.body) as Map<String, dynamic>,
+    );
   }
 
   /// Steps of [version] annotated added / removed / modified against

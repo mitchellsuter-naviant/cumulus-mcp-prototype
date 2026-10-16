@@ -3,9 +3,10 @@ import 'package:flutter/material.dart';
 import '../models/session.dart';
 import '../models/task.dart';
 import '../services/api_client.dart';
+import '../tasks/registry.dart';
 import '../theme/cumulus_theme.dart';
 import 'ref_chips.dart';
-import 'review_screens.dart';
+import 'skeleton.dart';
 import 'ui_kit.dart';
 
 /// My Tasks — the queue as a destination rather than a drawer.
@@ -141,7 +142,16 @@ class _TasksSectionState extends State<TasksSection> {
         message: _error!,
       );
     }
-    if (tasks == null) return const CumulusLoading();
+    // The heading, its pills and the Refresh button are already on screen, and
+    // the split below them is the page's shape whether or not the queue has
+    // arrived. A spinner in the middle of the canvas threw that away and made
+    // the layout appear only once the data did.
+    if (tasks == null) {
+      return const SingleChildScrollView(
+        padding: EdgeInsets.fromLTRB(28, 0, 28, 24),
+        child: SkeletonMasterDetail(listWidth: 440),
+      );
+    }
 
     final open = tasks.where((t) => t.isOpen).toList();
     final done = tasks.where((t) => !t.isOpen).toList();
@@ -368,6 +378,14 @@ class _TaskRow extends StatelessWidget {
                   [
                     kindLabel(task.kind).toUpperCase(),
                     task.queue,
+                    // Who the case is about, when it is about somebody. Last
+                    // and in the same small caps as the desk, because it is
+                    // the same kind of fact: a queue says who answers this,
+                    // and this says whose paperwork it is. Absent on a case
+                    // with no human subject rather than filled in with the
+                    // desk's own name.
+                    if (task.subjectEmail.isNotEmpty)
+                      'about ${task.subjectEmail}',
                   ].join('  ·  '),
                   style: CumulusText.statLabel,
                   overflow: TextOverflow.ellipsis,
@@ -450,11 +468,7 @@ class _TaskReviewState extends State<_TaskReview> {
   /// right vendor — happens in the full screen, where the checks then run
   /// again over what was changed.
   Future<void> _openReview() async {
-    final outcome = await openReviewScreen(
-      context: context,
-      api: widget.api,
-      task: widget.task,
-    );
+    final outcome = await openReviewScreen(context, widget.api, widget.task);
     if (outcome == null || !mounted) return;
     await _decide(
       outcome.verdict,
@@ -560,6 +574,13 @@ class _TaskReviewState extends State<_TaskReview> {
                         dense: true,
                       ),
                       MetaPill(task.queue),
+                      // The desk beside the subject: on both flows that raise
+                      // a gate over somebody's own paperwork these are the
+                      // same person, and the one case where they are not — a
+                      // routing that could not open a personal desk — is
+                      // exactly the case worth being able to see.
+                      if (task.subjectEmail.isNotEmpty)
+                        MetaPill('about ${task.subjectEmail}'),
                     ],
                   ),
                 ),
@@ -795,7 +816,7 @@ class _TaskReviewState extends State<_TaskReview> {
         ),
       ),
       const SizedBox(height: 8),
-      Text(reviewHint(task), style: CumulusText.meta),
+      Text(reviewHint(task) ?? '', style: CumulusText.meta),
       const SizedBox(height: 18),
       const Divider(height: 1),
       const SizedBox(height: 18),
@@ -940,59 +961,6 @@ CumulusTone _toneFor(QueueTask task) => switch (task.kind) {
   'eval_review' => CumulusTone.neutral,
   'exception' => CumulusTone.danger,
   _ => CumulusTone.neutral,
-};
-
-/// Which tasks have a bespoke review screen. Everything else gets the pane's
-/// approve/reject, which is the honest affordance when there is nothing
-/// structured to edit.
-///
-/// `merge_review` joined the list once there was something to open onto. The
-/// generic pane showed it the evidence rows the sweep attached and nothing
-/// else — no side-by-side records, no way to see which fields disagree, and an
-/// Approve button that said nothing about what approving does. On the one
-/// screen where "approve" could plausibly be read as "merge these two rows",
-/// that was the wrong affordance.
-///
-/// `state_disagreement` joined it for a sharper version of the same reason. Its
-/// generic pane offered an Approve button whose entire account of itself was
-/// the word "Approve" — over a decision that writes to a customer's ERP and
-/// cannot be undone. That is the one place in this console where a bare verdict
-/// control is not merely thin but wrong.
-bool hasReviewScreen(QueueTask task) =>
-    task.kind == 'match_review' ||
-    task.kind == 'merge_review' ||
-    task.kind == 'state_disagreement' ||
-    task.flowId == 'expense-reimbursement' ||
-    task.flowId == 'accounts-payable';
-
-String reviewLabel(QueueTask task) {
-  if (task.kind == 'match_review') return 'Open the match review';
-  if (task.kind == 'merge_review') return 'Open the merge review';
-  if (task.kind == 'state_disagreement') return 'Open the disagreement';
-  if (task.flowId == 'expense-reimbursement') return 'Open the expense review';
-  if (task.kind == 'curation') return 'Open the extraction verification';
-  return 'Open the invoice review';
-}
-
-/// What the full screen is *for*, per kind. Not one sentence for all of them:
-/// three of these screens exist so a person can correct the facts, and the
-/// other two have no facts to correct. A proposed merge's two records are what
-/// their sources say they are, and a disagreement's two rows are each correct
-/// in their own book — in both, the judgment is about the edge between them.
-/// Telling either reviewer the checks will re-run would promise something that
-/// does not happen.
-String reviewHint(QueueTask task) => switch (task.kind) {
-  'merge_review' =>
-    'Opens the two records side by side, with every signal the score was '
-        'blended from and the governed policy behind the weights. Nothing '
-        'merges on either verdict.',
-  'state_disagreement' =>
-    'Opens what each system says, the evidence that correlated them, and '
-        'exactly what releasing would change in the ERP — and what it would '
-        'leave alone.',
-  _ =>
-    'Opens the full screen, where the facts themselves can be corrected — '
-        'the checks then run again over what you changed.',
 };
 
 /// `12m`, `2h`, `3d` — how long this has been waiting.

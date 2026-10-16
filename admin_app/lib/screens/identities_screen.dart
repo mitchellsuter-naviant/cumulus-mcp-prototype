@@ -8,6 +8,7 @@ import '../services/auth_service.dart';
 import '../theme/cumulus_theme.dart';
 import '../theme/domain_tones.dart';
 import '../widgets/cumulus_shell.dart';
+import '../widgets/skeleton.dart';
 import '../widgets/ui_kit.dart';
 import 'identity_detail_screen.dart';
 import 'team_detail_screen.dart';
@@ -37,6 +38,11 @@ class IdentitiesSection extends StatefulWidget {
 class _IdentitiesSectionState extends State<IdentitiesSection> {
   final ApiClient _api = ApiClient();
   List<Identity> _identities = [];
+
+  /// The roster split and ordered once per load. Two lists rather than two
+  /// getters, because a getter that sorts is a sort per build.
+  List<Identity> _people = [];
+  List<Identity> _machines = [];
   List<ApiKey> _keys = [];
   List<Team> _teams = [];
   String _myRole = 'user';
@@ -66,15 +72,32 @@ class _IdentitiesSectionState extends State<IdentitiesSection> {
       _loading = true;
       _error = null;
     });
+    // Four independent reads. Awaited one after another they cost the sum of
+    // four round trips to say one page; issued together they cost the slowest
+    // of them.
+    final Future<Map<String, dynamic>> meRead = _api.whoami();
+    final Future<List<Identity>> identitiesRead = _api.listIdentities();
+    final Future<List<ApiKey>> keysRead = _api.listApiKeys();
+    final Future<List<Team>> teamsRead = _api.listTeams();
     try {
-      final me = await _api.whoami();
-      final identities = await _api.listIdentities();
-      final keys = await _api.listApiKeys();
-      final teams = await _api.listTeams();
+      // Waited on as a group rather than one `await` after another: awaiting
+      // them in a row means the first failure escapes while the other three
+      // are still in flight, and their errors then land with nobody listening.
+      await Future.wait<void>([meRead, identitiesRead, keysRead, teamsRead]);
+      final me = await meRead;
+      final identities = await identitiesRead;
+      final keys = await keysRead;
+      final teams = await teamsRead;
       if (!mounted) return;
       setState(() {
         _myRole = me['role'] as String? ?? 'user';
         _identities = identities;
+        // Sorted once, here, rather than twice per build: the order is a
+        // property of the roster, and the roster changes only on a refresh.
+        _people = identities.where((i) => i.isPerson).toList()
+          ..sort(_byRoleThenName);
+        _machines = identities.where((i) => !i.isPerson).toList()
+          ..sort(_byRoleThenName);
         _keys = keys;
         _teams = teams;
         _loading = false;
@@ -116,12 +139,6 @@ class _IdentitiesSectionState extends State<IdentitiesSection> {
     if (!identity.isPerson) roles.remove('owner');
     return roles;
   }
-
-  List<Identity> get _people =>
-      _identities.where((i) => i.isPerson).toList()..sort(_byRoleThenName);
-
-  List<Identity> get _machines =>
-      _identities.where((i) => !i.isPerson).toList()..sort(_byRoleThenName);
 
   /// Keys minted before identities existed. They authenticate nothing, but they
   /// have no holder to be reached through, so they surface here or nowhere.
@@ -747,7 +764,18 @@ class _IdentitiesSectionState extends State<IdentitiesSection> {
         _statStrip(),
         if (_error != null) ErrorNotice(message: _error!, onRetry: _refresh),
         if (_loading)
-          const CumulusCard(child: CumulusLoading())
+          // The heading and the strip above are already real; only the three
+          // rosters are unknown, so only they turn to geometry.
+          const SkeletonPulse(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 16,
+              children: [
+                SkeletonListCard(rows: 3),
+                SkeletonListCard(rows: 4),
+              ],
+            ),
+          )
         else ...[
           _teamsCard(),
           ListCard(

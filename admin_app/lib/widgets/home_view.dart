@@ -2,11 +2,12 @@ import 'package:flutter/material.dart';
 import '../models/session.dart';
 
 import '../models/calendar.dart';
-import '../models/payable.dart';
+import '../tasks/accounts_payable/models.dart';
 import '../models/task.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
 import 'calendar_view.dart';
+import 'skeleton.dart';
 import 'ui_kit.dart';
 
 /// Home — the first thing the console shows, and deliberately the thinnest.
@@ -67,16 +68,32 @@ class _HomeSectionState extends State<HomeSection> {
 
   Future<void> _load() async {
     final today = DateTime.now();
+    // Four independent reads behind the first screen anybody sees. Run in
+    // series they cost four round trips of latency before a single number
+    // lands, and none of them has anything to say to the others.
+    //
+    // One day's worth of calendar: the week lives one rail stop down, and
+    // asking for seven here would be loading a screen nobody is looking at.
+    final Future<Agenda> agendaRead = widget.api.calendarAgenda(
+      start: isoDate(today),
+      days: 1,
+    );
+    final Future<PayableStats> payableRead = widget.api.payableStats();
+    final Future<List<PayableInvoice>> pendingRead = widget.api.listPayables(
+      state: 'pending',
+    );
+    final Future<TaskStats> taskRead = widget.api.taskStats();
     try {
-      // One day's worth: the week lives one rail stop down, and asking for
-      // seven here would be loading a screen nobody is looking at.
-      final agenda = await widget.api.calendarAgenda(
-        start: isoDate(today),
-        days: 1,
-      );
-      final payables = await widget.api.payableStats();
-      final pending = await widget.api.listPayables(state: 'pending');
-      final tasks = await widget.api.taskStats();
+      // Waited on as a group rather than one `await` after another: awaiting
+      // them in a row means the first failure escapes while the other three
+      // are still in flight, and their errors then land with nobody listening.
+      // `Future.wait` listens to all four and rethrows the first, so the catch
+      // below still sees the ApiException it was written for.
+      await Future.wait<void>([agendaRead, payableRead, pendingRead, taskRead]);
+      final agenda = await agendaRead;
+      final payables = await payableRead;
+      final pending = await pendingRead;
+      final tasks = await taskRead;
       if (!mounted) return;
       setState(() {
         _agenda = agenda;
@@ -128,7 +145,10 @@ class _HomeSectionState extends State<HomeSection> {
         message: _error!,
       );
     }
-    if (_agenda == null) return const CumulusLoading();
+    // The heading above has already rendered — the date, the greeting's
+    // fallback, and the Refresh button are not waiting on anything — so only
+    // the two panels stand in as geometry.
+    if (_agenda == null) return const _HomeSkeleton();
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 1080;
@@ -349,6 +369,138 @@ class _HomeSectionState extends State<HomeSection> {
             ],
           ],
         ],
+      ),
+    );
+  }
+}
+
+/// Home's two panels while the four reads are in flight.
+///
+/// Same split, same gutters, same card frames as [_HomeSectionState._body], so
+/// the swap from grey to data moves nothing: a schedule of timed rows on the
+/// left, the AP metric row and its held-invoice list on the right.
+class _HomeSkeleton extends StatelessWidget {
+  const _HomeSkeleton();
+
+  @override
+  Widget build(BuildContext context) {
+    final schedule = SkeletonCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SkeletonBar(width: 74, height: 11),
+          const SizedBox(height: 10),
+          const SkeletonBar(width: 210, height: 9),
+          const SizedBox(height: 20),
+          for (var i = 0; i < 5; i++)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 14),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SkeletonBar(width: 48, height: 10),
+                  SizedBox(width: 18),
+                  SkeletonBar(width: 3, height: 44, radius: 2),
+                  SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SkeletonBar(width: 200, height: 12),
+                        SizedBox(height: 7),
+                        SkeletonBar(width: 140, height: 9),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    final payables = SkeletonCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SkeletonBar(width: 128, height: 11),
+          const SizedBox(height: 10),
+          const SkeletonBar(width: 190, height: 9),
+          const SizedBox(height: 22),
+          Row(
+            children: [
+              for (var i = 0; i < 3; i++)
+                const Expanded(
+                  child: Padding(
+                    padding: EdgeInsets.only(right: 14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SkeletonBar(width: 60, height: 9),
+                        SizedBox(height: 10),
+                        SkeletonBar(width: 44, height: 22),
+                        SizedBox(height: 8),
+                        SkeletonBar(height: 9),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 22),
+          const SkeletonBar(height: 11),
+          const SizedBox(height: 9),
+          const SkeletonBar(height: 11),
+          const SizedBox(height: 9),
+          const SkeletonBar(width: 240, height: 11),
+          const SizedBox(height: 22),
+          const SkeletonBar(width: 132, height: 9),
+          const SizedBox(height: 14),
+          for (var i = 0; i < 3; i++)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SkeletonBar(width: 170, height: 12),
+                        SizedBox(height: 6),
+                        SkeletonBar(width: 120, height: 9),
+                      ],
+                    ),
+                  ),
+                  SizedBox(width: 10),
+                  SkeletonBar(width: 66, height: 11),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    return SkeletonPulse(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final wide = constraints.maxWidth >= 1080;
+          return SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(28, 18, 28, 48),
+            child: wide
+                ? Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(flex: 5, child: schedule),
+                      const SizedBox(width: 16),
+                      Expanded(flex: 4, child: payables),
+                    ],
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [schedule, const SizedBox(height: 16), payables],
+                  ),
+          );
+        },
       ),
     );
   }

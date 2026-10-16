@@ -33,6 +33,12 @@ dependencies:
 
   http: ^1.2.0
 
+  # For `usePathUrlStrategy` — the console's links are real paths
+  # (`/flows/ap-invoice/runs`), not `/#/...`. Imported behind a conditional
+  # export so a VM build (the test runner) never sees a web-only library.
+  flutter_web_plugins:
+    sdk: flutter
+
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8

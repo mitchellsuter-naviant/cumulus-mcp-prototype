@@ -1,14 +1,16 @@
 import 'dart:convert';
-import '../models/graph.dart';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
 import '../models/employee.dart';
-import '../models/reimbursement.dart';
+import '../models/graph.dart';
 import '../services/api_client.dart';
+import '../tasks/expense_reimbursement/models.dart';
 import '../theme/cumulus_theme.dart';
+import '../widgets/hr_agent_panel.dart';
+import '../widgets/skeleton.dart';
 import '../widgets/ui_kit.dart';
 
 /// The Employee Hub — the one-stop personal page: PTO balance and requests,
@@ -30,11 +32,26 @@ class EmployeeHubSection extends StatefulWidget {
   /// never closes it.
   final ApiClient api;
 
-  const EmployeeHubSection({super.key, required this.api});
+  /// Land on a document in the Library. The HR Agent's citations are the
+  /// reason this exists: a citation you cannot open is a claim you cannot
+  /// check, which is most of what a citation is for.
+  final void Function(String assetId)? onOpenAsset;
+
+  const EmployeeHubSection({super.key, required this.api, this.onOpenAsset});
 
   @override
   State<EmployeeHubSection> createState() => _EmployeeHubSectionState();
 }
+
+/// One read's outcome: what came back, or what went wrong reading it.
+///
+/// The hub is four independent reads behind one page and it used to treat them
+/// as one: the first failure blanked the lot, so a dead PTO endpoint took the
+/// receipts, the benefits and the HR Agent down with it. A result per read is
+/// what lets a failure cost its own card and nothing else. Only the profile is
+/// still load-bearing for the whole page — it is the page's identity, and
+/// without it there is nobody to draw a hub for.
+typedef _Read<T> = ({T? value, String? error});
 
 class _EmployeeHubSectionState extends State<EmployeeHubSection> {
   ExpenseRollup? _rollup;
@@ -42,7 +59,18 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
   EmployeeProfile? _profile;
   List<PtoRequest>? _pto;
   List<Reimbursement>? _mine;
+
+  /// The cold-start failure: no profile, so there is no page to draw. Every
+  /// other failure is a notice beside data that still stands.
   String? _error;
+
+  /// A refresh that could not re-read the profile, over data already on the
+  /// screen. Kept apart from [_error] because replacing a page of good rows
+  /// with an error card is the most destructive thing a Refresh button can do.
+  String? _staleNotice;
+  String? _ptoError;
+  String? _expenseError;
+  String? _rollupError;
 
   @override
   void initState() {
@@ -50,32 +78,62 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
     _load();
   }
 
-  Future<void> _load() async {
+  /// Runs one read to a value or a message, never to a thrown error.
+  ///
+  /// Broad on purpose: the failure that used to hang this screen forever was
+  /// not an `ApiException` at all but a `TypeError` out of a `fromJson` on a
+  /// shape the server had changed — an unhandled async error, no `_error` set,
+  /// and a spinner that never stopped.
+  Future<_Read<T>> _read<T>(Future<T> future) async {
     try {
-      final profile = await _api.employeeProfile();
-      final pto = await _api.listPtoRequests();
-      final all = await _api.listReimbursements(mine: true);
-      // The traversal, not a search: Employee --submitted--> ExpenseRequest
-      // --has_expense_line--> ExpenseLine, summed. It is the question the
-      // graph exists to make answerable, and until now nothing asked it.
-      ExpenseRollup? rollup;
-      try {
-        rollup = await _api.employeeExpenses(profile.email);
-      } on ApiException {
-        // A persona outside the org chart has nothing to traverse from.
-      }
-      if (mounted) {
-        setState(() {
-          _profile = profile;
-          _pto = pto;
-          _mine = all;
-          _rollup = rollup;
-          _error = null;
-        });
-      }
+      return (value: await future, error: null);
     } on ApiException catch (e) {
-      if (mounted) setState(() => _error = e.message);
+      return (value: null, error: e.message);
+    } catch (e) {
+      return (value: null, error: '$e');
     }
+  }
+
+  Future<void> _load() async {
+    // Three independent reads: the profile does not gate the PTO list or the
+    // receipts, and running them in series spent three round trips of latency
+    // to draw one page. Started together, awaited in turn.
+    final profileRead = _read(_api.employeeProfile());
+    final ptoRead = _read(_api.listPtoRequests());
+    final mineRead = _read(_api.listReimbursements(mine: true));
+    final profile = await profileRead;
+    final pto = await ptoRead;
+    final mine = await mineRead;
+
+    // The traversal, not a search: Employee --submitted--> ExpenseRequest
+    // --has_expense_line--> ExpenseLine, summed. It is the question the
+    // graph exists to make answerable, and until now nothing asked it. It
+    // needs the resolved address, so it is the one read that waits.
+    _Read<ExpenseRollup> rollup = (value: null, error: null);
+    final resolved = profile.value;
+    if (resolved != null) {
+      rollup = await _read(_api.employeeExpenses(resolved.email));
+    }
+
+    if (!mounted) return;
+    setState(() {
+      // Whatever came back replaces what it had; whatever did not keeps it.
+      // A failed refresh leaves the page as it was and says so.
+      if (profile.value != null) _profile = profile.value;
+      if (pto.value != null) _pto = pto.value;
+      if (mine.value != null) _mine = mine.value;
+      if (rollup.value != null) _rollup = rollup.value;
+      _ptoError = pto.error;
+      _expenseError = mine.error;
+      // A principal outside the org chart has nothing to traverse from, which
+      // is an answer rather than a fault — so the rollup only reports a
+      // failure to somebody it was supposed to have one for.
+      _rollupError = (resolved?.inWorkforce ?? false) ? rollup.error : null;
+      // Only the read nothing else can stand without blanks the page, and only
+      // while there is nothing to stand on.
+      _error = _profile == null ? profile.error : null;
+      _staleNotice = _profile == null ? null : profile.error;
+    });
   }
 
   @override
@@ -90,9 +148,7 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
             // A principal outside the org chart has no name to show, so the
             // heading falls back to the address rather than rendering blank.
             title: _hubTitle(),
-            subtitle:
-                'Time off, expenses, and benefits — plus the HR Agent, which '
-                'answers from the people policies in the knowledge layer.',
+            subtitle: _hubSubtitle(),
             trailing: OutlinedButton.icon(
               onPressed: _load,
               icon: const Icon(Icons.refresh, size: 16),
@@ -113,16 +169,40 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
         message: _error!,
       );
     }
-    if (_profile == null) {
-      return const Center(child: CircularProgressIndicator(strokeWidth: 2.5));
-    }
+    if (_profile == null) return const _HubSkeleton();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // The Refresh that failed over a page that had already loaded. Said
+        // here rather than by swapping the page for an error card: what is on
+        // screen is still the last good read, and it is still worth reading.
+        if (_staleNotice != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(28, 14, 28, 0),
+            child: ErrorNotice(
+              message:
+                  'Could not refresh — showing the last good read. '
+                  '$_staleNotice',
+              onRetry: _load,
+            ),
+          ),
+        Expanded(child: _columns()),
+      ],
+    );
+  }
+
+  Widget _columns() {
     return LayoutBuilder(
       builder: (context, constraints) {
         // The rail and the section padding eat into the width the standalone
         // page had, so the two-column split turns on a little earlier.
         final wide = constraints.maxWidth >= 1000;
         final left = _leftColumn();
-        final chat = _HrChatPanel(api: _api);
+        final chat = HrAgentPanel(
+          ask: (message, history) => _api.hrChat(message, history: history),
+          inWorkforce: _profile!.inWorkforce,
+          onOpenAsset: widget.onOpenAsset,
+        );
         if (!wide) {
           return SingleChildScrollView(
             padding: const EdgeInsets.fromLTRB(28, 16, 28, 40),
@@ -158,8 +238,51 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
     return profile.email.isEmpty ? 'Your hub' : profile.email;
   }
 
+  /// What this page actually offers *this* reader.
+  ///
+  /// The old copy promised time off, expenses and benefits to everyone and
+  /// said the agent answered "from the people policies", which was both a
+  /// promise the operator's view could not keep and a description of a scope
+  /// the agent has stopped having — it reads the whole corpus now, because
+  /// travel and expenses are employee questions filed under other desks.
+  String _hubSubtitle() {
+    final profile = _profile;
+    if (profile != null && !profile.inWorkforce) {
+      return 'This account is not on the customer\u2019s org chart, so the '
+          'personal half does not apply. The HR Agent still answers policy '
+          'questions from the governed corpus, with citations.';
+    }
+    return 'Time off, expenses, and benefits \u2014 plus the HR Agent, which '
+        'answers from the governed corpus and your own records, with '
+        'citations and the precedence it ranked them under.';
+  }
+
   Widget _leftColumn() {
     final profile = _profile!;
+    // A principal the org chart has never heard of — the operator, the support
+    // engineer — has no balance, no enrolment and no manager. The page used to
+    // render the whole personal column anyway: two stat tiles reading `0` and
+    // an empty one, a form that would deny whatever it submitted, and a
+    // Benefits card with nothing in it. That is not an empty state, it is a
+    // broken one, and it was the first thing anybody saw here.
+    //
+    // So the personal half is not drawn at all, and what stands in its place
+    // says why and names what *does* apply to this account. The governed rule
+    // stays, because the PTO window is a fact about the deployment rather than
+    // about the reader.
+    if (!profile.inWorkforce) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _WhoThisIs(profile: profile),
+          const SizedBox(height: 14),
+          _GovernedRuleCard(
+            autoApproveDays: profile.ptoAutoApproveDays,
+            policyRef: profile.ptoPolicyRef,
+          ),
+        ],
+      );
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -167,56 +290,111 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
         if (_rollup != null) ...[
           const SizedBox(height: 14),
           _SpendRollup(rollup: _rollup!),
+        ] else if (_rollupError != null) ...[
+          const SizedBox(height: 14),
+          CumulusCard(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: _CardNotice(
+                'The spend walk did not come back, so this card is empty '
+                'rather than wrong. $_rollupError',
+              ),
+            ),
+          ),
         ],
         const SizedBox(height: 14),
         StatStrip(
           tiles: [
-            // The balance and the accrual are the deployment's defaults until
-            // somebody enrols this person — the hub mints a profile at these
-            // numbers the first time it is read, and nothing has varied them.
-            // The caption says so rather than presenting a class default as
-            // this person's accrued record.
+            // A balance nobody delivered is not a balance. This tile used to
+            // read `17.5` with a caption admitting it was "the deployment
+            // default, not an HRIS balance" — a number and a disclaimer, where
+            // the honest rendering of an absent fact is an em dash.
             StatTile(
               label: 'PTO balance',
-              value: '${profile.ptoBalanceDays}',
-              caption:
-                  'days · +${profile.ptoAccrualPerMonth}/month · the '
-                  'deployment default, not an HRIS balance',
+              value: profile.ptoBalanceDays == null
+                  ? '\u2014'
+                  : '${profile.ptoBalanceDays}',
+              caption: profile.ptoBalanceDays == null
+                  ? 'no balance on record'
+                  : 'days'
+                        '${profile.ptoAccrualPerMonth == null ? '' : ' · +${profile.ptoAccrualPerMonth}/month'}',
             ),
+            // A failed read is not zero pending requests. `0` under "waiting
+            // on HR" is the one wrong answer this tile can give, so it
+            // declines to give it.
             StatTile(
               label: 'Pending requests',
-              value: '${(_pto ?? []).where((r) => r.state == 'pending').length}',
-              caption: 'with HR',
+              value: _ptoError != null
+                  ? '—'
+                  : '${(_pto ?? []).where((r) => r.state == 'pending').length}',
+              caption: _ptoError != null ? 'not read' : 'with HR',
             ),
-            StatTile(
-              label: 'Next holiday',
-              value: profile.nextCompanyHoliday.split('·').last.trim(),
-              caption: profile.nextCompanyHoliday.split('·').first.trim(),
-            ),
+            // Drawn only when a calendar has one. An empty tile captioned with
+            // half of an empty string was the third thing on this screen that
+            // said nothing while looking like data.
+            if (profile.nextCompanyHoliday.isNotEmpty)
+              StatTile(
+                label: 'Next holiday',
+                value: profile.nextCompanyHoliday.split('·').last.trim(),
+                caption: profile.nextCompanyHoliday.split('·').first.trim(),
+              ),
           ],
         ),
+        if (profile.recordsNote.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          CumulusCard(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: _CardNotice(profile.recordsNote),
+            ),
+          ),
+        ],
         const SizedBox(height: 16),
         _PtoCard(
           api: _api,
           onChanged: _load,
           requests: _pto ?? const [],
+          // The form still works when the history behind it did not load:
+          // requesting time off does not depend on being able to list what you
+          // asked for last month.
+          notice: _ptoError == null
+              ? null
+              : 'Your request history did not load, so the list below may be '
+                    'short. $_ptoError',
           autoApproveDays: profile.ptoAutoApproveDays,
           policyRef: profile.ptoPolicyRef,
         ),
         const SizedBox(height: 16),
-        _ExpenseCard(api: _api, onChanged: _load, mine: _mine ?? const []),
+        _ExpenseCard(
+          api: _api,
+          onChanged: _load,
+          mine: _mine ?? const [],
+          notice: _expenseError == null
+              ? null
+              : 'Your recent requests did not load. Submitting still works. '
+                    '$_expenseError',
+        ),
         const SizedBox(height: 16),
-        // Not "what you are enrolled in". Every profile gets the same four
-        // plans the first time the hub reads it; nothing here comes from an
-        // enrolment system and nothing varies per person yet. Presenting a
-        // deployment default as somebody's own record is the kind of claim a
-        // reader has no way to check.
+        // Every profile used to get the same four invented plans — "Health PPO
+        // 2500", a 4% match, a learning stipend — minted on first read and shown
+        // as this person's enrolments. Nothing delivers enrolment data, so the
+        // card says that instead. What the organization *offers* is written
+        // down in the governed benefits guide, which the HR Agent cites.
         SectionCard(
           title: 'Benefits',
-          subtitle: 'the plans this deployment offers — enrolment is not '
-              'modelled yet, so these are the same for everyone',
+          subtitle: profile.benefits.isEmpty
+              ? 'no enrolment is on record for you'
+              : 'as delivered for you',
           child: Column(
             children: [
+              if (profile.benefits.isEmpty)
+                const _CardNotice(
+                  'Enrolment is not modelled yet: no system delivers which '
+                  'plans you are in, so this card shows nothing rather than a '
+                  'set of plans everybody would see. Ask the HR Agent what the '
+                  'organization offers — it answers from the governed benefits '
+                  'guide, with the citation.',
+                ),
               for (final b in profile.benefits)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 10),
@@ -256,6 +434,182 @@ class _EmployeeHubSectionState extends State<EmployeeHubSection> {
   }
 }
 
+/// One card's own bad news, stated inside that card.
+///
+/// Quieter than [ErrorNotice], which owns a whole page's failure. This one says
+/// "this part did not load" beside the parts that did — which is the honest
+/// reading when three independent reads back one screen and one of them fell
+/// over.
+class _CardNotice extends StatelessWidget {
+  final String message;
+
+  const _CardNotice(this.message);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+      decoration: BoxDecoration(
+        color: CumulusColors.warnSoft,
+        borderRadius: BorderRadius.circular(CumulusRadius.control),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(
+            Icons.info_outline,
+            size: 14,
+            color: CumulusColors.warn,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: CumulusText.meta.copyWith(color: CumulusColors.warn),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The hub's own shape while its reads are in flight.
+///
+/// The page heading, the eyebrow and the Refresh button above this are real
+/// and already on screen; only the regions waiting on data are grey. The
+/// geometry mirrors [_leftColumn] and the agent panel beside it — profile
+/// card, stat strip, the two form cards, the chat frame — so nothing moves
+/// when the reads land.
+class _HubSkeleton extends StatelessWidget {
+  const _HubSkeleton();
+
+  @override
+  Widget build(BuildContext context) {
+    const left = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SkeletonCard(
+          padding: EdgeInsets.fromLTRB(16, 16, 16, 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SkeletonBar(width: 190, height: 15),
+              SizedBox(height: 9),
+              SkeletonBar(width: 320, height: 10),
+            ],
+          ),
+        ),
+        SizedBox(height: 14),
+        SkeletonStatStrip(count: 3),
+        SizedBox(height: 16),
+        SkeletonCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SkeletonBar(width: 96, height: 11),
+              SizedBox(height: 10),
+              SkeletonBar(width: 280, height: 9),
+              SizedBox(height: 18),
+              Row(
+                children: [
+                  SkeletonPill(width: 128),
+                  SizedBox(width: 10),
+                  Expanded(child: SkeletonBar(height: 20)),
+                  SizedBox(width: 10),
+                  SkeletonPill(width: 84),
+                ],
+              ),
+              SizedBox(height: 18),
+              SkeletonBar(width: 120, height: 9),
+              SizedBox(height: 12),
+              SkeletonBar(height: 11),
+              SizedBox(height: 10),
+              SkeletonBar(height: 11),
+            ],
+          ),
+        ),
+        SizedBox(height: 16),
+        SkeletonCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SkeletonBar(width: 140, height: 11),
+              SizedBox(height: 10),
+              SkeletonBar(width: 300, height: 9),
+              SizedBox(height: 18),
+              SkeletonBar(height: 96, radius: CumulusRadius.control),
+              SizedBox(height: 16),
+              SkeletonBar(height: 58, radius: CumulusRadius.control),
+            ],
+          ),
+        ),
+      ],
+    );
+    const chat = SkeletonCard(
+      padding: EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              SkeletonCircle(size: 30),
+              SizedBox(width: 10),
+              SkeletonBar(width: 92, height: 12),
+            ],
+          ),
+          SizedBox(height: 22),
+          SkeletonBar(width: 260, height: 44, radius: 14),
+          SizedBox(height: 12),
+          Align(
+            alignment: Alignment.centerRight,
+            child: SkeletonBar(width: 170, height: 32, radius: 14),
+          ),
+          Spacer(),
+          SkeletonBar(height: 34, radius: CumulusRadius.control),
+        ],
+      ),
+    );
+    return SkeletonPulse(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final wide = constraints.maxWidth >= 1000;
+          if (!wide) {
+            return const SingleChildScrollView(
+              padding: EdgeInsets.fromLTRB(28, 16, 28, 40),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  left,
+                  SizedBox(height: 16),
+                  SizedBox(height: 560, child: chat),
+                ],
+              ),
+            );
+          }
+          return const Padding(
+            padding: EdgeInsets.fromLTRB(28, 16, 28, 24),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  flex: 3,
+                  child: SingleChildScrollView(child: left),
+                ),
+                SizedBox(width: 20),
+                Expanded(flex: 2, child: chat),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
 // ---- PTO ---------------------------------------------------------------
 
 class _PtoCard extends StatefulWidget {
@@ -270,12 +624,18 @@ class _PtoCard extends StatefulWidget {
   final double autoApproveDays;
   final String policyRef;
 
+  /// What went wrong reading the history, when something did. The card renders
+  /// either way: a form you can still use is worth more than a page that
+  /// refused to draw because one list behind it was unavailable.
+  final String? notice;
+
   const _PtoCard({
     required this.api,
     required this.onChanged,
     required this.requests,
     required this.autoApproveDays,
     required this.policyRef,
+    this.notice,
   });
 
   @override
@@ -368,6 +728,10 @@ class _PtoCardState extends State<_PtoCard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (widget.notice != null) ...[
+            _CardNotice(widget.notice!),
+            const SizedBox(height: 12),
+          ],
           Row(
             children: [
               OutlinedButton.icon(
@@ -471,10 +835,15 @@ class _ExpenseCard extends StatefulWidget {
   final VoidCallback onChanged;
   final List<Reimbursement> mine;
 
+  /// What went wrong reading `mine`, when something did. Submitting a receipt
+  /// does not depend on being able to list the last five.
+  final String? notice;
+
   const _ExpenseCard({
     required this.api,
     required this.onChanged,
     required this.mine,
+    this.notice,
   });
 
   @override
@@ -542,9 +911,16 @@ class _ExpenseCardState extends State<_ExpenseCard> {
     });
   }
 
-  bool get _canSubmit =>
-      !_busy &&
-      (_attachments.isNotEmpty || _commentary.text.trim().isNotEmpty);
+  /// Evidence is the requirement, and prose is not evidence.
+  ///
+  /// The button used to light up on commentary alone, and the door it posts
+  /// through now refuses that with a 400 — "this door carries bytes, not a
+  /// story". A submission described in prose used to be accepted, extracted,
+  /// projected into lines and written to the graph, leaving facts with no
+  /// artifact behind them, indistinguishable afterwards from facts with one.
+  /// An enabled button over a request the server will reject is the console
+  /// disagreeing with its own backend in the one place a person can see it.
+  bool get _canSubmit => !_busy && _attachments.isNotEmpty;
 
   Future<void> _submit() async {
     setState(() {
@@ -579,10 +955,22 @@ class _ExpenseCardState extends State<_ExpenseCard> {
           'approved' =>
             'Approved automatically — \$${row.requestedUsd.toStringAsFixed(2)} '
                 'across ${row.lines.length} line(s). ${row.verdictReason}.',
+          // Not "elevated for review", and not a named queue. Under the live
+          // version every run stops and the review comes back to the person
+          // who submitted it — nobody else can say whether the number on the
+          // receipt is the number on the receipt — so this is not an
+          // escalation and there is no clerk waiting on it. The desk is
+          // deliberately unnamed: the governed routing table sends it to your
+          // own, and only a routing that could not open one falls back to the
+          // shared expense-review desk. The console cannot tell which
+          // happened from this response, and My Tasks shows either.
           _ =>
-            'Elevated for review — ${row.verdictReason}. It is in the '
-                'expense-review queue, and the run is suspended until someone '
-                'decides.',
+            'Submitted — the run read your receipt'
+                '${row.documents.length == 1 ? '' : 's'} and stopped for you '
+                'to confirm what it read. Nothing has been recorded yet: open '
+                'My Tasks to check the values and confirm them.'
+                '${row.escalations.isEmpty ? '' : ' The governed check also '
+                    'had something to say: ${row.verdictReason}.'}',
         };
       });
       widget.onChanged();
@@ -600,11 +988,16 @@ class _ExpenseCardState extends State<_ExpenseCard> {
     return SectionCard(
       title: 'Submit an expense',
       subtitle:
-          'several receipts go in as one request · your notes are read by the '
-          'flow, not filed beside it',
+          'several receipts go in as one request · a note on a receipt is read '
+          'by the flow and shown back to you, and is never given to the '
+          'extractor',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (widget.notice != null) ...[
+            _CardNotice(widget.notice!),
+            const SizedBox(height: 12),
+          ],
           DropTarget(
             onDragEntered: (_) => setState(() => _dragging = true),
             onDragExited: (_) => setState(() => _dragging = false),
@@ -757,8 +1150,15 @@ class _ExpenseCardState extends State<_ExpenseCard> {
               const SizedBox(width: 12),
               Expanded(
                 child: Text(
-                  'Submitting runs the flow now: extraction per document, the '
-                  'governed policy read, then auto-approval or a review Task.',
+                  _attachments.isEmpty
+                      // The server's own sentence, because the button is
+                      // disabled for exactly the reason the door refuses.
+                      ? 'Attach at least one receipt — this door carries '
+                          'bytes, not a story.'
+                      : 'Submitting runs the flow now: one metered extraction '
+                          'per receipt, the governed policy read, then a '
+                          'confirmation that comes back to you. Nothing is '
+                          'recorded until you confirm it.',
                   style: CumulusText.meta,
                 ),
               ),
@@ -840,233 +1240,39 @@ class _ExpenseCardState extends State<_ExpenseCard> {
   }
 }
 
-// ---- The HR Agent ----------------------------------------------------------
+/// The governed PTO rule on its own, for a reader with no records to apply it
+/// to. The window is a fact about the deployment rather than about the person,
+/// so it is the one thing the personal column can honestly still show.
+class _GovernedRuleCard extends StatelessWidget {
+  final double autoApproveDays;
+  final String policyRef;
 
-class _ChatMessage {
-  final bool fromAgent;
-  final String text;
-  final List<HrCitation> citations;
-
-  const _ChatMessage(this.fromAgent, this.text, [this.citations = const []]);
-}
-
-class _HrChatPanel extends StatefulWidget {
-  final ApiClient api;
-
-  const _HrChatPanel({required this.api});
-
-  @override
-  State<_HrChatPanel> createState() => _HrChatPanelState();
-}
-
-class _HrChatPanelState extends State<_HrChatPanel> {
-  final _input = TextEditingController();
-  final _scroll = ScrollController();
-  final List<_ChatMessage> _messages = [
-    const _ChatMessage(
-      true,
-      'Hi — I\'m the HR Agent. I answer from the PTO policy, the benefits '
-      'guide, and your own records, with citations. Try “how much PTO do I '
-      'have?” or “what\'s the 401(k) match?”',
-    ),
-  ];
-  bool _busy = false;
-
-  @override
-  void dispose() {
-    _input.dispose();
-    _scroll.dispose();
-    super.dispose();
-  }
-
-  Future<void> _send() async {
-    final text = _input.text.trim();
-    if (text.isEmpty || _busy) return;
-    setState(() {
-      _messages.add(_ChatMessage(false, text));
-      _input.clear();
-      _busy = true;
-    });
-    _autoScroll();
-    try {
-      final reply = await widget.api.hrChat(text);
-      if (mounted) {
-        setState(() {
-          _messages.add(_ChatMessage(true, reply.reply, reply.citations));
-          _busy = false;
-        });
-      }
-    } on ApiException catch (e) {
-      if (mounted) {
-        setState(() {
-          _messages.add(_ChatMessage(true, 'Something went wrong: ${e.message}'));
-          _busy = false;
-        });
-      }
-    }
-    _autoScroll();
-  }
-
-  void _autoScroll() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients) {
-        _scroll.animateTo(
-          _scroll.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
-        );
-      }
-    });
-  }
+  const _GovernedRuleCard({
+    required this.autoApproveDays,
+    required this.policyRef,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return CumulusCard(
-      padding: EdgeInsets.zero,
+    return SectionCard(
+      title: 'The governed rule',
+      subtitle: 'what this deployment does with a time-off request, whoever '
+          'makes it',
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            padding: const EdgeInsets.fromLTRB(18, 14, 18, 12),
-            decoration: const BoxDecoration(
-              border: Border(bottom: BorderSide(color: CumulusColors.border)),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  width: 30,
-                  height: 30,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: CumulusColors.accentSoft,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: const Icon(
-                    Icons.support_agent,
-                    size: 17,
-                    color: CumulusColors.accentInk,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                const Text('HR Agent', style: CumulusText.rowTitle),
-                const SizedBox(width: 8),
-                Text('grounded · cited', style: CumulusText.meta),
-              ],
-            ),
+          Text(
+            autoApproveDays <= 0
+                ? 'The PTO policy does not state an auto-approval window, so '
+                      'every request routes to the HR queue.'
+                : 'Requests of '
+                      '${autoApproveDays.toStringAsFixed(autoApproveDays % 1 == 0 ? 0 : 1)} '
+                      'working days or fewer auto-approve when the balance '
+                      'covers them; longer ones raise a Task to the HR queue.',
+            style: CumulusText.body,
           ),
-          Expanded(
-            child: ListView.builder(
-              controller: _scroll,
-              padding: const EdgeInsets.all(16),
-              itemCount: _messages.length + (_busy ? 1 : 0),
-              itemBuilder: (context, i) {
-                if (i == _messages.length) {
-                  return const Padding(
-                    padding: EdgeInsets.all(8),
-                    child: Align(
-                      alignment: Alignment.centerLeft,
-                      child: SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                    ),
-                  );
-                }
-                final m = _messages[i];
-                return Align(
-                  alignment: m.fromAgent
-                      ? Alignment.centerLeft
-                      : Alignment.centerRight,
-                  child: Container(
-                    margin: const EdgeInsets.only(bottom: 10),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 10,
-                    ),
-                    constraints: const BoxConstraints(maxWidth: 420),
-                    decoration: BoxDecoration(
-                      color: m.fromAgent
-                          ? CumulusColors.surfaceMuted
-                          : CumulusColors.ink,
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        SelectableText(
-                          m.text,
-                          style: CumulusText.body.copyWith(
-                            color: m.fromAgent
-                                ? CumulusColors.ink
-                                : Colors.white,
-                          ),
-                        ),
-                        if (m.citations.isNotEmpty) ...[
-                          const SizedBox(height: 8),
-                          Wrap(
-                            spacing: 6,
-                            runSpacing: 6,
-                            children: [
-                              for (final c in m.citations)
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 8,
-                                    vertical: 3,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: CumulusColors.surface,
-                                    borderRadius: BorderRadius.circular(6),
-                                    border: Border.all(
-                                      color: CumulusColors.border,
-                                    ),
-                                  ),
-                                  child: Text(
-                                    c.title.isEmpty ? c.id : c.title,
-                                    style: CumulusText.mono.copyWith(
-                                      fontSize: 10.5,
-                                    ),
-                                  ),
-                                ),
-                            ],
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-          Container(
-            padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
-            decoration: const BoxDecoration(
-              border: Border(top: BorderSide(color: CumulusColors.border)),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _input,
-                    enabled: !_busy,
-                    onSubmitted: (_) => _send(),
-                    decoration: const InputDecoration(
-                      hintText: 'Ask about PTO, benefits, policies…',
-                      isDense: true,
-                      border: InputBorder.none,
-                    ),
-                  ),
-                ),
-                IconButton(
-                  tooltip: 'Send',
-                  onPressed: _busy ? null : _send,
-                  icon: const Icon(Icons.send, size: 18),
-                  color: CumulusColors.accentInk,
-                ),
-              ],
-            ),
-          ),
+          const SizedBox(height: 10),
+          MetaPill(policyRef.isEmpty ? 'knowledge:pto-policy' : policyRef),
         ],
       ),
     );

@@ -112,7 +112,6 @@ const _assetSummaryShape = '''{
   "title": "Expense Approval Policy",
   "content_type": "text/markdown",
   "authority_level": "policy",
-  "scope": "org",
   "owner": "finance",
   "tags": ["expenses", "approval"],
   "status": "published",
@@ -258,14 +257,12 @@ const knowledgeGroup = EndpointGroup(
             description:
                 '`policy`, `standard`, `guideline`, `how-to`, or `note`. '
                 'Agents prefer higher authority when sources disagree.'),
-        ApiParam('scope', 'string', defaultValue: 'org'),
         ApiParam('owner', 'string',
             defaultValue: '""',
             description: 'Team slug. Must name an existing team, or be empty.'),
         ApiParam('tags', 'string[]', defaultValue: '[]'),
         ApiParam('parent', 'string | null', defaultValue: 'null'),
         ApiParam('related', 'string[]', defaultValue: '[]'),
-        ApiParam('supersedes', 'string | null', defaultValue: 'null'),
         ApiParam('superseded_by', 'string | null', defaultValue: 'null'),
         ApiParam('status', 'string',
             defaultValue: 'draft',
@@ -430,9 +427,11 @@ const searchGroup = EndpointGroup(
 const usersGroup = EndpointGroup(
   title: 'Users',
   blurb:
-      'People who sign in. Admins manage plain users; anything touching an '
-      'admin or owner account needs owner. Nobody may delete themselves or '
-      'change their own role.',
+      'People who sign in. Creating one is the only act here that is a '
+      'Firebase Auth account rather than a row; listing, re-roling and '
+      'deleting a person are identity acts and live under Identities, beside '
+      'the same acts for agents and service clients. Creating an admin or '
+      'owner account needs owner.',
   endpoints: [
     Endpoint(
       method: 'GET',
@@ -444,12 +443,6 @@ const usersGroup = EndpointGroup(
           'used, and null for a Firebase token or the legacy admin key.',
       responseExample:
           '{\n  "uid": "…",\n  "email": "you@example.com",\n  "role": "owner",\n  "key_id": null\n}',
-    ),
-    Endpoint(
-      method: 'GET',
-      path: '/api/v1/users',
-      summary: 'List people.',
-      auth: ApiAuth.admin,
     ),
     Endpoint(
       method: 'POST',
@@ -469,36 +462,6 @@ const usersGroup = EndpointGroup(
       errors: [
         ApiError(403, 'Requires owner role or higher'),
         ApiError(409, 'User already exists: {email}'),
-      ],
-    ),
-    Endpoint(
-      method: 'PUT',
-      path: '/api/v1/users/{uid}/role',
-      summary: "Change a person's platform role.",
-      auth: ApiAuth.admin,
-      notes:
-          'Owner is required when the current role or the new role is admin '
-          'or owner.',
-      params: [
-        ApiParam('uid', 'string', where: 'path', required: true),
-        ApiParam('role', 'string',
-            required: true, description: '`owner`, `admin`, or `user`.'),
-      ],
-      errors: [
-        ApiError(400, 'You cannot change your own role'),
-        ApiError(404, 'User not found: {uid}'),
-      ],
-    ),
-    Endpoint(
-      method: 'DELETE',
-      path: '/api/v1/users/{uid}',
-      status: 204,
-      summary: 'Delete a person, revoke their keys, drop their memberships.',
-      auth: ApiAuth.admin,
-      params: [ApiParam('uid', 'string', where: 'path', required: true)],
-      errors: [
-        ApiError(400, 'You cannot delete yourself'),
-        ApiError(404, 'User not found: {uid}'),
       ],
     ),
   ],
@@ -955,18 +918,23 @@ const flowsGroup = EndpointGroup(
     Endpoint(
       method: 'GET',
       path: '/api/v1/flows/{id}/versions',
-      summary: 'Published history plus any open draft, newest first.',
+      summary: 'Version history, newest first.',
       auth: ApiAuth.reader,
       notes:
           'A version is a full snapshot of the declarative export, never a '
           'delta — a chain of deltas is exactly the opaque artifact the '
-          'transparency bar rules out. At most one version is `draft`, and '
-          'exactly one is `active`.',
+          'transparency bar rules out. Exactly one version is `active`; a '
+          'version above it whose package this deployment ships is a `draft` '
+          'the console can make live, and there may be several. A flow that '
+          'has shipped once has one version.',
       responseExample: '''[
-  {"version": 15, "label": "v15-draft", "status": "draft",
-   "steps": [], "notes": "Adds a deterministic duplicate guard…",
+  {"version": 8, "label": "v8", "status": "draft", "shipped": true,
+   "steps": [], "notes": "Arithmetic checks and per-field verdicts.",
    "authored_by": "fde:m.suter", "created_at": "2026-08-23T09:00:00Z"},
-  {"version": 14, "label": "v14", "status": "active", "steps": []}
+  {"version": 7, "label": "v7", "status": "draft", "shipped": true,
+   "steps": []},
+  {"version": 6, "label": "v6", "status": "active", "shipped": true,
+   "steps": []}
 ]''',
     ),
     Endpoint(
@@ -975,6 +943,32 @@ const flowsGroup = EndpointGroup(
       summary: 'One version with its full step list.',
       auth: ApiAuth.reader,
       errors: [ApiError(404, 'Version not found.')],
+    ),
+    Endpoint(
+      method: 'POST',
+      path: '/api/v1/flows/{id}/versions/{version}/activate',
+      summary: 'Make this version the live one; returns the updated flow.',
+      auth: ApiAuth.admin,
+      notes:
+          'A version is a definition; running it takes an executable package '
+          'in the deployed code, and the two are published on different days. '
+          '`shipped` on a version says whether this deployment carries that '
+          'package, and activating a version it does not is refused rather '
+          'than dispatched into nothing. Exactly one version is `active` '
+          'afterwards: the one that held it is archived in the same write, so '
+          'a flow can never be running two definitions. Runs already in '
+          'flight finish on the version they started under — a task carries '
+          'its `flow_version` for exactly this reason.',
+      responseExample: '''{
+  "id": "accounts-payable", "status": "active", "version": 6,
+  "steps": []
+}''',
+      errors: [
+        ApiError(404, 'Flow or version not found.'),
+        ApiError(409,
+            'This deployment does not ship that version — nothing would '
+            'execute it.'),
+      ],
     ),
     Endpoint(
       method: 'GET',
@@ -991,9 +985,9 @@ const flowsGroup = EndpointGroup(
             description: 'Version to compare with. Defaults to the active one.'),
       ],
       responseExample: '''[
-  {"step": {"id": "x0", "type": "transform", "name": "duplicate-check"},
+  {"step": {"id": "c0", "type": "check", "name": "check-arithmetic"},
    "change": "added", "changed_fields": []},
-  {"step": {"id": "t1", "type": "trigger", "name": "InvoiceReceived"},
+  {"step": {"id": "m1", "type": "modelcall", "name": "extract-invoice"},
    "change": "modified", "changed_fields": ["next"]}
 ]''',
       errors: [ApiError(404, 'Version not found.')],
@@ -1062,19 +1056,27 @@ const reimbursementsGroup = EndpointGroup(
       summary: 'Submit a receipt — one live run of the flow.',
       auth: ApiAuth('user+', keysRefused: true),
       notes:
-          'With MODEL_BACKEND=vertex the image is read by a multimodal '
-          'ModelCall; locally a deterministic stub honors hints like '
-          '`total=64.20 category=meals vendor=corner-bistro` (and the word '
-          '`blurry` drops confidence) so the pipeline is drivable without a '
-          'credential. The rule\'s limit, confidence floor, and restricted '
-          'categories are parsed from the expense-approval-policy asset at '
-          'run time — edit the document and the flow behaves differently.',
+          'Evidence is required: a body carrying no bytes is refused with a '
+          '400. A submission described in prose used to be accepted, '
+          'extracted, projected into lines and written to the graph, leaving '
+          'facts with no artifact behind them. The receipt is read by one '
+          'metered multimodal ModelCall per document; locally a deterministic '
+          'stub stands in, and its steering string reaches it only from a '
+          'test, a fixture or the seed — **no REST body can set it**, which is '
+          'the door this version closed. The rule\'s limit, confidence floor, '
+          'and restricted categories are parsed from the '
+          'expense-approval-policy asset at run time — edit the document and '
+          'the flow behaves differently. Every run then stops for the '
+          'submitter to confirm what was read, on their own desk.',
       params: [
         ApiParam('documents', 'array', description:
-            'One entry per artifact: `{content_base64, filename, note, hint}`. '
-            'The note is a real input to the run — the projection reads a '
-            'stated claim out of it ("only requesting \$75 of the \$110") and '
-            'the journal quotes it.'),
+            'One entry per artifact: `{content_base64, filename, note}`. At '
+            'least one must carry bytes. The note is the submitter\'s own '
+            'words about *that* document and lands as its `memo`: the '
+            'projection reads a stated claim out of it ("only requesting '
+            '\$75 of the \$110"), the confirm screen shows it back beside the '
+            'reading, and the journal quotes it. It is never given to the '
+            'extractor.'),
         ApiParam('commentary', 'string', description:
             'The submitter\'s framing of the whole request. A stated purpose '
             'here is what keeps a line above the governed threshold from '
@@ -1151,17 +1153,23 @@ const payablesGroup = EndpointGroup(
       summary: 'Submit an invoice — one live run of the flow.',
       auth: ApiAuth('user+', keysRefused: true),
       notes:
-          'Locally the stub readers honor hints (`vendor=acme-industrial '
-          'total=1840 invoice=ACME-INV-20881 po=PO-7741`); an unrecognized '
-          'vendor is minted `onboarding` by the resolver. The auto-post limit '
-          'and extraction-confidence floor parse from the '
+          'The side door: a document somebody has in their hand. A submission '
+          'with no bytes is refused — an extraction with no artifact behind '
+          'it is a claim nobody can check — and there is no field to describe '
+          'a case with. Filed invoices reach the flow through `ap-intake` '
+          'instead, out of the folders the customer files them in. An '
+          'unrecognized vendor is minted `onboarding` by the resolver; the '
+          'auto-post limit and extraction-confidence floor parse from the '
           'invoice-posting-policy asset at run time.',
       params: [
-        ApiParam('image_base64', 'string'),
+        ApiParam('image_base64', 'string',
+            description: 'Required. The document, base64-encoded.'),
         ApiParam('filename', 'string'),
-        ApiParam('note', 'string', description: 'Hint text / reviewer note.'),
       ],
-      errors: [ApiError(403, 'Minted API keys cannot submit invoices.')],
+      errors: [
+        ApiError(400, 'A submission with no document.'),
+        ApiError(403, 'Minted API keys cannot submit invoices.'),
+      ],
     ),
     Endpoint(
       method: 'GET',
@@ -1202,8 +1210,17 @@ const employeeGroup = EndpointGroup(
     Endpoint(
       method: 'GET',
       path: '/api/v1/employee/me',
-      summary: 'The caller\'s profile: PTO balance, accrual, benefits.',
+      summary: 'The caller\'s profile: org-chart placement, plus whatever the '
+          'hub actually holds.',
       auth: ApiAuth.reader,
+      notes:
+          'Name, title, team, manager and location are read through from the '
+          'graph on every call. `pto_balance_days`, `pto_accrual_per_month`, '
+          '`next_company_holiday` and `benefits` are **null or empty unless '
+          'something delivered them** — an HRIS is their source and none does '
+          'yet — and `records_note` is the sentence saying so. A principal the '
+          'org chart has never heard of gets `in_workforce: false` and '
+          '`workforce_note` instead.',
     ),
     Endpoint(
       method: 'GET',
@@ -1230,7 +1247,7 @@ const employeeGroup = EndpointGroup(
     Endpoint(
       method: 'POST',
       path: '/api/v1/employee/hr-chat',
-      summary: 'Ask the HR Agent — grounded on people/ knowledge, cited.',
+      summary: 'Ask the HR Agent — grounded on the governed corpus, cited.',
       auth: ApiAuth.reader,
       notes:
           'With MODEL_BACKEND=vertex the agent plans with tools over the '
@@ -1333,7 +1350,9 @@ const _taskShape = '''{
   "priority": "normal",
   "status": "open",
   "flow_id": "vendor-master-sync",
+  "flow_version": 6,
   "case_ref": "erp-vend-88410",
+  "subject_email": null,
   "refs": ["vendor:acme-industrial@rev12"],
   "evidence": [{"label": "Method", "value": "fuzzy_name · confidence 0.71"}],
   "proposal": {
@@ -1361,6 +1380,22 @@ const tasksGroup = EndpointGroup(
           'Every task, open before done, high priority first among open, '
           'oldest first within a band.',
       auth: ApiAuth.reader,
+      notes:
+          '`flow_version` is the definition version the run was executing when '
+          'it raised the task, not whatever is live when somebody gets to it. '
+          'A queue three days deep outlives a publish, and the console answers '
+          'a task through the screens of the version that asked — a v6 '
+          'question read through a v7 screen is how a reviewer corrects a '
+          'field the run never looked at. Absent or `0` on records raised '
+          'before the field existed.\n\n'
+          '`subject_email` is who the case is *about* — the person who '
+          'submitted the invoice or the expense — set by both flows at gate '
+          'time. It is often also whose desk the task landed on, since the '
+          'governed routing tables send these back to the submitter, but a '
+          'routing fallback separates the two. `null` when the case has no '
+          'human subject (a sim-filed intake) or on records raised before the '
+          'field existed; consoles may render it, and nothing re-parses '
+          'evidence rows for it.',
       params: [
         ApiParam(
           'status',
@@ -1664,32 +1699,6 @@ const graphGroup = EndpointGroup(
     ),
     Endpoint(
       method: 'GET',
-      path: '/api/v1/graph/vendors',
-      summary:
-          'The vendor master: one row per canonical vendor, carrying every '
-          'source system\'s id for it.',
-      auth: ApiAuth.reader,
-      notes:
-          'The column that matters is `source_records`. When a vendor was a '
-          'slug on a row, the same company in two systems was two vendors and '
-          'merging them merged nothing.',
-      responseExample: '''[{
-  "id": "vendor_5c1b0f9a3e21",
-  "label": "Acme Industrial Inc.",
-  "status": "active",
-  "tax_id": "94-2711883",
-  "source_records": [
-    {"source": "erp-vendors", "external_id": "V-10041", "confidence": 1.0,
-     "method": "exact", "live": true},
-    {"source": "procurement-coupa", "external_id": "C-5501",
-     "confidence": 1.0, "method": "exact", "live": true}
-  ],
-  "invoices": 3,
-  "conflict_fields": ["payment_terms"]
-}]''',
-    ),
-    Endpoint(
-      method: 'GET',
       path: '/api/v1/graph/employees/{email}/expenses',
       summary:
           'How much this employee has submitted — a traversal, not a search.',
@@ -1843,18 +1852,11 @@ const dataGroup = EndpointGroup(
       auth: ApiAuth.reader,
       errors: [
         ApiError(404,
-            'No stored bytes — the run was hint-driven and carried no file.'),
+            'No stored bytes. Both document doors now require evidence, so '
+            'this is a reference to an artifact nobody filed — a '
+            '`storage_ref` with no content behind it — rather than a run that '
+            'was driven without one.'),
       ],
-    ),
-    Endpoint(
-      method: 'GET',
-      path: '/api/v1/sources',
-      summary: 'One row per inbound feed and kind.',
-      auth: ApiAuth.reader,
-      notes:
-          'Assembled from the sync runs, not from a second bookkeeping store — '
-          'inventing one would guarantee the two disagree. A feed that has '
-          'never run does not appear.',
     ),
     Endpoint(
       method: 'POST',
@@ -2094,6 +2096,281 @@ const worldsGroup = EndpointGroup(
   ],
 );
 
+// ---- Plant workspaces (console BFF) ----------------------------------------
+
+const plantWorkspacesGroup = EndpointGroup(
+  title: 'Plant workspaces',
+  blurb:
+      'The console API rather than the platform one: `/api/ui/v1` is '
+      'view-shaped and composed, one route per screen, and it is documented '
+      'here because these three screens carry claims a caller has to be able '
+      'to check — a packet that names no folder, an untracked unit that is '
+      'not an overdue one, and a day that is written before it is signed. '
+      'Each route is the desk it belongs to: hold that queue, or read past '
+      'your own work.',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/ui/v1/field-documents',
+      summary:
+          'Every scheduled job\'s packet, the crews, and the governed '
+          'convention that named them.',
+      auth: ApiAuth('user+ holding `field-operations`, or reading past self'),
+      notes:
+          '**Packets, not folders.** Nothing in this answer describes a '
+          'directory, because nothing in the system creates, moves or deletes '
+          'one. A packet is `Job —documented_by→ Document` at the latest '
+          'revision of each governed type; `former_crews` is an assignment '
+          'whose validity ended and which is still on the record; a document '
+          'with `superseded: true` is a revision the packet has moved past '
+          'and kept, so a crew holding a printed copy can find out what they '
+          'have. Read from what the flow *wrote* — the edges, the '
+          '`packet_label` claim and its note, the `documents_complete` claim '
+          '— rather than by re-deriving the convention here, which would be a '
+          'second implementation free to disagree with the label a crew was '
+          'handed. `unresolved_crew_id` is an identity question, not a '
+          'document one: no document question was asked about that job. '
+          '`empty_windows` counts consecutive passes that found none of the '
+          'governed types, which is the only case that raises a Task.',
+      responseExample: '''{
+  "jobs": [{
+    "job_number": "260118",
+    "packet_label": "260118 - Cedar Ridge Lot 42",
+    "label_rule": "job number, then the customer's site, per the convention",
+    "customer": "Cedar Ridge Homes", "builder": "Vantage Builders",
+    "plant_site": "kaukauna", "status": "scheduled", "load_date": "2026-09-14",
+    "current_crew": {"team_slug": "crew-b", "name": "Crew B",
+                     "foreman": "Dale Mattson"},
+    "former_crews": [{"team_slug": "crew-a", "name": "Crew A",
+                      "until_iso": "2026-09-02T13:20:00Z"}],
+    "unresolved_crew_id": "",
+    "documents": [{"kind": "truss placement plan", "filename": "260118-tpp.pdf",
+                   "version": "2", "filed_at": "2026-09-03T10:02:00Z",
+                   "superseded": false}],
+    "missing": ["crew hours sheet"], "complete": false, "empty_windows": 0,
+    "last_run_id": "run_fd_9c1", "last_run_at_iso": "2026-09-06T06:00:00Z",
+    "object_ref": "graph:job/260118@7"
+  }],
+  "crews": [{"team_slug": "crew-b", "name": "Crew B",
+             "foreman": "Dale Mattson", "jobs": 6, "complete": 4}],
+  "stats": {"jobs": 24, "in_horizon": 9, "packets_complete": 15,
+            "missing": 8, "unresolved_crews": 1},
+  "policy_clauses": [{"id": "document-types", "label": "Document types",
+                      "value": "truss placement plan, site map, …",
+                      "ref": "knowledge:field-document-policy@4"}],
+  "gap_task_ids": ["task_fd_260044"],
+  "policy_ref": "knowledge:field-document-policy@4", "policy_found": true
+}''',
+      errors: [
+        ApiError(403,
+            'The `field-operations` desk, when you are bound to neither it '
+            'nor a scope that reads past your own work.'),
+      ],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/ui/v1/compliance',
+      summary:
+          'Credentials and inspections by days to expiry, with the notice '
+          'trail and the exception classes.',
+      auth: ApiAuth('user+ holding `hr-safety`, or reading past self'),
+      notes:
+          '`rows` arrives in the order the sweep works it — days to expiry '
+          'ascending, unreadable dates last — and a client that re-sorts by '
+          'default is substituting its own opinion about urgency for the '
+          'governed one. **`days_to_expiry: null` is not zero**: it is a date '
+          'nobody could read, the first exception class, and `expires_on` '
+          'keeps the issuing system\'s text verbatim so a person can see why. '
+          '**`untracked_assets` are not overdue**: a unit the register holds '
+          'no next-due date for is excluded at the *unit*, never at the '
+          'examination, and it is a separate list rather than a row with an '
+          'empty date because a sweep that reported it as out of inspection '
+          'would chase it forever. `stages_sent` is derived from the one '
+          'stamp the record carries, so the answer cannot show a notice trail '
+          'the record does not hold. Nothing is deleted: a row past '
+          '`retention_horizon` is flagged and kept.',
+      responseExample: '''{
+  "rows": [{
+    "kind": "credential", "subject": "Marisol Vega", "subject_kind": "employee",
+    "credential_type": "forklift certification", "category": "equipment",
+    "expires_on": "2026-09-19", "days_to_expiry": 12, "status": "expiring",
+    "last_notified_on": "2026-09-04", "last_notice_stage": 15,
+    "stages_sent": [60, 30, 15], "supervisor": "Dale Mattson",
+    "exception": "", "retain_until": "2033-09-19",
+    "object_ref": "graph:credential/vega-forklift@3"
+  }],
+  "untracked_assets": [{
+    "equipment_id": "EQ-4471", "name": "Yard crane 2", "category": "lifting",
+    "home_site": "kaukauna",
+    "why": "the register holds no next-due date for this unit",
+    "object_ref": "graph:equipment/EQ-4471@2"
+  }],
+  "stats": {"rows": 84, "expiring_60": 11, "expiring_30": 6, "expiring_15": 2,
+            "expired": 1, "untracked": 3,
+            "exceptions_by_class": {"unreadable_date": 2, "sla_floor": 0,
+                                    "no_supervisor": 1, "past_retention": 4},
+            "retention_flagged": 4},
+  "policy_clauses": [{"id": "stages", "label": "Notice stages",
+                      "value": "60 day, 30 day, 15 day",
+                      "ref": "knowledge:credential-alert-policy@2"}],
+  "exception_task_ids": ["task_cred_ex_18"],
+  "retention_horizon": "2019-09-07",
+  "policy_ref": "knowledge:credential-alert-policy@2", "policy_found": true
+}''',
+      errors: [
+        ApiError(403,
+            'The `hr-safety` desk, when you are bound to neither it nor a '
+            'scope that reads past your own work.'),
+      ],
+    ),
+    Endpoint(
+      method: 'GET',
+      path: '/api/ui/v1/plant-schedule',
+      summary: 'One week of the plant schedule, as a department × day grid.',
+      auth: ApiAuth('user+ holding `plant-supervisor`, or reading past self'),
+      notes:
+          'The grid is drawn over the departments the governed page declares '
+          'rather than over the days that happen to exist, because a '
+          'department with no day is the finding. A cell with '
+          '`exists: false` is **no day opened**, which is a different fact '
+          'from a day scheduled for zero hours, and a client that renders it '
+          'as `0` has said the opposite of what the graph holds. There is no '
+          '`exported_at`, deliberately: an export is regenerated on request '
+          'and stored nowhere, so a "last handed out" date would be a record '
+          'of reads nothing keeps. `exportable` is exactly '
+          '`status == approved` — the same answer '
+          '`GET /api/v1/schedule/export` gives — and `export_url` is where '
+          'that answer lives. `goal_max_hours`, `abs_max_hours` and '
+          '`fudge_hours` are the three bounds a supervisor argues with '
+          'separately; exceeding the absolute max *within* the fudge is '
+          'accepted by the page and is not an exception.',
+      params: [
+        ApiParam('week', 'string', where: 'query',
+            description:
+                'ISO week, `YYYY-Www` (for example `2026-W37`). Omitted asks '
+                'for the current week — which the server decides, so the grid '
+                'and the export route can never disagree about which seven '
+                'days that is.'),
+      ],
+      responseExample: '''{
+  "week": "2026-W37",
+  "departments": ["truss-fab", "wall-panel"],
+  "dates": ["2026-09-07", "2026-09-08", "…"],
+  "cells": [{
+    "department": "truss-fab", "date": "2026-09-08",
+    "status": "pending_approval", "exists": true, "total_hours": 268.0,
+    "goal_max_hours": 260.0, "abs_max_hours": 280.0, "fudge_hours": 10.0,
+    "capacity_row": "14 in the crew → 260 goal / 280 absolute",
+    "incentive_per_hour": 1.4,
+    "incentive_basis": "-\$18.00 + \$0.0724/h × 268 h = \$1.40",
+    "incentive_start_usd": -18.0, "incentive_rate_usd_per_hour": 0.0724,
+    "incentive_crossing_hours": 248.6, "out_of_the_hole": true,
+    "below_capacity": false, "stopped_at": "goal-max-with-fudge",
+    "headcount": 14.0, "headcount_as_of": "2026-09-01",
+    "headcount_stale": false,
+    "entries": [{"job_number": "260118", "job_label": "Cedar Ridge Lot 42",
+                 "labor_hours": 42.0, "basis": "next in load order",
+                 "sequence": 1.0, "row_kind": "job", "vehicle_ref": "TR-3",
+                 "placed_by": "flow",
+                 "object_ref": "graph:schedule_entry/…@1"}],
+    "deferred": [{"job_number": "260144", "clause": "goal-max-with-fudge",
+                  "reason": "the day is at the goal plus its fudge",
+                  "labor_hours": 36.0}],
+    "approved_by": "", "approved_at": "",
+    "pending_task_id": "task_sched_truss_fab_2026_09_08",
+    "run_id": "run_ds_41c", "exportable": false,
+    "export_url": "/api/v1/schedule/export?week=2026-W37&department=truss-fab",
+    "object_ref": "graph:schedule_day/truss-fab-2026-09-08@2"
+  }],
+  "stats": {"days": 9, "pending_approval": 4, "approved": 5, "deferred": 3,
+            "below_capacity": 1},
+  "policy_clauses": [{"id": "fudge", "label": "Fudge band",
+                      "value": "applies to the goal maximum",
+                      "ref": "knowledge:scheduling-parameters@6"}],
+  "policy_ref": "knowledge:scheduling-parameters@6", "policy_found": true
+}''',
+      errors: [
+        ApiError(403,
+            'The `plant-supervisor` desk, when you are bound to neither it '
+            'nor a scope that reads past your own work.'),
+        ApiError(422,
+            '`week` is not an ISO week of the form `YYYY-Www` — the same '
+            'sentence the export route answers, parsed by the same code.'),
+      ],
+    ),
+  ],
+);
+
+// ---- Schedule export ---------------------------------------------------------
+
+const scheduleGroup = EndpointGroup(
+  title: 'Schedule export',
+  blurb:
+      'The plant schedule handed to the customer as a file they own. A Tier-1 '
+      'REST route and deliberately not a console endpoint: a portable export '
+      'is a platform capability rather than a screen\'s concern, and a '
+      'customer must be able to pull their own approved schedule with a '
+      'script they wrote — which is the honest answer to "what happens if the '
+      'deployment goes dark".',
+  endpoints: [
+    Endpoint(
+      method: 'GET',
+      path: '/api/v1/schedule/export',
+      summary:
+          'One week of one department\'s approved days, as CSV. Answers '
+          '`text/csv`, not JSON.',
+      auth: ApiAuth.reader,
+      notes:
+          '**A derived Dataset, regenerated on request and stored nowhere.** '
+          'Sources are synced; derivatives are regenerated. Nothing here '
+          'writes — a GET must not, and there is no declared Action for it if '
+          'it wanted to — and the response carries `Cache-Control: no-store`, '
+          'because a copy would go stale the moment a supervisor adjusts a '
+          'row. Comment lines above the header name the derivation the way a '
+          'derived Dataset is asked to name it: the recipe '
+          '(`schedule-export-v1`), the `ScheduleDay` revision each day came '
+          'from, the run that produced it, and who approved it and when — so '
+          'a file found in a drive six months from now traces back to a run '
+          'journal. Columns, in order: `date, job_number, job_label, '
+          'labor_hours, basis, sequence, row_kind, vehicle_ref, placed_by`; a '
+          'changed column set is a new recipe, not a silent edit of this one. '
+          '**Only an `approved` day exports** — the enforcement half of the '
+          'scheduling flow\'s central claim, and the reason the flow writes '
+          'the day *before* it asks: the record exists and the door onto it '
+          'stays shut. `user+` and deliberately not queue-gated, because '
+          'reading is not deciding: the decision happened at the approval '
+          'Task, through `require_queue`, and is already on the ledger.',
+      params: [
+        ApiParam('week', 'string', where: 'query', required: true,
+            description: 'ISO week, `YYYY-Www` — the week the days fall in.'),
+        ApiParam('department', 'string', where: 'query', required: true,
+            description: 'The department\'s Cumulus slug, e.g. `truss-fab`.'),
+      ],
+      responseExample: '''# cumulus schedule export · recipe: schedule-export-v1
+# department: truss-fab
+# generated_at: 2026-09-07T14:02:11.884Z
+# stored: nowhere — this is a derived Dataset, regenerated on request from the graph that holds the schedule
+# day: 2026-09-08 · from: graph:schedule_day/truss-fab-2026-09-08@2 · produced_by: run_ds_41c · approved_by: dale · approved_at: 2026-09-07T13:40:02Z · total_hours: 268.0 · incentive_per_hour: 1.4
+date,job_number,job_label,labor_hours,basis,sequence,row_kind,vehicle_ref,placed_by
+2026-09-08,260118,Cedar Ridge Lot 42,42.0,next in load order,1.0,job,TR-3,flow''',
+      errors: [
+        ApiError(404,
+            'The week holds no schedule day for this department at all — '
+            'either no window opened one, or every candidate share was '
+            'deferred. A different fact from an unsigned day, and the caller '
+            'is owed the difference.'),
+        ApiError(409,
+            'A day in the week is not approved. The body names each one, its '
+            'status, the open Task holding it and the desk that Task is on: '
+            'an export nobody signed reads to whoever opens it as a '
+            'schedule.'),
+        ApiError(422,
+            '`week` is not an ISO week of the form `YYYY-Www`.'),
+      ],
+    ),
+  ],
+);
+
 const restGroups = <EndpointGroup>[
   knowledgeGroup,
   searchGroup,
@@ -2104,6 +2381,8 @@ const restGroups = <EndpointGroup>[
   tasksGroup,
   reimbursementsGroup,
   payablesGroup,
+  plantWorkspacesGroup,
+  scheduleGroup,
   employeeGroup,
   calendarGroup,
   runsGroup,

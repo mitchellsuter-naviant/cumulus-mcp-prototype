@@ -8,6 +8,7 @@ import '../services/auth_service.dart';
 import '../theme/cumulus_theme.dart';
 import '../theme/domain_tones.dart';
 import '../widgets/cumulus_shell.dart';
+import '../widgets/skeleton.dart';
 import '../widgets/ui_kit.dart';
 
 /// One team: who is on it, what it owns, and who may change either.
@@ -65,9 +66,17 @@ class _TeamDetailViewState extends State<TeamDetailView> {
       _loading = true;
       _error = null;
     });
+    // The team and what it owns are independent reads of the same slug, so the
+    // page waits for the slower of the two rather than for their sum.
+    final Future<Team> teamRead = _api.getTeam(widget.slug);
+    final Future<List<AssetSummary>> assetsRead = _api.teamAssets(widget.slug);
     try {
-      final team = await _api.getTeam(widget.slug);
-      final assets = await _api.teamAssets(widget.slug);
+      // Grouped rather than awaited in a row: a first failure would otherwise
+      // escape while the second read is still in flight, and its error would
+      // land with nobody listening.
+      await Future.wait<void>([teamRead, assetsRead]);
+      final team = await teamRead;
+      final assets = await assetsRead;
       if (!mounted) return;
       setState(() {
         _team = team;
@@ -340,7 +349,36 @@ class _TeamDetailViewState extends State<TeamDetailView> {
         ),
         if (_error != null) ErrorNotice(message: _error!, onRetry: _refresh),
         if (_loading || team == null)
-          const CumulusCard(child: CumulusLoading())
+          // The back link above is real — the way out of a page owes the page
+          // nothing. The team's own name, counts, members and assets are what
+          // the read is for, so they stand in as geometry.
+          const SkeletonPulse(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 16,
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SkeletonBar(width: 132, height: 10),
+                    SizedBox(height: 12),
+                    SkeletonBar(width: 260, height: 26),
+                    SizedBox(height: 14),
+                    Row(
+                      spacing: 8,
+                      children: [
+                        SkeletonPill(width: 88),
+                        SkeletonPill(width: 140),
+                      ],
+                    ),
+                  ],
+                ),
+                SkeletonStatStrip(count: 4),
+                SkeletonListCard(rows: 4),
+                SkeletonListCard(rows: 4, leadingCircle: false),
+              ],
+            ),
+          )
         else ...[
           _heading(team),
           _statStrip(team),

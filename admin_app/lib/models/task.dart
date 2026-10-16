@@ -5,6 +5,8 @@
 /// decide in seconds without leaving the panel.
 library;
 
+import 'data_layer.dart' show DocumentRegion;
+
 class TaskEvidence {
   final String label;
   final String value;
@@ -17,22 +19,199 @@ class TaskEvidence {
   );
 }
 
+/// One extracted field the flow's checks put in doubt, and where on the page
+/// it was read from.
+///
+/// The seam between the flow that decides *which* fields need a human and the
+/// screen that asks about them, written down in WORKPLAN-REAL §4 so neither
+/// side owns it. The point of the shape is subtraction: an extraction has
+/// thirty fields and a clerk should be asked about the three that are actually
+/// in doubt, so a run reports a verdict per field and the screen leads with
+/// the ones whose [status] is not `ok`.
+///
+/// [path] is the canonical fact path — the same vocabulary [DocumentRegion.field],
+/// the flow contract and the golden sets use — which is what lets a box on the
+/// page, an editable input and a correction all name one thing.
+class FieldVerdict {
+  final String path;
+
+  /// Screen copy for the field: "Invoice total", "Line 3 — amount". Written by
+  /// the step that raised the verdict because it knows what it looked at; the
+  /// screen shows it rather than deriving a label from the path.
+  final String label;
+
+  /// The value as read, already rendered for display.
+  final String value;
+
+  /// 0–1 from the extractor. Zero means it did not say, which is not the same
+  /// claim as "certainly wrong" and is rendered differently.
+  final double confidence;
+
+  /// `ok` · `low_confidence` · `inconsistent` · `missing`.
+  final String status;
+
+  /// One sentence, shown to the clerk verbatim. Never reworded on the way to
+  /// the screen: it is the check's own account of what it found.
+  final String reason;
+
+  /// The box on the page, filled in by the targeted locate call. Present only
+  /// for fields that need review — a clean field is never located, which is
+  /// the whole reason the second model call is cheap — and absent even then
+  /// when the locator could not find it or the document has no pages to draw.
+  final DocumentRegion? region;
+
+  const FieldVerdict({
+    required this.path,
+    required this.label,
+    required this.value,
+    required this.confidence,
+    required this.status,
+    required this.reason,
+    this.region,
+  });
+
+  /// Whether this field is settled. Note the asymmetry: only the literal
+  /// string `ok` is settled, so a verdict that arrives with no status at all
+  /// reads as needing a look. Showing a clerk one field too many costs them a
+  /// glance; hiding one the checks flagged costs the invoice.
+  bool get ok => status == 'ok';
+
+  bool get disputed => !ok;
+
+  /// What to put in front of a person. Nothing derived from the path: a
+  /// verdict with no label is a wire defect, and the path is the one string
+  /// certain to be there.
+  String get displayLabel => label.isNotEmpty ? label : path;
+
+  factory FieldVerdict.fromJson(Map<String, dynamic> json) => FieldVerdict(
+    path: json['path'] as String? ?? '',
+    label: json['label'] as String? ?? '',
+    value: json['value'] as String? ?? '',
+    confidence: (json['confidence'] as num? ?? 0).toDouble(),
+    status: json['status'] as String? ?? '',
+    reason: json['reason'] as String? ?? '',
+    region: json['region'] == null
+        ? null
+        : DocumentRegion.fromJson(json['region'] as Map<String, dynamic>),
+  );
+}
+
+/// One vendor the resolver thought this invoice might be from, and how well.
+class VendorCandidate {
+  final String id;
+  final String name;
+
+  /// 0–1 from the resolver's own blend. Shown rather than thresholded: the
+  /// reason a person is being asked is that no score cleared the bar, and
+  /// hiding the numbers would hide how close the call is.
+  final double score;
+
+  const VendorCandidate({
+    required this.id,
+    required this.name,
+    required this.score,
+  });
+
+  factory VendorCandidate.fromJson(Map<String, dynamic> json) =>
+      VendorCandidate(
+        id: json['id'] as String? ?? '',
+        name: json['name'] as String? ?? '',
+        score: (json['score'] as num? ?? 0).toDouble(),
+      );
+}
+
+/// Which entity a case is about, when the resolver could not settle it.
+///
+/// Accounts payable v9 folds this into the invoice review rather than raising a
+/// gate of its own: two gates over one document is two interruptions for one
+/// reading of it, and the person checking the numbers can see the printed name
+/// while they do it. Null is the normal case — the resolver settled it, or the
+/// flow has no entity question — and a decision answers it by naming the chosen
+/// id in its payload.
+class VendorQuestion {
+  /// The id the resolver settled on, or null when it settled nothing — which
+  /// is the only reason this block is on a Task at all.
+  final String? resolved;
+
+  /// The name as printed on the document. What a person compares against.
+  final String printed;
+
+  final List<VendorCandidate> candidates;
+
+  const VendorQuestion({
+    this.resolved,
+    required this.printed,
+    this.candidates = const [],
+  });
+
+  factory VendorQuestion.fromJson(Map<String, dynamic> json) => VendorQuestion(
+    resolved: json['resolved'] as String?,
+    printed: json['printed'] as String? ?? '',
+    candidates: [
+      for (final candidate in (json['candidates'] as List<dynamic>? ?? const []))
+        VendorCandidate.fromJson(candidate as Map<String, dynamic>),
+    ],
+  );
+}
+
 class TaskProposal {
   final String action;
   final String target;
   final String summary;
 
+  /// The per-field verdicts, when the version that raised this task computed
+  /// them. **Null and empty are different facts and the screens rely on it:**
+  /// null is a flow that never ran a field-verdict step, and the honest screen
+  /// for that is the whole extraction; empty is a flow that ran one and found
+  /// nothing in doubt, which is a clean invoice and reads as a fast approve.
+  /// Collapsing the two would turn "we did not look" into "we looked and it is
+  /// fine".
+  final List<FieldVerdict>? fields;
+
+  /// The same `fields` before any flow's reading of them.
+  ///
+  /// `fields` is untyped by contract — the flow that raised the Task is the
+  /// only thing that interprets it — and the two flows that use it put
+  /// different shapes there. Accounts payable puts [FieldVerdict]s, which is
+  /// what [fields] projects. Expense-reimbursement v10 puts one row per
+  /// document: the stored artifact, the submitter's own memo about it, and the
+  /// extraction summary for it. Reading those rows as verdicts would yield a
+  /// verdict with no path, no status and no reason — not an error, which is
+  /// worse than one — so a screen for the second reads these.
+  final List<Map<String, dynamic>>? rawFields;
+
+  /// The entity question this review also answers, or null when there is none.
+  final VendorQuestion? vendor;
+
   const TaskProposal({
     required this.action,
     required this.target,
     required this.summary,
+    this.fields,
+    this.rawFields,
+    this.vendor,
   });
 
-  factory TaskProposal.fromJson(Map<String, dynamic> json) => TaskProposal(
-    action: json['action'] as String? ?? '',
-    target: json['target'] as String? ?? '',
-    summary: json['summary'] as String? ?? '',
-  );
+  factory TaskProposal.fromJson(Map<String, dynamic> json) {
+    final raw = json['fields'] == null
+        ? null
+        : [
+            for (final field in json['fields'] as List<dynamic>)
+              (field as Map).cast<String, dynamic>(),
+          ];
+    return TaskProposal(
+      action: json['action'] as String? ?? '',
+      target: json['target'] as String? ?? '',
+      summary: json['summary'] as String? ?? '',
+      fields: raw?.map(FieldVerdict.fromJson).toList(),
+      rawFields: raw,
+      vendor: json['vendor'] == null
+          ? null
+          : VendorQuestion.fromJson(
+              (json['vendor'] as Map).cast<String, dynamic>(),
+            ),
+    );
+  }
 }
 
 class TaskDecision {
@@ -111,7 +290,29 @@ class QueueTask {
   final String priority; // low | normal | high
   final String status; // open | done
   final String flowId;
+
+  /// The flow-definition version this task was raised under.
+  ///
+  /// A task is answered by the screens of the definition that raised it, not
+  /// by whatever is live when somebody gets to it: a queue three days deep can
+  /// outlive a publish, and asking a v6 question through a v7 screen is how a
+  /// reviewer ends up correcting a field the run never read. Zero when the
+  /// record predates the field or the task was built locally — the registry
+  /// falls back to the newest package it has.
+  final int flowVersion;
+
   final String caseRef;
+
+  /// Who the case is *about* — the submitter, on both flows that raise a gate
+  /// over somebody's own paperwork. Empty when the case has no human subject
+  /// (a sim-filed intake, an older record): a task about nobody is a real
+  /// state, and a console that guessed one would be attributing work.
+  ///
+  /// First-class rather than display text in an evidence row, so a surface can
+  /// show it without re-parsing prose. It is often, but not always, the person
+  /// whose desk the task landed on — a routing fallback separates the two.
+  final String subjectEmail;
+
   final List<String> refs;
   final List<TaskEvidence> evidence;
   final TaskProposal? proposal;
@@ -152,7 +353,9 @@ class QueueTask {
     required this.priority,
     required this.status,
     required this.flowId,
+    this.flowVersion = 0,
     required this.caseRef,
+    this.subjectEmail = '',
     required this.refs,
     required this.evidence,
     required this.proposal,
@@ -201,7 +404,11 @@ class QueueTask {
     priority: json['priority'] as String? ?? 'normal',
     status: json['status'] as String? ?? 'open',
     flowId: json['flow_id'] as String? ?? '',
+    flowVersion: (json['flow_version'] as num? ?? 0).toInt(),
     caseRef: json['case_ref'] as String? ?? '',
+    // Null on the wire is "this case is about nobody", which reads as empty
+    // rather than as a missing value to go looking for.
+    subjectEmail: json['subject_email'] as String? ?? '',
     refs: (json['refs'] as List<dynamic>? ?? const [])
         .map((e) => e as String)
         .toList(),

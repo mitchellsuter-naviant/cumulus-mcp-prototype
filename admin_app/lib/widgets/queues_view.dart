@@ -22,6 +22,7 @@ import 'package:flutter/material.dart';
 import '../models/queue.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'skeleton.dart';
 import 'ui_kit.dart';
 
 class QueuesView extends StatefulWidget {
@@ -76,6 +77,7 @@ class _QueuesViewState extends State<QueuesView> {
     final all = _queues ?? const <WorkQueue>[];
     final unheld = all.where((q) => q.unheldWithWork).toList();
     final personal = all.where((q) => q.personal).length;
+    final visible = _visible;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -157,7 +159,14 @@ class _QueuesViewState extends State<QueuesView> {
         ),
         Expanded(
           child: _queues == null
-              ? const Center(child: CircularProgressIndicator())
+              // Heading and the personal-desk filter above are real already;
+              // the split below them is what the read is for.
+              ? const SkeletonPulse(
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(28, 0, 28, 24),
+                    child: SkeletonMasterDetail(listWidth: 320, rows: 7),
+                  ),
+                )
               : Padding(
                   padding: const EdgeInsets.fromLTRB(28, 0, 28, 24),
                   child: Row(
@@ -165,19 +174,22 @@ class _QueuesViewState extends State<QueuesView> {
                     children: [
                       SizedBox(
                         width: 320,
-                        child: ListView(
-                          children: [
-                            for (final queue in _visible)
-                              Padding(
-                                padding: const EdgeInsets.only(bottom: 10),
-                                child: _QueueRow(
-                                  queue: queue,
-                                  selected: queue.slug == _selected,
-                                  onTap: () =>
-                                      setState(() => _selected = queue.slug),
-                                ),
+                        // Built on demand: a tenant with a personal desk per
+                        // employee has a long list here, and a plain ListView
+                        // builds every row of it whether or not it is on
+                        // screen.
+                        child: ListView.builder(
+                          itemCount: visible.length,
+                          itemBuilder: (context, i) => Padding(
+                            padding: const EdgeInsets.only(bottom: 10),
+                            child: _QueueRow(
+                              queue: visible[i],
+                              selected: visible[i].slug == _selected,
+                              onTap: () => setState(
+                                () => _selected = visible[i].slug,
                               ),
-                          ],
+                            ),
+                          ),
                         ),
                       ),
                       const SizedBox(width: 20),

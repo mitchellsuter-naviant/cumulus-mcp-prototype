@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/calendar.dart';
 import '../services/api_client.dart';
 import '../theme/cumulus_theme.dart';
+import 'skeleton.dart';
 import 'ui_kit.dart';
 
 /// The week view: one person's calendar, mirrored from the provider.
@@ -23,8 +24,15 @@ class CalendarSection extends StatefulWidget {
 }
 
 class _CalendarSectionState extends State<CalendarSection> {
-  /// The Monday the grid starts on.
+  /// The Monday the grid starts on — the week being *asked for*, which during
+  /// a page-turn is not yet the week on screen.
   late DateTime _weekStart = mondayOf(DateTime.now());
+
+  /// The Monday the loaded agenda actually covers. The grid is drawn against
+  /// this one while a page-turn is in flight: drawing the new week's columns
+  /// over the old week's events would show seven empty days, which is a claim
+  /// about somebody's calendar rather than a loading state.
+  DateTime? _shownWeekStart;
   Agenda? _agenda;
   String? _error;
   bool _loading = true;
@@ -36,20 +44,24 @@ class _CalendarSectionState extends State<CalendarSection> {
   }
 
   Future<void> _load() async {
+    final asked = _weekStart;
     setState(() => _loading = true);
     try {
       final agenda = await widget.api.calendarAgenda(
-        start: isoDate(_weekStart),
+        start: isoDate(asked),
         days: 7,
       );
-      if (!mounted) return;
+      // Two quick clicks on `next` put two weeks in flight; only the one still
+      // being asked for is allowed to land.
+      if (!mounted || asked != _weekStart) return;
       setState(() {
         _agenda = agenda;
+        _shownWeekStart = asked;
         _error = null;
         _loading = false;
       });
     } on ApiException catch (e) {
-      if (mounted) {
+      if (mounted && asked == _weekStart) {
         setState(() {
           _error = e.message;
           _loading = false;
@@ -141,12 +153,37 @@ class _CalendarSectionState extends State<CalendarSection> {
       );
     }
     final agenda = _agenda;
-    if (agenda == null || _loading) return const CumulusLoading();
+    // The cold load and a page-turn are different states and used to be the
+    // same one: `_loading` in the gate meant every step to the next week threw
+    // the whole grid away and put a spinner where a calendar had been. Only
+    // the cold load has nothing to show.
+    if (agenda == null) return const _WeekSkeleton();
     return Padding(
       padding: const EdgeInsets.fromLTRB(28, 0, 28, 28),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          // The page-turn's whole announcement: the week on screen is the one
+          // you were reading, the one you asked for is on its way.
+          if (_loading) ...[
+            Row(
+              children: [
+                const SizedBox(
+                  width: 13,
+                  height: 13,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                const SizedBox(width: 9),
+                Text(
+                  'Fetching '
+                  '${_rangeLabel(_weekStart, _weekStart.add(const Duration(days: 6)))}'
+                  '…',
+                  style: CumulusText.meta,
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+          ],
           if (agenda.personaNote.isNotEmpty) ...[
             Container(
               padding: const EdgeInsets.all(12),
@@ -161,8 +198,117 @@ class _CalendarSectionState extends State<CalendarSection> {
             ),
             const SizedBox(height: 12),
           ],
-          Expanded(child: _WeekGrid(weekStart: _weekStart, agenda: agenda)),
+          Expanded(
+            child: AnimatedOpacity(
+              opacity: _loading ? 0.45 : 1,
+              duration: const Duration(milliseconds: 150),
+              child: _WeekGrid(
+                weekStart: _shownWeekStart ?? _weekStart,
+                agenda: agenda,
+              ),
+            ),
+          ),
         ],
+      ),
+    );
+  }
+}
+
+/// The week grid before its first agenda: the seven day columns, the hour
+/// gutter and the card frame, with grey blocks where events will be.
+///
+/// Only on a cold load. A page-turn keeps the week it already has — see
+/// [_CalendarSectionState._body].
+class _WeekSkeleton extends StatelessWidget {
+  const _WeekSkeleton();
+
+  static const _gutter = 60.0;
+
+  @override
+  Widget build(BuildContext context) {
+    return SkeletonPulse(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(28, 0, 28, 28),
+        child: SkeletonCard(
+          padding: EdgeInsets.zero,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                child: Row(
+                  children: [
+                    const SizedBox(width: _gutter),
+                    for (var day = 0; day < 7; day++)
+                      const Expanded(
+                        child: Column(
+                          children: [
+                            SkeletonBar(width: 30, height: 9),
+                            SizedBox(height: 8),
+                            SkeletonCircle(size: 28),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: SingleChildScrollView(
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SizedBox(
+                        width: _gutter,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            for (var hour = 0; hour < 6; hour++)
+                              const Padding(
+                                padding: EdgeInsets.fromLTRB(0, 14, 8, 38),
+                                child: SkeletonBar(width: 34, height: 9),
+                              ),
+                          ],
+                        ),
+                      ),
+                      for (var day = 0; day < 7; day++)
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(3, 10, 3, 10),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                SizedBox(height: 16.0 * (day % 3)),
+                                const SkeletonBar(
+                                  height: 46,
+                                  radius: 7,
+                                  color: CumulusColors.surfaceMuted,
+                                ),
+                                const SizedBox(height: 14),
+                                SkeletonBar(
+                                  height: day.isEven ? 76 : 34,
+                                  radius: 7,
+                                  color: CumulusColors.surfaceMuted,
+                                ),
+                                if (day < 5) ...[
+                                  const SizedBox(height: 14),
+                                  const SkeletonBar(
+                                    height: 40,
+                                    radius: 7,
+                                    color: CumulusColors.surfaceMuted,
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

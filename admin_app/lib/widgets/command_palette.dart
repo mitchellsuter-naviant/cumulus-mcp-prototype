@@ -84,12 +84,23 @@ const int flowsIndex = 8;
 const int identitiesIndex = 9;
 const int employeeHubIndex = 10;
 const int queuesIndex = 11;
+// Appended, never renumbered. A constant here is the position a section
+// occupies in the shell's IndexedStack, so moving one moves a page out from
+// under every link that already pointed at it — see `_sectionSlugs` in
+// `home_shell.dart`, which exists because the *slug* is the durable name and
+// the index is not.
+const int fieldDocumentsWorkspaceIndex = 12;
+const int complianceWorkspaceIndex = 13;
+const int plantScheduleWorkspaceIndex = 14;
 
-/// The queues the two business workspaces belong to. Named because the rail,
-/// the palette and the shell's unmounting rule all have to agree, and three
-/// copies of a string is how they stop agreeing.
+/// The queues the business workspaces belong to. Named because the rail, the
+/// palette and the shell's unmounting rule all have to agree, and three copies
+/// of a string is how they stop agreeing.
 const String expenseQueue = 'expense-review';
 const String payablesQueue = 'ap-clerk';
+const String fieldOpsQueue = 'field-operations';
+const String hrSafetyQueue = 'hr-safety';
+const String plantSupervisorQueue = 'plant-supervisor';
 
 /// Whether this session reaches a workspace whose work sits in one queue.
 ///
@@ -107,6 +118,37 @@ const String payablesQueue = 'ap-clerk';
 /// the two errors — the route behind it refuses in a sentence.
 bool ownsWorkspace(Session? session, String queue) =>
     session == null || session.scope != 'own' || session.queues.contains(queue);
+
+/// Whether to offer a workspace at all: it has to be your work *and* it has to
+/// exist in this deployment.
+///
+/// Two gates, because they answer two different questions and only one of them
+/// was ever asked here. [ownsWorkspace] asks whether this persona's work sits
+/// in that queue. The second asks whether this deployment *has* the workspace
+/// — a fact the server computes from whether anybody in the cast holds the
+/// desk and whether estate discovery says the namespace runs the app the
+/// surface rests on. The console used to answer that one with a compiled
+/// boolean, which is a copy of a rule the server already holds and could be
+/// shipped believing in a deployment it had never reached; [Session.workspaces]
+/// is the server's own answer, and silence from it still means yes, so a
+/// console talking to an older deployment behaves exactly as it did before.
+///
+/// The last clause is the part worth arguing about. When a workspace is
+/// unavailable but the queue is *literally on your session*, the stop is still
+/// offered. That is deliberate: a person who holds the plant-supervisor desk
+/// and finds the plant schedule silently missing has no way to learn why, and
+/// "the stop vanished" is the least debuggable failure a console has. Offering
+/// it means the route behind it answers with the deployment's own sentence —
+/// `Session.workspaceReason` is written to be shown verbatim — which is a
+/// person being told something rather than a person being left to guess.
+/// Somebody who does not hold the desk is not owed that explanation and gets
+/// the clean absence instead.
+bool showsWorkspace(Session? session, String queue, String slug) {
+  if (!ownsWorkspace(session, queue)) return false;
+  final availability = session?.workspaceFor(slug);
+  if (availability == null || availability.available) return true;
+  return session!.queues.contains(queue);
+}
 
 /// Escape hatch to the full-page result list when the dropdown's ten aren't
 /// enough.
@@ -393,6 +435,9 @@ class CommandCatalog extends ChangeNotifier {
   set session(Session? value) {
     if (value == _session) return;
     _session = value;
+    // The predicates below read the session, so both memos are answers to a
+    // question that has just changed.
+    _invalidate();
     notifyListeners();
   }
 
@@ -525,6 +570,43 @@ class CommandCatalog extends ChangeNotifier {
       ),
       _ownsPayables,
     ),
+    // The three plant workspaces. Same two-part gate as the rail's children:
+    // the desk whose work it is, and whether this deployment has the surface
+    // at all — see [showsWorkspace] for why an unavailable one is still
+    // offered to the desk that holds it.
+    (
+      const CatalogEntry(
+        label: 'Field Documents',
+        detail: 'workspace — job packets, crews, what is missing',
+        keywords: 'workspace field documents packets jobs crews foreman '
+            'plans site map hours sheet',
+        icon: Icons.folder_outlined,
+        intent: OpenSectionIntent(fieldDocumentsWorkspaceIndex),
+      ),
+      _ownsFieldDocuments,
+    ),
+    (
+      const CatalogEntry(
+        label: 'Compliance',
+        detail: 'workspace — credentials, inspections, days to expiry',
+        keywords: 'workspace compliance credentials certifications '
+            'inspections expiry safety osha retention',
+        icon: Icons.verified_user_outlined,
+        intent: OpenSectionIntent(complianceWorkspaceIndex),
+      ),
+      _ownsCompliance,
+    ),
+    (
+      const CatalogEntry(
+        label: 'Plant Schedule',
+        detail: 'workspace — the week, department by day',
+        keywords: 'workspace plant schedule production week department day '
+            'capacity incentive approval export',
+        icon: Icons.grid_on_outlined,
+        intent: OpenSectionIntent(plantScheduleWorkspaceIndex),
+      ),
+      _ownsPlantSchedule,
+    ),
     (
       const CatalogEntry(
         label: 'Counterparty identity',
@@ -542,9 +624,29 @@ class CommandCatalog extends ChangeNotifier {
   static bool _curatesIdentity(Session? s) => s == null || s.mayOpenIdentity;
   static bool _ownsExpenses(Session? s) => ownsWorkspace(s, expenseQueue);
   static bool _ownsPayables(Session? s) => ownsWorkspace(s, payablesQueue);
+  static bool _ownsFieldDocuments(Session? s) =>
+      showsWorkspace(s, fieldOpsQueue, 'field-documents');
+  static bool _ownsCompliance(Session? s) =>
+      showsWorkspace(s, hrSafetyQueue, 'compliance');
+  static bool _ownsPlantSchedule(Session? s) =>
+      showsWorkspace(s, plantSupervisorQueue, 'plant-schedule');
+
+  /// The two flattened views of the catalog, held rather than rebuilt.
+  ///
+  /// [match] runs over [entries] on every keystroke, and the getter it reads
+  /// used to allocate a [CatalogEntry] for every asset, team and identity each
+  /// time — the whole corpus rebuilt to score six rows. Both are cleared
+  /// whenever an input to them moves: the session, or the fetched lists.
+  List<CatalogEntry>? _navigationMemo;
+  List<CatalogEntry>? _entriesMemo;
+
+  void _invalidate() {
+    _navigationMemo = null;
+    _entriesMemo = null;
+  }
 
   /// The destinations this session may actually open.
-  List<CatalogEntry> get navigationEntries => [
+  List<CatalogEntry> get navigationEntries => _navigationMemo ??= [
     for (final (entry, allowed) in _navigation)
       if (allowed(_session)) entry,
   ];
@@ -563,16 +665,20 @@ class CommandCatalog extends ChangeNotifier {
     _identities = (results[2] as List<Identity>?) ?? const [];
     _loaded = true;
     _loading = false;
+    _invalidate();
     notifyListeners();
   }
 
   /// Re-fetch after a write, so a document authored a moment ago is jumpable.
+  /// The memos are dropped here as well as on the way out, so a palette opened
+  /// mid-refresh is never scoring against a list the write has already voided.
   Future<void> refresh() async {
     _loaded = false;
+    _invalidate();
     return ensureLoaded();
   }
 
-  List<CatalogEntry> get entries => [
+  List<CatalogEntry> get entries => _entriesMemo ??= [
     ...navigationEntries,
     for (final a in _assets)
       CatalogEntry(

@@ -350,6 +350,12 @@ class FlowCanvas extends StatefulWidget {
   final ValueChanged<FlowStep?> onSelect;
   final VoidCallback? onExportSchema;
 
+  /// A control the owning screen stands on the canvas — the version selector.
+  /// It sits here rather than in the page header because which revision of
+  /// the graph is drawn is a fact about the graph, and a selector in the
+  /// header looked like it governed the whole page.
+  final Widget? toolbar;
+
   const FlowCanvas({
     super.key,
     required this.steps,
@@ -358,6 +364,7 @@ class FlowCanvas extends StatefulWidget {
     this.runPath,
     this.selectedStepId,
     this.onExportSchema,
+    this.toolbar,
   });
 
   @override
@@ -459,6 +466,11 @@ class _FlowCanvasState extends State<FlowCanvas> {
           top: 12,
           child: Row(
             children: [
+              if (widget.toolbar != null)
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: widget.toolbar,
+                ),
               if (widget.diffAgainst.isNotEmpty)
                 _FloatingBar(
                   children: [

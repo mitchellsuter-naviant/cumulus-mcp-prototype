@@ -245,10 +245,13 @@ class MaterializedWorld {
         tasks: (json['tasks'] as List<dynamic>? ?? const [])
             .map((e) => WorldTask.fromJson(e as Map<String, dynamic>))
             .toList(),
+        // Tolerant like every other field here: a count that arrives as a
+        // JSON double — which is what a Firestore round trip can make of an
+        // integer — took the whole world down on a hard `as int`.
         byType: (json['by_type'] as Map<String, dynamic>? ?? const {})
-            .map((k, v) => MapEntry(k, v as int)),
+            .map((k, v) => MapEntry(k, (v as num?)?.toInt() ?? 0)),
         byLinkType: (json['by_link_type'] as Map<String, dynamic>? ?? const {})
-            .map((k, v) => MapEntry(k, v as int)),
+            .map((k, v) => MapEntry(k, (v as num?)?.toInt() ?? 0)),
         violations: (json['violations'] as List<dynamic>? ?? const [])
             .map((e) {
               final v = e as Map<String, dynamic>;
