@@ -76,6 +76,8 @@ claim — one asserted value for one property, carrying its source, its confiden
 key alias — a business handle for an Entity (a vendor's name, an invoice number), several per Entity and correctable; the id beneath them is minted, permanent, and never a business value.
 File — bytes plus their record: name, type, size, hash, page count.
 Record — one semi-structured item as it was delivered, with provenance (an API payload, a CRM contact, a webhook).
+
+[PROPOSED 2026-10-19, cumulus-vision WORKPLAN-PERSONAS D1] A judgment the business says a person owns — MRA's persona on a member contact — is placed by an Action that names its actor and never derived: no sync lands it, no Flow or ModelCall writes it, and no seed fills it in. The record holds the current word and who placed it; the history is the Ledger's.
 Row — one item under a declared schema.
 Framing · AI-Native Is a Discipline, Not a Feature
 
