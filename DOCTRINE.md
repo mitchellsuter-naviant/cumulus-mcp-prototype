@@ -78,6 +78,8 @@ File — bytes plus their record: name, type, size, hash, page count.
 Record — one semi-structured item as it was delivered, with provenance (an API payload, a CRM contact, a webhook).
 
 [PROPOSED 2026-10-19, cumulus-vision WORKPLAN-PERSONAS D1] A judgment the business says a person owns — MRA's persona on a member contact — is placed by an Action that names its actor and never derived: no sync lands it, no Flow or ModelCall writes it, and no seed fills it in. The record holds the current word and who placed it; the history is the Ledger's.
+
+[AMENDED 2026-10-19, owner] A demo's cast may be placed in advance by a one-off the owner runs, pressing the same Action as the owner for a named handful of people; it is never a bulk fill and never a derivation. A stage a business draws its accounts through (MRA's member journey) is derived by the reading under a Policy, and a person may set it by an Action naming its actor; their word stands for the Policy's held period, then the reading takes over again.
 Row — one item under a declared schema.
 Framing · AI-Native Is a Discipline, Not a Feature
 
